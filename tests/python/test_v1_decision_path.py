@@ -9,6 +9,8 @@ raw feature cannot express.
 from __future__ import annotations
 
 import math
+import os
+import struct
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -16,7 +18,10 @@ from pathlib import Path
 import pytest
 
 _PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
-if str(_PYTHON_SRC) not in sys.path:
+if (
+    os.environ.get("GAFIME_TEST_INSTALLED_PACKAGE") != "1"
+    and str(_PYTHON_SRC) not in sys.path
+):
     sys.path.insert(0, str(_PYTHON_SRC))
 
 pytest.importorskip("gafime.gafime_py")
@@ -27,7 +32,6 @@ from gafime.decision_path import (  # noqa: E402
     decision_path_candidate_from_result,
     evaluate_decision_path_candidate,
 )
-from gafime.errors import V1UnsupportedError  # noqa: E402
 
 
 def _and_dataset(per_quadrant=20):
@@ -113,6 +117,12 @@ def test_native_decision_path_result_params_preserve_original_path_nodes():
     assert result.feature_names == (expected_label,)
     assert candidate.candidate_id == result.candidate_id
     assert candidate.native_candidate_id == int(result.candidate_id.rsplit(":", 1)[-1])
+    assert isinstance(candidate.support, int)
+    native_params = report.interactions.native_handle.decision_path_params(
+        result.combo[0]
+    )
+    assert native_params["thresholds"].typecode == "f"
+    assert isinstance(native_params["support"], int)
     assert len(evaluate_decision_path_candidate(X, candidate)) == len(X)
 
 
@@ -179,6 +189,110 @@ def test_decision_path_compiled_and_eager_preserve_full_unary_order():
         ]
     finally:
         artifact.close()
+
+
+def _float32_from_bits(bits: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def _float64_from_bits(bits: int) -> float:
+    return struct.unpack("<d", struct.pack("<Q", bits))[0]
+
+
+@pytest.mark.parametrize(
+    ("precision", "lower", "upper", "threshold_typecode"),
+    [
+        (
+            "fp32",
+            _float32_from_bits(0x3F800000),
+            _float32_from_bits(0x3F800001),
+            "f",
+        ),
+        (
+            "fp32",
+            _float32_from_bits(0x3F800001),
+            _float32_from_bits(0x3F800002),
+            "f",
+        ),
+        (
+            "mixed",
+            _float32_from_bits(0x3F800000),
+            _float32_from_bits(0x3F800001),
+            "f",
+        ),
+        (
+            "mixed",
+            _float32_from_bits(0x3F800001),
+            _float32_from_bits(0x3F800002),
+            "f",
+        ),
+        (
+            "fp64",
+            _float64_from_bits(0x3FF0000000000000),
+            _float64_from_bits(0x3FF0000000000001),
+            "d",
+        ),
+        (
+            "fp64",
+            _float64_from_bits(0x3FF0000000000001),
+            _float64_from_bits(0x3FF0000000000002),
+            "d",
+        ),
+    ],
+)
+def test_adjacent_float_decision_path_split_survives_eager_and_compiled(
+    precision, lower, upper, threshold_typecode
+):
+    inputs = [[lower], [lower], [upper], [upper]]
+    target = [0.0, 0.0, 1.0, 1.0]
+    config = _config(
+        precision=precision,
+        backend="core",
+        decision_path_max_depth=1,
+        decision_path_rounds=1,
+        decision_path_max_paths=1,
+        decision_path_max_bins=0,
+        decision_path_min_leaf=1,
+        decision_path_top_k_features=1,
+    )
+
+    eager = GafimeEngine(config).analyze(inputs, target, feature_names=["value"])
+    artifact = GafimeEngine(config).compile(inputs, target, feature_names=["value"])
+    try:
+        compiled = artifact.analyze()
+    finally:
+        artifact.close()
+
+    for report in (eager, compiled):
+        path = next(
+            item
+            for item in report.interactions
+            if item.family == "decision_path" and item.params
+        )
+        threshold = float(path.params["thresholds"][0])
+        assert lower <= threshold < upper
+        assert path.params["thresholds"].typecode == threshold_typecode
+        assert path.params["signs"] == [1]
+        assert path.params["support"] == 2
+        assert float(path.params["gain"]) == 2.0
+        assert float(path.metrics["pearson"]) == 1.0
+        candidate = decision_path_candidate_from_result(path)
+        assert evaluate_decision_path_candidate(inputs, candidate) == [
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+        ]
+        assert any(name.startswith("path[") for name in report.feature_names)
+
+    assert compiled.feature_names == eager.feature_names
+    assert [
+        (item.combo, item.candidate_id, item.family, item.metrics, item.params)
+        for item in compiled.interactions
+    ] == [
+        (item.combo, item.candidate_id, item.family, item.metrics, item.params)
+        for item in eager.interactions
+    ]
 
 
 @pytest.mark.parametrize(
@@ -291,31 +405,41 @@ def test_decision_path_source_selection_uses_unary_strength_and_original_index()
         artifact.close()
 
 
-def test_compiled_decision_path_update_target_is_rejected_before_mutation():
+def test_compiled_decision_path_update_target_rediscovers_atomically():
     X, y = _and_dataset()
     artifact = GafimeEngine(_config()).compile(X, y, feature_names=["f0", "f1"])
     try:
-        before = [item.metrics for item in artifact.analyze().interactions]
-        with pytest.raises(V1UnsupportedError, match="target-derived.*recompile"):
-            artifact.update_target(list(reversed(y)))
-        after = [item.metrics for item in artifact.analyze().interactions]
-        assert after == before
+        before = artifact.analyze()
+        assert artifact.update_target(list(reversed(y))) is artifact
+        after = artifact.analyze()
+        assert after.feature_names == artifact.feature_names
+        assert any(name.startswith("path[") for name in after.feature_names)
+        assert after.feature_names != before.feature_names or [
+            item.metrics for item in after.interactions
+        ] != [item.metrics for item in before.interactions]
         assert artifact.native_handle.closed is False
     finally:
         artifact.close()
 
 
-def test_decision_path_permutation_requires_per_target_rediscovery():
+def test_decision_path_permutation_rediscovers_each_null_target():
     X, y = _and_dataset()
     config = _config(permutation_tests=5)
 
-    with pytest.raises(V1UnsupportedError, match="rediscovery.*permuted target"):
-        GafimeEngine(config).analyze(X, y, feature_names=["f0", "f1"])
-    with pytest.raises(V1UnsupportedError, match="rediscovery.*permuted target"):
-        GafimeEngine(config).compile(X, y, feature_names=["f0", "f1"])
+    eager = GafimeEngine(config).analyze(X, y, feature_names=["f0", "f1"])
+    artifact = GafimeEngine(config).compile(X, y, feature_names=["f0", "f1"])
+    try:
+        compiled = artifact.analyze()
+    finally:
+        artifact.close()
+    assert eager.permutations
+    assert compiled.permutations
+    assert [item.candidate_id for item in eager.permutations] == [
+        item.candidate_id for item in compiled.permutations
+    ]
 
 
-def test_decision_path_opt_in_rejects_the_default_permutation_request():
+def test_decision_path_opt_in_supports_the_default_permutation_request():
     X, y = _and_dataset()
     config = EngineConfig(
         enable_decision_path_functions=True,
@@ -323,8 +447,8 @@ def test_decision_path_opt_in_rejects_the_default_permutation_request():
     )
 
     assert config.permutation_tests == 25
-    with pytest.raises(V1UnsupportedError, match="rediscovery.*permuted target"):
-        GafimeEngine(config).analyze(X, y, feature_names=["f0", "f1"])
+    report = GafimeEngine(config).analyze(X, y, feature_names=["f0", "f1"])
+    assert report.permutations
 
 
 def test_decision_path_carries_stability_when_requested():

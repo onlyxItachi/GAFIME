@@ -116,6 +116,26 @@ def _validate_skills() -> None:
         "interpret-results must label bootstrap variability conditionally",
     )
 
+    health_path = skill_root / "check-install" / "scripts" / "health_check.py"
+    health = subprocess.run(
+        [sys.executable, str(health_path)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    health_output = (health.stdout + health.stderr).strip()
+    _require(
+        health.returncode == 0,
+        f"check-install health check failed: {health_output[-1000:]}",
+    )
+    _require(
+        "[PASS] Family capability contract:" in health_output
+        and "decision_path_permutation=true" in health_output,
+        "check-install health check does not admit decision-path permutation support",
+    )
+
 
 def _validate_notebook() -> None:
     generator_path = ROOT / "python" / "gafime" / "tutorial.py"
@@ -146,8 +166,9 @@ def _validate_notebook() -> None:
         if cell.get("cell_type") == "code"
     )
     for token in (
-        "backend_capabilities('auto', probe=True)",
+        "backend_capabilities('auto', probe=True, precision='mixed')",
         "CompileFlags(export=True)",
+        "precision='mixed'",
         "enable_time_series_functions=True",
         "enable_decision_path_functions=True",
         "permutation_tests=0",
@@ -255,6 +276,24 @@ def _validate_release_docs() -> None:
         "README does not expose the supported notebook generator",
     )
     for token in (
+        'precision="mixed"',
+        "single public arithmetic profile",
+        "Core, CUDA, and ROCm support all three profiles",
+        "Metal supports only the genuine fp32 profile",
+        "docs/precision-contract.md",
+    ):
+        _require(token in readme, f"README is missing precision guidance: {token}")
+    usage = (ROOT / "USAGE.md").read_text(encoding="utf-8")
+    for token in (
+        'precision="mixed"',
+        "`fp32`: fp32 ingest/storage",
+        "`mixed` (default)",
+        "`fp64`: fp64 ingest/storage",
+        "float32+fast -> fp32",
+        'backend="metal"',
+    ):
+        _require(token in usage, f"USAGE is missing precision guidance: {token}")
+    for token in (
         "Windows ARM64 uses an ARM64 Python 3.11",
         "workflow host while cibuildwheel",
         "including CPython 3.10",
@@ -272,6 +311,16 @@ def _validate_release_docs() -> None:
     for token in ("## Deliberate Non-Claims", "overflowed before normalization"):
         _require(
             token in note_text, f"release note is missing evidence boundary: {token}"
+        )
+    for token in (
+        "## Precision Profiles",
+        "`EngineConfig(precision=...)`",
+        "genuine lane-wide fp32",
+        "No precision-specific package",
+    ):
+        _require(
+            token in note_text,
+            f"release note is missing precision capability: {token}",
         )
     for token in (
         "Windows ARM64 contributes",
@@ -295,6 +344,7 @@ def _validate_release_docs() -> None:
             f"release note is missing version-policy identity: {token}",
         )
     runbook_text = runbook.read_text(encoding="utf-8")
+    normalized_runbook = " ".join(runbook_text.split())
     matrix_text = release_matrix.read_text(encoding="utf-8")
     _require(
         matrix_text == render_release_matrix(RELEASE_MANIFEST),
@@ -315,6 +365,9 @@ def _validate_release_docs() -> None:
         "release-artifact-matrix.md",
         "rocm-wheel-policy-report.json",
         "libamdhip64.so.7",
+        "Every Core, CUDA, and ROCm wheel contains `fp32`, `mixed`, and `fp64`",
+        "exact profile capability mask",
+        "compressed wheel and uncompressed",
         "Core -> CUDA and ROCm -> public exact-version installs -> GitHub Release",
         "must never build, repair, retag, rename, or otherwise mutate a package",
         "RT/OptiX is locally buildable through CMake only",
@@ -325,7 +378,10 @@ def _validate_release_docs() -> None:
         "PyPI's release-yanking guidance",
         "PEP 592",
     ):
-        _require(token in runbook_text, f"release runbook is missing {token}")
+        _require(
+            token in runbook_text or token in normalized_runbook,
+            f"release runbook is missing {token}",
+        )
 
     normal_publication = runbook_text.split("## Normal Publication", 1)[1].split(
         "## Hash-Matched Recovery", 1
@@ -347,7 +403,6 @@ def _validate_release_docs() -> None:
             0 <= position < tag_creation,
             f"normal publication must verify {prerequisite!r} before tag creation",
         )
-    normalized_runbook = " ".join(runbook_text.split())
     _require(
         "After one successful publication, remove or disable the old entries"
         not in normalized_runbook,
@@ -407,6 +462,22 @@ def _validate_release_docs() -> None:
     _require(
         "      core_wheel_build_tag:" in build_workflow,
         "build workflow must expose only the pre-freeze Core build-tag input",
+    )
+    for token in (
+        "--machine-code-evidence-dir",
+        "--verify-wheel-evidence dist",
+        "Verify requested retagged Core wheels install as exact archives",
+    ):
+        _require(
+            token in build_workflow,
+            f"build/freeze workflow is missing artifact-profile proof: {token}",
+        )
+    static_report = (
+        ROOT / "tests" / "release_measure" / "gpu_static_kernel_report.py"
+    ).read_text(encoding="utf-8")
+    _require(
+        "wheel_sha256=" in static_report and "native_sha256=" in static_report,
+        "wheel evidence must record both wheel and native-member SHA-256",
     )
     for forbidden in (
         "pypa/gh-action-pypi-publish",

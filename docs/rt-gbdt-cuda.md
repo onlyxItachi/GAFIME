@@ -35,7 +35,9 @@ The implementation preserves Rust ownership:
 - Missing support is explicit through optional symbols. Cross-backend fallback
   remains a Rust decision; the per-call require-RT policy can also forbid CUDA
   SM fallback.
-- Generic CUDA metric files remain separate: `kernels.cu` / `launcher.cu` must not absorb RT-specific execution logic beyond the exported C ABI bridge in `launcher.cu`.
+- Standard CUDA metric files remain separate: `precision_kernels.cu` /
+  `precision_launcher.cu` must not absorb RT-specific execution logic beyond
+  the opaque matrix bridge consumed by `rt_launcher.cu`.
 
 ## Runtime RT Path
 

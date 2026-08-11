@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from fnmatch import fnmatchcase
+import json
 from pathlib import Path
 import sys
 
@@ -174,6 +175,21 @@ def test_rocm_policy_report_aggregates_every_cpython_wheel_deterministically(
             "platform_tag": "linux_x86_64",
             "userspace_bundled": False,
             "required_sonames": ["libamdhip64.so.7"],
+            "advertised_architectures": [
+                "gfx90a",
+                "gfx942",
+                "gfx950",
+                "gfx1030",
+                "gfx1031",
+                "gfx1032",
+                "gfx1100",
+                "gfx1101",
+                "gfx1102",
+                "gfx1150",
+                "gfx1151",
+                "gfx1200",
+                "gfx1201",
+            ],
         }
 
     monkeypatch.setattr(
@@ -187,3 +203,27 @@ def test_rocm_policy_report_aggregates_every_cpython_wheel_deterministically(
         f"gafime_rocm-1.0.0b2-{tag}-{tag}-linux_x86_64.whl"
         for tag in python_tags
     ]
+
+
+def test_rocm_build_marker_requires_the_exact_thirteen_target_policy() -> None:
+    policy = json.loads(
+        (
+            ROOT / ".github" / "scripts" / "rocm_7_2_3_system_policy.json"
+        ).read_text(encoding="utf-8")
+    )
+    targets = policy["gfx_targets"]
+    payload = (
+        b"GAFIME_ROCM_BUILD_INFO:arch="
+        + ",".join(targets).encode("ascii")
+        + b";wave_mi_mask=3;"
+    )
+
+    assert artifact_gate._assert_rocm_build_target_marker(
+        payload, "test.so", targets
+    ) == tuple(targets)
+
+    incomplete = payload.replace(b",gfx1201", b"")
+    with pytest.raises(AssertionError, match="exact policy target set"):
+        artifact_gate._assert_rocm_build_target_marker(
+            incomplete, "test.so", targets
+        )

@@ -13,6 +13,7 @@ import random
 import os
 import sys
 from pathlib import Path
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -102,6 +103,31 @@ def test_strong_signal_is_detected_with_low_pvalue_and_stability():
     # The driving feature reaches the permutation floor 1/(50+1) ~= 0.0196.
     best_pearson_p = min(perm.p_values["pearson"] for perm in report.permutations)
     assert best_pearson_p <= 0.05, f"strong-signal p={best_pearson_p}"
+
+
+@pytest.mark.parametrize(
+    ("precision", "typecode"),
+    [("fp32", "f"), ("mixed", "d"), ("fp64", "d")],
+)
+def test_native_significance_vectors_preserve_public_result_dtype(precision, typecode):
+    X, y = _dataset(lambda a, b, c, rng: a + 0.1 * b, n=32)
+    config = replace(
+        _config(),
+        precision=precision,
+        permutation_tests=3,
+        num_repeats=2,
+    )
+    report = GafimeEngine(config).analyze(X, y, feature_names=["f0", "f1", "f2"])
+    native = report.interactions.native_handle
+
+    for getter_name in (
+        "significance_pvalues",
+        "significance_means",
+        "significance_stds",
+    ):
+        rows = getattr(native, getter_name)()
+        assert rows
+        assert all(row.typecode == typecode for row in rows)
 
 
 def test_pure_noise_is_not_detected_under_family_wise_maxt():

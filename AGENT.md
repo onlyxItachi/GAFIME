@@ -49,13 +49,15 @@ Target source layout for kernel/orchestration work inside the root native source
 src/
   common/
     gafime_gpu_abi.hpp # Stable Rust/GPU extern C ABI declarations
+    gafime_gpu_internal_abi.hpp # Private native adapter layouts
 
   cuda/
     cuda_api.hpp      # CUDA export/compatibility wrapper for the standard ABI
     cuda_internal.hpp # CUDA-internal opaque matrix view bridge
     kernels.cuh       # CUDA-internal declarations for NVCC
-    kernels.cu        # CUDA __global__ / __device__ implementations
-    launcher.cu       # CUDA host launch, graph capture, <<<>>> dispatch
+    precision_kernels.cuh # Profile-specialized CUDA declarations for NVCC
+    precision_kernels.cu  # Profile-specialized CUDA device implementations
+    precision_launcher.cu # ABI 1.0 adapters + generic ABI 1.1 host dispatch
     rt_abi.hpp        # Local-only RT/decision-path extern C ABI declarations
     rt_kernels.cuh    # CUDA RT/decision-path declarations for NVCC
     rt_kernels.cu     # CUDA RT/decision-path __global__ / __device__ implementations
@@ -74,11 +76,11 @@ src/
     launcher.mm       # Objective-C++ Metal pipeline, encoder, dispatch
 ```
 
-Host launch files may contain launch syntax and graph orchestration. Device kernel files own device functions and kernels. `src/common/gafime_gpu_abi.hpp` owns the standard Rust-facing ABI; backend `*_api.hpp` files are export/compatibility wrappers only. The local RT experiment's optional ABI must stay in `rt_abi.hpp`.
+Host launch files may contain launch syntax and graph orchestration. Device kernel files own device functions and kernels. CUDA `precision_kernels.cu` owns the shared profile-specialized implementation declared by `precision_kernels.cuh`; `precision_launcher.cu` owns canonical ABI 1.1 dispatch and thin frozen ABI 1.0 adapters into that same implementation. ABI 1.0 does not own a complete second engine. `kernels.cuh` contains shared launch policy only. `src/common/gafime_gpu_abi.hpp` owns the standard Rust-facing ABI, `src/common/gafime_gpu_internal_abi.hpp` owns private adapter layouts, and backend `*_api.hpp` files are export/compatibility wrappers only. The local RT experiment's optional ABI must stay in `rt_abi.hpp`.
 
-CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_abi.hpp` owns the local experiment's optional ABI declarations. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, grouped point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, instanced IAS/GAS grouped dispatch, resident IAS/GAS geometry caching, cached OptiX workspace, exact SM fallback, RT membership dispatch, and the local ABI bridge. `cuda_internal.hpp` may expose only the RT-free opaque matrix view needed by that bridge. The generic CUDA metric files must not absorb RT-specific device or host execution logic.
+CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_abi.hpp` owns the local experiment's optional ABI declarations. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, grouped point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, instanced IAS/GAS grouped dispatch, resident IAS/GAS geometry caching, cached OptiX workspace, exact SM fallback, RT membership dispatch, and the local ABI bridge. `cuda_internal.hpp` may expose only the RT-free opaque matrix view needed by that bridge. The standard precision files must not absorb RT-specific device or host execution logic.
 
-GPU payload staging and release packaging must source backend files from this root `src/` layout. Standard CUDA payloads compile only `kernels.cu` and `launcher.cu`; standard ROCm payloads compile both `kernels.hip` and `launcher.hip`. Local OptiX builds may compile `rt_kernels.cu` and `rt_launcher.cu` and generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
+GPU payload staging and release packaging must source backend files from this root `src/` layout. Standard CUDA payloads compile only `precision_kernels.cu` and `precision_launcher.cu`; `precision_kernels.cuh` is the specialization surface and `kernels.cuh` contains shared launch policy. Standard ROCm payloads compile both `kernels.hip` and `launcher.hip`. Local OptiX builds may compile `rt_kernels.cu` and `rt_launcher.cu` and generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, hidden source copies under old runtime paths, or a second legacy engine.
 
 The standard CUDA distribution is `gafime-cuda`, package `gafime_cuda`, and
 is always RT-disabled. OptiX RT is a local CMake experiment only, may use a
@@ -205,6 +207,24 @@ Rust communicates with native backends only through approved C ABI surfaces. Bac
 
 ABI changes must be intentional, documented, reviewed through PR, and validated for Rust/C boundary compatibility and Python API compatibility.
 
+ABI 1.0 is frozen and remains byte-compatible through thin adapters into shared
+modern internals. ABI 1.1 is the canonical generic numeric-route boundary: a
+caller enumerates complete routes into caller-owned storage, selects one exact
+route, and passes typed buffer views to generic allocation, upload,
+target-update, execute, forecast, significance, diagnostics, and free
+operations. Dtype masks are summaries only. Dtype-suffixed ABI 1.1 operation or
+result symbol families are forbidden.
+
+Every extensible ABI 1.1 structure starts with `abi_version` and `struct_size`.
+Major mismatch, a missing stable prefix, unknown required flags, nonzero known
+reserved fields, duplicate or contradictory known routes, and unsupported
+dtypes fail closed. Newer minor records and ignorable tails may be accepted;
+unknown future routes are skipped while known float routes remain usable. A
+future ABI 1.2 integer engine extends dtype IDs, routes, overflow policies, and
+internal specializations without new per-integer-width upload or execute
+symbols. Integer support is not implemented or advertised in v1. Follow the
+normative layouts and compatibility rules in `docs/abi-evolution.md`.
+
 CUDA may expose the optional `gafime_gpu_permutation_pvalues` ABI to compute permutation-test p-values for already-surfaced compact result rows in a target-independent family. The symbol is optional so older payloads and non-CUDA backends remain loadable. Target-dependent adaptive families must repeat their exact device unary screening and shortlist construction for every permutation. Rust may orchestrate that bounded sequence through target replacement plus `gafime_gpu_execute`, provided every family maximum is obtained with device `top_k=1` ranking (both directions for signed metrics), only bounded rows cross the ABI, and the original target is restored or the artifact fails closed. Each ranking pass must bind only its selected metric without aliasing the prepared immutable descriptor generation, probe device-ranking capability before selecting the route, and treat a successful zero-row result as negative infinity. `gafime_gpu_execute` still returns scores only; Rust owns the exceedance counts and p-value calculation and must never infer a null maximum from a report-compacted subset.
 
 CUDA may expose the optional `gafime_gpu_decision_path_membership` ABI for RT-core/GBDT acceleration. Rust remains the owner of decision-path discovery, feature planning, scheduling, and backend selection. The CUDA payload receives compact validated `GafimeDecisionPathTerm` descriptors and materializes hard-AND membership over the resident feature-major matrix with exact `<=`, `>`, and NaN-undetermined semantics. OptiX RT traversal is allowed only for finite <=3D box batches where exact semantics are preserved. Every 1D, 3D, unbounded, empty, narrow, or otherwise ineligible shape uses a conservative ordered-float-bucket custom AABB for traversal culling and rechecks the original fp32 values and open/closed predicates in the intersection program. A grouped 2D score plan may use fixed-function instanced triangles only when every box is finite and bounded and each axis span is at least `2^-12 * max(1, abs(lo), abs(hi))`; triangle bounds expand by eight binary32 ULPs and any-hit rechecks the same original predicates before accepting a hit. Geometry selection is internal, signature-keyed, and must not be controlled by an environment selector. Three-dimensional paths keep their third coordinate in the exact guard even though the custom acceleration lattice uses two coordinates. The payload must query `OPTIX_DEVICE_PROPERTY_RTCORE_VERSION` and fail closed when it reports no RT-core support; architecture names are not capability proofs. Duplicate intersection callbacks must not duplicate membership or direct statistics. Otherwise CUDA must use its exact SM comparator or return unsupported when RT is explicitly required. The symbol is CUDA-only during the spike; ROCm, Metal, and older CUDA payloads must report unsupported by omitting the symbol, not by falling back to another backend.
@@ -249,19 +269,31 @@ managed/concurrent-managed capability. A failed managed allocation must return
 an error; it must not fall back to a device-only pointer while retaining a
 host-accessible copy mode.
 
-`backend="auto"` is a Rust-owned ranked resolver. It must rank usable GPU device payloads above CPU, then rank CPU vector ISA above scalar CPU (`AVX512 > AVX2 > SSE4.2/NEON > scalar`). A GPU candidate is usable only when its configured C ABI payload loads and `gafime_gpu_device_info` succeeds for the requested `device_id`. Explicit `cuda`, `rocm`/`hip`, and `metal` requests must not fall back to another backend.
+`backend="auto"` is a Rust-owned ranked resolver. It must rank usable GPU device payloads above CPU, then rank CPU vector ISA above scalar CPU (`AVX512 > AVX2 > SSE4.2/NEON > scalar`). A GPU candidate is usable only when its configured C ABI payload loads, `gafime_gpu_device_info` succeeds for the requested `device_id`, and the ABI 1.1 capability masks advertise the requested precision profile plus its storage/result dtypes. Auto must exclude Metal for `mixed` and `fp64`; explicit `cuda`, `rocm`/`hip`, and `metal` requests must not fall back to another backend.
 
 Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the reference is gated by Apple-hardware validation. Because Metal Shading Language has no fp64, Metal reductions accumulate in fp32; parity tolerances against CPU and CUDA/HIP must account for backend-specific precision and reduction order, then be measured and approved on Apple hardware. Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and backend-native permutation replay remain unsupported on Metal; Rust-orchestrated target replacement plus exact Metal screening/ranking is the approved bounded maxT path. Unsupported Metal metrics, graph replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
 
-Metal host-side interaction centering must use the same f64 column-mean
-accumulation and non-finite propagation semantics as CPU, CUDA, and ROCm. The
-macOS gate must execute CPU-oracle parity for all four continuous metrics on
+Metal host-side interaction centering must remain lane-wide fp32, including
+column-mean accumulation, while preserving the established non-finite
+propagation semantics. Offline Metal shader compilation must pass
+`-fno-fast-math`; Apple enables unsafe fast math by default, which can change
+exact fp32 histogram-boundary placement and relax non-finite semantics. Metal
+builds the integer MI histogram in parallel, then performs probability,
+correction, logarithm, normalization, and final-score accumulation in
+deterministic row-major bin order in fp32. The macOS gate must execute
+CPU-oracle parity for all four continuous metrics on
 high-dynamic and NaN/Inf inputs plus multi-block ascending/descending top-k.
 `GAFIME_METAL_PARITY_TOLERANCE=0.00005` is the approved absolute fp32 release
-tolerance for that gate. Apple-hardware run `30207767348` observed a worst-case
-absolute delta of `4.045665264e-6`; the approved bound is about `12.36x` that
-measurement. Increasing the bound requires new Apple-hardware evidence and
-explicit maintainer approval.
+tolerance for the direct ABI 1.0 compatibility and short ABI 1.1 genuine-fp32
+gates. Apple-hardware run `30207767348` observed a worst-case
+absolute delta of `4.045665264e-6` on the legacy surface. For ABI 1.1 fp32
+inputs of up to 256 rows, Metal must compute the paired finite correlation
+means in Core row order before retaining its parallel fp32 covariance pass;
+this must not affect ABI 1.0 or serialize larger workloads. The broader
+end-to-end fp32 cross-backend gate retains its separate `2e-4` absolute and
+`2e-5` relative bounds for backend reduction-order differences. Increasing
+either gate requires new Apple-hardware evidence and explicit maintainer
+approval.
 
 ## Numerical Policy
 
@@ -280,17 +312,19 @@ Performance improvements are never accepted as a justification for undocumented 
 
 CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation. Its SIMD implementation must preserve exact fixed-bin histogram counts against the scalar/index reference, keep the same finite-sample correction and normalization, and stay gated by release-measure architecture checks plus focused Rust tests.
 
-Precision requests separate matrix storage from compute policy. The only
-current executable pair is `float32 + stable`: inputs, interaction products,
-and result-table metrics remain fp32, while accumulator widths are reported per
-metric and backend. `GAFIME_DTYPE_F64` and
-`GAFIME_GPU_DEVICE_FLAG_F64_STORAGE` reserve an additive ABI contract, but no
-current payload may advertise or accept f64 storage. A `float64`, `exact`, or
-guard-disabling `fast` request must fail before fp32 coercion or backend
-execution. CUDA and ROCm must advertise their separately compiled fp64 MI mode
-through `GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64`; that bit must never be
-interpreted as f64 storage, interaction arithmetic, or result output. The full
-admission requirements are documented in `docs/precision-contract.md`.
+The only public precision selector is keyword-only `EngineConfig(precision=...)`:
+`fp32`, `mixed` (default), or `fp64`. `fp32` uses fp32 for ingest/storage,
+pointwise/interactions, reductions/statistics, ranking, and public results.
+`mixed` uses fp32 ingest/storage and pointwise/interactions with fp64
+reductions/statistics, ranking, and public results. `fp64` preserves fp64
+end-to-end without an fp32 intermediate. Core, CUDA, and ROCm must carry all
+three specializations in every applicable existing artifact; Metal carries
+only genuine fp32 and rejects explicit `mixed`/`fp64` before allocation or
+execution. ABI 1.0 remains byte-compatible; typed ABI 1.1 surfaces bind the
+profile to resident, descriptor, graph, result, significance, and memory-peak
+identity. The legacy MI device flag describes ABI 1.0 only and must not become
+a second precision policy. The full contract is documented in
+`docs/precision-contract.md`.
 
 `EngineConfig.mi_bins` is an adaptive maximum, not a fixed histogram request.
 Continuous MI planning selects the largest template in
@@ -345,6 +379,15 @@ No accepted optimization may:
 
 Every optimization must demonstrate a measurable benefit relative to the current implementation.
 
+Production Core execution is throughput-first. Independent candidate work must
+use multi-core parallel execution, while arithmetic within each candidate uses
+the strongest semantics-preserving SIMD/native path available. A new dtype,
+precision profile, ABI generation, operator family, or executor must not
+silently serialize an established parallel production workload.
+
+Single-core microbenchmarks are supplemental leaf-kernel diagnostics. They are
+not Core product-throughput evidence and must not be reported or gated as such.
+
 ## Backend Ownership
 
 Rust owns:
@@ -398,7 +441,7 @@ Build rules and compiler flags for these sources may express the required compil
 Compiler flags fall into two classes, governed differently. The distinction is numerical, not performance-vs-not: a flag is judged by whether it can change the reference numerical result, never by whether it makes the backend faster.
 
 - **Permitted without separate approval — performance/optimization flags that do not change numerical results.** Standard optimization-level and code-generation flags are allowed because they optimize the compiled backend source without altering IEEE floating-point semantics or the reference result. Examples: `-O1`/`-O2`/`-O3` and `-Xptxas -O3` (NVCC), `-O1`/`-O2`/`-O3` (clang++/amdclang++/hipcc), `/O1`/`/O2` (MSVC), function inlining, loop unrolling, and `--generate-line-info`/`-lineinfo` for profiling.
-- **Forbidden without explicit maintainer approval — math-breaking flags that change numerical results.** Any flag that relaxes IEEE semantics is forbidden because it breaks the f64/Kahan-accumulator parity oracle. Examples: `-ffast-math`, `-Ofast`, `-funsafe-math-optimizations`, `-fassociative-math`, `-freciprocal-math`, `-ffinite-math-only`, `-fno-signed-zeros`, `-ffp-contract=fast` (global FMA reassociation), flush-to-zero / denormals-are-zero (`-ftz=true`), approximate/fast-math transcendental intrinsics, `--use_fast_math` (NVCC), and `/fp:fast` (MSVC).
+- **Forbidden without explicit maintainer approval — math-breaking flags that change numerical results.** Any flag that relaxes IEEE semantics is forbidden because it breaks the selected profile's reviewed lane-specific numerical oracle (`fp32`, `mixed`, or `fp64`). Examples: `-ffast-math`, `-Ofast`, `-funsafe-math-optimizations`, `-fassociative-math`, `-freciprocal-math`, `-ffinite-math-only`, `-fno-signed-zeros`, `-ffp-contract=fast` (global FMA reassociation), flush-to-zero / denormals-are-zero (`-ftz=true`), approximate/fast-math transcendental intrinsics, `--use_fast_math` (NVCC), and `/fp:fast` (MSVC).
 
 Backend-substitution flags, introduction of a new compiler, and undocumented ABI-changing flags remain forbidden without explicit maintainer approval.
 

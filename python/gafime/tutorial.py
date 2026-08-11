@@ -19,7 +19,7 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
             "import gafime\n"
             "from gafime import backend_capabilities\n\n"
             "print('GAFIME', gafime.__version__)\n"
-            "caps = backend_capabilities('auto', probe=True)\n"
+            "caps = backend_capabilities('auto', probe=True, precision='mixed')\n"
             "print('configured:', caps.configured_backend)\n"
             "print('selected:', caps.selected_backend)\n"
             "print('status:', caps.selection_status)\n"
@@ -41,6 +41,7 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
             "config = EngineConfig(\n"
             "    metric_names=('pearson', 'r2'),\n"
             "    backend='core',\n"
+            "    precision='mixed',\n"
             "    permutation_tests=0,\n"
             "    num_repeats=1,\n"
             "    budget=ComputeBudget(\n"
@@ -77,6 +78,7 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
         _code(
             "time_series_config = EngineConfig(\n"
             "    backend='core',\n"
+            "    precision='mixed',\n"
             "    metric_names=('pearson', 'r2'),\n"
             "    enable_time_series_functions=True,\n"
             "    time_series_lags=(1, 2),\n"
@@ -105,8 +107,9 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
         _code(
             "decision_config = EngineConfig(\n"
             "    backend='core',\n"
+            "    precision='mixed',\n"
             "    metric_names=('pearson', 'r2'),\n"
-            "    enable_decision_path_functions=True, permutation_tests=0,\n"
+            "    enable_decision_path_functions=True, permutation_tests=25,\n"
             "    decision_path_max_depth=2,\n"
             "    decision_path_max_paths=8,\n"
             "    decision_path_min_leaf=4,\n"
@@ -120,10 +123,9 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
             "list(decision_report.interactions.top_k(5, metric_name='pearson'))"
         ),
         _md(
-            "Decision-path bootstrap stability is supported. Permutation "
-            "significance is unavailable because every permuted target would "
-            "require path rediscovery, so this family must use "
-            "`permutation_tests=0`. Bootstrap stability resamples an "
+            "Decision-path permutation maxT rediscovers paths for every "
+            "permuted target before rescoring the full expanded family. "
+            "Bootstrap stability resamples an "
             "already-selected candidate on the same rows; it measures "
             "variability conditional on selection, not out-of-sample "
             "generalization."
@@ -144,7 +146,7 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
         _md("## 9. sklearn-Style Pair Selection"),
         _code(
             "from gafime import GafimeSelector\n"
-            "selector = GafimeSelector(k=1, metric='pearson')\n"
+            "selector = GafimeSelector(k=1, metric='pearson', precision='mixed')\n"
             "augmented = selector.fit_transform(X, y)\n"
             "print('selected pairs:', selector.top_interactions_)\n"
             "print('shape:', len(augmented), 'x', len(augmented[0]))"
@@ -152,7 +154,7 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
         _md(
             "For model evaluation, place `GafimeSelector` inside a scikit-learn "
             "Pipeline so discovery is refit on every training fold. Install the "
-            "optional integration with `pip install \"gafime[sklearn]\"`."
+            'optional integration with `pip install "gafime[sklearn]"`.'
         ),
     ]
     notebook = {

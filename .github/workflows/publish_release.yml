@@ -306,6 +306,10 @@ jobs:
           python-version: ${{ matrix.python_version }}
           architecture: ${{ matrix.platform.architecture }}
 
+      - name: Set up installed-payload ABI tools (Windows)
+        if: runner.os == 'Windows' && matrix.platform.cuda == true
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+
       - name: Install exact public artifacts from PyPI
         shell: bash
         env:
@@ -359,6 +363,25 @@ jobs:
                   for req in requirements
               )
           PY
+
+      - name: Verify public Core wheel and advertised precision profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp tests/release_measure/installed_wheel_smoke.py "$RUNNER_TEMP/installed_wheel_smoke.py"
+          cd "$RUNNER_TEMP"
+          python installed_wheel_smoke.py --source-root "$GITHUB_WORKSPACE"
+
+      - name: Verify public CUDA payload separation and precision ABI exports
+        if: matrix.platform.cuda == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp tests/release_measure/installed_payload_smoke.py "$RUNNER_TEMP/installed_payload_smoke.py"
+          cd "$RUNNER_TEMP"
+          python installed_payload_smoke.py \
+            --source-root "$GITHUB_WORKSPACE" \
+            --backend cuda
 
       - name: Execute Metal from the public macOS Core wheel
         if: matrix.platform.metal == true
@@ -431,6 +454,17 @@ jobs:
           }
           throw "The Windows ARM64 Core wheel did not become installable in time."
 
+      - name: Verify public Windows ARM64 Core precision profiles
+        shell: pwsh
+        run: |
+          Copy-Item tests/release_measure/installed_wheel_smoke.py "$env:RUNNER_TEMP\installed_wheel_smoke.py"
+          Push-Location $env:RUNNER_TEMP
+          & $env:TARGET_PYTHON installed_wheel_smoke.py --source-root "$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Public Windows ARM64 Core precision smoke failed."
+          }
+          Pop-Location
+
   verify_public_rocm_install:
     name: Public ROCm source install with system runtime
     needs:
@@ -487,7 +521,10 @@ jobs:
                 fi
                 sleep 10
               done
+              cp /project/tests/release_measure/installed_wheel_smoke.py /tmp/
               cp /project/tests/release_measure/installed_payload_smoke.py /tmp/
+              "$python" /tmp/installed_wheel_smoke.py \
+                --source-root /project
               "$python" /tmp/installed_payload_smoke.py \
                 --source-root /project \
                 --backend rocm

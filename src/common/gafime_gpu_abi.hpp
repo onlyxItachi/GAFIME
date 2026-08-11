@@ -17,7 +17,7 @@
     #define GAFIME_GPU_API __declspec(dllimport)
   #endif
 #else
-  #define GAFIME_GPU_API
+  #define GAFIME_GPU_API __attribute__((visibility("default")))
 #endif
 
 #ifdef __cplusplus
@@ -27,6 +27,26 @@ extern "C" {
 #define GAFIME_ABI_VERSION_MAJOR 1u
 #define GAFIME_ABI_VERSION_MINOR 0u
 #define GAFIME_ABI_VERSION ((GAFIME_ABI_VERSION_MAJOR << 16) | GAFIME_ABI_VERSION_MINOR)
+#define GAFIME_PRECISION_ABI_VERSION_MAJOR 1u
+#define GAFIME_PRECISION_ABI_VERSION_MINOR 1u
+#define GAFIME_PRECISION_ABI_VERSION \
+    ((GAFIME_PRECISION_ABI_VERSION_MAJOR << 16) | GAFIME_PRECISION_ABI_VERSION_MINOR)
+/* Stable floor for the generic numeric-route structures and operations. */
+#define GAFIME_NUMERIC_ROUTE_ABI_MIN_MINOR 1u
+
+/*
+ * ABI 1.1 extensibility rules.
+ *
+ * The high 16 bits of abi_version are the incompatible major version.  The
+ * low 16 bits are additive.  Consumers accept a newer minor version when the
+ * structure's known stable prefix is present.  Flag bits in the upper half of
+ * a flags word are explicitly ignorable hints; unknown lower-half bits are
+ * required semantics and fail closed.
+ */
+#define GAFIME_ABI_VERSION_MAJOR_OF(version) ((uint32_t)(version) >> 16)
+#define GAFIME_ABI_VERSION_MINOR_OF(version) ((uint32_t)(version) & 0xffffu)
+#define GAFIME_ABI_IGNORABLE_FLAG_MASK 0xffff0000u
+#define GAFIME_ABI_REQUIRED_FLAG_MASK 0x0000ffffu
 
 #define GAFIME_LAUNCH_FLAG_GRAPH 0x1u
 #define GAFIME_LAUNCH_FLAG_MI_APPROX 0x2u
@@ -53,9 +73,9 @@ extern "C" {
 #define GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL 0x200u
 /* Payload keys immutable launch descriptors by reserved[0] generation. */
 #define GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION 0x400u
-/* Payload compiles MI contribution/reduction arithmetic in fp64. */
+/* Legacy ABI 1.0 payload-wide MI mode; ABI 1.1 follows the requested profile. */
 #define GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64 0x800u
-/* Payload accepts GAFIME_DTYPE_F64 matrix storage. Reserved until implemented. */
+/* Legacy device flag. ABI 1.1 f64 support is authoritative in numeric routes. */
 #define GAFIME_GPU_DEVICE_FLAG_F64_STORAGE 0x1000u
 
 #define GAFIME_GPU_ARCH_UNKNOWN 0u
@@ -103,6 +123,31 @@ typedef enum GafimeDataType {
     GAFIME_DTYPE_F64 = 2
 } GafimeDataType;
 
+#define GAFIME_DTYPE_MASK_F32 0x1u
+#define GAFIME_DTYPE_MASK_F64 0x2u
+
+typedef enum GafimePrecisionProfile {
+    GAFIME_PRECISION_FP32 = 1,
+    GAFIME_PRECISION_MIXED = 2,
+    GAFIME_PRECISION_FP64 = 3
+} GafimePrecisionProfile;
+
+#define GAFIME_PRECISION_PROFILE_MASK_FP32 0x1u
+#define GAFIME_PRECISION_PROFILE_MASK_MIXED 0x2u
+#define GAFIME_PRECISION_PROFILE_MASK_FP64 0x4u
+
+typedef enum GafimeOverflowPolicy {
+    GAFIME_OVERFLOW_IEEE = 1
+} GafimeOverflowPolicy;
+
+#define GAFIME_NUMERIC_ROUTE_FP32 1u
+#define GAFIME_NUMERIC_ROUTE_MIXED 2u
+#define GAFIME_NUMERIC_ROUTE_FP64 3u
+
+/* Current ABI calls accept caller-owned, contiguous host buffers only. */
+#define GAFIME_BUFFER_FLAG_HOST 0x1u
+#define GAFIME_BUFFER_FLAG_CONTIGUOUS 0x2u
+
 typedef enum GafimeMatrixLayout {
     GAFIME_MATRIX_ROW_MAJOR = 1,
     GAFIME_MATRIX_COLUMN_MAJOR = 2,
@@ -133,6 +178,11 @@ typedef struct GafimeSliceF32 {
     uint64_t len;
 } GafimeSliceF32;
 
+typedef struct GafimeSliceF64 {
+    const double* ptr;
+    uint64_t len;
+} GafimeSliceF64;
+
 typedef struct GafimeMatrixDesc {
     uint32_t abi_version;
     uint32_t dtype;
@@ -143,6 +193,67 @@ typedef struct GafimeMatrixDesc {
     uint32_t row_stride;
     uint64_t bytes;
 } GafimeMatrixDesc;
+
+/*
+ * One authoritative numeric route.  The four dtype domains are a supported
+ * combination, never four independently configurable knobs.  Future ABI 1.2
+ * payloads may append fields and advertise additional route records.
+ */
+typedef struct GafimeNumericRoute {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t route_id;
+    uint32_t profile;
+    uint32_t storage_dtype;
+    uint32_t pointwise_dtype;
+    uint32_t reduction_dtype;
+    uint32_t result_dtype;
+    uint32_t overflow_policy;
+    uint32_t flags;
+    uint64_t reserved[8];
+} GafimeNumericRoute;
+
+/*
+ * Standalone typed-view pointers may advertise an additive tail.  The
+ * by-value instances embedded in the numeric result/significance records
+ * below are fixed ABI 1.1 layout components and must not grow in place.
+ */
+typedef struct GafimeConstBufferView {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t dtype;
+    uint32_t flags;
+    const void* data;
+    uint64_t element_count;
+    uint64_t byte_length;
+    uint64_t byte_stride;
+    uint64_t reserved[4];
+} GafimeConstBufferView;
+
+typedef struct GafimeMutableBufferView {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t dtype;
+    uint32_t flags;
+    void* data;
+    uint64_t element_capacity;
+    uint64_t byte_length;
+    uint64_t byte_stride;
+    uint64_t reserved[4];
+} GafimeMutableBufferView;
+
+typedef struct GafimeNumericMatrixDesc {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    GafimeNumericRoute route;
+    uint32_t layout;
+    uint32_t flags;
+    uint64_t rows;
+    uint32_t cols;
+    uint32_t row_stride;
+    uint64_t bytes;
+    uint64_t reserved[8];
+} GafimeNumericMatrixDesc;
 
 typedef struct GafimeGpuDeviceInfo {
     uint32_t abi_version;
@@ -237,6 +348,14 @@ typedef struct GafimeLaunchProtocol {
     uint64_t reserved[8];
 } GafimeLaunchProtocol;
 
+typedef struct GafimeNumericLaunchProtocol {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    GafimeNumericRoute route;
+    const GafimeLaunchProtocol* base;
+    uint64_t reserved[8];
+} GafimeNumericLaunchProtocol;
+
 typedef struct GafimeResultTable {
     uint32_t abi_version;
     uint32_t max_arity;
@@ -254,6 +373,24 @@ typedef struct GafimeResultTable {
     uint64_t reserved[8];
 } GafimeResultTable;
 
+typedef struct GafimeNumericResultTable {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t max_arity;
+    uint32_t metric_count;
+    uint32_t flags;
+    uint32_t reserved32;
+    uint64_t capacity;
+    uint64_t row_count;
+    uint32_t* combo_indices;
+    GafimeMutableBufferView metric_values;
+    uint32_t* ranks;
+    uint32_t* families;
+    uint64_t* candidate_ids;
+    uint32_t* row_flags;
+    uint64_t reserved[8];
+} GafimeNumericResultTable;
+
 typedef struct GafimePermutationSignificanceTable {
     uint32_t abi_version;
     uint32_t metric_count;
@@ -264,11 +401,39 @@ typedef struct GafimePermutationSignificanceTable {
     uint64_t reserved[8];
 } GafimePermutationSignificanceTable;
 
+typedef struct GafimeNumericSignificanceTable {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t metric_count;
+    uint32_t flags;
+    uint64_t row_count;
+    const uint64_t* candidate_ids;
+    GafimeConstBufferView observed_metric_values;
+    GafimeMutableBufferView p_values;
+    uint64_t reserved[8];
+} GafimeNumericSignificanceTable;
+
+typedef struct GafimeNumericInteractionDiagnosticBatch {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    GafimeNumericRoute route;
+    uint32_t max_arity;
+    uint32_t flags;
+    uint64_t row_count;
+    const uint32_t* combo_indices;
+    uint64_t combo_index_count;
+    uint64_t* overflow_row_counts;
+    uint32_t* row_flags;
+    uint32_t reserved32;
+    uint64_t reserved[7];
+} GafimeNumericInteractionDiagnosticBatch;
+
 /*
  * Optional post-selection precision diagnostic. `combo_indices` contains
  * row_count rows padded to max_arity with UINT32_MAX. Payloads report the
- * number of sample rows whose finite inputs overflow during centered fp32
- * interaction materialization, separately from source non-finite values.
+ * number of sample rows whose finite inputs overflow during centered
+ * interaction materialization in the resident profile's pointwise dtype,
+ * separately from source non-finite values.
  */
 typedef struct GafimeInteractionDiagnosticBatch {
     uint32_t abi_version;
@@ -312,6 +477,11 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     uint64_t rows
 );
 
+/*
+ * Teardown is generation-neutral.  After validating the opaque owner, either
+ * ABI generation's free symbol may release it; all non-free operations remain
+ * generation-strict and reject an opposite-generation handle.
+ */
 GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix);
 
 GAFIME_GPU_API int gafime_gpu_execute(
@@ -355,6 +525,83 @@ GAFIME_GPU_API int gafime_gpu_permutation_pvalues(
     const GafimeLaunchProtocol* protocol,
     GafimePermutationSignificanceTable* significance_out
 );
+
+/*
+ * Canonical ABI 1.1 numeric-route surface. These ten v2 declarations form one
+ * complete operation table: a payload advertising numeric_routes_v2 must
+ * export every one, and consumers reject a partial table before allocation.
+ * ABI 1.0 entry points above stay byte-for-byte compatible and their optional
+ * capability symbols retain their legacy semantics. Route records and all
+ * typed buffers are caller-owned for the duration of a synchronous call.
+ * `route_stride` is the byte distance between caller-owned records and must
+ * contain the stable prefix through `flags`. A producer may report a
+ * `struct_size` larger than that stride, but must never write beyond the
+ * caller-provided stride. Passing routes_out == NULL with route_capacity == 0
+ * performs a count query.
+ */
+GAFIME_GPU_API int gafime_gpu_numeric_routes_v2(
+    uint32_t device_id,
+    uint32_t consumer_abi_version,
+    uint32_t route_stride,
+    GafimeNumericRoute* routes_out,
+    uint32_t route_capacity,
+    uint32_t* route_count_out
+);
+
+GAFIME_GPU_API int gafime_gpu_matrix_alloc_v2(
+    uint32_t device_id,
+    const GafimeNumericMatrixDesc* matrix_desc,
+    GafimeGpuMatrix* matrix_out
+);
+
+GAFIME_GPU_API int gafime_gpu_matrix_upload_v2(
+    GafimeGpuMatrix matrix,
+    const GafimeNumericRoute* route,
+    const GafimeConstBufferView* features,
+    const GafimeConstBufferView* target,
+    uint64_t rows,
+    uint32_t cols
+);
+
+GAFIME_GPU_API int gafime_gpu_matrix_update_target_v2(
+    GafimeGpuMatrix matrix,
+    const GafimeNumericRoute* route,
+    const GafimeConstBufferView* target,
+    uint64_t rows
+);
+
+GAFIME_GPU_API int gafime_gpu_execute_v2(
+    GafimeGpuMatrix matrix,
+    const GafimeNumericLaunchProtocol* protocol,
+    GafimeNumericResultTable* result_out
+);
+
+GAFIME_GPU_API int gafime_gpu_execution_memory_peak_v2(
+    GafimeGpuMatrix matrix,
+    const GafimeNumericLaunchProtocol* protocol,
+    uint64_t* peak_bytes_out
+);
+
+GAFIME_GPU_API int gafime_gpu_permutation_memory_peak_v2(
+    GafimeGpuMatrix matrix,
+    const GafimeNumericLaunchProtocol* protocol,
+    uint64_t selected_row_count,
+    uint64_t* peak_bytes_out
+);
+
+GAFIME_GPU_API int gafime_gpu_permutation_pvalues_v2(
+    GafimeGpuMatrix matrix,
+    const GafimeNumericLaunchProtocol* protocol,
+    GafimeNumericSignificanceTable* significance_out
+);
+
+GAFIME_GPU_API int gafime_gpu_interaction_diagnostics_v2(
+    GafimeGpuMatrix matrix,
+    GafimeNumericInteractionDiagnosticBatch* diagnostics
+);
+
+/* Accepts a validated ABI 1.0 or ABI 1.1 owner for cross-generation teardown. */
+GAFIME_GPU_API int gafime_gpu_matrix_free_v2(GafimeGpuMatrix matrix);
 
 GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
     GafimeGpuMatrix matrix,

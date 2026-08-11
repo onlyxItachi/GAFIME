@@ -71,6 +71,7 @@ from gafime import ComputeBudget, EngineConfig, GafimeEngine
 
 config = EngineConfig(
     backend="auto",
+    precision="mixed",
     metric_names=("pearson", "r2"),
     budget=ComputeBudget(max_comb_size=2),
 )
@@ -79,6 +80,18 @@ report = GafimeEngine(config).analyze(X, y, feature_names=feature_names)
 print(report.backend)
 print(report.interactions[:5])
 ```
+
+`precision` is the single public arithmetic profile and is keyword-only.
+`"mixed"` is the default: fp32 ingest/storage and pointwise interaction work,
+with fp64 reductions, ranking, and public results. `"fp32"` keeps all four
+numeric domains in fp32 for maximum throughput. `"fp64"` preserves fp64 from
+ingest through public results without an fp32 staging conversion.
+Core, CUDA, and ROCm support all three profiles
+in their existing packages.
+Metal supports only the genuine fp32 profile; an explicit Metal mixed/fp64 request fails before
+payload discovery or allocation, while `backend="auto"` can select Core on an
+Apple system for those profiles. See
+[docs/precision-contract.md](docs/precision-contract.md) for the full contract.
 
 Generate the reference notebook:
 
@@ -110,10 +123,10 @@ The v0.4 discrete candidate family has been deprecated and removed from the
 current engine path. Use decision-path candidates for tree-like threshold and
 region structure.
 
-Decision-path bootstrap stability is supported, but permutation significance
-requires per-target path rediscovery and is not yet available. Set
-`permutation_tests=0` when enabling decision-path generation; unsupported
-permutation requests fail closed rather than reporting invalid p-values.
+Decision-path permutation maxT and bootstrap stability are supported.
+Every permuted target triggers fresh path discovery before the complete
+expanded candidate family is rescored, so the reported null distribution never
+reuses target-derived paths from the observed run.
 Bootstrap `stability_std` is variability conditional on an already-selected
 candidate using the same rows; it is not out-of-sample evidence and does not
 correct selection bias. Validate selected candidates on untouched data.

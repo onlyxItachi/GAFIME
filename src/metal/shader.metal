@@ -7,6 +7,7 @@ constant uint GAFIME_METRIC_SPEARMAN = 2;
 constant uint GAFIME_METRIC_MUTUAL_INFO = 3;
 constant uint GAFIME_METRIC_R2 = 4;
 constant uint GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE = 0x1u;
+constant uint GAFIME_PRECISION_FP32 = 1;
 
 // Metal has no fp64, so the reductions below accumulate in fp32. Parity
 // tolerances account for backend-specific precision and reduction order. The
@@ -94,6 +95,7 @@ struct MetalLaunchInfo {
     uint cols;
     uint metric_count;
     uint chunk_count;
+    uint precision_profile;
 };
 
 struct MetalRankInfo {
@@ -288,7 +290,7 @@ kernel void gafime_score_continuous(
 
     threadgroup float s_sx[kMetalReduceWidth];
     threadgroup float s_sy[kMetalReduceWidth];
-    threadgroup float s_n[kMetalReduceWidth];
+    threadgroup ulong s_n[kMetalReduceWidth];
     threadgroup float s_sxx[kMetalReduceWidth];
     threadgroup float s_syy[kMetalReduceWidth];
     threadgroup float s_sxy[kMetalReduceWidth];
@@ -298,9 +300,15 @@ kernel void gafime_score_continuous(
     threadgroup float scale_y;
 
     const bool scaled_covariance = selected->scaled_covariance != 0;
+    // The ABI 1.1 fp32 oracle sums short vectors in row order. Keep the legacy
+    // ABI 1.0 route unchanged, and retain the parallel reduction for larger
+    // workloads where serialization would compromise the throughput lane.
+    const bool core_ordered_fp32_mean =
+        info.precision_profile == GAFIME_PRECISION_FP32 &&
+        info.rows <= static_cast<ulong>(4u * kMetalReduceWidth);
     float local_sx = 0.0f;
     float local_sy = 0.0f;
-    float local_count = 0.0f;
+    ulong local_count = 0;
     if (scaled_covariance) {
         for (ulong row = lane; row < info.rows; row += lane_count) {
             const float x = interaction_value(
@@ -309,7 +317,7 @@ kernel void gafime_score_continuous(
             if (isfinite(x) && isfinite(y)) {
                 local_sx = max(local_sx, fabs(x));
                 local_sy = max(local_sy, fabs(y));
-                local_count += 1.0f;
+                ++local_count;
             }
         }
 
@@ -333,60 +341,102 @@ kernel void gafime_score_continuous(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        local_sx = 0.0f;
-        local_sy = 0.0f;
-        for (ulong row = lane; row < info.rows; row += lane_count) {
-            const float x = interaction_value(
-                features, column_means, row, info.rows, combo, selected->arity);
-            const float y = target[row];
-            if (isfinite(x) && isfinite(y)) {
-                local_sx += scale_x > 0.0f ? x / scale_x : 0.0f;
-                local_sy += scale_y > 0.0f ? y / scale_y : 0.0f;
-            }
-        }
-
-        s_sx[lane] = local_sx;
-        s_sy[lane] = local_sy;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
-            if (lane < stride) {
-                s_sx[lane] += s_sx[lane + stride];
-                s_sy[lane] += s_sy[lane + stride];
+        if (core_ordered_fp32_mean) {
+            if (lane == 0) {
+                local_sx = 0.0f;
+                local_sy = 0.0f;
+                local_count = 0;
+                for (ulong row = 0; row < info.rows; ++row) {
+                    const float x = interaction_value(
+                        features, column_means, row, info.rows, combo, selected->arity);
+                    const float y = target[row];
+                    if (isfinite(x) && isfinite(y)) {
+                        local_sx += scale_x > 0.0f ? x / scale_x : 0.0f;
+                        local_sy += scale_y > 0.0f ? y / scale_y : 0.0f;
+                        ++local_count;
+                    }
+                }
+                s_sx[0] = local_sx;
+                s_sy[0] = local_sy;
+                s_n[0] = local_count;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else {
+            local_sx = 0.0f;
+            local_sy = 0.0f;
+            for (ulong row = lane; row < info.rows; row += lane_count) {
+                const float x = interaction_value(
+                    features, column_means, row, info.rows, combo, selected->arity);
+                const float y = target[row];
+                if (isfinite(x) && isfinite(y)) {
+                    local_sx += scale_x > 0.0f ? x / scale_x : 0.0f;
+                    local_sy += scale_y > 0.0f ? y / scale_y : 0.0f;
+                }
+            }
+
+            s_sx[lane] = local_sx;
+            s_sy[lane] = local_sy;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
+                if (lane < stride) {
+                    s_sx[lane] += s_sx[lane + stride];
+                    s_sy[lane] += s_sy[lane + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
     } else {
-        for (ulong row = lane; row < info.rows; row += lane_count) {
-            const float x = interaction_value(
-                features, column_means, row, info.rows, combo, selected->arity);
-            const float y = target[row];
-            if (isfinite(x) && isfinite(y)) {
-                local_sx += x;
-                local_sy += y;
-                local_count += 1.0f;
-            }
-        }
-
-        s_sx[lane] = local_sx;
-        s_sy[lane] = local_sy;
-        s_n[lane] = local_count;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
-            if (lane < stride) {
-                s_sx[lane] += s_sx[lane + stride];
-                s_sy[lane] += s_sy[lane + stride];
-                s_n[lane] += s_n[lane + stride];
+        if (core_ordered_fp32_mean) {
+            if (lane == 0) {
+                for (ulong row = 0; row < info.rows; ++row) {
+                    const float x = interaction_value(
+                        features, column_means, row, info.rows, combo, selected->arity);
+                    const float y = target[row];
+                    if (isfinite(x) && isfinite(y)) {
+                        local_sx += x;
+                        local_sy += y;
+                        ++local_count;
+                    }
+                }
+                s_sx[0] = local_sx;
+                s_sy[0] = local_sy;
+                s_n[0] = local_count;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else {
+            for (ulong row = lane; row < info.rows; row += lane_count) {
+                const float x = interaction_value(
+                    features, column_means, row, info.rows, combo, selected->arity);
+                const float y = target[row];
+                if (isfinite(x) && isfinite(y)) {
+                    local_sx += x;
+                    local_sy += y;
+                    ++local_count;
+                }
+            }
+
+            s_sx[lane] = local_sx;
+            s_sy[lane] = local_sy;
+            s_n[lane] = local_count;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
+                if (lane < stride) {
+                    s_sx[lane] += s_sx[lane + stride];
+                    s_sy[lane] += s_sy[lane + stride];
+                    s_n[lane] += s_n[lane + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
     }
 
     if (lane == 0) {
-        if (s_n[0] > 0.0f) {
-            mean_x = s_sx[0] / s_n[0];
-            mean_y = s_sy[0] / s_n[0];
+        if (s_n[0] > 0) {
+            const float count = static_cast<float>(s_n[0]);
+            mean_x = s_sx[0] / count;
+            mean_y = s_sy[0] / count;
         } else {
             mean_x = 0.0f;
             mean_y = 0.0f;
@@ -487,7 +537,6 @@ kernel void gafime_score_mutual_info(
     threadgroup float s_float2[kMetalReduceWidth];
     threadgroup float s_float3[kMetalReduceWidth];
     threadgroup uint s_uint0[kMetalReduceWidth];
-    threadgroup uint s_uint1[kMetalReduceWidth];
 
     for (uint i = lane; i < bins; i += lane_count) {
         atomic_store_explicit(&hist_x[i], 0u, memory_order_relaxed);
@@ -558,52 +607,38 @@ kernel void gafime_score_mutual_info(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float total = static_cast<float>(valid);
-    float local_mi = 0.0f;
-    uint local_active_x = 0;
-    uint local_active_y = 0;
-    for (uint idx = lane; idx < bins * bins; idx += lane_count) {
-        const uint xb = idx / bins;
-        const uint yb = idx - xb * bins;
-        const uint count = atomic_load_explicit(&joint[idx], memory_order_relaxed);
-        const uint hx = atomic_load_explicit(&hist_x[xb], memory_order_relaxed);
-        const uint hy = atomic_load_explicit(&hist_y[yb], memory_order_relaxed);
-        if (count == 0 || hx == 0 || hy == 0) {
-            continue;
-        }
-        const float px = static_cast<float>(hx) / total;
-        const float py = static_cast<float>(hy) / total;
-        const float pxy = static_cast<float>(count) / total;
-        local_mi += pxy * log(pxy / (px * py));
-    }
-    for (uint xb = lane; xb < bins; xb += lane_count) {
-        if (atomic_load_explicit(&hist_x[xb], memory_order_relaxed) != 0) {
-            ++local_active_x;
-        }
-    }
-    for (uint yb = lane; yb < bins; yb += lane_count) {
-        if (atomic_load_explicit(&hist_y[yb], memory_order_relaxed) != 0) {
-            ++local_active_y;
-        }
-    }
-
-    s_float0[lane] = local_mi;
-    s_uint0[lane] = local_active_x;
-    s_uint1[lane] = local_active_y;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
-        if (lane < stride) {
-            s_float0[lane] += s_float0[lane + stride];
-            s_uint0[lane] += s_uint0[lane + stride];
-            s_uint1[lane] += s_uint1[lane + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
     if (lane == 0) {
-        const float mi = s_float0[0];
-        const uint active_x = s_uint0[0];
-        const uint active_y = s_uint1[0];
+        // Histogram construction remains parallel and count-exact. Finalize in
+        // the same row-major bin order as Core/CUDA/ROCm so the fp32 score has a
+        // deterministic, backend-comparable reduction order.
+        const float total = static_cast<float>(valid);
+        float mi = 0.0f;
+        uint active_x = 0;
+        uint active_y = 0;
+        for (uint xb = 0; xb < bins; ++xb) {
+            const uint hx = atomic_load_explicit(&hist_x[xb], memory_order_relaxed);
+            if (hx == 0) {
+                continue;
+            }
+            ++active_x;
+            const float px = static_cast<float>(hx) / total;
+            for (uint yb = 0; yb < bins; ++yb) {
+                const uint count = atomic_load_explicit(
+                    &joint[xb * bins + yb], memory_order_relaxed);
+                const uint hy = atomic_load_explicit(&hist_y[yb], memory_order_relaxed);
+                if (count == 0 || hy == 0) {
+                    continue;
+                }
+                const float py = static_cast<float>(hy) / total;
+                const float pxy = static_cast<float>(count) / total;
+                mi += pxy * log(pxy / (px * py));
+            }
+        }
+        for (uint yb = 0; yb < bins; ++yb) {
+            if (atomic_load_explicit(&hist_y[yb], memory_order_relaxed) != 0) {
+                ++active_y;
+            }
+        }
         const float correction = active_x > 0 && active_y > 0
             ? static_cast<float>((active_x - 1) * (active_y - 1)) / (2.0f * total)
             : 0.0f;
@@ -620,7 +655,7 @@ kernel void gafime_score_mutual_info(
 // calculation as the pairwise fallback.
 kernel void gafime_build_spearman_target_ranks(
     device const float* target [[buffer(0)]],
-    device float* target_ranks [[buffer(1)]],
+    device uint* target_ranks_twice [[buffer(1)]],
     constant MetalLaunchInfo& info [[buffer(2)]],
     uint row [[thread_position_in_grid]]
 ) {
@@ -629,23 +664,23 @@ kernel void gafime_build_spearman_target_ranks(
     }
     const float yi = target[row];
     if (!isfinite(yi)) {
-        target_ranks[row] = 0.0f;
+        target_ranks_twice[row] = 0;
         return;
     }
-    float less_y = 0.0f;
-    float eq_y = 0.0f;
+    uint less_y = 0;
+    uint eq_y = 0;
     for (ulong j = 0; j < info.rows; ++j) {
         const float yj = target[j];
         if (!isfinite(yj)) {
             continue;
         }
         if (yj < yi) {
-            less_y += 1.0f;
+            ++less_y;
         } else if (yj == yi) {
-            eq_y += 1.0f;
+            ++eq_y;
         }
     }
-    target_ranks[row] = less_y + 0.5f * (eq_y - 1.0f);
+    target_ranks_twice[row] = less_y * 2 + eq_y - 1;
 }
 
 // Spearman = Pearson on average-tie ranks, one threadgroup per candidate. Ranks
@@ -662,7 +697,7 @@ kernel void gafime_score_spearman(
     device const MetalChunk* chunks [[buffer(5)]],
     device float* metric_values [[buffer(6)]],
     constant MetalLaunchInfo& info [[buffer(7)]],
-    device const float* target_ranks [[buffer(8)]],
+    device const uint* target_ranks_twice [[buffer(8)]],
     constant uint& use_cached_target_ranks [[buffer(9)]],
     uint candidate [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
@@ -689,17 +724,18 @@ kernel void gafime_score_spearman(
     const bool use_cached_target_ranks_for_candidate =
         use_cached_target_ranks != 0 && arity == 1;
 
-    float l_srx = 0.0f, l_sry = 0.0f, l_srxx = 0.0f, l_sryy = 0.0f, l_srxy = 0.0f, l_n = 0.0f;
+    float l_srx = 0.0f, l_sry = 0.0f, l_srxx = 0.0f, l_sryy = 0.0f, l_srxy = 0.0f;
+    ulong l_n = 0;
     for (ulong i = lane; i < info.rows; i += lane_count) {
         const float xi = interaction_value(features, column_means, i, info.rows, combo, arity);
         const float yi = target[i];
         if (!isfinite(xi) || !isfinite(yi)) {
             continue;
         }
-        float less_x = 0.0f;
-        float eq_x = 0.0f;
-        float less_y = 0.0f;
-        float eq_y = 0.0f;
+        uint less_x = 0;
+        uint eq_x = 0;
+        uint less_y = 0;
+        uint eq_y = 0;
         if (use_cached_target_ranks_for_candidate) {
             for (ulong j = 0; j < info.rows; ++j) {
                 const float xj = interaction_value(features, column_means, j, info.rows, combo, arity);
@@ -707,9 +743,9 @@ kernel void gafime_score_spearman(
                     continue;
                 }
                 if (xj < xi) {
-                    less_x += 1.0f;
+                    ++less_x;
                 } else if (xj == xi) {
-                    eq_x += 1.0f;
+                    ++eq_x;
                 }
             }
         } else {
@@ -720,27 +756,29 @@ kernel void gafime_score_spearman(
                     continue;
                 }
                 if (xj < xi) {
-                    less_x += 1.0f;
+                    ++less_x;
                 } else if (xj == xi) {
-                    eq_x += 1.0f;
+                    ++eq_x;
                 }
                 if (yj < yi) {
-                    less_y += 1.0f;
+                    ++less_y;
                 } else if (yj == yi) {
-                    eq_y += 1.0f;
+                    ++eq_y;
                 }
             }
         }
-        const float rx = less_x + 0.5f * (eq_x - 1.0f);
-        const float ry = use_cached_target_ranks_for_candidate
-            ? target_ranks[i]
-            : less_y + 0.5f * (eq_y - 1.0f);
+        const uint rx_twice = less_x * 2 + eq_x - 1;
+        const uint ry_twice = use_cached_target_ranks_for_candidate
+            ? target_ranks_twice[i]
+            : less_y * 2 + eq_y - 1;
+        const float rx = static_cast<float>(rx_twice) * 0.5f;
+        const float ry = static_cast<float>(ry_twice) * 0.5f;
         l_srx += rx;
         l_sry += ry;
         l_srxx += rx * rx;
         l_sryy += ry * ry;
         l_srxy += rx * ry;
-        l_n += 1.0f;
+        ++l_n;
     }
 
     threadgroup float s_srx[kMetalReduceWidth];
@@ -748,7 +786,7 @@ kernel void gafime_score_spearman(
     threadgroup float s_srxx[kMetalReduceWidth];
     threadgroup float s_sryy[kMetalReduceWidth];
     threadgroup float s_srxy[kMetalReduceWidth];
-    threadgroup float s_n[kMetalReduceWidth];
+    threadgroup ulong s_n[kMetalReduceWidth];
     s_srx[lane] = l_srx;
     s_sry[lane] = l_sry;
     s_srxx[lane] = l_srxx;
@@ -768,7 +806,7 @@ kernel void gafime_score_spearman(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lane == 0) {
-        const float n = s_n[0];
+        const float n = static_cast<float>(s_n[0]);
         float out = 0.0f;
         if (n > 1.0f) {
             const float cov = n * s_srxy[0] - s_srx[0] * s_sry[0];

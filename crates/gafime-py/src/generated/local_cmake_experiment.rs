@@ -613,6 +613,8 @@ pub(crate) fn try_compile(
         local_cmake_experiment_state: Some(state),
         runtime_cache_counters: RefCell::new(RuntimeCacheCounters::default()),
         decision_path_params: Vec::new(),
+        decision_path_state: None,
+        feature_names: Vec::new(),
         target_updates_supported: false,
         closed: false,
     }))
@@ -944,6 +946,8 @@ mod tests {
             local_cmake_experiment_state: Some(compiled_state),
             runtime_cache_counters: RefCell::new(RuntimeCacheCounters::default()),
             decision_path_params: Vec::new(),
+            decision_path_state: None,
+            feature_names: Vec::new(),
             target_updates_supported: false,
             closed: false,
         };

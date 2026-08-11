@@ -53,6 +53,8 @@ PACKAGE_NAME = "{package_name}"
 CUDA_LANGUAGE_STANDARD = "c++20"
 CUDA_ARCHITECTURES = ("75", "80", "86", "89", "90", "100", "120")
 CUDA_TUNING_POLICY = "runtime-device-class"
+PRECISION_ABI_VERSION = "1.1"
+PRECISION_PROFILES = ("fp32", "mixed", "fp64")
 RUNTIME_ARCHITECTURE_DISPATCH = True
 PER_ARCHITECTURE_TUNING = False
 
@@ -93,15 +95,19 @@ class CudaPayloadBuildExt(build_ext):
 
         src_dir = ROOT / "src"
         cuda_sources = [
-            src_dir / "cuda" / "kernels.cu",
-            src_dir / "cuda" / "launcher.cu",
+            src_dir / "cuda" / "precision_kernels.cu",
+            src_dir / "cuda" / "precision_launcher.cu",
         ]
         if sys.platform == "win32":
             output_file = self.output_dir / f"{{PACKAGE_NAME}}.dll"
             compiler_flags = ["/MD"]
         else:
             output_file = self.output_dir / f"lib{{PACKAGE_NAME}}.so"
-            compiler_flags = ["-fPIC"]
+            compiler_flags = [
+                "-fPIC",
+                "-fvisibility=hidden",
+                "-fvisibility-inlines-hidden",
+            ]
 
         gencode_flags = [
             "-gencode=arch=compute_75,code=sm_75",
@@ -126,6 +132,14 @@ class CudaPayloadBuildExt(build_ext):
             "shared",
             "-Xcompiler",
             ",".join(compiler_flags),
+            *(
+                [
+                    "-Xlinker",
+                    f"--version-script={{src_dir / 'common' / 'gafime_gpu_exports.map'}}",
+                ]
+                if sys.platform != "win32"
+                else []
+            ),
             "-I",
             str(src_dir / "common"),
             "-I",
@@ -164,6 +178,7 @@ setup(
 ROCM_SETUP = r"""
 from __future__ import annotations
 
+import json
 import os
 import platform
 import shutil
@@ -175,6 +190,8 @@ ROOT = Path(__file__).resolve().parent
 DIST_NAME = "{dist_name}"
 PACKAGE_NAME = "{package_name}"
 ROCM_WHEEL_POLICY = "{rocm_wheel_policy}"
+PRECISION_ABI_VERSION = "1.1"
+PRECISION_PROFILES = ("fp32", "mixed", "fp64")
 
 
 def _rocm_wheel_policy() -> str:
@@ -191,6 +208,13 @@ _rocm_wheel_policy()
 
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+
+
+def _hip_target_arch_tag(archs: list[str]) -> str:
+    # hipcc is invoked without a shell. Keep the resolved target list in one
+    # C string literal argv so quotes, backslashes, and control characters in
+    # an explicitly supplied target cannot change the compiler argument.
+    return json.dumps(",".join(archs), ensure_ascii=True)
 
 
 def _linux_cxx_runtime_link_flags() -> list[str]:
@@ -273,6 +297,8 @@ class RocmPayloadBuildExt(build_ext):
             "--shared",
             "-DGAFIME_GPU_BUILDING_DLL",
             "-DGAFIME_GPU_MI_ACCUMULATION_FP64=0",
+            "-DGAFIME_HIP_PRECISION_PROFILE_MASK=7",
+            f"-DGAFIME_HIP_TARGET_ARCH_TAG={{_hip_target_arch_tag(archs)}}",
             "-I",
             str(src_dir / "common"),
             "-I",
@@ -283,7 +309,13 @@ class RocmPayloadBuildExt(build_ext):
             *(str(source) for source in rocm_sources),
         ]
         if sys.platform != "win32":
-            cmd.insert(cmd.index("--shared"), "-fPIC")
+            shared_index = cmd.index("--shared")
+            cmd[shared_index:shared_index] = [
+                "-fPIC",
+                "-fvisibility=hidden",
+                "-fvisibility-inlines-hidden",
+                f"-Wl,--version-script={{src_dir / 'common' / 'gafime_gpu_exports.map'}}",
+            ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"ROCm/HIP build failed\nSTDOUT:\n{{result.stdout}}\nSTDERR:\n{{result.stderr}}")
@@ -406,7 +438,10 @@ def stage_payload(
     version = project_version()
     package_name = f"gafime_{kind}"
     dist_name = f"gafime-{kind}"
-    if rocm_policy is not None and rocm_policy.get("distribution_identity") != dist_name:
+    if (
+        rocm_policy is not None
+        and rocm_policy.get("distribution_identity") != dist_name
+    ):
         raise ValueError(
             "checked-in ROCm policy distribution identity does not match staged source"
         )
@@ -417,11 +452,18 @@ def stage_payload(
             "cuda_api.hpp",
             "cuda_internal.hpp",
             "kernels.cuh",
-            "kernels.cu",
-            "launcher.cu",
+            "precision_kernels.cuh",
+            "precision_kernels.cu",
+            "precision_launcher.cu",
         ]
         if kind == "cuda"
-        else ["rocm_api.hpp", "kernels.hpp", "kernels.hip", "launcher.hip"]
+        else [
+            "rocm_api.hpp",
+            "kernels.hpp",
+            "kernels.hip",
+            "launcher.hip",
+            "precision.hpp",
+        ]
     )
     setup_template = CUDA_SETUP if kind == "cuda" else ROCM_SETUP
 
@@ -458,6 +500,8 @@ def stage_payload(
     common_source_names = (
         "covariance_policy.hpp",
         "gafime_gpu_abi.hpp",
+        "gafime_gpu_internal_abi.hpp",
+        "gafime_gpu_exports.map",
         "gpu_abi_impl.hpp",
     )
     for source_name in common_source_names:
@@ -501,7 +545,7 @@ def stage_payload(
     include LICENSE
     recursive-include {package_name} *
     recursive-include gafime _dummy.c
-    recursive-include src/common *.hpp
+    recursive-include src/common *.hpp *.map
     recursive-include src/{source_subdir} *
     global-exclude *.py[cod]
     global-exclude __pycache__
@@ -543,6 +587,8 @@ def stage_payload(
                         "windows": "nvcudart_hybrid64.dll",
                     },
                     "optix_rt": "off",
+                    "precision_abi_version": "1.1",
+                    "precision_profiles": ["fp32", "mixed", "fp64"],
                     "rt_sources_included": False,
                     "per_architecture_tuning": False,
                     "runtime_architecture_dispatch": True,

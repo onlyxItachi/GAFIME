@@ -10,9 +10,11 @@ pub mod schedule;
 
 pub use backend::{
     BackendExecutionStats, ComputeBackend, MatrixHandle, OrchestratorError, OrchestratorResult,
+    PrecisionComputeBackend,
 };
 pub use continuous::{
-    continuous_backend_kind, continuous_plan_device_footprint_bytes, prepare_continuous_execution,
+    continuous_backend_kind, continuous_plan_device_footprint_bytes,
+    continuous_staged_device_footprint_bytes, prepare_continuous_execution,
     prepare_continuous_execution_for_feature_orders, prepare_ranked_continuous_execution,
     prepare_ranked_continuous_execution_for_feature_orders, PreparedContinuousExecution,
 };

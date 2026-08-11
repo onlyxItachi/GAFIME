@@ -51,6 +51,33 @@ ROCM_BUILD_PACKAGES = (
     "rocm-device-libs7.2.3-1.0.0.70203-90.el8.x86_64",
     "libstdc++-devel-8.5.0-28.el8_10.alma.1.x86_64",
 )
+CANONICAL_PRECISION_PROFILES = ("fp32", "mixed", "fp64")
+REQUIRED_PRECISION_ABI_IDENTITIES = (
+    b"gafime_gpu_numeric_routes_v2",
+    b"gafime_gpu_matrix_alloc_v2",
+    b"gafime_gpu_matrix_upload_v2",
+    b"gafime_gpu_matrix_update_target_v2",
+    b"gafime_gpu_execute_v2",
+    b"gafime_gpu_execution_memory_peak_v2",
+    b"gafime_gpu_permutation_memory_peak_v2",
+    b"gafime_gpu_permutation_pvalues_v2",
+    b"gafime_gpu_interaction_diagnostics_v2",
+    b"gafime_gpu_matrix_free_v2",
+)
+FORBIDDEN_PREFREEZE_PRECISION_ABI_IDENTITIES = (
+    b"gafime_gpu_precision_capabilities",
+    b"gafime_gpu_matrix_upload_f32_v2",
+    b"gafime_gpu_matrix_upload_f64_v2",
+    b"gafime_gpu_matrix_update_target_f32_v2",
+    b"gafime_gpu_matrix_update_target_f64_v2",
+    b"gafime_gpu_execute_f32_v2",
+    b"gafime_gpu_execute_f64_v2",
+    b"gafime_gpu_permutation_pvalues_f32_v2",
+    b"gafime_gpu_permutation_pvalues_f64_v2",
+)
+FORBIDDEN_PRECISION_DISTRIBUTION_IDENTITY = re.compile(
+    r"(?i)(?:^|[/_.-])gafime(?:[/_.-](?:cuda|rocm))?[/_.-](?:fp32|mixed|fp64)(?:$|[/_.-])"
+)
 
 # Experimental CUDA RT/OptiX remains valid local CMake-only source, but none of
 # its identities may cross an archive boundary.  These names are deliberately
@@ -161,6 +188,7 @@ SDIST_SOURCE_SUFFIXES = {
     ".inc",
     ".in",
     ".json",
+    ".map",
     ".metal",
     ".mm",
     ".ptx",
@@ -188,22 +216,30 @@ DISTRIBUTIONS = RELEASE_MANIFEST.all_distribution_names
 CUDA_SDIST_SOURCES = {
     "src/common/covariance_policy.hpp",
     "src/common/gafime_gpu_abi.hpp",
+    "src/common/gafime_gpu_exports.map",
+    "src/common/gafime_gpu_internal_abi.hpp",
     "src/common/gpu_abi_impl.hpp",
     "src/cuda/cuda_api.hpp",
     "src/cuda/cuda_internal.hpp",
-    "src/cuda/kernels.cu",
     "src/cuda/kernels.cuh",
-    "src/cuda/launcher.cu",
+    "src/cuda/precision_kernels.cu",
+    "src/cuda/precision_kernels.cuh",
+    "src/cuda/precision_launcher.cu",
 }
 ROCM_SDIST_SOURCES = {
     "src/common/covariance_policy.hpp",
     "src/common/gafime_gpu_abi.hpp",
+    "src/common/gafime_gpu_exports.map",
+    "src/common/gafime_gpu_internal_abi.hpp",
     "src/common/gpu_abi_impl.hpp",
     "src/rocm/kernels.hip",
     "src/rocm/kernels.hpp",
     "src/rocm/launcher.hip",
+    "src/rocm/precision.hpp",
     "src/rocm/rocm_api.hpp",
 }
+
+
 @dataclass(frozen=True)
 class Artifact:
     path: Path
@@ -231,13 +267,180 @@ def _require(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def _assert_no_precision_distribution_identity(artifact: Artifact) -> None:
+    identities = [artifact.path.name, *artifact.members]
+    forbidden = sorted(
+        identity
+        for identity in identities
+        if FORBIDDEN_PRECISION_DISTRIBUTION_IDENTITY.search(identity)
+    )
+    _require(
+        not forbidden,
+        f"{artifact.path.name} contains forbidden precision-specific package "
+        f"identities: {forbidden}",
+    )
+
+
+def _run_export_tool(command: list[str], native_path: Path) -> str:
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise AssertionError(
+            f"{command[0]} is required to inspect exact exports from {native_path.name}"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or exc.stdout.strip()
+        raise AssertionError(
+            f"unable to inspect exact exports from {native_path.name} with "
+            f"{' '.join(command)}: {detail}"
+        ) from exc
+    return result.stdout
+
+
+def _native_exported_symbols(native_path: Path, native: bytes) -> set[str]:
+    if native.startswith(b"\x7fELF"):
+        output = _run_export_tool(
+            ["readelf", "--dyn-syms", "--wide", str(native_path)], native_path
+        )
+        exports = set()
+        for line in output.splitlines():
+            fields = line.split()
+            if (
+                len(fields) >= 8
+                and fields[0].endswith(":")
+                and fields[4] in {"GLOBAL", "WEAK"}
+                and fields[6] != "UND"
+            ):
+                exports.add(fields[7].split("@", 1)[0])
+        return exports
+    if native.startswith(b"MZ"):
+        if os.name == "nt":
+            output = _run_export_tool(
+                ["dumpbin", "/exports", str(native_path)], native_path
+            )
+            return {
+                match.group(1)
+                for line in output.splitlines()
+                if (
+                    match := re.match(
+                        r"^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+"
+                        r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:=.*)?$",
+                        line,
+                    )
+                )
+            }
+        output = _run_export_tool(
+            ["llvm-readobj", "--coff-exports", str(native_path)], native_path
+        )
+        return {
+            match.group(1)
+            for line in output.splitlines()
+            if (match := re.match(r"^\s*Name:\s+(\S+)\s*$", line))
+        }
+    if native.startswith(
+        (
+            b"\xca\xfe\xba\xbe",
+            b"\xca\xfe\xba\xbf",
+            b"\xce\xfa\xed\xfe",
+            b"\xcf\xfa\xed\xfe",
+            b"\xbf\xba\xfe\xca",
+            b"\xfe\xed\xfa\xce",
+            b"\xfe\xed\xfa\xcf",
+        )
+    ):
+        if sys.platform == "darwin":
+            output = _run_export_tool(["nm", "-gjU", str(native_path)], native_path)
+            return {
+                line.strip().removeprefix("_")
+                for line in output.splitlines()
+                if line.strip()
+            }
+        output = _run_export_tool(
+            [
+                "llvm-nm",
+                "--defined-only",
+                "--extern-only",
+                "--format=posix",
+                str(native_path),
+            ],
+            native_path,
+        )
+        return {
+            line.split()[0].removeprefix("_")
+            for line in output.splitlines()
+            if line.split()
+        }
+    raise AssertionError(
+        f"cannot identify native binary format for exact ABI export inspection: "
+        f"{native_path.name}"
+    )
+
+
+def _assert_native_precision_abi(
+    archive: zipfile.ZipFile,
+    artifact: Artifact,
+    native_member: str,
+    backend: str,
+) -> None:
+    native = archive.read(native_member)
+    with tempfile.TemporaryDirectory(prefix="gafime-native-exports-") as temporary:
+        native_path = Path(temporary) / PurePosixPath(native_member).name
+        native_path.write_bytes(native)
+        exports = _native_exported_symbols(native_path, native)
+    missing = [
+        identity.decode("ascii")
+        for identity in REQUIRED_PRECISION_ABI_IDENTITIES
+        if identity.decode("ascii") not in exports
+    ]
+    _require(
+        not missing,
+        f"{artifact.path.name} native payload {native_member} is missing additive "
+        f"precision ABI identities: {missing}",
+    )
+    unexpected = [
+        identity.decode("ascii")
+        for identity in FORBIDDEN_PREFREEZE_PRECISION_ABI_IDENTITIES
+        if identity.decode("ascii") in exports
+    ]
+    _require(
+        not unexpected,
+        f"{artifact.path.name} native payload {native_member} exposes removed "
+        f"pre-freeze precision ABI identities: {unexpected}",
+    )
+
+
+def _sdist_member_bytes(artifact: Artifact, relative: str) -> bytes:
+    with tarfile.open(artifact.path, "r:gz") as archive:
+        matches = [
+            member
+            for member in archive.getmembers()
+            if member.isfile()
+            and (member.name == relative or member.name.endswith(f"/{relative}"))
+        ]
+        _require(
+            len(matches) == 1,
+            f"{artifact.path.name} expected one source member {relative!r}, "
+            f"found {[member.name for member in matches]}",
+        )
+        extracted = archive.extractfile(matches[0])
+        _require(
+            extracted is not None,
+            f"unable to read {relative} from {artifact.path.name}",
+        )
+        assert extracted is not None
+        return extracted.read()
+
+
 def _forbidden_rt_path(path: str) -> bool:
     lowered = path.lower()
     if "optix" in lowered:
         return True
-    return "rt" in {
-        token for token in re.split(r"[^a-z0-9]+", lowered) if token
-    }
+    return "rt" in {token for token in re.split(r"[^a-z0-9]+", lowered) if token}
 
 
 def _is_native_member(member: str, data: bytes) -> bool:
@@ -252,8 +455,7 @@ def _is_native_member(member: str, data: bytes) -> bool:
 def _is_sdist_source_member(member: str) -> bool:
     path = PurePosixPath(member)
     return (
-        path.name in SDIST_SOURCE_NAMES
-        or path.suffix.lower() in SDIST_SOURCE_SUFFIXES
+        path.name in SDIST_SOURCE_NAMES or path.suffix.lower() in SDIST_SOURCE_SUFFIXES
     )
 
 
@@ -357,9 +559,7 @@ def _assert_rt_matchers() -> None:
         )
 
     _require(
-        not _forbidden_rt_content(
-            b"QvYRtE", source_member=False, native_member=True
-        ),
+        not _forbidden_rt_content(b"QvYRtE", source_member=False, native_member=True),
         "native artifact matcher must not interpret arbitrary fatbinary bytes "
         "as source identifiers",
     )
@@ -370,9 +570,7 @@ def _assert_rt_matchers() -> None:
     ):
         _require(
             bool(
-                _forbidden_rt_content(
-                    sample, source_member=False, native_member=True
-                )
+                _forbidden_rt_content(sample, source_member=False, native_member=True)
             ),
             f"native artifact matcher missed exact forbidden identity {sample!r}",
         )
@@ -405,9 +603,7 @@ def _assert_rt_matchers() -> None:
         )
         and bool(
             _forbidden_rt_content(
-                _rt_scan_data(
-                    "crates/gafime-py/src/build_policy.json", allowed_policy
-                ),
+                _rt_scan_data("crates/gafime-py/src/build_policy.json", allowed_policy),
                 source_member=True,
             )
         ),
@@ -423,13 +619,10 @@ def _assert_rt_matchers() -> None:
 def _assert_wheel_rt_free(
     path: Path, archive: zipfile.ZipFile, members: frozenset[str]
 ) -> None:
-    forbidden_paths = sorted(
-        member for member in members if _forbidden_rt_path(member)
-    )
+    forbidden_paths = sorted(member for member in members if _forbidden_rt_path(member))
     _require(
         not forbidden_paths,
-        f"{path.name} contains forbidden RT/OptiX archive members: "
-        f"{forbidden_paths}",
+        f"{path.name} contains forbidden RT/OptiX archive members: {forbidden_paths}",
     )
     findings = []
     nested_archives = []
@@ -460,8 +653,7 @@ def _assert_wheel_rt_free(
             findings.append(f"{member}: {identity}")
     _require(
         not nested_archives,
-        f"{path.name} contains forbidden nested archive members: "
-        f"{nested_archives}",
+        f"{path.name} contains forbidden nested archive members: {nested_archives}",
     )
     _require(
         not findings,
@@ -481,13 +673,10 @@ def _assert_sdist_rt_free(
         for name in raw_members
         if name.startswith(f"{root}/") and len(name) > len(root) + 1
     )
-    forbidden_paths = sorted(
-        member for member in members if _forbidden_rt_path(member)
-    )
+    forbidden_paths = sorted(member for member in members if _forbidden_rt_path(member))
     _require(
         not forbidden_paths,
-        f"{path.name} contains forbidden RT/OptiX archive members: "
-        f"{forbidden_paths}",
+        f"{path.name} contains forbidden RT/OptiX archive members: {forbidden_paths}",
     )
 
     findings = []
@@ -517,8 +706,7 @@ def _assert_sdist_rt_free(
             findings.append(f"{member}: {identity}")
     _require(
         not nested_archives,
-        f"{path.name} contains forbidden nested archive members: "
-        f"{nested_archives}",
+        f"{path.name} contains forbidden nested archive members: {nested_archives}",
     )
     _require(
         not findings,
@@ -538,9 +726,9 @@ def _metadata_from_text(text: str, path: Path) -> tuple[str, str, object]:
 
 def _read_wheel(path: Path) -> Artifact:
     try:
-        filename_prefix, wheel_python_tag, abi_tag, platform_tag = path.name[:-4].rsplit(
-            "-", 3
-        )
+        filename_prefix, wheel_python_tag, abi_tag, platform_tag = path.name[
+            :-4
+        ].rsplit("-", 3)
         prefix_parts = filename_prefix.split("-")
         if not path.name.endswith(".whl") or len(prefix_parts) not in (2, 3):
             raise ValueError
@@ -802,16 +990,13 @@ def _assert_core_sdist(artifact: Artifact, root: Path) -> None:
         for path in (root / "src" / "common").rglob("*")
         if path.is_file()
     }
-    expected = (
-        expected_native
-        | {
-            "Cargo.lock",
-            "Cargo.toml",
-            "LICENSE",
-            "README.md",
-            "pyproject.toml",
-        }
-    )
+    expected = expected_native | {
+        "Cargo.lock",
+        "Cargo.toml",
+        "LICENSE",
+        "README.md",
+        "pyproject.toml",
+    }
     missing = sorted(expected - artifact.members)
     _require(not missing, f"core sdist is missing reproducibility sources: {missing}")
     backend_sources = sorted(
@@ -938,6 +1123,52 @@ def _assert_payload_sdist(artifact: Artifact, expected_distribution: str) -> Non
         f"{expected_distribution} sdist contains experimental RT sources: "
         f"{experimental_rt}",
     )
+    precision_sources = b"\n".join(
+        _sdist_member_bytes(artifact, member) for member in sorted(expected_sources)
+    )
+    for identity in REQUIRED_PRECISION_ABI_IDENTITIES:
+        _require(
+            identity in precision_sources,
+            f"{expected_distribution} sdist precision sources omit "
+            f"{identity.decode('ascii')}",
+        )
+    backend_precision_source = _sdist_member_bytes(
+        artifact,
+        f"src/{backend}/{'precision_launcher.cu' if backend == 'cuda' else 'launcher.hip'}",
+    )
+    for identity in REQUIRED_PRECISION_ABI_IDENTITIES:
+        _require(
+            identity in backend_precision_source,
+            f"{expected_distribution} {backend} sources omit canonical ABI identity "
+            f"{identity.decode('ascii')}",
+        )
+    for profile in (
+        b"GAFIME_PRECISION_FP32",
+        b"GAFIME_PRECISION_MIXED",
+        b"GAFIME_PRECISION_FP64",
+    ):
+        _require(
+            profile in precision_sources,
+            f"{expected_distribution} sdist precision sources omit {profile.decode('ascii')}",
+        )
+    specialization_markers = {
+        "cuda": (
+            b"make_kernel_set<GAFIME_PRECISION_FP32>",
+            b"make_kernel_set<GAFIME_PRECISION_MIXED>",
+            b"make_kernel_set<GAFIME_PRECISION_FP64>",
+        ),
+        "rocm": (
+            b"GAFIME_HIP_INSTANTIATE_PRECISION_PROFILE(float, float, float)",
+            b"GAFIME_HIP_INSTANTIATE_PRECISION_PROFILE(float, double, double)",
+            b"GAFIME_HIP_INSTANTIATE_PRECISION_PROFILE(double, double, double)",
+        ),
+    }[backend]
+    for marker in specialization_markers:
+        _require(
+            marker in precision_sources,
+            f"{expected_distribution} sdist omits compiled specialization "
+            f"{marker.decode('ascii')}",
+        )
 
 
 def _assert_cuda_build_policy(artifact: Artifact, expected_rt_mode: str) -> None:
@@ -952,6 +1183,8 @@ def _assert_cuda_build_policy(artifact: Artifact, expected_rt_mode: str) -> None
             "windows": "nvcudart_hybrid64.dll",
         },
         "optix_rt": "off",
+        "precision_abi_version": "1.1",
+        "precision_profiles": ["fp32", "mixed", "fp64"],
         "rt_sources_included": False,
         "per_architecture_tuning": False,
         "runtime_architecture_dispatch": True,
@@ -961,12 +1194,21 @@ def _assert_cuda_build_policy(artifact: Artifact, expected_rt_mode: str) -> None
         f"{artifact.path.name} CUDA build policy {artifact.build_policy!r} != {expected!r}",
     )
     forbidden = sorted(
-        member for member in artifact.members
-        if PurePosixPath(member).name in {
-            "rt_kernels.cu", "rt_kernels.cuh", "rt_launcher.cu", "rt_launcher.cuh",
-        } or ".optix-sdk/" in member or PurePosixPath(member).name == "optix.h"
+        member
+        for member in artifact.members
+        if PurePosixPath(member).name
+        in {
+            "rt_kernels.cu",
+            "rt_kernels.cuh",
+            "rt_launcher.cu",
+            "rt_launcher.cuh",
+        }
+        or ".optix-sdk/" in member
+        or PurePosixPath(member).name == "optix.h"
     )
-    _require(not forbidden, f"CUDA distribution contains RT or OptiX sources: {forbidden}")
+    _require(
+        not forbidden, f"CUDA distribution contains RT or OptiX sources: {forbidden}"
+    )
     _require(
         artifact.build_provenance is None,
         f"{artifact.path.name} standard CUDA artifact contains RT provenance",
@@ -974,14 +1216,13 @@ def _assert_cuda_build_policy(artifact: Artifact, expected_rt_mode: str) -> None
     bundled_runtime = sorted(
         member
         for member in artifact.members
-        if PurePosixPath(member).name.lower().startswith(
-            ("libcudart", "cudart64_", "nvcudart")
-        )
+        if PurePosixPath(member)
+        .name.lower()
+        .startswith(("libcudart", "cudart64_", "nvcudart"))
     )
     _require(
         not bundled_runtime,
-        f"{artifact.path.name} contains bundled CUDA runtime files: "
-        f"{bundled_runtime}",
+        f"{artifact.path.name} contains bundled CUDA runtime files: {bundled_runtime}",
     )
 
 
@@ -992,9 +1233,8 @@ def _assert_cuda_system_wheel(artifact: Artifact) -> None:
         for platform in artifact.platforms
         if re.fullmatch(r"manylinux_[0-9]+_[0-9]+_x86_64", platform)
     }
-    valid_linux = (
-        "manylinux_2_28_x86_64" in linux_platforms
-        and linux_platforms == set(artifact.platforms)
+    valid_linux = "manylinux_2_28_x86_64" in linux_platforms and linux_platforms == set(
+        artifact.platforms
     )
     valid_windows = artifact.platforms == {"win_amd64"}
     _require(
@@ -1051,9 +1291,6 @@ def _assert_cuda_system_wheel(artifact: Artifact) -> None:
                 )
 
 
-
-
-
 def _load_rocm_system_policy(root: Path) -> dict[str, object]:
     policy_path = root / ".github" / "scripts" / ROCM_SYSTEM_POLICY.name
     policy = json.loads(policy_path.read_text(encoding="utf-8"))
@@ -1069,6 +1306,11 @@ def _load_rocm_system_policy(root: Path) -> dict[str, object]:
         and policy.get("sbom_required") is False
         and policy.get("mixed_runtime_coexistence") == "host-managed-single-runtime",
         "checked-in ROCm system-wheel policy identity is invalid",
+    )
+    _require(
+        policy.get("precision_abi_version") == "1.1"
+        and policy.get("precision_profiles") == ["fp32", "mixed", "fp64"],
+        "checked-in ROCm system-wheel precision profile contract is invalid",
     )
     expected_build_inputs = {
         "image": ROCM_MANYLINUX_IMAGE,
@@ -1145,6 +1387,40 @@ def _readelf_dynamic(path: Path) -> dict[str, tuple[str, ...]]:
     return {name: tuple(items) for name, items in values.items()}
 
 
+def _assert_rocm_build_target_marker(
+    native_payload: bytes, artifact_name: str, expected_targets: object
+) -> tuple[str, ...]:
+    matches = re.findall(rb"GAFIME_ROCM_BUILD_INFO:arch=([^;\x00]+);", native_payload)
+    _require(
+        matches and all(match == matches[0] for match in matches),
+        f"{artifact_name} ROCm payload has no single consistent build target marker",
+    )
+    try:
+        advertised = tuple(matches[0].decode("ascii").split(","))
+    except UnicodeDecodeError as exc:
+        raise AssertionError(
+            f"{artifact_name} ROCm build target marker is not ASCII"
+        ) from exc
+    _require(
+        isinstance(expected_targets, list)
+        and len(expected_targets) == 13
+        and all(
+            isinstance(target, str) and target.startswith("gfx")
+            for target in expected_targets
+        )
+        and len(set(expected_targets)) == len(expected_targets),
+        f"{artifact_name} reviewed ROCm target policy is not a unique 13-target set",
+    )
+    _require(
+        all(advertised)
+        and len(set(advertised)) == len(advertised)
+        and set(advertised) == set(expected_targets),
+        f"{artifact_name} ROCm build target marker does not advertise the exact "
+        f"policy target set: {advertised}",
+    )
+    return advertised
+
+
 def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, object]:
     policy = _assert_rocm_build_policy(artifact, root)
     _require(
@@ -1185,6 +1461,7 @@ def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, objec
             f"{artifact.path.name} native payload size {native_info.file_size} exceeds "
             f"policy limit {limits['native_payload_uncompressed_bytes']}",
         )
+        native_payload = archive.read(native_info)
         forbidden = sorted(
             info.filename
             for info in file_infos
@@ -1213,8 +1490,11 @@ def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, objec
         )
         with tempfile.TemporaryDirectory(prefix="gafime-rocm-system-") as temporary:
             native_path = Path(temporary) / "libgafime_rocm.so"
-            native_path.write_bytes(archive.read(native_info))
+            native_path.write_bytes(native_payload)
             dynamic = _readelf_dynamic(native_path)
+        advertised_architectures = _assert_rocm_build_target_marker(
+            native_payload, artifact.path.name, policy["gfx_targets"]
+        )
 
     _require(
         not dynamic["RPATH"] and not dynamic["RUNPATH"],
@@ -1254,6 +1534,7 @@ def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, objec
         "platform_tag": policy["platform_tag"],
         "userspace_bundled": False,
         "required_sonames": required_sonames,
+        "advertised_architectures": list(advertised_architectures),
     }
 
 
@@ -1286,6 +1567,7 @@ def _rocm_system_policy_report(
         "wheel_bytes",
         "wheel_uncompressed_bytes",
         "native_payload_uncompressed_bytes",
+        "advertised_architectures",
     )
     return {
         "schema_version": 2,
@@ -1344,6 +1626,13 @@ def _assert_core_wheel(artifact: Artifact) -> None:
             f"{artifact.path.name} bundled Metal files {sorted(packaged_metal)} != "
             f"{sorted(metal_members)}",
         )
+        with zipfile.ZipFile(artifact.path) as archive:
+            _assert_native_precision_abi(
+                archive,
+                artifact,
+                "gafime/_metal/libgafime_metal_v1.dylib",
+                "metal",
+            )
     else:
         _require(
             not packaged_metal,
@@ -1374,6 +1663,9 @@ def _assert_payload_wheel(artifact: Artifact, expected_distribution: str) -> Non
         "payload artifacts; "
         f"found {native_members}",
     )
+    with zipfile.ZipFile(artifact.path) as archive:
+        backend = _payload_identity(expected_distribution)[0]
+        _assert_native_precision_abi(archive, artifact, native_members[0], backend)
     other_packages = {
         f"{other_package}/"
         for distribution, (_, other_package, _) in PAYLOAD_IDENTITIES.items()
@@ -1441,9 +1733,7 @@ def _assert_distribution_wheels(
     distribution = RELEASE_MANIFEST.distribution(distribution_name)
     wheels = _select(artifacts, distribution_name, "wheel")
     expected_patterns = [
-        pattern
-        for wheel in distribution.wheels
-        for pattern in wheel.filename_patterns
+        pattern for wheel in distribution.wheels for pattern in wheel.filename_patterns
     ]
     for pattern in expected_patterns:
         matches = [
@@ -1476,6 +1766,7 @@ def _assert_scope(
     artifacts: list[Artifact], scope: str, root: Path, version: str
 ) -> None:
     for artifact in artifacts:
+        _assert_no_precision_distribution_identity(artifact)
         _assert_common_metadata(artifact, version)
         if artifact.kind == "wheel" and artifact.distribution == "gafime":
             _assert_core_wheel(artifact)
@@ -1680,6 +1971,7 @@ def _assert_release_manifest_pyproject(
             f"expects {expected!r}, found {actual!r}",
         )
 
+
 def _assert_release_manifest_workflow(workflow: str) -> None:
     global_selector = f'CIBW_BUILD: "{RELEASE_MANIFEST.build_selector}"'
     _require(
@@ -1757,8 +2049,7 @@ def _assert_release_manifest_workflow(workflow: str) -> None:
 
     freeze_job = _workflow_job_block(workflow, "freeze_release_bundle")
     _require(
-        "name: Shared release tag, version, and full-artifact preflight"
-        in freeze_job,
+        "name: Shared release tag, version, and full-artifact preflight" in freeze_job,
         "freeze job must preserve the protected-branch required check name",
     )
     for dependency in sorted(required_freeze_dependencies):
@@ -1775,6 +2066,15 @@ def _assert_release_manifest_workflow(workflow: str) -> None:
         "--scope full-release" in freeze_job
         and ".github/scripts/release_bundle.py create" in freeze_job,
         "freeze job must validate complete composition before writing provenance",
+    )
+    _require(
+        "Bind built and authoritative source identities" in freeze_job
+        and "git rev-parse HEAD" in freeze_job
+        and "github.event.pull_request.head.sha" in freeze_job
+        and "--built-source-sha" in freeze_job
+        and "--authoritative-source-sha" in freeze_job,
+        "freeze provenance must bind the checked-out tree and PR-head source "
+        "identities separately",
     )
 
 
@@ -1796,6 +2096,7 @@ def _assert_release_manifest_documentation(root: Path) -> None:
         "release-artifact-matrix.md" in runbook,
         "release operations must link the manifest-derived artifact matrix",
     )
+
 
 def _assert_build_workflow(workflow: str) -> None:
     _assert_release_manifest_workflow(workflow)
@@ -1828,12 +2129,9 @@ def _assert_build_workflow(workflow: str) -> None:
         "workflow caches must not archive build target directories",
     )
     _require(
-        "auditwheel repair --plat manylinux_2_28_x86_64 "
-        "--exclude libcudart.so.13" in workflow
-        and (
-            'delvewheel repair --exclude "cudart64_13.dll;'
-            'nvcudart_hybrid64.dll"'
-        )
+        "auditwheel repair --plat manylinux_2_28_x86_64 --exclude libcudart.so.13"
+        in workflow
+        and ('delvewheel repair --exclude "cudart64_13.dll;nvcudart_hybrid64.dll"')
         in workflow
         and "cudart_static.lib" not in workflow,
         "CUDA wheel repair must preserve the system-runtime boundary",
@@ -1883,6 +2181,19 @@ def _assert_build_workflow(workflow: str) -> None:
     _require(
         '"cudart_$componentVersion"' not in workflow,
         "the Windows network installer must not provide an unpinned CUDA runtime",
+    )
+    _require(
+        "components-nvcc-crt-nvvm-cuobjdump-nvdisasm-v1" in workflow
+        and '"cuobjdump_$componentVersion"' in workflow
+        and '"nvdisasm_$componentVersion"' in workflow
+        and '"$cudaRoot\\bin\\cuobjdump.exe"' in workflow
+        and '"$cudaRoot\\bin\\nvdisasm.exe"' in workflow
+        and "cuda-nvdisasm-13-3" in workflow
+        and "command -v nvdisasm" in workflow
+        and "where.exe nvdisasm.exe" in workflow,
+        "the CUDA toolkit component manifest, immutable Windows cache key, and "
+        "strict cross-platform preflights must cover the complete toolchain used "
+        "for machine-code evidence",
     )
     validator_conditions = {
         "validate_wheels": (
@@ -1939,16 +2250,47 @@ def _assert_build_workflow(workflow: str) -> None:
         "\n          fi\n" not in windows_arm_validator,
         "Windows ARM64 PowerShell validation must not contain Bash terminators",
     )
+    core_validator = _workflow_job_block(workflow, "validate_wheels")
+    _require(
+        "Run full Python suite from the fresh Core wheel" in core_validator
+        and "GAFIME_TEST_INSTALLED_PACKAGE=1" in core_validator
+        and "import gafime.gafime_py" in core_validator
+        and 'os.path.join(os.environ["GITHUB_WORKSPACE"], "tests", "python")'
+        in core_validator,
+        "the Linux Core CPython matrix must run the full Python suite from each "
+        "fresh wheel",
+    )
     rocm_validator = _workflow_job_block(workflow, "validate_rocm_payload_wheels")
     _require(
         'python_abi_tag="${python_tag}-${python_tag}"' in rocm_validator
         and 'python="/opt/python/${python_abi_tag}/bin/python"' in rocm_validator
-        and 'gafime-*-"${python_abi_tag}"-manylinux_2_28_x86_64.whl'
-        in rocm_validator
-        and 'gafime_rocm-*-"${python_abi_tag}"-linux_x86_64.whl'
-        in rocm_validator
+        and 'gafime-*-"${python_abi_tag}"-manylinux_2_28_x86_64.whl' in rocm_validator
+        and 'gafime_rocm-*-"${python_abi_tag}"-linux_x86_64.whl' in rocm_validator
         and '"${python_tag}"-"${python_tag}"' not in rocm_validator,
         "ROCm validation must select one matching Core/payload pair per CPython ABI",
+    )
+    _require(
+        workflow.count("--machine-code-evidence-dir") == 3
+        and workflow.count("--machine-code-wheel") == 3
+        and "cuda-profile-evidence-${{ runner.os }}" in workflow
+        and "name: rocm-profile-evidence" in workflow,
+        "CUDA and ROCm wheel builds must retain hash-bound typed machine-code "
+        "profile evidence",
+    )
+    freeze = _workflow_job_block(workflow, "freeze_release_bundle")
+    _require(
+        "Download CUDA and ROCm profile machine-code evidence" in freeze
+        and "--verify-wheel-evidence dist" in freeze
+        and "--evidence-dir precision-evidence" in freeze,
+        "the release freeze must bind typed machine-code evidence to the exact "
+        "downloaded payload wheels",
+    )
+    _require(
+        'python -m pip install "installer==0.7.0" "packaging==25.0"' in freeze
+        and "Verify requested retagged Core wheels install as exact archives" in freeze
+        and 'python -m installer --destdir "$install_root" "$wheel"' in freeze,
+        "the optional Core build-tag path must verify every post-retag archive "
+        "before the release freeze",
     )
 
 
@@ -2021,8 +2363,7 @@ def _assert_publish_workflow(workflow: str) -> None:
         )
     for name, job in (("Core", core), ("CUDA", cuda), ("ROCm", rocm)):
         _require(
-            "release_bundle.py verify" in job
-            and "pypa/gh-action-pypi-publish" in job,
+            "release_bundle.py verify" in job and "pypa/gh-action-pypi-publish" in job,
             f"{name} publisher must verify then upload the frozen bytes",
         )
         _require(
@@ -2056,6 +2397,16 @@ def _assert_publish_workflow(workflow: str) -> None:
         "public Apple Silicon Core installation must execute bundled Metal",
     )
     _require(
+        "installed_wheel_smoke.py" in public_matrix
+        and "Verify public Core wheel and advertised precision profiles"
+        in public_matrix
+        and "Verify public CUDA payload separation and precision ABI exports"
+        in public_matrix
+        and "--backend cuda" in public_matrix,
+        "public Core/CUDA installs must verify the fresh Core wheel and CUDA "
+        "precision ABI surface",
+    )
+    _require(
         '"gafime==$PYPI_VERSION"' in public_matrix
         and '"gafime-cuda==$PYPI_VERSION"' in public_matrix,
         "public installation must pin Core and CUDA to the same release identity",
@@ -2075,6 +2426,19 @@ def _assert_publish_workflow(workflow: str) -> None:
         and "$env:TARGET_PYTHON" in public_windows_arm,
         "public Windows ARM64 validation must execute every exact wheel in its "
         "NuGet-provisioned target interpreter",
+    )
+    _require(
+        "Verify public Windows ARM64 Core precision profiles" in public_windows_arm
+        and "installed_wheel_smoke.py" in public_windows_arm,
+        "public Windows ARM64 installs must execute the Core precision smoke",
+    )
+    public_rocm = _workflow_job_block(workflow, "verify_public_rocm_install")
+    _require(
+        "installed_wheel_smoke.py" in public_rocm
+        and "installed_payload_smoke.py" in public_rocm
+        and "--backend rocm" in public_rocm,
+        "public ROCm source installation must verify both Core and payload "
+        "precision surfaces",
     )
 
     github_release = _workflow_job_block(workflow, "publish_github_release")
@@ -2176,6 +2540,8 @@ def _assert_source_tree(root: Path) -> None:
         '"cuda_runtime": "system"',
         '"linux": "libcudart.so.13"',
         '"windows": "nvcudart_hybrid64.dll"',
+        '"precision_abi_version": "1.1"',
+        '"precision_profiles": ["fp32", "mixed", "fp64"]',
         '"rt_sources_included": False',
         'choices=("system",)',
     ):
@@ -2236,13 +2602,36 @@ def _assert_source_tree(root: Path) -> None:
             )
             _require(
                 not forbidden_files,
-                f"{backend} staged distribution contains RT sources: "
-                f"{forbidden_files}",
+                f"{backend} staged distribution contains RT sources: {forbidden_files}",
+            )
+            expected_precision_sources = {
+                "cuda": {
+                    "src/cuda/precision_kernels.cu",
+                    "src/cuda/precision_kernels.cuh",
+                    "src/cuda/precision_launcher.cu",
+                },
+                "rocm": {"src/rocm/precision.hpp"},
+            }[backend]
+            staged_files = {
+                path.relative_to(output).as_posix()
+                for path in output.rglob("*")
+                if path.is_file()
+            }
+            _require(
+                expected_precision_sources <= staged_files,
+                f"{backend} staged distribution omits precision sources: "
+                f"{sorted(expected_precision_sources - staged_files)}",
+            )
+            _require(
+                not any(
+                    path.endswith("precision_abi_smoke.cpp") for path in staged_files
+                ),
+                f"{backend} staged distribution contains a backend test helper",
             )
 
-    metal_stage = (
-        root / ".github" / "scripts" / "stage_metal_payload.py"
-    ).read_text(encoding="utf-8")
+    metal_stage = (root / ".github" / "scripts" / "stage_metal_payload.py").read_text(
+        encoding="utf-8"
+    )
     _require(
         'default=REPO_ROOT / "python" / "gafime" / "_metal"' in metal_stage
         and '"-DCMAKE_OSX_ARCHITECTURES=arm64"' in metal_stage,
@@ -2253,12 +2642,10 @@ def _assert_source_tree(root: Path) -> None:
         "a separate Metal distribution path must not exist",
     )
 
-    cuda_cmake = (root / "src" / "cuda" / "CMakeLists.txt").read_text(
-        encoding="utf-8"
-    )
+    cuda_cmake = (root / "src" / "cuda" / "CMakeLists.txt").read_text(encoding="utf-8")
     _require(
         "GAFIME_CUDA_RT_BUILD_MODE" in cuda_cmake
-        and 'PROPERTY STRINGS off on both' in cuda_cmake,
+        and "PROPERTY STRINGS off on both" in cuda_cmake,
         "experimental RT must remain available only through local CMake selection",
     )
 
@@ -2303,8 +2690,7 @@ def _assert_source_tree(root: Path) -> None:
     ):
         _require(
             retired_staging_option not in workflow_text,
-            f"workflow still invokes retired payload option "
-            f"{retired_staging_option!r}",
+            f"workflow still invokes retired payload option {retired_staging_option!r}",
         )
 
 

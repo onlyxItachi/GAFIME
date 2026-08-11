@@ -2,13 +2,18 @@ use core::ffi::c_void;
 
 use gafime_types::{
     DataType, GafimeInputDescriptor, GafimeStringView, InputSourceKind, MatrixLayout,
-    GAFIME_ABI_VERSION, GAFIME_DTYPE_F32, GAFIME_INPUT_ARROW_C_DATA, GAFIME_INPUT_HOST_F32,
-    GAFIME_INPUT_PARQUET_PATH, GAFIME_MATRIX_ARROW_COLUMNAR, GAFIME_MATRIX_ROW_MAJOR,
+    GAFIME_ABI_VERSION, GAFIME_DTYPE_F32, GAFIME_DTYPE_F64, GAFIME_INPUT_ARROW_C_DATA,
+    GAFIME_INPUT_HOST_F32, GAFIME_INPUT_HOST_F64, GAFIME_INPUT_PARQUET_PATH,
+    GAFIME_MATRIX_ARROW_COLUMNAR, GAFIME_MATRIX_ROW_MAJOR,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputSource {
     HostF32 {
+        features: *const c_void,
+        target: *const c_void,
+    },
+    HostF64 {
         features: *const c_void,
         target: *const c_void,
     },
@@ -47,6 +52,27 @@ impl NativeInputDescriptor {
         target: *const c_void,
         schema: *const c_void,
     ) -> Self {
+        Self::arrow_c_data_typed(rows, cols, GAFIME_DTYPE_F32, features, target, schema)
+    }
+
+    pub fn host_f64(rows: u64, cols: u32, features: *const c_void, target: *const c_void) -> Self {
+        Self {
+            source: InputSource::HostF64 { features, target },
+            rows,
+            cols,
+            dtype: GAFIME_DTYPE_F64,
+            layout: GAFIME_MATRIX_ROW_MAJOR,
+        }
+    }
+
+    pub fn arrow_c_data_typed(
+        rows: u64,
+        cols: u32,
+        dtype: DataType,
+        features: *const c_void,
+        target: *const c_void,
+        schema: *const c_void,
+    ) -> Self {
         Self {
             source: InputSource::ArrowCData {
                 features,
@@ -55,7 +81,7 @@ impl NativeInputDescriptor {
             },
             rows,
             cols,
-            dtype: GAFIME_DTYPE_F32,
+            dtype,
             layout: GAFIME_MATRIX_ARROW_COLUMNAR,
         }
     }
@@ -73,6 +99,7 @@ impl NativeInputDescriptor {
     pub fn source_kind(&self) -> InputSourceKind {
         match self.source {
             InputSource::HostF32 { .. } => GAFIME_INPUT_HOST_F32,
+            InputSource::HostF64 { .. } => GAFIME_INPUT_HOST_F64,
             InputSource::ArrowCData { .. } => GAFIME_INPUT_ARROW_C_DATA,
             InputSource::ParquetPath(_) => GAFIME_INPUT_PARQUET_PATH,
         }
@@ -91,6 +118,10 @@ impl NativeInputDescriptor {
         };
         match &self.source {
             InputSource::HostF32 { features, target } => {
+                raw.features_ptr = *features;
+                raw.target_ptr = *target;
+            }
+            InputSource::HostF64 { features, target } => {
                 raw.features_ptr = *features;
                 raw.target_ptr = *target;
             }

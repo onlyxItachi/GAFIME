@@ -1,15 +1,18 @@
 use std::{error::Error, fmt, sync::Arc};
 
 use arrow::array::{
-    ArrayRef, FixedSizeListArray, Float32Array, StructArray, UInt32Array, UInt64Array,
+    ArrayRef, FixedSizeListArray, Float32Array, Float64Array, StructArray, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Fields};
-use gafime_cpu::result::OwnedResultTable;
+use gafime_cpu::{
+    precision::{CpuPrecisionScalar, CpuPrecisionValues},
+    result::{OwnedResultTable, OwnedResultTableF64, PrecisionOwnedResultTable},
+};
 use gafime_gpu_sys::GpuSysError;
 use gafime_orchestrator::OrchestratorError;
 use gafime_types::{
-    GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
-    GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+    PrecisionProfile, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
+    GAFIME_METRIC_SPEARMAN, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
 };
 use pyo3::{exceptions::PyValueError, prelude::*};
 
@@ -18,9 +21,67 @@ pub(crate) trait ResultTableView {
     fn metric_count(&self) -> usize;
     fn max_arity(&self) -> usize;
     fn combo_indices(&self) -> &[u32];
-    fn metric_values(&self) -> &[f32];
+    fn metric_values(&self) -> MetricValuesRef<'_>;
     fn ranks(&self) -> &[u32];
     fn candidate_ids(&self) -> &[u64];
+    fn flags(&self) -> u32;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum MetricValuesRef<'a> {
+    F32(&'a [f32]),
+    F64(&'a [f64]),
+}
+
+impl MetricValuesRef<'_> {
+    fn to_arrow(self) -> (Arc<Field>, ArrayRef) {
+        match self {
+            Self::F32(values) => {
+                let item = Arc::new(Field::new("item", DataType::Float32, false));
+                (
+                    item,
+                    Arc::new(Float32Array::from(values.to_vec())) as ArrayRef,
+                )
+            }
+            Self::F64(values) => {
+                let item = Arc::new(Field::new("item", DataType::Float64, false));
+                (
+                    item,
+                    Arc::new(Float64Array::from(values.to_vec())) as ArrayRef,
+                )
+            }
+        }
+    }
+
+    pub(crate) fn range_to_owned(self, start: usize, end: usize) -> CpuPrecisionValues {
+        match self {
+            Self::F32(values) => CpuPrecisionValues::F32(values[start..end].to_vec()),
+            Self::F64(values) => CpuPrecisionValues::F64(values[start..end].to_vec()),
+        }
+    }
+}
+
+pub(crate) fn precision_values_to_python_array(
+    py: Python<'_>,
+    values: &CpuPrecisionValues,
+) -> PyResult<Py<PyAny>> {
+    let array = py.import("array")?.getattr("array")?;
+    let array = match values {
+        CpuPrecisionValues::F32(values) => array.call1(("f", values))?,
+        CpuPrecisionValues::F64(values) => array.call1(("d", values))?,
+    };
+    Ok(array.unbind())
+}
+
+pub(crate) fn precision_scalar_to_python(
+    py: Python<'_>,
+    value: CpuPrecisionScalar,
+) -> PyResult<Py<PyAny>> {
+    let scalar = match value {
+        CpuPrecisionScalar::F32(value) => value.into_pyobject(py)?.into_any().unbind(),
+        CpuPrecisionScalar::F64(value) => value.into_pyobject(py)?.into_any().unbind(),
+    };
+    Ok(scalar)
 }
 
 impl ResultTableView for OwnedResultTable {
@@ -40,8 +101,8 @@ impl ResultTableView for OwnedResultTable {
         OwnedResultTable::combo_indices(self)
     }
 
-    fn metric_values(&self) -> &[f32] {
-        OwnedResultTable::metric_values(self)
+    fn metric_values(&self) -> MetricValuesRef<'_> {
+        MetricValuesRef::F32(OwnedResultTable::metric_values(self))
     }
 
     fn ranks(&self) -> &[u32] {
@@ -51,13 +112,17 @@ impl ResultTableView for OwnedResultTable {
     fn candidate_ids(&self) -> &[u64] {
         OwnedResultTable::candidate_ids(self)
     }
+
+    fn flags(&self) -> u32 {
+        self.raw().flags
+    }
 }
 
 #[derive(Debug)]
-pub(crate) struct SendOwnedResultTable(OwnedResultTable);
+pub(crate) struct SendOwnedResultTable(PrecisionOwnedResultTable);
 
 impl SendOwnedResultTable {
-    pub(crate) fn new(table: OwnedResultTable) -> Self {
+    pub(crate) fn new(table: PrecisionOwnedResultTable) -> Self {
         Self(table)
     }
 }
@@ -78,37 +143,161 @@ unsafe impl Sync for SendOwnedResultTable {}
 
 impl ResultTableView for SendOwnedResultTable {
     fn row_count(&self) -> usize {
-        self.0.row_count()
+        match &self.0 {
+            PrecisionOwnedResultTable::Fp32(table) => table.row_count(),
+            PrecisionOwnedResultTable::F64 { table, .. } => table.row_count(),
+        }
     }
 
     fn metric_count(&self) -> usize {
-        self.0.metric_count()
+        match &self.0 {
+            PrecisionOwnedResultTable::Fp32(table) => table.metric_count(),
+            PrecisionOwnedResultTable::F64 { table, .. } => table.metric_count(),
+        }
     }
 
     fn max_arity(&self) -> usize {
-        self.0.max_arity()
+        match &self.0 {
+            PrecisionOwnedResultTable::Fp32(table) => table.max_arity(),
+            PrecisionOwnedResultTable::F64 { table, .. } => table.max_arity(),
+        }
     }
 
     fn combo_indices(&self) -> &[u32] {
-        self.0.combo_indices()
+        match &self.0 {
+            PrecisionOwnedResultTable::Fp32(table) => table.combo_indices(),
+            PrecisionOwnedResultTable::F64 { table, .. } => table.combo_indices(),
+        }
     }
 
-    fn metric_values(&self) -> &[f32] {
-        self.0.metric_values()
+    fn metric_values(&self) -> MetricValuesRef<'_> {
+        match &self.0 {
+            PrecisionOwnedResultTable::Fp32(table) => MetricValuesRef::F32(table.metric_values()),
+            PrecisionOwnedResultTable::F64 { table, .. } => {
+                MetricValuesRef::F64(table.metric_values())
+            }
+        }
     }
 
     fn ranks(&self) -> &[u32] {
-        self.0.ranks()
+        match &self.0 {
+            PrecisionOwnedResultTable::Fp32(table) => table.ranks(),
+            PrecisionOwnedResultTable::F64 { table, .. } => table.ranks(),
+        }
     }
 
     fn candidate_ids(&self) -> &[u64] {
-        self.0.candidate_ids()
+        match &self.0 {
+            PrecisionOwnedResultTable::Fp32(table) => table.candidate_ids(),
+            PrecisionOwnedResultTable::F64 { table, .. } => table.candidate_ids(),
+        }
+    }
+
+    fn flags(&self) -> u32 {
+        match &self.0 {
+            PrecisionOwnedResultTable::Fp32(table) => table.raw().flags,
+            PrecisionOwnedResultTable::F64 { table, .. } => table.raw().flags,
+        }
+    }
+}
+
+impl ResultTableView for OwnedResultTableF64 {
+    fn row_count(&self) -> usize {
+        OwnedResultTableF64::row_count(self)
+    }
+
+    fn metric_count(&self) -> usize {
+        OwnedResultTableF64::metric_count(self)
+    }
+
+    fn max_arity(&self) -> usize {
+        OwnedResultTableF64::max_arity(self)
+    }
+
+    fn combo_indices(&self) -> &[u32] {
+        OwnedResultTableF64::combo_indices(self)
+    }
+
+    fn metric_values(&self) -> MetricValuesRef<'_> {
+        MetricValuesRef::F64(OwnedResultTableF64::metric_values(self))
+    }
+
+    fn ranks(&self) -> &[u32] {
+        OwnedResultTableF64::ranks(self)
+    }
+
+    fn candidate_ids(&self) -> &[u64] {
+        OwnedResultTableF64::candidate_ids(self)
+    }
+
+    fn flags(&self) -> u32 {
+        self.raw().flags
+    }
+}
+
+impl ResultTableView for PrecisionOwnedResultTable {
+    fn row_count(&self) -> usize {
+        match self {
+            Self::Fp32(table) => table.row_count(),
+            Self::F64 { table, .. } => table.row_count(),
+        }
+    }
+
+    fn metric_count(&self) -> usize {
+        match self {
+            Self::Fp32(table) => table.metric_count(),
+            Self::F64 { table, .. } => table.metric_count(),
+        }
+    }
+
+    fn max_arity(&self) -> usize {
+        match self {
+            Self::Fp32(table) => table.max_arity(),
+            Self::F64 { table, .. } => table.max_arity(),
+        }
+    }
+
+    fn combo_indices(&self) -> &[u32] {
+        match self {
+            Self::Fp32(table) => table.combo_indices(),
+            Self::F64 { table, .. } => table.combo_indices(),
+        }
+    }
+
+    fn metric_values(&self) -> MetricValuesRef<'_> {
+        match self {
+            Self::Fp32(table) => MetricValuesRef::F32(table.metric_values()),
+            Self::F64 { table, .. } => MetricValuesRef::F64(table.metric_values()),
+        }
+    }
+
+    fn ranks(&self) -> &[u32] {
+        match self {
+            Self::Fp32(table) => table.ranks(),
+            Self::F64 { table, .. } => table.ranks(),
+        }
+    }
+
+    fn candidate_ids(&self) -> &[u64] {
+        match self {
+            Self::Fp32(table) => table.candidate_ids(),
+            Self::F64 { table, .. } => table.candidate_ids(),
+        }
+    }
+
+    fn flags(&self) -> u32 {
+        match self {
+            Self::Fp32(table) => table.raw().flags,
+            Self::F64 { table, .. } => table.raw().flags,
+        }
     }
 }
 
 /// Build a zero-copy-to-consumer Arrow `StructArray` over the compact result
 /// table. Columns: `candidate_id` (u64), `rank` (u32), `combo`
-/// (FixedSizeList<u32>[max_arity]), `metrics` (FixedSizeList<f32>[metric_count]).
+/// (FixedSizeList<u32>[max_arity]), `metrics`
+/// (FixedSizeList<f32>[metric_count] for fp32 or
+/// FixedSizeList<f64>[metric_count] for mixed/fp64).
 /// The only copy is the compact (top-K) table into Arrow-owned buffers; the
 /// Arrow -> framework (Polars/torch/pyarrow) handoff is then zero-copy, and the
 /// FFI release callbacks are owned by arrow-rs (no hand-rolled unsafe).
@@ -132,10 +321,14 @@ pub(crate) fn result_table_view_to_arrow(table: &impl ResultTableView) -> Struct
         None,
     )) as ArrayRef;
 
-    let metric_item = Arc::new(Field::new("item", DataType::Float32, false));
-    let metric_child = Arc::new(Float32Array::from(
-        table.metric_values()[..rows * metric_count].to_vec(),
-    )) as ArrayRef;
+    let (metric_item, metric_child) = match table.metric_values() {
+        MetricValuesRef::F32(values) => {
+            MetricValuesRef::F32(&values[..rows * metric_count]).to_arrow()
+        }
+        MetricValuesRef::F64(values) => {
+            MetricValuesRef::F64(&values[..rows * metric_count]).to_arrow()
+        }
+    };
     let metrics = Arc::new(FixedSizeListArray::new(
         metric_item.clone(),
         metric_count as i32,
@@ -216,7 +409,7 @@ pub(crate) fn native_version() -> String {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContinuousRecord {
     pub combo: Vec<u32>,
-    pub metrics: Vec<f32>,
+    pub metrics: CpuPrecisionValues,
     pub candidate_id: u64,
 }
 
@@ -225,9 +418,9 @@ pub struct ContinuousRecord {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SignificanceEntry {
     pub row: usize,
-    pub pvalues: Vec<f32>,
-    pub means: Vec<f32>,
-    pub stds: Vec<f32>,
+    pub pvalues: CpuPrecisionValues,
+    pub means: CpuPrecisionValues,
+    pub stds: CpuPrecisionValues,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -240,30 +433,70 @@ pub struct InteractionPrecisionDiagnostic {
 pub(crate) struct DecisionPathResultParams {
     pub(crate) feature_index: u32,
     pub(crate) features: Vec<u32>,
-    pub(crate) thresholds: Vec<f32>,
+    pub(crate) thresholds: CpuPrecisionValues,
     pub(crate) signs: Vec<i8>,
-    pub(crate) gain: f32,
+    pub(crate) gain: CpuPrecisionScalar,
     pub(crate) support: u32,
     pub(crate) round_id: u32,
 }
 
 impl DecisionPathResultParams {
-    pub(crate) fn from_path(
+    pub(crate) fn from_precision_path(
         feature_index: u32,
-        path: &gafime_cpu::decision_path::DecisionPath,
-    ) -> Self {
+        precision: PrecisionProfile,
+        path: &gafime_cpu::decision_path::PrecisionDecisionPath,
+    ) -> Result<Self, PyBoundaryError> {
+        use gafime_cpu::precision::CpuPrecisionScalar;
+
         let mut features = Vec::with_capacity(path.nodes.len());
-        let mut thresholds = Vec::with_capacity(path.nodes.len());
         let mut signs = Vec::with_capacity(path.nodes.len());
         for node in &path.nodes {
             features.push(node.feature);
-            thresholds.push(node.threshold);
             signs.push(match node.sign {
                 gafime_cpu::decision_path::SplitSign::Le => -1,
                 gafime_cpu::decision_path::SplitSign::Gt => 1,
             });
         }
-        Self {
+        let thresholds = match precision {
+            PrecisionProfile::Fp32 | PrecisionProfile::Mixed => CpuPrecisionValues::F32(
+                path.nodes
+                    .iter()
+                    .map(|node| {
+                        node.threshold.f32().ok_or_else(|| {
+                            PyBoundaryError::InvalidInput(
+                                "fp32/mixed decision-path has an fp64 threshold".to_string(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            PrecisionProfile::Fp64 => CpuPrecisionValues::F64(
+                path.nodes
+                    .iter()
+                    .map(|node| {
+                        node.threshold.f64().ok_or_else(|| {
+                            PyBoundaryError::InvalidInput(
+                                "fp64 decision-path has an fp32 threshold".to_string(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        };
+        let gain_matches_profile = matches!(
+            (precision, path.gain),
+            (PrecisionProfile::Fp32, CpuPrecisionScalar::F32(_))
+                | (
+                    PrecisionProfile::Mixed | PrecisionProfile::Fp64,
+                    CpuPrecisionScalar::F64(_)
+                )
+        );
+        if !gain_matches_profile {
+            return Err(PyBoundaryError::InvalidInput(format!(
+                "{precision:?} decision-path gain has the wrong public result dtype"
+            )));
+        }
+        Ok(Self {
             feature_index,
             features,
             thresholds,
@@ -271,7 +504,7 @@ impl DecisionPathResultParams {
             gain: path.gain,
             support: path.support,
             round_id: path.round,
-        }
+        })
     }
 }
 
@@ -282,10 +515,11 @@ pub struct ContinuousReport {
     pub max_arity: u32,
     pub metric_ids: Vec<u32>,
     pub backend_kind: u32,
+    pub precision: PrecisionProfile,
     pub graph_replayed: bool,
     pub mi_accumulation_fp64: bool,
     pub interaction_diagnostics: Option<Vec<InteractionPrecisionDiagnostic>>,
-    pub(crate) table: OwnedResultTable,
+    pub(crate) table: PrecisionOwnedResultTable,
     pub(crate) significance: Vec<SignificanceEntry>,
 }
 
@@ -302,7 +536,7 @@ impl ContinuousReport {
         combo_from_table(&self.table, index)
     }
 
-    pub fn metric_values(&self, index: usize) -> Option<Vec<f32>> {
+    pub fn metric_values(&self, index: usize) -> Option<CpuPrecisionValues> {
         metric_values_from_table(&self.table, index)
     }
 
@@ -397,10 +631,128 @@ pub(crate) fn decode_f32_le(bytes: &[u8], label: &str) -> Result<Vec<f32>, PyBou
         .collect())
 }
 
+pub(crate) fn decode_f64_le(bytes: &[u8], label: &str) -> Result<Vec<f64>, PyBoundaryError> {
+    if !bytes.len().is_multiple_of(std::mem::size_of::<f64>()) {
+        return Err(PyBoundaryError::InvalidInput(format!(
+            "{label} byte length is not divisible by eight"
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|chunk| {
+            f64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ])
+        })
+        .collect())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum OwnedNumericInput {
+    F32 {
+        features: Vec<f32>,
+        target: Vec<f32>,
+    },
+    F64 {
+        features: Vec<f64>,
+        target: Vec<f64>,
+    },
+}
+
+impl OwnedNumericInput {
+    pub(crate) fn from_f32(
+        precision: PrecisionProfile,
+        features: Vec<f32>,
+        target: Vec<f32>,
+    ) -> Result<Self, PyBoundaryError> {
+        if precision == PrecisionProfile::Fp64 {
+            return Err(PyBoundaryError::InvalidInput(
+                "fp64 precision cannot ingest an intermediate f32 buffer".to_string(),
+            ));
+        }
+        Ok(Self::F32 { features, target })
+    }
+
+    pub(crate) fn from_f64(
+        precision: PrecisionProfile,
+        features: Vec<f64>,
+        target: Vec<f64>,
+    ) -> Result<Self, PyBoundaryError> {
+        if precision != PrecisionProfile::Fp64 {
+            return Err(PyBoundaryError::InvalidInput(
+                "f64 resident input requires precision=\"fp64\"".to_string(),
+            ));
+        }
+        Ok(Self::F64 { features, target })
+    }
+
+    pub(crate) fn feature_len(&self) -> usize {
+        match self {
+            Self::F32 { features, .. } => features.len(),
+            Self::F64 { features, .. } => features.len(),
+        }
+    }
+
+    pub(crate) fn target_len(&self) -> usize {
+        match self {
+            Self::F32 { target, .. } => target.len(),
+            Self::F64 { target, .. } => target.len(),
+        }
+    }
+}
+
+pub(crate) fn decode_precision_input(
+    precision: PrecisionProfile,
+    feature_bytes: &[u8],
+    target_bytes: &[u8],
+) -> Result<OwnedNumericInput, PyBoundaryError> {
+    match precision {
+        PrecisionProfile::Fp32 | PrecisionProfile::Mixed => OwnedNumericInput::from_f32(
+            precision,
+            decode_f32_le(feature_bytes, "feature")?,
+            decode_f32_le(target_bytes, "target")?,
+        ),
+        PrecisionProfile::Fp64 => OwnedNumericInput::from_f64(
+            precision,
+            decode_f64_le(feature_bytes, "feature")?,
+            decode_f64_le(target_bytes, "target")?,
+        ),
+    }
+}
+
 pub(crate) fn flatten_continuous_rows(
     features: Vec<Vec<f32>>,
     target: Vec<f32>,
 ) -> Result<(u64, u32, Vec<f32>, Vec<f32>), PyBoundaryError> {
+    let rows = u64::try_from(features.len()).map_err(|_| {
+        PyBoundaryError::InvalidInput("X row count exceeds the supported range".to_string())
+    })?;
+    let cols = features.first().map_or(0usize, Vec::len);
+    let cols = u32::try_from(cols).map_err(|_| {
+        PyBoundaryError::InvalidInput("X feature count exceeds the supported range".to_string())
+    })?;
+    let capacity = features.len().checked_mul(cols as usize).ok_or_else(|| {
+        PyBoundaryError::InvalidInput("X shape exceeds the supported range".to_string())
+    })?;
+    validate_shape(rows, cols, capacity, target.len())?;
+
+    let mut flat = Vec::with_capacity(capacity);
+    for (row_index, row) in features.into_iter().enumerate() {
+        if row.len() != cols as usize {
+            return Err(PyBoundaryError::InvalidInput(format!(
+                "X row {row_index} has length {}; expected {cols}",
+                row.len()
+            )));
+        }
+        flat.extend(row);
+    }
+    Ok((rows, cols, flat, target))
+}
+
+pub(crate) fn flatten_continuous_rows_f64(
+    features: Vec<Vec<f64>>,
+    target: Vec<f64>,
+) -> Result<(u64, u32, Vec<f64>, Vec<f64>), PyBoundaryError> {
     let rows = u64::try_from(features.len()).map_err(|_| {
         PyBoundaryError::InvalidInput("X row count exceeds the supported range".to_string())
     })?;
@@ -458,18 +810,20 @@ pub(crate) fn report_from_table(
     max_arity: u32,
     metric_ids: Vec<u32>,
     backend_kind: u32,
+    precision: PrecisionProfile,
     mi_accumulation_fp64: bool,
     interaction_diagnostics: Option<Vec<InteractionPrecisionDiagnostic>>,
-    table: OwnedResultTable,
+    table: PrecisionOwnedResultTable,
     significance: Vec<SignificanceEntry>,
 ) -> ContinuousReport {
-    let graph_replayed = (table.raw().flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0;
+    let graph_replayed = (table.flags() & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0;
     ContinuousReport {
         rows,
         cols,
         max_arity,
         metric_ids,
         backend_kind,
+        precision,
         graph_replayed,
         mi_accumulation_fp64,
         interaction_diagnostics,
@@ -496,19 +850,25 @@ pub(crate) fn combo_from_table(table: &impl ResultTableView, index: usize) -> Op
 pub(crate) fn metric_values_from_table(
     table: &impl ResultTableView,
     index: usize,
-) -> Option<Vec<f32>> {
+) -> Option<CpuPrecisionValues> {
     if index >= table.row_count() {
         return None;
     }
     let metric_count = table.metric_count();
     let metric_base = index.checked_mul(metric_count)?;
-    Some(table.metric_values()[metric_base..metric_base + metric_count].to_vec())
+    Some(
+        table
+            .metric_values()
+            .range_to_owned(metric_base, metric_base + metric_count),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::Array;
+    use gafime_cpu::decision_path::{PrecisionDecisionPath, PrecisionPathNode, SplitSign};
+    use gafime_cpu::precision::CpuPrecisionScalar;
     use gafime_types::GAFIME_BACKEND_CUDA;
 
     use crate::continuous::analyze_continuous_cpu_rows;
@@ -516,6 +876,41 @@ mod tests {
     #[test]
     fn boundary_name_is_stable() {
         assert_eq!(boundary_name(), "gafime-py");
+    }
+
+    #[test]
+    fn decision_path_public_params_reject_mixed_scalar_widths() {
+        let path = PrecisionDecisionPath {
+            nodes: vec![PrecisionPathNode {
+                feature: 0,
+                threshold: CpuPrecisionScalar::F64(0.5),
+                sign: SplitSign::Le,
+            }],
+            gain: CpuPrecisionScalar::F32(0.25),
+            support: 3,
+            round: 0,
+        };
+        let error = DecisionPathResultParams::from_precision_path(2, PrecisionProfile::Fp32, &path)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("fp32/mixed decision-path has an fp64 threshold"));
+
+        let mixed_path = PrecisionDecisionPath {
+            nodes: vec![PrecisionPathNode {
+                feature: 0,
+                threshold: CpuPrecisionScalar::F32(0.5),
+                sign: SplitSign::Gt,
+            }],
+            gain: CpuPrecisionScalar::F64(0.25),
+            support: 3,
+            round: 0,
+        };
+        let params =
+            DecisionPathResultParams::from_precision_path(2, PrecisionProfile::Mixed, &mixed_path)
+                .unwrap();
+        assert_eq!(params.thresholds.as_f32(), Some(&[0.5][..]));
+        assert_eq!(params.gain, CpuPrecisionScalar::F64(0.25));
     }
 
     #[test]
@@ -557,9 +952,10 @@ mod tests {
             1,
             vec![GAFIME_METRIC_PEARSON],
             GAFIME_BACKEND_CUDA,
+            PrecisionProfile::Fp32,
             false,
             Some(Vec::new()),
-            table,
+            PrecisionOwnedResultTable::Fp32(table),
             Vec::new(),
         );
 
@@ -579,7 +975,7 @@ mod tests {
         )
         .unwrap();
 
-        let array = result_table_to_arrow(&report.table);
+        let array = result_table_view_to_arrow(&report.table);
         assert_eq!(array.len(), report.len());
         assert_eq!(array.num_columns(), 4);
 

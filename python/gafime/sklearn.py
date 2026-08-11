@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 from typing import Iterable, List, Sequence
 
 from .api import GafimeEngine
@@ -23,6 +24,8 @@ class GafimeSelector:
         operator: str = "multiply",
         n_jobs: int = -1,
         verbose: bool = False,
+        *,
+        precision: str = "mixed",
     ) -> None:
         self.k = int(k)
         self.backend = backend
@@ -30,8 +33,31 @@ class GafimeSelector:
         self.operator = operator
         self.n_jobs = n_jobs
         self.verbose = verbose
+        from ._precision import normalize_precision
+
+        # Scikit-learn requires constructor parameters to be stored without
+        # replacing their object identity so clone() can verify the estimator
+        # contract. Validate here, then let EngineConfig retain the canonical
+        # normalized execution value used by fit/transform.
+        normalize_precision(precision)
+        self.precision = precision
 
     def fit(self, X: Iterable[Iterable[float]], y: Iterable[float]):
+        cfg = EngineConfig(
+            metric_names=(self.metric,),
+            backend=self.backend,
+            budget=ComputeBudget(max_comb_size=2),
+            permutation_tests=0,
+            num_repeats=1,
+            precision=self.precision,
+        )
+        # Reject impossible backend/profile pairs before touching caller-owned
+        # values. In particular, explicit Metal mixed/fp64 must not coerce an
+        # input or trigger payload discovery before its capability error.
+        from .v1_adapter import _validate_precision_config
+
+        _validate_precision_config(cfg)
+        self._effective_precision_ = cfg.precision
         rows = [[float(value) for value in row] for row in X]
         target = [float(value) for value in y]
         if not rows or not rows[0]:
@@ -41,21 +67,10 @@ class GafimeSelector:
         n_features = len(rows[0])
         if any(len(row) != n_features for row in rows):
             raise ValueError("X rows must all have the same feature count.")
-        cfg = EngineConfig(
-            metric_names=(self.metric,),
-            backend=self.backend,
-            budget=ComputeBudget(max_comb_size=2),
-            permutation_tests=0,
-            num_repeats=1,
-        )
         report = GafimeEngine(cfg).analyze(rows, target)
         pairs = [
             result.combo
-            for result in sorted(
-                report.interactions,
-                key=lambda item: abs(item.metrics.get(self.metric, 0.0)),
-                reverse=True,
-            )
+            for result in report.interactions.ranked(metric_name=self.metric)
             if len(result.combo) == 2
         ]
         self.top_interactions_ = pairs[: self.k]
@@ -71,7 +86,9 @@ class GafimeSelector:
                 raise ValueError("X feature count does not match fitted data.")
         return [row + self._interaction_values(row) for row in rows]
 
-    def fit_transform(self, X: Iterable[Iterable[float]], y: Iterable[float]) -> List[List[float]]:
+    def fit_transform(
+        self, X: Iterable[Iterable[float]], y: Iterable[float]
+    ) -> List[List[float]]:
         return self.fit(X, y).transform(X)
 
     def get_params(self, deep: bool = True) -> dict[str, object]:
@@ -85,6 +102,7 @@ class GafimeSelector:
             "operator": self.operator,
             "n_jobs": self.n_jobs,
             "verbose": self.verbose,
+            "precision": self.precision,
         }
 
     def set_params(self, **params: object):
@@ -97,22 +115,37 @@ class GafimeSelector:
                     f"Invalid parameter {name!r} for GafimeSelector. "
                     f"Valid parameters are: {', '.join(sorted(valid))}."
                 )
+            if name == "precision":
+                from ._precision import normalize_precision
+
+                normalize_precision(value)
             setattr(self, name, value)
         return self
 
     def _interaction_values(self, row: Sequence[float]) -> List[float]:
         values: List[float] = []
         for i, j in self.top_interactions_:
-            a = float(row[i])
-            b = float(row[j])
+            a = self._pointwise_value(row[i])
+            b = self._pointwise_value(row[j])
             if self.operator == "multiply":
-                values.append(a * b)
+                value = a * b
             elif self.operator == "add":
-                values.append(a + b)
+                value = a + b
             elif self.operator == "subtract":
-                values.append(a - b)
+                value = a - b
             elif self.operator == "divide":
-                values.append(a / (b if abs(b) > 1e-8 else 1e-8))
+                epsilon = self._pointwise_value(1e-8)
+                value = a / (b if abs(b) > epsilon else epsilon)
             else:
-                raise ValueError("operator must be one of multiply, add, subtract, divide.")
+                raise ValueError(
+                    "operator must be one of multiply, add, subtract, divide."
+                )
+            values.append(self._pointwise_value(value))
         return values
+
+    def _pointwise_value(self, value: float) -> float:
+        value = float(value)
+        precision = getattr(self, "_effective_precision_", self.precision)
+        if precision == "fp64":
+            return value
+        return struct.unpack("<f", struct.pack("<f", value))[0]

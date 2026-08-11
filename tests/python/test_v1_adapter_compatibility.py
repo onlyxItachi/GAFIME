@@ -397,23 +397,79 @@ def test_current_family_switches_are_keyword_only():
 def test_engine_config_precision_contract_is_keyword_only_and_truthful():
     signature = inspect.signature(EngineConfig)
 
-    assert signature.parameters["storage_dtype"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert signature.parameters["compute_policy"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["precision"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert "storage_dtype" not in signature.parameters
+    assert "compute_policy" not in signature.parameters
     config = EngineConfig()
-    assert config.storage_dtype == "float32"
-    assert config.compute_policy == "stable"
+    assert config.precision == "mixed"
+    assert EngineConfig(precision="fp32").precision == "fp32"
+    assert EngineConfig(precision="fp64").precision == "fp64"
+    for alias in ("float32", "f32", "float64", "f64"):
+        with pytest.raises(ValueError, match="fp32, mixed, fp64"):
+            EngineConfig(precision=alias)
 
 
 @pytest.mark.parametrize(
-    ("config", "message"),
+    ("storage_dtype", "compute_policy", "expected"),
     [
-        (EngineConfig(storage_dtype="float64"), "no current Core, CUDA, ROCm, or Metal"),
-        (EngineConfig(compute_policy="exact"), "true f64 ingest"),
-        (EngineConfig(compute_policy="fast"), "high-dynamic normalization guard"),
+        ("float32", "fast", "fp32"),
+        ("float32", "stable", "mixed"),
+        ("float64", "exact", "fp64"),
+    ],
+)
+def test_legacy_precision_pair_has_only_unambiguous_deprecated_mappings(
+    storage_dtype, compute_policy, expected
+):
+    with pytest.warns(DeprecationWarning, match="precision profile"):
+        config = EngineConfig(
+            storage_dtype=storage_dtype,
+            compute_policy=compute_policy,
+        )
+    assert config.precision == expected
+
+
+@pytest.mark.parametrize(
+    ("storage_dtype", "compute_policy"),
+    [("float64", "stable"), ("float32", "exact"), ("float64", "fast")],
+)
+def test_legacy_precision_pair_rejects_contradictory_combinations(
+    storage_dtype, compute_policy
+):
+    with pytest.raises(ValueError, match="unsupported legacy precision pair"):
+        EngineConfig(storage_dtype=storage_dtype, compute_policy=compute_policy)
+
+
+def test_fp64_numpy_overflow_diagnostics_name_selected_storage_range():
+    np = pytest.importorskip("numpy")
+    value = np.longdouble(np.finfo(np.float64).max) * np.longdouble(2)
+    if not bool(np.isfinite(value)):
+        pytest.skip("platform NumPy longdouble has no range beyond binary64")
+
+    with pytest.raises(ValueError, match="outside fp64 range") as ingest_error:
+        v1_adapter._coerce_row_major_f32_for_cache(
+            np.asarray([[value]], dtype=np.longdouble),
+            np.asarray([0.0], dtype=np.longdouble),
+            None,
+            precision="fp64",
+        )
+    assert "selected storage for precision='fp64'" in str(ingest_error.value)
+
+    with pytest.raises(ValueError, match="outside fp64 range") as target_error:
+        v1_adapter._coerce_target_storage(
+            np.asarray([value], dtype=np.longdouble), precision="fp64"
+        )
+    assert "selected storage for precision='fp64'" in str(target_error.value)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        EngineConfig(backend="metal", precision="mixed"),
+        EngineConfig(backend="metal", precision="fp64"),
     ],
 )
 def test_unsupported_precision_requests_fail_before_discovery_or_coercion(
-    config, message, monkeypatch
+    config, monkeypatch
 ):
     def tripwire(*_args, **_kwargs):
         raise AssertionError("precision validation ran too late")
@@ -428,9 +484,7 @@ def test_unsupported_precision_requests_fail_before_discovery_or_coercion(
 
     operations = (
         lambda: v1_adapter.analyze_with_v1_boundary(config, [[1.0]], [1.0]),
-        lambda: v1_adapter.analyze_time_series_with_v1_boundary(
-            config, [[1.0]], [1.0]
-        ),
+        lambda: v1_adapter.analyze_time_series_with_v1_boundary(config, [[1.0]], [1.0]),
         lambda: v1_adapter.analyze_decision_path_with_v1_boundary(
             config, [[1.0]], [1.0]
         ),
@@ -438,7 +492,9 @@ def test_unsupported_precision_requests_fail_before_discovery_or_coercion(
         lambda: v1_adapter.analyze_arrow_with_v1_boundary(config, None, None, []),
     )
     for operation in operations:
-        with pytest.raises(V1UnsupportedError, match=message):
+        with pytest.raises(
+            V1UnsupportedError, match="Metal supports precision='fp32' only"
+        ):
             operation()
 
 
@@ -588,14 +644,14 @@ def test_only_resident_cache_computes_content_digests(
     monkeypatch.setattr(
         v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
     )
-    original_digest = v1_adapter._f32_buffer_digest
+    original_digest = v1_adapter._numeric_buffer_digest
     digest_calls = []
 
-    def counted_digest(count, data):
-        digest_calls.append((count, len(data)))
-        return original_digest(count, data)
+    def counted_digest(count, data, precision):
+        digest_calls.append((count, len(data), precision))
+        return original_digest(count, data, precision)
 
-    monkeypatch.setattr(v1_adapter, "_f32_buffer_digest", counted_digest)
+    monkeypatch.setattr(v1_adapter, "_numeric_buffer_digest", counted_digest)
     engine = GafimeEngine(_config(keep_in_vram=path == "resident-cache"))
     features = [[1.0, 2.0], [3.0, 4.0]]
     target = [0.0, 1.0]

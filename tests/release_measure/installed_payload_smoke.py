@@ -10,6 +10,7 @@ import importlib.metadata
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -23,6 +24,55 @@ REQUIRED_GPU_ABI_SYMBOLS = (
     "gafime_gpu_matrix_free",
     "gafime_gpu_execute",
 )
+
+REQUIRED_PRECISION_ABI_SYMBOLS = (
+    "gafime_gpu_numeric_routes_v2",
+    "gafime_gpu_matrix_alloc_v2",
+    "gafime_gpu_matrix_upload_v2",
+    "gafime_gpu_matrix_update_target_v2",
+    "gafime_gpu_execute_v2",
+    "gafime_gpu_execution_memory_peak_v2",
+    "gafime_gpu_permutation_memory_peak_v2",
+    "gafime_gpu_permutation_pvalues_v2",
+    "gafime_gpu_interaction_diagnostics_v2",
+    "gafime_gpu_matrix_free_v2",
+)
+
+FORBIDDEN_PREFREEZE_PRECISION_ABI_SYMBOLS = (
+    "gafime_gpu_precision_capabilities",
+    "gafime_gpu_matrix_upload_f32_v2",
+    "gafime_gpu_matrix_upload_f64_v2",
+    "gafime_gpu_matrix_update_target_f32_v2",
+    "gafime_gpu_matrix_update_target_f64_v2",
+    "gafime_gpu_execute_f32_v2",
+    "gafime_gpu_execute_f64_v2",
+    "gafime_gpu_permutation_pvalues_f32_v2",
+    "gafime_gpu_permutation_pvalues_f64_v2",
+)
+
+PRECISION_ABI_VERSION = (1 << 16) | 1
+EXPECTED_PROFILES = {
+    "cuda": ("fp32", "mixed", "fp64"),
+    "rocm": ("fp32", "mixed", "fp64"),
+    "metal": ("fp32",),
+}
+
+
+class GafimeNumericRoute(ctypes.Structure):
+    _fields_ = (
+        ("abi_version", ctypes.c_uint32),
+        ("struct_size", ctypes.c_uint32),
+        ("route_id", ctypes.c_uint32),
+        ("profile", ctypes.c_uint32),
+        ("storage_dtype", ctypes.c_uint32),
+        ("pointwise_dtype", ctypes.c_uint32),
+        ("reduction_dtype", ctypes.c_uint32),
+        ("result_dtype", ctypes.c_uint32),
+        ("overflow_policy", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint64 * 8),
+    )
+
 
 PAYLOADS = {
     "cuda": {
@@ -52,6 +102,8 @@ CUDA_BUILD_POLICY = {
         "windows": "nvcudart_hybrid64.dll",
     },
     "optix_rt": "off",
+    "precision_abi_version": "1.1",
+    "precision_profiles": ["fp32", "mixed", "fp64"],
     "per_architecture_tuning": False,
     "rt_sources_included": False,
     "runtime_architecture_dispatch": True,
@@ -146,7 +198,9 @@ def _assert_cuda_distribution_surface(library: Path) -> None:
         )
 
 
-def _assert_rocm_build_policy(payload_module: object, source_root: Path) -> dict[str, object]:
+def _assert_rocm_build_policy(
+    payload_module: object, source_root: Path
+) -> dict[str, object]:
     module_path = Path(str(payload_module.__file__)).resolve().parent
     policy_path = module_path / "build_policy.json"
     if not policy_path.is_file():
@@ -156,12 +210,11 @@ def _assert_rocm_build_policy(payload_module: object, source_root: Path) -> dict
     policy = json.loads(policy_path.read_text(encoding="utf-8"))
     wheel_policy = policy.get("wheel_policy")
     if wheel_policy != "system":
-        raise AssertionError(f"installed ROCm wheel policy is invalid: {wheel_policy!r}")
+        raise AssertionError(
+            f"installed ROCm wheel policy is invalid: {wheel_policy!r}"
+        )
     expected_path = (
-        source_root
-        / ".github"
-        / "scripts"
-        / "rocm_7_2_3_system_policy.json"
+        source_root / ".github" / "scripts" / "rocm_7_2_3_system_policy.json"
     )
     expected = json.loads(expected_path.read_text(encoding="utf-8"))
     if policy != expected:
@@ -169,7 +222,6 @@ def _assert_rocm_build_policy(payload_module: object, source_root: Path) -> dict
             f"installed ROCm build policy differs from {expected_path}"
         )
     return policy
-
 
 
 def _assert_linux_rocm_runtime(
@@ -292,13 +344,13 @@ def _assert_payload_separation(backend: str, payload: dict[str, str]) -> None:
         )
 
 
-def _assert_exported_symbols(library: Path) -> None:
+def _assert_exported_symbols(library: Path, backend: str) -> None:
     if sys.platform == "win32":
         command = ["dumpbin", "/exports", str(library)]
     elif sys.platform == "darwin":
-        command = ["nm", "-gU", str(library)]
+        command = ["nm", "-gjU", str(library)]
     else:
-        command = ["nm", "-D", "--defined-only", str(library)]
+        command = ["nm", "-D", "--defined-only", "-j", str(library)]
     try:
         result = subprocess.run(command, check=True, capture_output=True, text=True)
     except FileNotFoundError as exc:
@@ -309,13 +361,216 @@ def _assert_exported_symbols(library: Path) -> None:
         raise AssertionError(
             f"unable to inspect payload ABI exports with {' '.join(command)}:\n{exc.stderr}"
         ) from exc
+    if sys.platform == "win32":
+        exports = {
+            match.group(1)
+            for line in result.stdout.splitlines()
+            if (
+                match := re.match(
+                    r"^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+"
+                    r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:=.*)?$",
+                    line,
+                )
+            )
+        }
+    else:
+        exports = {
+            line.strip().removeprefix("_")
+            for line in result.stdout.splitlines()
+            if line.strip()
+        }
     missing = [
-        symbol for symbol in REQUIRED_GPU_ABI_SYMBOLS if symbol not in result.stdout
+        symbol
+        for symbol in (*REQUIRED_GPU_ABI_SYMBOLS, *REQUIRED_PRECISION_ABI_SYMBOLS)
+        if symbol not in exports
     ]
     if missing:
         raise AssertionError(
             f"payload library is missing required GPU ABI exports: {missing}"
         )
+    removed = tuple(
+        symbol
+        for symbol in FORBIDDEN_PREFREEZE_PRECISION_ABI_SYMBOLS
+        if symbol in exports
+    )
+    if removed:
+        raise AssertionError(
+            f"{backend} payload exports removed pre-freeze ABI 1.1 symbols: {removed!r}"
+        )
+    unexpected = sorted(
+        symbol for symbol in exports if not symbol.startswith("gafime_gpu_")
+    )
+    if unexpected:
+        raise AssertionError(
+            f"{backend} payload leaks non-ABI dynamic symbols: {unexpected!r}"
+        )
+
+
+def _write_machine_code_evidence(
+    library: Path,
+    wheel: Path,
+    backend: str,
+    source_root: Path,
+    output: Path,
+) -> None:
+    if backend == "metal":
+        raise AssertionError("Metal machine-code evidence uses its physical macOS gate")
+    script = source_root / "tests" / "release_measure" / "gpu_static_kernel_report.py"
+    command = [
+        sys.executable,
+        str(script),
+        "--require-precision-profiles",
+        "--require-topk-split",
+        "--require-no-spills",
+        "--write-evidence-dir",
+        str(output),
+        "--evidence-wheel",
+        str(wheel),
+    ]
+    if backend == "cuda":
+        command.extend(("--cuda-lib", str(library)))
+    else:
+        command.extend(("--hip-lib", str(library), "--hip-all-targets"))
+    result = subprocess.run(command, check=False, text=True)
+    if result.returncode != 0:
+        raise AssertionError(
+            f"{backend} typed device machine-code evidence failed with "
+            f"status {result.returncode}"
+        )
+
+
+def _assert_numeric_route_abi(library: Path, backend: str) -> None:
+    """Physically enumerate authoritative routes without allocating a matrix."""
+
+    loaded = ctypes.CDLL(str(library))
+    query = loaded.gafime_gpu_numeric_routes_v2
+    query.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(GafimeNumericRoute),
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    query.restype = ctypes.c_int
+    count = ctypes.c_uint32()
+    status = int(
+        query(
+            0,
+            PRECISION_ABI_VERSION,
+            ctypes.sizeof(GafimeNumericRoute),
+            None,
+            0,
+            ctypes.byref(count),
+        )
+    )
+    if status != 0:
+        raise AssertionError(
+            f"{backend} numeric-route count query failed on device 0 with status {status}"
+        )
+    expected_profiles = EXPECTED_PROFILES[backend]
+    if count.value != len(expected_profiles):
+        raise AssertionError(
+            f"{backend} numeric route count {count.value} != {len(expected_profiles)}"
+        )
+    routes = (GafimeNumericRoute * count.value)()
+    written = ctypes.c_uint32(count.value)
+    status = int(
+        query(
+            0,
+            PRECISION_ABI_VERSION,
+            ctypes.sizeof(GafimeNumericRoute),
+            routes,
+            count.value,
+            ctypes.byref(written),
+        )
+    )
+    if status != 0 or written.value != count.value:
+        raise AssertionError(
+            f"{backend} numeric-route retrieval failed: status={status}, count={written.value}"
+        )
+    canonical = {
+        "fp32": (1, 1, 1, 1, 1, 1),
+        "mixed": (2, 2, 1, 1, 2, 2),
+        "fp64": (3, 3, 2, 2, 2, 2),
+    }
+    actual = []
+    for route in routes:
+        actual.append(
+            (
+                route.route_id,
+                route.profile,
+                route.storage_dtype,
+                route.pointwise_dtype,
+                route.reduction_dtype,
+                route.result_dtype,
+            )
+        )
+        if route.abi_version != PRECISION_ABI_VERSION or (
+            route.struct_size != ctypes.sizeof(GafimeNumericRoute)
+        ):
+            raise AssertionError(
+                f"{backend} returned an invalid numeric-route record prefix"
+            )
+        if route.overflow_policy != 1 or route.flags != 0 or any(route.reserved):
+            raise AssertionError(
+                f"{backend} returned a contradictory numeric-route record"
+            )
+    expected = [canonical[profile] for profile in expected_profiles]
+    if actual != expected:
+        raise AssertionError(f"{backend} numeric routes {actual!r} != {expected!r}")
+
+
+def _assert_public_precision_capabilities(
+    gafime: object, backend: str, *, probe: bool
+) -> None:
+    expected_profiles = EXPECTED_PROFILES[backend]
+    for profile in ("fp32", "mixed", "fp64"):
+        expected_supported = profile in expected_profiles
+        capabilities = gafime.backend_capabilities(
+            backend,
+            probe=probe and expected_supported,
+            precision=profile,
+        )
+        precision = capabilities.precision_contract.value
+        if tuple(precision["supported_profiles"]) != expected_profiles:
+            raise AssertionError(
+                f"{backend} public profiles {precision['supported_profiles']!r} != "
+                f"{expected_profiles!r}"
+            )
+        if bool(precision["request_supported"]) is not expected_supported:
+            raise AssertionError(
+                f"{backend} precision={profile!r} support was reported as "
+                f"{precision['request_supported']!r}"
+            )
+        if expected_supported and probe and precision["effective"] != profile:
+            raise AssertionError(
+                f"{backend} precision={profile!r} was not reported effective"
+            )
+        if not expected_supported:
+            reason = str(precision.get("rejection_reason") or "")
+            if "Metal supports precision='fp32' only" not in reason:
+                raise AssertionError(
+                    f"{backend} precision={profile!r} rejection was not actionable: "
+                    f"{reason!r}"
+                )
+            if probe:
+                try:
+                    gafime.backend_capabilities(
+                        backend,
+                        probe=True,
+                        precision=profile,
+                    )
+                except ValueError as exc:
+                    if "Metal supports precision='fp32' only" not in str(exc):
+                        raise AssertionError(
+                            f"{backend} precision={profile!r} probe rejection was "
+                            f"not actionable: {exc}"
+                        ) from exc
+                else:
+                    raise AssertionError(
+                        f"{backend} precision={profile!r} probe did not fail closed"
+                    )
 
 
 def _assert_package_helpers(
@@ -344,7 +599,8 @@ def _assert_package_helpers(
 def _exercise_metal_public_api(gafime: object) -> None:
     config = gafime.EngineConfig(
         backend="metal",
-        metric_names=("pearson", "r2"),
+        precision="fp32",
+        metric_names=("pearson", "spearman", "mutual_info", "r2"),
         permutation_tests=0,
         num_repeats=1,
         budget=gafime.ComputeBudget(max_comb_size=1, max_combinations_per_k=8),
@@ -360,6 +616,93 @@ def _exercise_metal_public_api(gafime: object) -> None:
         raise AssertionError(
             "installed Metal public API did not produce GPU interaction results"
         )
+    if (
+        report.backend.requested_precision != "fp32"
+        or report.backend.effective_precision != "fp32"
+        or report.backend.storage_dtype != "float32"
+        or report.backend.interaction_arithmetic != "float32"
+        or report.backend.reduction_dtype != "float32"
+        or report.backend.result_dtype != "float32"
+    ):
+        raise AssertionError(
+            f"installed Metal did not report the full fp32 lane: {report.backend!r}"
+        )
+    for unsupported in ("mixed", "fp64"):
+        try:
+            gafime.GafimeEngine(
+                gafime.EngineConfig(backend="metal", precision=unsupported)
+            ).analyze([[0.0], [1.0]], [0.0, 1.0], ["x"])
+        except Exception as exc:
+            message = str(exc)
+            if "Metal supports precision='fp32' only" not in message:
+                raise AssertionError(
+                    f"Metal precision={unsupported!r} rejection was not actionable: "
+                    f"{message!r}"
+                ) from exc
+        else:
+            raise AssertionError(
+                f"installed Metal accepted unsupported precision={unsupported!r}"
+            )
+
+
+def _exercise_distributed_profiles(gafime: object, backend: str) -> None:
+    """Execute every advertised profile through the installed top-level API."""
+
+    if backend == "metal":
+        _exercise_metal_public_api(gafime)
+        return
+    features = [[float(index), float((index * 5 + 1) % 17)] for index in range(32)]
+    target = [float((index * 7 + 3) % 19) for index in range(32)]
+    for profile in EXPECTED_PROFILES[backend]:
+        report = gafime.GafimeEngine(
+            gafime.EngineConfig(
+                backend=backend,
+                precision=profile,
+                metric_names=("pearson", "spearman", "mutual_info", "r2"),
+                permutation_tests=0,
+                num_repeats=1,
+                budget=gafime.ComputeBudget(
+                    max_comb_size=1,
+                    max_combinations_per_k=8,
+                ),
+            )
+        ).analyze(features, target, ["trend", "cycle"])
+        if report.backend is None or report.backend.selected_backend != backend:
+            raise AssertionError(
+                f"installed {backend} precision={profile!r} resolved to "
+                f"{report.backend!r}"
+            )
+        expected_storage = "float64" if profile == "fp64" else "float32"
+        expected_result = "float32" if profile == "fp32" else "float64"
+        expected = (
+            profile,
+            profile,
+            expected_storage,
+            expected_storage,
+            expected_result,
+            expected_result,
+        )
+        actual = (
+            report.backend.requested_precision,
+            report.backend.effective_precision,
+            report.backend.storage_dtype,
+            report.backend.interaction_arithmetic,
+            report.backend.reduction_dtype,
+            report.backend.result_dtype,
+        )
+        if actual != expected:
+            raise AssertionError(
+                f"installed {backend} precision={profile!r} domains "
+                f"{actual!r} != {expected!r}"
+            )
+        rows = list(report.interactions)
+        if not rows or any(
+            set(row.metrics) != {"pearson", "spearman", "mutual_info", "r2"}
+            for row in rows
+        ):
+            raise AssertionError(
+                f"installed {backend} precision={profile!r} did not execute all metrics"
+            )
 
 
 def main() -> None:
@@ -380,9 +723,30 @@ def main() -> None:
         action="store_true",
         help="execute the top-level Metal public API after artifact checks",
     )
+    parser.add_argument(
+        "--execute-profiles",
+        action="store_true",
+        help="physically query and execute every profile supported by the backend",
+    )
+    parser.add_argument(
+        "--machine-code-evidence-dir",
+        type=Path,
+        help="write no-device typed specialization evidence from the installed payload",
+    )
+    parser.add_argument(
+        "--machine-code-wheel",
+        type=Path,
+        help="exact repaired wheel paired with --machine-code-evidence-dir",
+    )
     args = parser.parse_args()
     if args.execute_metal and args.backend != "metal":
         parser.error("--execute-metal is only valid with --backend metal")
+    if args.machine_code_evidence_dir is not None and args.backend == "metal":
+        parser.error("Metal machine-code evidence is owned by the macOS physical gate")
+    if (args.machine_code_evidence_dir is None) != (args.machine_code_wheel is None):
+        parser.error(
+            "--machine-code-evidence-dir and --machine-code-wheel must be supplied together"
+        )
 
     backend = args.backend
     source_root = (args.source_root or Path.cwd()).resolve()
@@ -464,7 +828,9 @@ def main() -> None:
                 "installed ROCm wheel policy must report package evidence"
             )
     elif backend == "metal":
-        capabilities = gafime.backend_capabilities("metal", probe=False)
+        capabilities = gafime.backend_capabilities(
+            "metal", probe=False, precision="fp32"
+        )
         expected_policy = {
             "distribution_identity": "gafime",
             "packaging": "embedded-in-macos-arm64-core-wheel",
@@ -480,7 +846,21 @@ def main() -> None:
                 "bundled Metal wheel policy must report a static package contract"
             )
     _assert_payload_separation(backend, payload)
-    _assert_exported_symbols(library)
+    _assert_exported_symbols(library, backend)
+    if args.machine_code_evidence_dir is not None:
+        _write_machine_code_evidence(
+            library,
+            args.machine_code_wheel.resolve(),
+            backend,
+            source_root,
+            args.machine_code_evidence_dir.resolve(),
+        )
+    _assert_public_precision_capabilities(gafime, backend, probe=False)
+    if args.execute_profiles or args.execute_metal:
+        _assert_numeric_route_abi(library, backend)
+        _assert_public_precision_capabilities(gafime, backend, probe=True)
+    if args.execute_profiles:
+        _exercise_distributed_profiles(gafime, backend)
     if args.execute_metal:
         _exercise_metal_public_api(gafime)
     print(

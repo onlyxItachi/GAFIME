@@ -9,7 +9,10 @@ import pytest
 
 
 _PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
-if os.environ.get("GAFIME_TEST_INSTALLED_PACKAGE") != "1" and str(_PYTHON_SRC) not in sys.path:
+if (
+    os.environ.get("GAFIME_TEST_INSTALLED_PACKAGE") != "1"
+    and str(_PYTHON_SRC) not in sys.path
+):
     sys.path.insert(0, str(_PYTHON_SRC))
 
 import gafime  # noqa: E402
@@ -17,10 +20,11 @@ from gafime import capabilities  # noqa: E402
 
 
 def _boundary(snapshot):
-    def runtime_capabilities(*, backend, device_id, probe):
+    def runtime_capabilities(*, backend, device_id, probe, precision):
         assert backend == snapshot["configured_backend"]
         assert device_id == 0
         assert probe is snapshot["probe_performed"]
+        assert precision in {"fp32", "mixed", "fp64"}
         return snapshot
 
     return SimpleNamespace(
@@ -53,7 +57,7 @@ def test_family_capabilities_separate_generation_from_scoring():
         # Legacy fields remain scoring aliases, never generation-kernel claims.
         assert family.cuda_kernel and family.rocm_kernel and family.metal_kernel
     assert families["decision_path"].native_compact_scoring == ()
-    assert families["decision_path"].significance_support.permutation is False
+    assert families["decision_path"].significance_support.permutation is True
     assert families["decision_path"].significance_support.stability is True
     assert "rediscovery" in families["decision_path"].significance_support.detail
     for name in ("continuous", "time_series", "decision_path"):
@@ -61,7 +65,7 @@ def test_family_capabilities_separate_generation_from_scoring():
         assert support.stability is True
         assert "conditional on selection" in support.detail
         assert "not out-of-sample" in support.detail
-    for name in ("continuous", "time_series"):
+    for name in ("continuous", "time_series", "decision_path"):
         assert families[name].significance_support.permutation is True
     assert families["time_series"].native_compact_scoring == ()
 
@@ -82,16 +86,21 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
             },
             "significance": {"permutation_pvalues_abi": True},
             "precision": {
-                "storage_dtypes": ["float32"],
-                "compute_policies": ["stable"],
-                "interaction_arithmetic": "float32",
-                "accumulators": {
-                    "pearson": "float32",
-                    "r2": "float32",
-                    "spearman": "float64",
-                    "mutual_info": "float64",
+                "profiles": ["fp32", "mixed", "fp64"],
+                "profile_domains": {
+                    "mixed": {
+                        "storage_dtype": "float32",
+                        "interaction_arithmetic": "float32",
+                        "reduction_dtype": "float64",
+                        "accumulators": {
+                            "pearson": "float64",
+                            "r2": "float64",
+                            "spearman": "float64",
+                            "mutual_info": "float64",
+                        },
+                        "result_dtype": "float64",
+                    }
                 },
-                "result_dtype": "float32",
                 "scale_normalization": "adaptive_high_dynamic",
                 "compensated_summation": False,
                 "interaction_overflow_diagnostics": True,
@@ -99,7 +108,9 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
         },
         "candidates": {"cuda": {"status": "available"}},
     }
-    monkeypatch.setattr(capabilities, "_load_boundary", lambda _backend: _boundary(snapshot))
+    monkeypatch.setattr(
+        capabilities, "_load_boundary", lambda _backend: _boundary(snapshot)
+    )
     monkeypatch.setattr(
         capabilities,
         "installed_payload_build_policy",
@@ -133,14 +144,11 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
     assert value.mi_bin_ceiling.value["effective_template_ceiling"] == 16
     assert value.host_significance_fallback.value == "gafime_cpu"
     assert value.precision_contract.source == "runtime"
-    assert value.precision_contract.value["effective"] == {
-        "storage_dtype": "float32",
-        "compute_policy": "stable",
-    }
+    assert value.precision_contract.value["effective"] == "mixed"
+    assert value.precision_contract.value["storage_dtype"] == "float32"
+    assert value.precision_contract.value["result_dtype"] == "float64"
     assert value.precision_contract.value["accumulators"]["mutual_info"] == "float64"
-    assert (
-        value.precision_contract.value["interaction_overflow_diagnostics"] is True
-    )
+    assert value.precision_contract.value["interaction_overflow_diagnostics"] is True
     assert value.payload_build_policy.source == "package"
     assert value.payload_build_policy.value["optix_rt"] == "off"
     decision_path = next(
@@ -149,7 +157,7 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
         if family["name"] == "decision_path"
     )
     decision_significance = decision_path["significance_support"]
-    assert decision_significance["permutation"] is False
+    assert decision_significance["permutation"] is True
     assert decision_significance["stability"] is True
     assert "decision-path rediscovery" in decision_significance["detail"]
     assert "conditional on selection" in decision_significance["detail"]
@@ -166,7 +174,9 @@ def test_unprobed_gpu_fields_are_unknown_not_invented(monkeypatch):
         "runtime": None,
         "candidates": {},
     }
-    monkeypatch.setattr(capabilities, "_load_boundary", lambda _backend: _boundary(snapshot))
+    monkeypatch.setattr(
+        capabilities, "_load_boundary", lambda _backend: _boundary(snapshot)
+    )
 
     value = gafime.backend_capabilities("cuda", probe=False)
 
@@ -179,13 +189,23 @@ def test_unprobed_gpu_fields_are_unknown_not_invented(monkeypatch):
     assert value.mi_bin_ceiling.source == "static"
     assert value.arrow_ingest_mode.value["zero_copy_into_compute"] is False
     assert value.precision_contract.value["effective"] is None
-    assert value.precision_contract.value["accumulators"]["mutual_info"] is None
-    assert (
-        value.precision_contract.value["interaction_overflow_diagnostics"] is False
+    assert value.precision_contract.value["accumulators"]["mutual_info"] == "float64"
+    assert value.precision_contract.value["interaction_overflow_diagnostics"] is False
+
+
+def test_native_unprobed_explicit_backend_is_configured_but_not_selected(monkeypatch):
+    snapshot = {
+        "configured_backend": "cuda",
+        "selected_backend": None,
+        "status": "not_probed",
+        "detail": "runtime payload probing is disabled",
+        "probe_performed": False,
+        "runtime": None,
+        "candidates": {},
+    }
+    monkeypatch.setattr(
+        capabilities, "_load_boundary", lambda _backend: _boundary(snapshot)
     )
-
-
-def test_native_unprobed_explicit_backend_is_configured_but_not_selected():
     value = gafime.backend_capabilities("cuda", probe=False)
 
     assert value.configured_backend == "cuda"
@@ -203,7 +223,9 @@ def test_core_static_capabilities_do_not_require_device_data(monkeypatch):
         "runtime": None,
         "candidates": {},
     }
-    monkeypatch.setattr(capabilities, "_load_boundary", lambda _backend: _boundary(snapshot))
+    monkeypatch.setattr(
+        capabilities, "_load_boundary", lambda _backend: _boundary(snapshot)
+    )
 
     value = gafime.backend_capabilities("core")
 
@@ -221,9 +243,7 @@ def test_core_static_capabilities_do_not_require_device_data(monkeypatch):
         "spearman": "float64",
         "mutual_info": "float64",
     }
-    assert (
-        value.precision_contract.value["interaction_overflow_diagnostics"] is True
-    )
+    assert value.precision_contract.value["interaction_overflow_diagnostics"] is True
     assert value.payload_build_policy.source == "static"
     assert value.payload_build_policy.value is None
     assert value.to_dict()["configured_backend"] == "core"
@@ -239,7 +259,9 @@ def test_payload_policy_errors_are_reported_as_unknown(monkeypatch):
         "runtime": {},
         "candidates": {},
     }
-    monkeypatch.setattr(capabilities, "_load_boundary", lambda _backend: _boundary(snapshot))
+    monkeypatch.setattr(
+        capabilities, "_load_boundary", lambda _backend: _boundary(snapshot)
+    )
 
     def invalid_policy(_backend):
         raise RuntimeError("malformed policy")
@@ -264,8 +286,14 @@ def test_backend_alias_normalization_is_publicly_stable(backend, monkeypatch):
         "runtime": None,
         "candidates": {},
     }
-    monkeypatch.setattr(capabilities, "_load_boundary", lambda _backend: _boundary(snapshot))
-    assert gafime.backend_capabilities(backend).configured_backend == backend
+    monkeypatch.setattr(
+        capabilities, "_load_boundary", lambda _backend: _boundary(snapshot)
+    )
+    precision = "fp32" if backend == "metal" else "mixed"
+    assert (
+        gafime.backend_capabilities(backend, precision=precision).configured_backend
+        == backend
+    )
 
 
 def test_report_backend_info_uses_native_selection_and_placement():
@@ -277,10 +305,10 @@ def test_report_backend_info_uses_native_selection_and_placement():
         is_gpu=True,
         selected_backend="cuda",
         execution_placement="cuda",
+        precision="mixed",
         storage_dtype="float32",
-        compute_policy="stable",
         interaction_arithmetic="float32",
-        result_dtype="float32",
+        result_dtype="float64",
         mi_accumulation_dtype="float64",
     )
 
@@ -288,22 +316,24 @@ def test_report_backend_info_uses_native_selection_and_placement():
 
     assert info.selected_backend == "cuda"
     assert info.execution_placement == "cuda"
-    assert info.requested_storage_dtype == "float32"
-    assert info.effective_storage_dtype == "float32"
+    assert info.requested_precision == "mixed"
+    assert info.effective_precision == "mixed"
+    assert info.storage_dtype == "float32"
+    assert info.result_dtype == "float64"
     assert info.metric_accumulators["mutual_info"] == "float64"
     assert info.metric_accumulators["spearman"] == "float64"
 
 
 @pytest.mark.parametrize(
-    ("storage_dtype", "compute_policy", "reason"),
+    ("storage_dtype", "compute_policy", "expected"),
     [
-        ("float64", "exact", "no current Core, CUDA, ROCm, or Metal"),
-        ("float32", "exact", "true f64 ingest"),
-        ("float32", "fast", "high-dynamic normalization guard"),
+        ("float32", "fast", "fp32"),
+        ("float32", "stable", "mixed"),
+        ("float64", "exact", "fp64"),
     ],
 )
-def test_precision_capability_reports_unsupported_requests(
-    storage_dtype, compute_policy, reason, monkeypatch
+def test_precision_capability_legacy_pairs_map_to_profiles(
+    storage_dtype, compute_policy, expected, monkeypatch
 ):
     snapshot = {
         "configured_backend": "core",
@@ -314,24 +344,83 @@ def test_precision_capability_reports_unsupported_requests(
         "runtime": None,
         "candidates": {},
     }
-    monkeypatch.setattr(capabilities, "_load_boundary", lambda _backend: _boundary(snapshot))
+    monkeypatch.setattr(
+        capabilities, "_load_boundary", lambda _backend: _boundary(snapshot)
+    )
 
-    value = gafime.backend_capabilities(
-        "core",
-        storage_dtype=storage_dtype,
-        compute_policy=compute_policy,
-    ).precision_contract.value
+    with pytest.warns(DeprecationWarning, match="precision profile"):
+        value = gafime.backend_capabilities(
+            "core",
+            storage_dtype=storage_dtype,
+            compute_policy=compute_policy,
+        ).precision_contract.value
 
-    assert value["request_supported"] is False
-    assert value["effective"] is None
-    assert reason in value["rejection_reason"]
+    assert value["requested"] == expected
+    assert value["request_supported"] is True
+    assert value["effective"] == expected
+
+
+@pytest.mark.parametrize(
+    ("storage_dtype", "compute_policy"),
+    [("float32", "exact"), ("float64", "stable"), ("float64", "fast")],
+)
+def test_precision_capability_rejects_unsupported_legacy_pairs(
+    storage_dtype, compute_policy
+):
+    with pytest.raises(ValueError, match="unsupported legacy precision pair"):
+        gafime.backend_capabilities(
+            "core",
+            storage_dtype=storage_dtype,
+            compute_policy=compute_policy,
+        )
 
 
 def test_precision_capability_rejects_unknown_names():
     with pytest.raises(ValueError, match="storage_dtype"):
-        gafime.backend_capabilities("core", storage_dtype="binary128")
+        gafime.backend_capabilities(
+            "core", storage_dtype="binary128", compute_policy="stable"
+        )
     with pytest.raises(ValueError, match="compute_policy"):
-        gafime.backend_capabilities("core", compute_policy="magic")
+        gafime.backend_capabilities(
+            "core", storage_dtype="float32", compute_policy="magic"
+        )
+
+
+def test_precision_capability_rejects_explicit_profile_with_legacy_pair():
+    with pytest.raises(TypeError, match="precision cannot be combined"):
+        gafime.backend_capabilities(
+            "core",
+            precision="mixed",
+            storage_dtype="float32",
+            compute_policy="fast",
+        )
+
+
+@pytest.mark.parametrize("precision", ["mixed", "fp64"])
+def test_static_metal_precision_rejection_is_reported_without_payload_discovery(
+    precision, monkeypatch
+):
+    def fail_discovery(_backend):
+        raise AssertionError("unsupported Metal profile reached payload discovery")
+
+    monkeypatch.setattr(capabilities, "_load_boundary", fail_discovery)
+    value = gafime.backend_capabilities(
+        "metal", probe=False, precision=precision
+    ).precision_contract.value
+
+    assert value["requested"] == precision
+    assert value["effective"] is None
+    assert value["request_supported"] is False
+    assert "Metal supports precision='fp32' only" in value["rejection_reason"]
+
+
+def test_probed_metal_unsupported_precision_fails_before_payload_discovery(monkeypatch):
+    def fail_discovery(_backend):
+        raise AssertionError("unsupported Metal profile reached payload discovery")
+
+    monkeypatch.setattr(capabilities, "_load_boundary", fail_discovery)
+    with pytest.raises(ValueError, match="Metal supports precision='fp32' only"):
+        gafime.backend_capabilities("metal", probe=True, precision="mixed")
 
 
 @pytest.mark.parametrize("backend", ["rocm", "metal"])
@@ -348,9 +437,12 @@ def test_ranked_gpu_replay_is_reported_as_device_significance(backend, monkeypat
         },
         "candidates": {},
     }
-    monkeypatch.setattr(capabilities, "_load_boundary", lambda _backend: _boundary(snapshot))
+    monkeypatch.setattr(
+        capabilities, "_load_boundary", lambda _backend: _boundary(snapshot)
+    )
 
-    value = gafime.backend_capabilities(backend, probe=True)
+    precision = "fp32" if backend == "metal" else "mixed"
+    value = gafime.backend_capabilities(backend, probe=True, precision=precision)
 
     assert value.device_significance.value is True
     assert value.permutation_significance.value["placement"] == backend

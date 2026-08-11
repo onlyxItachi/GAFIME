@@ -71,6 +71,7 @@ def continuous_case(backend: str) -> None:
     y = [0.0, 1.0, 2.0, 3.5, 4.2, 5.0, 6.8, 8.1]
     cfg = gafime.EngineConfig(
         backend=backend,
+        precision="fp32" if backend == "metal" else "mixed",
         metric_names=ALL_METRICS,
         budget=gafime.ComputeBudget(max_comb_size=2, max_combinations_per_k=32),
         permutation_tests=0,
@@ -102,6 +103,7 @@ def time_series_case(backend: str) -> None:
     y = [0.0, 1.0, 2.0, 4.0, 7.0, 11.0, 16.0, 22.0, 29.0, 37.0]
     cfg = gafime.EngineConfig(
         backend=backend,
+        precision="fp32" if backend == "metal" else "mixed",
         enable_time_series_functions=True,
         time_series_lags=(1, 2),
         time_series_windows=(3,),
@@ -150,6 +152,7 @@ def decision_path_case(backend: str) -> None:
                 y.append(6.0 if q0 == 1 and q1 == 1 else 0.25 * q0)
     cfg = gafime.EngineConfig(
         backend=backend,
+        precision="fp32" if backend == "metal" else "mixed",
         enable_decision_path_functions=True,
         decision_path_max_depth=2,
         decision_path_rounds=1,

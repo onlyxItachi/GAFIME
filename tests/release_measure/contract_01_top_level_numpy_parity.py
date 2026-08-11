@@ -13,8 +13,8 @@ def f32(value: float) -> np.float32:
     return np.float32(value)
 
 
-def f32_bits(value: float) -> int:
-    return struct.unpack("<I", struct.pack("<f", float(np.float32(value))))[0]
+def f64_bits(value: float) -> int:
+    return struct.unpack("<Q", struct.pack("<d", float(value)))[0]
 
 
 def column_means_f32(matrix: np.ndarray) -> list[np.float32]:
@@ -41,9 +41,9 @@ def interaction_signal(matrix: np.ndarray, combo: tuple[int, ...]) -> list[np.fl
     return out
 
 
-def pearson_scalar_f32(signal: list[np.float32], target: list[np.float32]) -> np.float32:
+def pearson_scalar_mixed(signal: list[np.float32], target: list[np.float32]) -> float:
     if len(signal) != len(target) or not signal:
-        return f32(0.0)
+        return 0.0
 
     sx = 0.0
     sy = 0.0
@@ -56,7 +56,7 @@ def pearson_scalar_f32(signal: list[np.float32], target: list[np.float32]) -> np
             sy += y
             n += 1
     if n == 0:
-        return f32(0.0)
+        return 0.0
 
     mean_x = sx / n
     mean_y = sy / n
@@ -75,25 +75,27 @@ def pearson_scalar_f32(signal: list[np.float32], target: list[np.float32]) -> np
 
     denom = max(sxx * syy, 0.0) ** 0.5
     if denom <= 0.0:
-        return f32(0.0)
-    return f32(min(1.0, max(-1.0, sxy / denom)))
+        return 0.0
+    return min(1.0, max(-1.0, sxy / denom))
 
 
-def r2_scalar_f32(signal: list[np.float32], target: list[np.float32]) -> np.float32:
-    corr = pearson_scalar_f32(signal, target)
-    return f32(min(1.0, max(0.0, float(f32(corr * corr)))))
+def r2_scalar_mixed(signal: list[np.float32], target: list[np.float32]) -> float:
+    corr = pearson_scalar_mixed(signal, target)
+    return min(1.0, max(0.0, corr * corr))
 
 
-def numpy_reference(matrix: np.ndarray, target: np.ndarray) -> dict[tuple[int, ...], dict[str, np.float32]]:
+def numpy_reference(
+    matrix: np.ndarray, target: np.ndarray
+) -> dict[tuple[int, ...], dict[str, float]]:
     target_values = [f32(value) for value in target]
-    out: dict[tuple[int, ...], dict[str, np.float32]] = {}
+    out: dict[tuple[int, ...], dict[str, float]] = {}
     for arity in (1, 2):
         for combo in combinations(range(matrix.shape[1]), arity):
             signal = interaction_signal(matrix, combo)
-            pearson = pearson_scalar_f32(signal, target_values)
+            pearson = pearson_scalar_mixed(signal, target_values)
             out[combo] = {
                 "pearson": pearson,
-                "r2": r2_scalar_f32(signal, target_values),
+                "r2": r2_scalar_mixed(signal, target_values),
             }
     return out
 
@@ -112,13 +114,33 @@ def api_report_map(report: object) -> dict[tuple[int, ...], dict[str, float]]:
     return mapped
 
 
-def assert_bit_equal(name: str, combo: tuple[int, ...], actual: float, expected: np.float32) -> None:
-    actual_bits = f32_bits(actual)
-    expected_bits = f32_bits(expected)
+def assert_mixed_lanes(report: object, label: str) -> None:
+    backend = getattr(report, "backend", None)
+    expected = {
+        "requested_precision": "mixed",
+        "effective_precision": "mixed",
+        "storage_dtype": "float32",
+        "interaction_arithmetic": "float32",
+        "reduction_dtype": "float64",
+        "result_dtype": "float64",
+    }
+    for field, expected_value in expected.items():
+        actual_value = getattr(backend, field, None)
+        if actual_value != expected_value:
+            raise AssertionError(
+                f"{label} {field}: actual={actual_value!r}, expected={expected_value!r}"
+            )
+
+
+def assert_bit_equal(
+    name: str, combo: tuple[int, ...], actual: float, expected: float
+) -> None:
+    actual_bits = f64_bits(actual)
+    expected_bits = f64_bits(expected)
     if actual_bits != expected_bits:
         raise AssertionError(
-            f"{combo} {name} bit mismatch: actual={actual:.9g} 0x{actual_bits:08x}, "
-            f"expected={float(expected):.9g} 0x{expected_bits:08x}"
+            f"{combo} {name} bit mismatch: actual={actual:.17g} 0x{actual_bits:016x}, "
+            f"expected={expected:.17g} 0x{expected_bits:016x}"
         )
 
 
@@ -136,24 +158,35 @@ def main() -> None:
 
     cfg = gafime.EngineConfig(
         backend="core",
+        precision="mixed",
         metric_names=("pearson", "r2"),
         budget=gafime.ComputeBudget(max_comb_size=2, max_combinations_per_k=64),
         permutation_tests=0,
         num_repeats=1,
     )
-    report = gafime.GafimeEngine(cfg).analyze(matrix.tolist(), target.tolist(), feature_names)
+    report = gafime.GafimeEngine(cfg).analyze(
+        matrix.tolist(), target.tolist(), feature_names
+    )
+    assert_mixed_lanes(report, "top-level NumPy report")
     actual = api_report_map(report)
     expected = numpy_reference(matrix, target)
 
     if set(actual) != set(expected):
-        raise AssertionError(f"combo set mismatch: actual={sorted(actual)}, expected={sorted(expected)}")
+        raise AssertionError(
+            f"combo set mismatch: actual={sorted(actual)}, expected={sorted(expected)}"
+        )
 
     for combo, expected_metrics in expected.items():
         actual_metrics = actual[combo]
         for metric_name, expected_value in expected_metrics.items():
-            assert_bit_equal(metric_name, combo, actual_metrics[metric_name], expected_value)
+            assert_bit_equal(
+                metric_name, combo, actual_metrics[metric_name], expected_value
+            )
 
-    print(f"top-level API NumPy bit parity verified for {len(expected)} candidates")
+    print(
+        "top-level API NumPy mixed-profile binary64 bit parity verified for "
+        f"{len(expected)} candidates"
+    )
 
 
 if __name__ == "__main__":

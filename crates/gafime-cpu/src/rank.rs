@@ -1,13 +1,67 @@
 use gafime_orchestrator::{OrchestratorError, OrchestratorResult};
 use gafime_types::GafimeResultTable;
 
+use crate::precision::CpuPrecisionSlice;
+
 pub fn top_k_indices(values: &[f32], k: usize, descending: bool) -> Vec<usize> {
-    let mut indices: Vec<usize> = (0..values.len()).collect();
+    let mut indices: Vec<usize> = (0..values.len())
+        .filter(|&index| values[index].is_finite())
+        .collect();
     indices.sort_by(|&left, &right| {
         let left_value = values[left];
         let right_value = values[right];
         let ordering = left_value
             .partial_cmp(&right_value)
+            .unwrap_or(core::cmp::Ordering::Equal);
+        if descending {
+            ordering.reverse().then(left.cmp(&right))
+        } else {
+            ordering.then(left.cmp(&right))
+        }
+    });
+    indices.truncate(k.min(indices.len()));
+    indices
+}
+
+/// Stable profile-typed ranking.  The comparator consumes the same f32/f64
+/// values that will be exposed publicly; it never ranks a widened hidden score
+/// and then rounds the visible table back down.
+pub fn top_k_precision_indices(
+    values: CpuPrecisionSlice<'_>,
+    k: usize,
+    descending: bool,
+) -> Vec<usize> {
+    match values {
+        CpuPrecisionSlice::F32(values) => top_k_indices_f32(values, k, descending),
+        CpuPrecisionSlice::F64(values) => top_k_indices_f64(values, k, descending),
+    }
+}
+
+fn top_k_indices_f32(values: &[f32], k: usize, descending: bool) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..values.len())
+        .filter(|&index| values[index].is_finite())
+        .collect();
+    indices.sort_by(|&left, &right| {
+        let ordering = values[left]
+            .partial_cmp(&values[right])
+            .unwrap_or(core::cmp::Ordering::Equal);
+        if descending {
+            ordering.reverse().then(left.cmp(&right))
+        } else {
+            ordering.then(left.cmp(&right))
+        }
+    });
+    indices.truncate(k.min(indices.len()));
+    indices
+}
+
+fn top_k_indices_f64(values: &[f64], k: usize, descending: bool) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..values.len())
+        .filter(|&index| values[index].is_finite())
+        .collect();
+    indices.sort_by(|&left, &right| {
+        let ordering = values[left]
+            .partial_cmp(&values[right])
             .unwrap_or(core::cmp::Ordering::Equal);
         if descending {
             ordering.reverse().then(left.cmp(&right))
@@ -141,6 +195,44 @@ mod tests {
     #[test]
     fn top_k_is_stable_on_ties() {
         assert_eq!(top_k_indices(&[0.5, 0.7, 0.7, 0.1], 2, true), vec![1, 2]);
+    }
+
+    #[test]
+    fn precision_ranking_uses_the_visible_lane_values_and_stable_ties() {
+        let fp32 = [0.5f32, 0.7, 0.7, 0.1];
+        let fp64 = [0.5f64, 0.7, 0.7, 0.1];
+        assert_eq!(
+            top_k_precision_indices(CpuPrecisionSlice::F32(&fp32), 2, true),
+            vec![1, 2]
+        );
+        assert_eq!(
+            top_k_precision_indices(CpuPrecisionSlice::F64(&fp64), 2, true),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn ranking_excludes_nonfinite_scores_in_both_public_lanes() {
+        assert_eq!(
+            top_k_indices(&[f32::NAN, 0.5, f32::INFINITY, -0.25], 4, true),
+            vec![1, 3]
+        );
+        assert_eq!(
+            top_k_precision_indices(
+                CpuPrecisionSlice::F32(&[f32::NAN, 0.5, f32::NEG_INFINITY, -0.25]),
+                4,
+                true,
+            ),
+            vec![1, 3]
+        );
+        assert_eq!(
+            top_k_precision_indices(
+                CpuPrecisionSlice::F64(&[f64::NAN, 0.5, f64::INFINITY, -0.25]),
+                4,
+                true,
+            ),
+            vec![1, 3]
+        );
     }
 
     #[test]

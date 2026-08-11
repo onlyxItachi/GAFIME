@@ -2,31 +2,51 @@ use std::cell::RefCell;
 
 use gafime_cpu::{
     kernels::MetricKernel,
-    matrix::CpuMatrix,
-    result::OwnedResultTable,
+    precision::{CpuPrecisionMatrix, CpuPrecisionSlice, CpuPrecisionValues},
+    result::{OwnedResultTable, OwnedResultTableF64, PrecisionOwnedResultTable},
     significance::{self, AdaptiveSearchSpec, SignificanceParams},
     CpuBackend,
 };
 use gafime_gpu_sys::{GpuBackend, OwnedGpuMatrix};
 use gafime_orchestrator::config::EngineConfig;
 use gafime_orchestrator::{
+    continuous_staged_device_footprint_bytes,
     plan::combos::{
-        legacy_higher_feature_order, legacy_unary_feature_order,
+        legacy_higher_feature_order, legacy_higher_feature_order_f64, legacy_unary_feature_order,
         DEFAULT_UNRANKED_HOST_STORAGE_BUDGET_BYTES,
     },
-    prepare_continuous_execution_for_feature_orders, PreparedContinuousExecution,
+    prepare_continuous_execution_for_feature_orders, OrchestratorError,
+    PreparedContinuousExecution,
 };
 use gafime_types::{
-    GafimeRankSpec, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
-    GAFIME_BACKEND_ROCM, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
+    GafimePrecisionLaunchProtocol, GafimeRankSpec, PrecisionProfile, GAFIME_BACKEND_CPU,
+    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_METRIC_PEARSON,
+    GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN, GAFIME_PRECISION_ABI_VERSION,
 };
 
 use crate::common::{
-    combo_from_table, metric_values_from_table, report_from_table, validate_metric_ids,
-    validate_shape, ContinuousReport, InteractionPrecisionDiagnostic, PyBoundaryError,
-    ResultTableView, SignificanceEntry,
+    combo_from_table, report_from_table, validate_metric_ids, validate_shape, ContinuousReport,
+    InteractionPrecisionDiagnostic, OwnedNumericInput, PyBoundaryError, ResultTableView,
+    SignificanceEntry,
 };
 use crate::runtime::RuntimeCacheCounters;
+
+/// Typed resident values for the additive profile-aware Core convenience API.
+///
+/// The variant must match the requested profile: `Fp32` and `Mixed` consume
+/// `F32`, while `Fp64` consumes `F64`. Mismatches fail closed instead of
+/// quantizing through an intermediate buffer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ContinuousCpuInput {
+    F32 {
+        features: Vec<f32>,
+        target: Vec<f32>,
+    },
+    F64 {
+        features: Vec<f64>,
+        target: Vec<f64>,
+    },
+}
 
 pub fn analyze_continuous_cpu_rows(
     rows: u64,
@@ -44,6 +64,57 @@ pub fn analyze_continuous_cpu_rows(
     };
     let config = continuous_config_for_cpu(max_arity, max_combinations_per_k, metric_ids)?;
     analyze_continuous_rows_once(config, rows, cols, features, target)
+}
+
+/// Analyze typed Core rows under an explicit precision profile.
+///
+/// This is additive to [`analyze_continuous_cpu_rows`], whose existing
+/// signature and default-mixed behavior remain source compatible.
+pub fn analyze_continuous_cpu_rows_with_precision(
+    precision: PrecisionProfile,
+    rows: u64,
+    cols: u32,
+    input: ContinuousCpuInput,
+    max_arity: u32,
+    max_combinations_per_k: u64,
+    metric_ids: Vec<u32>,
+) -> Result<ContinuousReport, PyBoundaryError> {
+    let input = match input {
+        ContinuousCpuInput::F32 { features, target } => {
+            OwnedNumericInput::from_f32(precision, features, target)?
+        }
+        ContinuousCpuInput::F64 { features, target } => {
+            OwnedNumericInput::from_f64(precision, features, target)?
+        }
+    };
+    analyze_continuous_cpu_input_rows(
+        precision,
+        rows,
+        cols,
+        input,
+        max_arity,
+        max_combinations_per_k,
+        metric_ids,
+    )
+}
+
+pub(crate) fn analyze_continuous_cpu_input_rows(
+    precision: PrecisionProfile,
+    rows: u64,
+    cols: u32,
+    input: OwnedNumericInput,
+    max_arity: u32,
+    max_combinations_per_k: u64,
+    metric_ids: Vec<u32>,
+) -> Result<ContinuousReport, PyBoundaryError> {
+    let metric_ids = if metric_ids.is_empty() {
+        vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2]
+    } else {
+        metric_ids
+    };
+    let mut config = continuous_config_for_cpu(max_arity, max_combinations_per_k, metric_ids)?;
+    config.precision = precision;
+    analyze_continuous_input_once(config, rows, cols, input)
 }
 
 pub(crate) fn continuous_config_for_cpu(
@@ -81,8 +152,19 @@ pub(crate) fn analyze_continuous_rows_once(
     features: Vec<f32>,
     target: Vec<f32>,
 ) -> Result<ContinuousReport, PyBoundaryError> {
-    validate_shape(rows, cols, features.len(), target.len())?;
-    let mut state = build_continuous_state(&config, rows, cols, features, target)?;
+    let precision = config.precision;
+    let input = OwnedNumericInput::from_f32(precision, features, target)?;
+    analyze_continuous_input_once(config, rows, cols, input)
+}
+
+pub(crate) fn analyze_continuous_input_once(
+    config: EngineConfig,
+    rows: u64,
+    cols: u32,
+    input: OwnedNumericInput,
+) -> Result<ContinuousReport, PyBoundaryError> {
+    validate_shape(rows, cols, input.feature_len(), input.target_len())?;
+    let mut state = build_continuous_state(&config, rows, cols, input)?;
     let counters = RefCell::new(RuntimeCacheCounters::default());
     execute_continuous_state(
         &config,
@@ -99,9 +181,18 @@ pub(crate) fn build_continuous_state(
     config: &EngineConfig,
     rows: u64,
     cols: u32,
-    features: Vec<f32>,
-    target: Vec<f32>,
+    input: OwnedNumericInput,
 ) -> Result<ContinuousRunState, PyBoundaryError> {
+    let precision = config.precision;
+    if config.backend_kind == GAFIME_BACKEND_METAL && precision != PrecisionProfile::Fp32 {
+        return Err(PyBoundaryError::UnsupportedFeature(
+            "Metal supports precision=\"fp32\" only; use backend=\"auto\" or backend=\"core\" for mixed/fp64"
+                .to_string(),
+        ));
+    }
+    if requires_gpu_budget_preflight(config) {
+        preflight_screened_continuous_execution(config, rows, cols)?;
+    }
     let needs_significance = config.permutation_tests > 0 || config.num_repeats > 1;
     // For GPU runs that still need CPU-side significance, build the host copy by
     // MOVING the ingest buffers into CpuMatrix after device upload borrows them.
@@ -110,25 +201,23 @@ pub(crate) fn build_continuous_state(
     // must retain the host matrix until the ABI can re-screen each permutation.
     let (backend, significance_matrix) =
         match config.backend_kind {
-            GAFIME_BACKEND_CPU => (
-                CompiledContinuousBackend::Cpu {
-                    matrix: CpuMatrix::from_row_major(rows, cols, features, target)?,
-                },
-                None,
-            ),
+            GAFIME_BACKEND_CPU => {
+                let matrix = cpu_matrix_from_input(precision, rows, cols, input)?;
+                (CompiledContinuousBackend::Cpu { matrix }, None)
+            }
             GAFIME_BACKEND_CUDA => {
                 let backend = GpuBackend::cuda_from_env(config.device_id)?;
-                let matrix = backend.alloc_matrix(rows, cols)?;
-                matrix.upload(&features, &target)?;
+                let matrix = backend.alloc_matrix_for_profile(precision, rows, cols)?;
+                upload_precision_matrix(&matrix, &input)?;
                 let use_device_pvalues = needs_significance
                     && device_permutation_pvalues_are_valid(
                         config,
                         cols,
-                        backend.supports_permutation_pvalues(),
+                        backend.supports_precision_permutation_pvalues(precision),
                     );
                 let significance_matrix =
                     if needs_significance && (!use_device_pvalues || config.num_repeats > 1) {
-                        Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
+                        Some(cpu_matrix_from_input(precision, rows, cols, input)?)
                     } else {
                         None
                     };
@@ -142,10 +231,10 @@ pub(crate) fn build_continuous_state(
             }
             GAFIME_BACKEND_ROCM => {
                 let backend = GpuBackend::rocm_from_env(config.device_id)?;
-                let matrix = backend.alloc_matrix(rows, cols)?;
-                matrix.upload(&features, &target)?;
+                let matrix = backend.alloc_matrix_for_profile(precision, rows, cols)?;
+                upload_precision_matrix(&matrix, &input)?;
                 let significance_matrix = if needs_significance {
-                    Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
+                    Some(cpu_matrix_from_input(precision, rows, cols, input)?)
                 } else {
                     None
                 };
@@ -159,10 +248,10 @@ pub(crate) fn build_continuous_state(
             }
             GAFIME_BACKEND_METAL => {
                 let backend = GpuBackend::metal_from_env(config.device_id)?;
-                let matrix = backend.alloc_matrix(rows, cols)?;
-                matrix.upload(&features, &target)?;
+                let matrix = backend.alloc_matrix_for_profile(precision, rows, cols)?;
+                upload_precision_matrix(&matrix, &input)?;
                 let significance_matrix = if needs_significance {
-                    Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
+                    Some(cpu_matrix_from_input(precision, rows, cols, input)?)
                 } else {
                     None
                 };
@@ -192,6 +281,37 @@ pub(crate) fn build_continuous_state(
     })
 }
 
+fn cpu_matrix_from_input(
+    precision: PrecisionProfile,
+    rows: u64,
+    cols: u32,
+    input: OwnedNumericInput,
+) -> Result<CpuPrecisionMatrix, PyBoundaryError> {
+    match input {
+        OwnedNumericInput::F32 { features, target } => Ok(CpuPrecisionMatrix::from_row_major_f32(
+            precision, rows, cols, features, target,
+        )?),
+        OwnedNumericInput::F64 { features, target } => Ok(CpuPrecisionMatrix::from_row_major_f64(
+            precision, rows, cols, features, target,
+        )?),
+    }
+}
+
+fn upload_precision_matrix(
+    matrix: &OwnedGpuMatrix,
+    input: &OwnedNumericInput,
+) -> Result<(), PyBoundaryError> {
+    match input {
+        OwnedNumericInput::F32 { features, target } => {
+            matrix.upload_f32_v2(features, target)?;
+        }
+        OwnedNumericInput::F64 { features, target } => {
+            matrix.upload_f64_v2(features, target)?;
+        }
+    }
+    Ok(())
+}
+
 fn has_adaptive_higher_order_search(config: &EngineConfig, cols: u32) -> bool {
     let candidate_cols = config.effective_feature_candidate_count(cols);
     let unary_count = u64::from(candidate_cols)
@@ -214,7 +334,7 @@ fn device_permutation_pvalues_are_valid(
 
 #[derive(Debug)]
 struct ScreenedContinuousExecution {
-    unary_table: OwnedResultTable,
+    unary_table: PrecisionOwnedResultTable,
     higher: PreparedContinuousExecution,
 }
 
@@ -253,37 +373,79 @@ impl PreparedContinuousRun {
 fn execute_prepared_continuous(
     backend: &CompiledContinuousBackend,
     prepared: &PreparedContinuousExecution,
-) -> Result<OwnedResultTable, PyBoundaryError> {
-    let mut table = OwnedResultTable::new(
+) -> Result<PrecisionOwnedResultTable, PyBoundaryError> {
+    let precision = backend.precision();
+    let mut table = PrecisionOwnedResultTable::new(
+        precision,
         prepared.result_capacity(),
         prepared.result_max_arity(),
         prepared.result_metric_count(),
     );
-    execute_prepared_continuous_into(backend, prepared, table.raw_mut())?;
+    execute_prepared_continuous_into(backend, prepared, &mut table)?;
     Ok(table)
 }
 
 fn execute_prepared_continuous_into(
     backend: &CompiledContinuousBackend,
     prepared: &PreparedContinuousExecution,
+    result: &mut PrecisionOwnedResultTable,
+) -> Result<gafime_orchestrator::BackendExecutionStats, PyBoundaryError> {
+    match result {
+        PrecisionOwnedResultTable::Fp32(table) => {
+            execute_prepared_fp32_into(backend, prepared, table.raw_mut())
+        }
+        PrecisionOwnedResultTable::F64 { profile, table } => {
+            if *profile != backend.precision() {
+                return Err(PyBoundaryError::InvalidInput(
+                    "result profile does not match resident backend identity".to_string(),
+                ));
+            }
+            execute_prepared_f64_into(backend, prepared, table.raw_mut())
+        }
+    }
+}
+
+fn execute_prepared_fp32_into(
+    backend: &CompiledContinuousBackend,
+    prepared: &PreparedContinuousExecution,
     result: &mut gafime_types::GafimeResultTable,
 ) -> Result<gafime_orchestrator::BackendExecutionStats, PyBoundaryError> {
     match backend {
         CompiledContinuousBackend::Cpu { matrix } => {
-            let mut backend = CpuBackend;
-            Ok(prepared.execute(&mut backend, &matrix.handle(), result)?)
+            let mut cpu = CpuBackend;
+            Ok(prepared.execute_precision_fp32(&mut cpu, &matrix.handle(), result)?)
         }
         CompiledContinuousBackend::Cuda { backend, matrix }
         | CompiledContinuousBackend::Rocm { backend, matrix }
-        | CompiledContinuousBackend::Metal { backend, matrix } => {
-            Ok(prepared.execute(&mut *backend.borrow_mut(), matrix.handle(), result)?)
+        | CompiledContinuousBackend::Metal { backend, matrix } => Ok(
+            prepared.execute_precision_fp32(&mut *backend.borrow_mut(), matrix.handle(), result)?
+        ),
+    }
+}
+
+fn execute_prepared_f64_into(
+    backend: &CompiledContinuousBackend,
+    prepared: &PreparedContinuousExecution,
+    result: &mut gafime_types::GafimeResultTableF64,
+) -> Result<gafime_orchestrator::BackendExecutionStats, PyBoundaryError> {
+    match backend {
+        CompiledContinuousBackend::Cpu { matrix } => {
+            let mut cpu = CpuBackend;
+            Ok(prepared.execute_precision_f64(&mut cpu, &matrix.handle(), result)?)
         }
+        CompiledContinuousBackend::Cuda { backend, matrix }
+        | CompiledContinuousBackend::Rocm { backend, matrix } => Ok(
+            prepared.execute_precision_f64(&mut *backend.borrow_mut(), matrix.handle(), result)?
+        ),
+        CompiledContinuousBackend::Metal { .. } => Err(PyBoundaryError::UnsupportedFeature(
+            "Metal supports precision=\"fp32\" only".to_string(),
+        )),
     }
 }
 
 fn collect_interaction_diagnostics(
     state: &mut ContinuousRunState,
-    table: &OwnedResultTable,
+    table: &PrecisionOwnedResultTable,
 ) -> Result<Option<Vec<InteractionPrecisionDiagnostic>>, PyBoundaryError> {
     let row_count = table.row_count();
     let max_arity = table.max_arity();
@@ -304,7 +466,7 @@ fn collect_interaction_diagnostics(
 
     let diagnostics: Option<Vec<InteractionPrecisionDiagnostic>> = match &state.backend {
         CompiledContinuousBackend::Cpu { matrix } => Some(
-            gafime_cpu::diagnostics::interaction_diagnostics(
+            gafime_cpu::diagnostics::interaction_diagnostics_precision(
                 matrix,
                 combo_indices,
                 max_arity,
@@ -348,36 +510,24 @@ fn execute_continuous_plan_set(
     result_capacity: u64,
     result_max_arity: u32,
     result_metric_count: u32,
-) -> Result<OwnedResultTable, PyBoundaryError> {
+) -> Result<PrecisionOwnedResultTable, PyBoundaryError> {
+    let precision = backend.precision();
     if result_capacity == 0 {
-        return Ok(OwnedResultTable::new(
+        return Ok(PrecisionOwnedResultTable::new(
+            precision,
             0,
             result_max_arity,
             result_metric_count,
         ));
     }
     if let Some(screened) = screened {
-        let mut combined =
-            OwnedResultTable::new(result_capacity, result_max_arity, result_metric_count);
-        combined
-            .append_rows_from(&screened.unary_table, 0)
-            .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
-        let start = screened.unary_table.row_count() as u64;
-        let (execution, row_count) = combined
-            .with_raw_rows_mut(start, screened.higher.result_capacity(), |raw| {
-                execute_prepared_continuous_into(backend, &screened.higher, raw)
-            })
-            .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
-        let execution = execution?;
-        if execution.rows_written != row_count {
-            return Err(PyBoundaryError::InvalidInput(
-                "backend result count differs from screened higher-order rows".to_string(),
-            ));
-        }
-        combined
-            .commit_appended_rows(start, row_count, start)
-            .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
-        return Ok(combined);
+        return combine_screened_results(
+            backend,
+            screened,
+            result_capacity,
+            result_max_arity,
+            result_metric_count,
+        );
     }
     let prepared = primary.ok_or_else(|| {
         PyBoundaryError::InvalidInput("direct continuous plan is missing".to_string())
@@ -385,12 +535,93 @@ fn execute_continuous_plan_set(
     execute_prepared_continuous(backend, prepared)
 }
 
-fn result_table_storage_bytes(capacity: u64, max_arity: u32, metric_count: u32) -> u64 {
+fn combine_screened_results(
+    backend: &CompiledContinuousBackend,
+    screened: &ScreenedContinuousExecution,
+    result_capacity: u64,
+    result_max_arity: u32,
+    result_metric_count: u32,
+) -> Result<PrecisionOwnedResultTable, PyBoundaryError> {
+    match &screened.unary_table {
+        PrecisionOwnedResultTable::Fp32(unary) => {
+            let mut combined =
+                OwnedResultTable::new(result_capacity, result_max_arity, result_metric_count);
+            combined
+                .append_rows_from(unary, 0)
+                .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
+            let start = unary.row_count() as u64;
+            let (execution, row_count) = combined
+                .with_raw_rows_mut(start, screened.higher.result_capacity(), |raw| {
+                    execute_prepared_fp32_into(backend, &screened.higher, raw)
+                })
+                .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
+            finish_combined_rows(&mut combined, start, execution?, row_count)?;
+            Ok(PrecisionOwnedResultTable::Fp32(combined))
+        }
+        PrecisionOwnedResultTable::F64 {
+            profile,
+            table: unary,
+        } => {
+            let mut combined =
+                OwnedResultTableF64::new(result_capacity, result_max_arity, result_metric_count);
+            combined
+                .append_rows_from(unary, 0)
+                .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
+            let start = unary.row_count() as u64;
+            let (execution, row_count) = combined
+                .with_raw_rows_mut(start, screened.higher.result_capacity(), |raw| {
+                    execute_prepared_f64_into(backend, &screened.higher, raw)
+                })
+                .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
+            let execution = execution?;
+            if execution.rows_written != row_count {
+                return Err(PyBoundaryError::InvalidInput(
+                    "backend result count differs from screened higher-order rows".to_string(),
+                ));
+            }
+            combined
+                .commit_appended_rows(start, row_count, start)
+                .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
+            Ok(PrecisionOwnedResultTable::F64 {
+                profile: *profile,
+                table: combined,
+            })
+        }
+    }
+}
+
+fn finish_combined_rows(
+    combined: &mut OwnedResultTable,
+    start: u64,
+    execution: gafime_orchestrator::BackendExecutionStats,
+    row_count: u64,
+) -> Result<(), PyBoundaryError> {
+    if execution.rows_written != row_count {
+        return Err(PyBoundaryError::InvalidInput(
+            "backend result count differs from screened higher-order rows".to_string(),
+        ));
+    }
+    combined
+        .commit_appended_rows(start, row_count, start)
+        .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))
+}
+
+fn result_table_storage_bytes(
+    precision: PrecisionProfile,
+    capacity: u64,
+    max_arity: u32,
+    metric_count: u32,
+) -> u64 {
     const U32_BYTES: u64 = 4;
     const U64_BYTES: u64 = 8;
+    let metric_bytes = if precision == PrecisionProfile::Fp32 {
+        U32_BYTES
+    } else {
+        U64_BYTES
+    };
     let row_bytes = u64::from(max_arity)
         .saturating_mul(U32_BYTES)
-        .saturating_add(u64::from(metric_count).saturating_mul(U32_BYTES))
+        .saturating_add(u64::from(metric_count).saturating_mul(metric_bytes))
         .saturating_add(U32_BYTES) // rank
         .saturating_add(U32_BYTES) // family
         .saturating_add(U64_BYTES) // candidate id
@@ -399,6 +630,7 @@ fn result_table_storage_bytes(capacity: u64, max_arity: u32, metric_count: u32) 
 }
 
 fn screened_candidate_storage_bytes(
+    precision: PrecisionProfile,
     unary_rows: u64,
     higher_descriptor_words: u64,
     combined_rows: u64,
@@ -408,8 +640,14 @@ fn screened_candidate_storage_bytes(
 ) -> u64 {
     higher_descriptor_words
         .saturating_mul(core::mem::size_of::<u32>() as u64)
-        .saturating_add(result_table_storage_bytes(unary_rows, 1, metric_count))
         .saturating_add(result_table_storage_bytes(
+            precision,
+            unary_rows,
+            1,
+            metric_count,
+        ))
+        .saturating_add(result_table_storage_bytes(
+            precision,
             combined_rows,
             combined_max_arity,
             metric_count,
@@ -417,6 +655,130 @@ fn screened_candidate_storage_bytes(
         .saturating_add(
             retained_complete_descriptor_words.saturating_mul(core::mem::size_of::<u32>() as u64),
         )
+}
+
+fn requires_gpu_budget_preflight(config: &EngineConfig) -> bool {
+    config.budget.vram_budget_mb > 0
+        && matches!(
+            config.backend_kind,
+            GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
+        )
+}
+
+/// Validate every structural plan shape that adaptive screening can select
+/// before loading a payload or allocating its resident matrix. Feature
+/// identities do not affect byte counts, so the eventual score-selected
+/// higher-order features can be represented by any equally sized unique set.
+fn preflight_screened_continuous_execution(
+    config: &EngineConfig,
+    rows: u64,
+    cols: u32,
+) -> Result<(), PyBoundaryError> {
+    let planning_seed_words = config.effective_planning_seed_words();
+    let candidate_cols = config.effective_feature_candidate_count(cols);
+    if candidate_cols == 0 {
+        return Ok(());
+    }
+    let unary_features = legacy_unary_feature_order(
+        candidate_cols,
+        config.budget.max_combinations_per_k,
+        &planning_seed_words,
+    );
+    let needs_screening = config.budget.max_comb_size >= 2
+        && config.budget.top_features_for_higher_k >= 2
+        && unary_features.len() >= 2;
+    if !needs_screening {
+        let _prepared = prepare_continuous_execution_for_feature_orders(
+            config,
+            rows,
+            cols,
+            &unary_features,
+            &[],
+            true,
+            true,
+        )?;
+        return Ok(());
+    }
+
+    let unary = prepare_continuous_execution_for_feature_orders(
+        config,
+        rows,
+        cols,
+        &unary_features,
+        &[],
+        true,
+        false,
+    )?;
+    let higher_feature_count = unary_features
+        .len()
+        .min(config.budget.top_features_for_higher_k as usize);
+    let higher_features = &unary_features[..higher_feature_count];
+    if config.graph_requested {
+        let _combined = prepare_continuous_execution_for_feature_orders(
+            config,
+            rows,
+            cols,
+            &unary_features,
+            higher_features,
+            true,
+            true,
+        )?;
+        return Ok(());
+    }
+
+    let higher = prepare_continuous_execution_for_feature_orders(
+        config,
+        rows,
+        cols,
+        &[],
+        higher_features,
+        false,
+        false,
+    )?;
+    let staged_footprint = continuous_staged_device_footprint_bytes(&[&unary, &higher]);
+    let budget_bytes = config.budget.vram_budget_mb.saturating_mul(1024 * 1024);
+    if staged_footprint > budget_bytes {
+        return Err(OrchestratorError::Unsupported(
+            "continuous plan device footprint exceeds budget.vram_budget_mb",
+        )
+        .into());
+    }
+    let result_capacity = unary
+        .result_capacity()
+        .saturating_add(higher.result_capacity());
+    let result_max_arity = unary.result_max_arity().max(higher.result_max_arity());
+    let result_metric_count = higher.result_metric_count();
+    let needs_complete_family = config.permutation_tests > 0 || config.num_repeats > 1;
+    let complete_descriptor_words = higher
+        .plan()
+        .logical_descriptor_words()
+        .saturating_add(unary.result_capacity());
+    let retained_complete_descriptor_words = if needs_complete_family {
+        complete_descriptor_words
+    } else {
+        0
+    };
+    let screened_storage = screened_candidate_storage_bytes(
+        config.precision,
+        unary.result_capacity(),
+        higher.plan().materialized_descriptor_words() as u64,
+        result_capacity,
+        result_max_arity,
+        result_metric_count,
+        retained_complete_descriptor_words,
+    );
+    if needs_complete_family || screened_storage > DEFAULT_UNRANKED_HOST_STORAGE_BUDGET_BYTES {
+        let _combined = prepare_continuous_execution_for_feature_orders(
+            config,
+            rows,
+            cols,
+            &unary_features,
+            higher_features,
+            true,
+            true,
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn prepare_screened_continuous_execution(
@@ -467,14 +829,13 @@ pub(crate) fn prepare_screened_continuous_execution(
         // Published Core inserted scheduler results by ascending feature ID,
         // while GPU mappings retained unary-plan order. Stable score sorting
         // therefore used this order only as the Core tie-break contract.
-        unary_strengths.sort_by_key(|(feature, _)| *feature);
+        unary_strengths.sort_by_feature();
     }
-    let higher_features = legacy_higher_feature_order(
+    let higher_features = unary_strengths.higher_feature_order(
         candidate_cols,
         config.budget.max_combinations_per_k,
         config.budget.top_features_for_higher_k,
         &planning_seed_words,
-        &unary_strengths,
     );
     if config.graph_requested {
         let prepared = prepare_continuous_execution_for_feature_orders(
@@ -517,6 +878,7 @@ pub(crate) fn prepare_screened_continuous_execution(
         0
     };
     let screened_storage = screened_candidate_storage_bytes(
+        config.precision,
         unary_table.row_count() as u64,
         higher.plan().materialized_descriptor_words() as u64,
         result_capacity,
@@ -563,33 +925,128 @@ pub(crate) fn prepare_screened_continuous_execution(
     })
 }
 
+pub(crate) enum PrecisionUnaryStrengths {
+    F32(Vec<(u32, f32)>),
+    F64(Vec<(u32, f64)>),
+}
+
+impl PrecisionUnaryStrengths {
+    pub(crate) fn sort_by_feature(&mut self) {
+        match self {
+            Self::F32(values) => values.sort_by_key(|(feature, _)| *feature),
+            Self::F64(values) => values.sort_by_key(|(feature, _)| *feature),
+        }
+    }
+
+    fn higher_feature_order(
+        &self,
+        candidate_cols: u32,
+        max_combinations_per_k: u64,
+        top_features_for_higher_k: u32,
+        planning_seed_words: &[u32],
+    ) -> Vec<u32> {
+        match self {
+            Self::F32(values) => legacy_higher_feature_order(
+                candidate_cols,
+                max_combinations_per_k,
+                top_features_for_higher_k,
+                planning_seed_words,
+                values,
+            ),
+            Self::F64(values) => legacy_higher_feature_order_f64(
+                candidate_cols,
+                max_combinations_per_k,
+                top_features_for_higher_k,
+                planning_seed_words,
+                values,
+            ),
+        }
+    }
+
+    pub(crate) fn into_ranked_features(mut self, top_k: u32) -> Vec<u32> {
+        match &mut self {
+            Self::F32(values) => {
+                values.sort_by(|left, right| {
+                    right
+                        .1
+                        .partial_cmp(&left.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                values.truncate(top_k as usize);
+                values.iter().map(|(feature, _)| *feature).collect()
+            }
+            Self::F64(values) => {
+                values.sort_by(|left, right| {
+                    right
+                        .1
+                        .partial_cmp(&left.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                values.truncate(top_k as usize);
+                values.iter().map(|(feature, _)| *feature).collect()
+            }
+        }
+    }
+}
+
 pub(crate) fn unary_strengths_from_table(
-    table: &OwnedResultTable,
+    table: &impl ResultTableView,
     unary_features: &[u32],
     metric_ids: &[u32],
-) -> Result<Vec<(u32, f32)>, PyBoundaryError> {
+) -> Result<PrecisionUnaryStrengths, PyBoundaryError> {
     if table.row_count() != unary_features.len() || table.metric_count() != metric_ids.len() {
         return Err(PyBoundaryError::InvalidInput(
             "unary screening result shape does not match its plan".to_string(),
         ));
     }
-    let mut strengths = Vec::with_capacity(unary_features.len());
-    for (row, &feature) in unary_features.iter().enumerate() {
-        let values = metric_values_from_table(table, row).ok_or_else(|| {
-            PyBoundaryError::InvalidInput("unary screening metric row is missing".to_string())
-        })?;
-        let mut strength = None::<f32>;
-        for (&metric_id, value) in metric_ids.iter().zip(values) {
-            let candidate = if matches!(metric_id, GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN) {
-                value.abs()
-            } else {
-                value
-            };
-            strength = Some(strength.map_or(candidate, |current| current.max(candidate)));
+    match table.metric_values() {
+        crate::common::MetricValuesRef::F32(values) => {
+            let mut strengths = Vec::with_capacity(unary_features.len());
+            for (row, &feature) in unary_features.iter().enumerate() {
+                let base = row * metric_ids.len();
+                let row_values = values.get(base..base + metric_ids.len()).ok_or_else(|| {
+                    PyBoundaryError::InvalidInput(
+                        "unary screening metric row is missing".to_string(),
+                    )
+                })?;
+                let mut strength = None::<f32>;
+                for (&metric_id, &value) in metric_ids.iter().zip(row_values) {
+                    let candidate =
+                        if matches!(metric_id, GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN) {
+                            value.abs()
+                        } else {
+                            value
+                        };
+                    strength = Some(strength.map_or(candidate, |current| current.max(candidate)));
+                }
+                strengths.push((feature, strength.unwrap_or(0.0)));
+            }
+            Ok(PrecisionUnaryStrengths::F32(strengths))
         }
-        strengths.push((feature, strength.unwrap_or(0.0)));
+        crate::common::MetricValuesRef::F64(values) => {
+            let mut strengths = Vec::with_capacity(unary_features.len());
+            for (row, &feature) in unary_features.iter().enumerate() {
+                let base = row * metric_ids.len();
+                let row_values = values.get(base..base + metric_ids.len()).ok_or_else(|| {
+                    PyBoundaryError::InvalidInput(
+                        "unary screening metric row is missing".to_string(),
+                    )
+                })?;
+                let mut strength = None::<f64>;
+                for (&metric_id, &value) in metric_ids.iter().zip(row_values) {
+                    let candidate =
+                        if matches!(metric_id, GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN) {
+                            value.abs()
+                        } else {
+                            value
+                        };
+                    strength = Some(strength.map_or(candidate, |current| current.max(candidate)));
+                }
+                strengths.push((feature, strength.unwrap_or(0.0)));
+            }
+            Ok(PrecisionUnaryStrengths::F64(strengths))
+        }
     }
-    Ok(strengths)
 }
 
 pub(crate) fn execute_continuous_state(
@@ -619,6 +1076,7 @@ pub(crate) fn execute_continuous_state(
             state.result_max_arity,
             metric_ids.to_vec(),
             config.backend_kind,
+            config.precision,
             state.backend.uses_fp64_mi_accumulation(),
             interaction_diagnostics,
             table,
@@ -642,6 +1100,7 @@ pub(crate) fn execute_continuous_state(
         state.result_max_arity,
         metric_ids.to_vec(),
         config.backend_kind,
+        config.precision,
         state.backend.uses_fp64_mi_accumulation(),
         interaction_diagnostics,
         table,
@@ -656,7 +1115,7 @@ fn compute_significance(
     significance_top_n: u32,
     runtime_cache_counters: &RefCell<RuntimeCacheCounters>,
     state: &mut ContinuousRunState,
-    table: &OwnedResultTable,
+    table: &PrecisionOwnedResultTable,
 ) -> Result<Vec<SignificanceEntry>, PyBoundaryError> {
     let adaptive_search = has_adaptive_higher_order_search(config, cols);
     let generated_family = state
@@ -749,6 +1208,9 @@ pub(crate) fn bounded_ranked_indices(
     let limit = limit.min(table.row_count());
     let mut selected = Vec::with_capacity(limit);
     for row in 0..table.row_count() {
+        if rank_value_at(table, metric_ids, row, metric_index).is_none() {
+            continue;
+        }
         let mut low = 0;
         let mut high = selected.len();
         while low < high {
@@ -777,8 +1239,17 @@ pub(crate) fn bounded_ranked_indices(
     selected
 }
 
+pub(crate) fn row_is_rankable(
+    table: &impl ResultTableView,
+    metric_ids: &[u32],
+    row: usize,
+    metric_index: Option<usize>,
+) -> bool {
+    rank_value_at(table, metric_ids, row, metric_index).is_some()
+}
+
 fn significance_order(
-    table: &OwnedResultTable,
+    table: &impl ResultTableView,
     metric_ids: &[u32],
     significance_top_n: u32,
 ) -> Vec<usize> {
@@ -791,26 +1262,140 @@ fn significance_order(
     )
 }
 
-fn metric_extremeness(metric_id: u32, value: f32) -> f32 {
-    if !value.is_finite() {
-        return f32::NEG_INFINITY;
+trait HostSignificanceScalar: Copy + PartialOrd {
+    const NEG_INFINITY: Self;
+    const ZERO: Self;
+
+    fn metric_extremeness(metric_id: u32, value: Self) -> Self;
+    fn pvalue(count: u32, permutations: u32) -> Self;
+    fn into_precision_values(values: Vec<Self>) -> CpuPrecisionValues;
+
+    fn metric_values(table: &impl ResultTableView) -> Result<&[Self], PyBoundaryError>;
+}
+
+impl HostSignificanceScalar for f32 {
+    const NEG_INFINITY: Self = f32::NEG_INFINITY;
+    const ZERO: Self = 0.0;
+
+    fn metric_extremeness(metric_id: u32, value: Self) -> Self {
+        if !value.is_finite() {
+            return Self::NEG_INFINITY;
+        }
+        if matches!(metric_id, GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN) {
+            value.abs()
+        } else {
+            value
+        }
     }
-    if matches!(metric_id, GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN) {
-        value.abs()
-    } else {
-        value
+
+    fn pvalue(count: u32, permutations: u32) -> Self {
+        (count as f32 + 1.0) / (permutations as f32 + 1.0)
     }
+
+    fn into_precision_values(values: Vec<Self>) -> CpuPrecisionValues {
+        CpuPrecisionValues::F32(values)
+    }
+
+    fn metric_values(table: &impl ResultTableView) -> Result<&[Self], PyBoundaryError> {
+        match table.metric_values() {
+            crate::common::MetricValuesRef::F32(values) => Ok(values),
+            crate::common::MetricValuesRef::F64(_) => Err(PyBoundaryError::InvalidInput(
+                "fp32 significance received an fp64 result table".to_string(),
+            )),
+        }
+    }
+}
+
+impl HostSignificanceScalar for f64 {
+    const NEG_INFINITY: Self = f64::NEG_INFINITY;
+    const ZERO: Self = 0.0;
+
+    fn metric_extremeness(metric_id: u32, value: Self) -> Self {
+        if !value.is_finite() {
+            return Self::NEG_INFINITY;
+        }
+        if matches!(metric_id, GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN) {
+            value.abs()
+        } else {
+            value
+        }
+    }
+
+    fn pvalue(count: u32, permutations: u32) -> Self {
+        (f64::from(count) + 1.0) / (f64::from(permutations) + 1.0)
+    }
+
+    fn into_precision_values(values: Vec<Self>) -> CpuPrecisionValues {
+        CpuPrecisionValues::F64(values)
+    }
+
+    fn metric_values(table: &impl ResultTableView) -> Result<&[Self], PyBoundaryError> {
+        match table.metric_values() {
+            crate::common::MetricValuesRef::F64(values) => Ok(values),
+            crate::common::MetricValuesRef::F32(_) => Err(PyBoundaryError::InvalidInput(
+                "mixed/fp64 significance received an fp32 result table".to_string(),
+            )),
+        }
+    }
+}
+
+fn precision_values_slice(values: &CpuPrecisionValues) -> CpuPrecisionSlice<'_> {
+    match values {
+        CpuPrecisionValues::F32(values) => CpuPrecisionSlice::F32(values),
+        CpuPrecisionValues::F64(values) => CpuPrecisionSlice::F64(values),
+    }
+}
+
+fn permutation_target_precision(
+    target: &CpuPrecisionValues,
+    base_seed: u64,
+    permutation_index: u32,
+) -> CpuPrecisionValues {
+    let mut state = base_seed
+        ^ 0xA5A5_A5A5u64.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ u64::from(permutation_index).wrapping_mul(0xD1B5_4A32_D192_ED03);
+    let seed = splitmix64(&mut state);
+    match target {
+        CpuPrecisionValues::F32(values) => {
+            CpuPrecisionValues::F32(shuffle_precision_values(values, seed))
+        }
+        CpuPrecisionValues::F64(values) => {
+            CpuPrecisionValues::F64(shuffle_precision_values(values, seed))
+        }
+    }
+}
+
+fn shuffle_precision_values<T: Copy>(values: &[T], seed: u64) -> Vec<T> {
+    let mut values = values.to_vec();
+    let mut state = seed;
+    for index in (1..values.len()).rev() {
+        let swap = (splitmix64(&mut state) % (index as u64 + 1)) as usize;
+        values.swap(index, swap);
+    }
+    values
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 fn update_gpu_target(
     backend: &CompiledContinuousBackend,
-    target: &[f32],
+    target: CpuPrecisionSlice<'_>,
 ) -> Result<(), PyBoundaryError> {
     match backend {
         CompiledContinuousBackend::Cuda { matrix, .. }
         | CompiledContinuousBackend::Rocm { matrix, .. }
         | CompiledContinuousBackend::Metal { matrix, .. } => {
-            matrix.update_target(target).map_err(PyBoundaryError::from)
+            match target {
+                CpuPrecisionSlice::F32(target) => matrix.update_target_f32_v2(target)?,
+                CpuPrecisionSlice::F64(target) => matrix.update_target_f64_v2(target)?,
+            }
+            Ok(())
         }
         CompiledContinuousBackend::Cpu { .. } => Err(PyBoundaryError::InvalidInput(
             "device significance requires a GPU matrix".to_string(),
@@ -860,16 +1445,14 @@ fn merge_significance_stability(
     Ok(())
 }
 
-fn ranked_metric_value(
-    result: &OwnedResultTable,
+fn ranked_metric_value<T: HostSignificanceScalar>(
+    result: &impl ResultTableView,
     metric_index: usize,
-) -> Result<f32, PyBoundaryError> {
+) -> Result<T, PyBoundaryError> {
     if result.row_count() == 0 {
-        return Ok(f32::NEG_INFINITY);
+        return Ok(T::NEG_INFINITY);
     }
-    let values = metric_values_from_table(result, 0).ok_or_else(|| {
-        PyBoundaryError::InvalidInput("ranked significance metric row is missing".to_string())
-    })?;
+    let values = T::metric_values(result)?;
     values.get(metric_index).copied().ok_or_else(|| {
         PyBoundaryError::InvalidInput(
             "ranked significance result has the wrong metric width".to_string(),
@@ -877,12 +1460,12 @@ fn ranked_metric_value(
     })
 }
 
-fn execute_ranked_metric_extremum(
+fn execute_ranked_metric_extremum<T: HostSignificanceScalar>(
     backend: &CompiledContinuousBackend,
     prepared: &PreparedContinuousExecution,
     metric_id: u32,
     descending: bool,
-) -> Result<f32, PyBoundaryError> {
+) -> Result<T, PyBoundaryError> {
     let metric_index = prepared
         .plan()
         .metric_ids()
@@ -901,59 +1484,180 @@ fn execute_ranked_metric_extremum(
         reserved: [0; 4],
     };
     let capacity = prepared.ranked_result_capacity(rank)?;
-    let mut result = OwnedResultTable::new(
+    let mut result = PrecisionOwnedResultTable::new(
+        backend.precision(),
         capacity,
         prepared.result_max_arity(),
         prepared.result_metric_count(),
     );
-    match backend {
-        CompiledContinuousBackend::Cpu { matrix } => {
-            let mut backend = CpuBackend;
-            prepared.execute_ranked(rank, &mut backend, &matrix.handle(), result.raw_mut())?;
+    execute_ranked_precision_into(backend, prepared, rank, &mut result)?;
+    ranked_metric_value::<T>(&result, metric_index)
+}
+
+fn execute_ranked_precision_into(
+    backend: &CompiledContinuousBackend,
+    prepared: &PreparedContinuousExecution,
+    rank: GafimeRankSpec,
+    result: &mut PrecisionOwnedResultTable,
+) -> Result<(), PyBoundaryError> {
+    match (backend, result) {
+        (CompiledContinuousBackend::Cpu { matrix }, PrecisionOwnedResultTable::Fp32(table)) => {
+            let mut cpu = CpuBackend;
+            prepared.execute_precision_ranked_fp32(
+                rank,
+                &mut cpu,
+                &matrix.handle(),
+                table.raw_mut(),
+            )?;
         }
-        CompiledContinuousBackend::Cuda { backend, matrix }
-        | CompiledContinuousBackend::Rocm { backend, matrix }
-        | CompiledContinuousBackend::Metal { backend, matrix } => {
-            prepared.execute_ranked(
+        (
+            CompiledContinuousBackend::Cuda { backend, matrix }
+            | CompiledContinuousBackend::Rocm { backend, matrix }
+            | CompiledContinuousBackend::Metal { backend, matrix },
+            PrecisionOwnedResultTable::Fp32(table),
+        ) => {
+            prepared.execute_precision_ranked_fp32(
                 rank,
                 &mut *backend.borrow_mut(),
                 matrix.handle(),
-                result.raw_mut(),
+                table.raw_mut(),
             )?;
         }
-    }
-    ranked_metric_value(&result, metric_index)
-}
-
-fn update_ranked_plan_maxima(
-    backend: &CompiledContinuousBackend,
-    prepared: &PreparedContinuousExecution,
-    metric_ids: &[u32],
-    maxima: &mut [f32],
-) -> Result<(), PyBoundaryError> {
-    for (metric_index, &metric_id) in metric_ids.iter().enumerate() {
-        let high = execute_ranked_metric_extremum(backend, prepared, metric_id, true)?;
-        maxima[metric_index] = maxima[metric_index].max(metric_extremeness(metric_id, high));
-        if matches!(metric_id, GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN) {
-            let low = execute_ranked_metric_extremum(backend, prepared, metric_id, false)?;
-            maxima[metric_index] = maxima[metric_index].max(metric_extremeness(metric_id, low));
+        (
+            CompiledContinuousBackend::Cpu { matrix },
+            PrecisionOwnedResultTable::F64 { table, .. },
+        ) => {
+            let mut cpu = CpuBackend;
+            prepared.execute_precision_ranked_f64(
+                rank,
+                &mut cpu,
+                &matrix.handle(),
+                table.raw_mut(),
+            )?;
+        }
+        (
+            CompiledContinuousBackend::Cuda { backend, matrix }
+            | CompiledContinuousBackend::Rocm { backend, matrix },
+            PrecisionOwnedResultTable::F64 { table, .. },
+        ) => {
+            prepared.execute_precision_ranked_f64(
+                rank,
+                &mut *backend.borrow_mut(),
+                matrix.handle(),
+                table.raw_mut(),
+            )?;
+        }
+        (CompiledContinuousBackend::Metal { .. }, PrecisionOwnedResultTable::F64 { .. }) => {
+            return Err(PyBoundaryError::UnsupportedFeature(
+                "Metal supports precision=\"fp32\" only".to_string(),
+            ));
         }
     }
     Ok(())
 }
 
-fn update_table_maxima(
-    table: &OwnedResultTable,
+fn update_ranked_plan_maxima<T: HostSignificanceScalar>(
+    backend: &CompiledContinuousBackend,
+    prepared: &PreparedContinuousExecution,
     metric_ids: &[u32],
-    maxima: &mut [f32],
+    maxima: &mut [T],
 ) -> Result<(), PyBoundaryError> {
+    for (metric_index, &metric_id) in metric_ids.iter().enumerate() {
+        let high = execute_ranked_metric_extremum::<T>(backend, prepared, metric_id, true)?;
+        let high = T::metric_extremeness(metric_id, high);
+        if high > maxima[metric_index] {
+            maxima[metric_index] = high;
+        }
+        if matches!(metric_id, GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN) {
+            let low = execute_ranked_metric_extremum::<T>(backend, prepared, metric_id, false)?;
+            let low = T::metric_extremeness(metric_id, low);
+            if low > maxima[metric_index] {
+                maxima[metric_index] = low;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build one permutation-specific expanded decision-path family on the
+/// requested GPU backend and return its lane-typed maxT extrema.
+///
+/// Decision-path discovery and membership materialization remain host-owned,
+/// but every score contributing to a GPU null-family maximum is evaluated and
+/// ranked through the device's bounded `top_k=1` execution surface. Retaining
+/// the complete screened plan is deliberate: the unary screening result may
+/// select a different higher-order family for every permuted target.
+pub(crate) fn execute_device_decision_path_null_maxima(
+    config: &EngineConfig,
+    rows: u64,
+    cols: u32,
+    input: OwnedNumericInput,
+) -> Result<CpuPrecisionValues, PyBoundaryError> {
+    if !matches!(
+        config.backend_kind,
+        GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
+    ) {
+        return Err(PyBoundaryError::InvalidInput(
+            "decision-path device maxT requires an explicit GPU backend".to_string(),
+        ));
+    }
+
+    let mut null_config = config.clone();
+    null_config.budget.max_feature_candidate = -2;
+    // This flag retains the complete permutation-specific screened family. The
+    // helper never invokes ordinary significance recursively.
+    null_config.permutation_tests = 1;
+    null_config.num_repeats = 1;
+    null_config.graph_requested = false;
+    let metric_ids = null_config.metric_ids.clone();
+    let state = build_continuous_state(&null_config, rows, cols, input)?;
+    require_device_ranking(&state.backend)?;
+    let complete_family = state.complete_family()?;
+
+    match null_config.precision {
+        PrecisionProfile::Fp32 => {
+            let mut maxima = vec![f32::NEG_INFINITY; metric_ids.len()];
+            update_ranked_plan_maxima::<f32>(
+                &state.backend,
+                complete_family,
+                &metric_ids,
+                &mut maxima,
+            )?;
+            Ok(CpuPrecisionValues::F32(maxima))
+        }
+        PrecisionProfile::Mixed | PrecisionProfile::Fp64 => {
+            let mut maxima = vec![f64::NEG_INFINITY; metric_ids.len()];
+            update_ranked_plan_maxima::<f64>(
+                &state.backend,
+                complete_family,
+                &metric_ids,
+                &mut maxima,
+            )?;
+            Ok(CpuPrecisionValues::F64(maxima))
+        }
+    }
+}
+
+fn update_table_maxima<T: HostSignificanceScalar>(
+    table: &impl ResultTableView,
+    metric_ids: &[u32],
+    maxima: &mut [T],
+) -> Result<(), PyBoundaryError> {
+    let all_values = T::metric_values(table)?;
     for row in 0..table.row_count() {
-        let values = metric_values_from_table(table, row).ok_or_else(|| {
-            PyBoundaryError::InvalidInput("GPU significance metric row is missing".to_string())
+        let base = row.checked_mul(table.metric_count()).ok_or_else(|| {
+            PyBoundaryError::InvalidInput("GPU significance metric offset overflow".to_string())
         })?;
+        let values = all_values
+            .get(base..base + table.metric_count())
+            .ok_or_else(|| {
+                PyBoundaryError::InvalidInput("GPU significance metric row is missing".to_string())
+            })?;
         for (metric_index, &metric_id) in metric_ids.iter().enumerate() {
-            maxima[metric_index] =
-                maxima[metric_index].max(metric_extremeness(metric_id, values[metric_index]));
+            let value = T::metric_extremeness(metric_id, values[metric_index]);
+            if value > maxima[metric_index] {
+                maxima[metric_index] = value;
+            }
         }
     }
     Ok(())
@@ -965,7 +1669,7 @@ fn compute_host_orchestrated_gpu_permutation_pvalues(
     significance_top_n: u32,
     runtime_cache_counters: &RefCell<RuntimeCacheCounters>,
     state: &mut ContinuousRunState,
-    table: &OwnedResultTable,
+    table: &PrecisionOwnedResultTable,
     adaptive_search: bool,
 ) -> Result<Option<Vec<SignificanceEntry>>, PyBoundaryError> {
     if config.permutation_tests == 0
@@ -974,24 +1678,71 @@ fn compute_host_orchestrated_gpu_permutation_pvalues(
         return Ok(None);
     }
     require_device_ranking(&state.backend)?;
+    if state.significance_matrix.is_none() {
+        return Err(PyBoundaryError::InvalidInput(
+            "GPU significance requires the retained host target".to_string(),
+        ));
+    }
+    if table.row_count() == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    match table {
+        PrecisionOwnedResultTable::Fp32(_) => {
+            compute_host_orchestrated_gpu_permutation_pvalues_typed::<f32>(
+                config,
+                metric_ids,
+                significance_top_n,
+                runtime_cache_counters,
+                state,
+                table,
+                adaptive_search,
+            )
+        }
+        PrecisionOwnedResultTable::F64 { .. } => {
+            compute_host_orchestrated_gpu_permutation_pvalues_typed::<f64>(
+                config,
+                metric_ids,
+                significance_top_n,
+                runtime_cache_counters,
+                state,
+                table,
+                adaptive_search,
+            )
+        }
+    }
+}
+
+fn compute_host_orchestrated_gpu_permutation_pvalues_typed<T: HostSignificanceScalar>(
+    config: &EngineConfig,
+    metric_ids: &[u32],
+    significance_top_n: u32,
+    runtime_cache_counters: &RefCell<RuntimeCacheCounters>,
+    state: &mut ContinuousRunState,
+    table: &PrecisionOwnedResultTable,
+    adaptive_search: bool,
+) -> Result<Option<Vec<SignificanceEntry>>, PyBoundaryError> {
     let host_matrix = state.significance_matrix.as_ref().ok_or_else(|| {
         PyBoundaryError::InvalidInput(
             "GPU significance requires the retained host target".to_string(),
         )
     })?;
-    if table.row_count() == 0 {
-        return Ok(Some(Vec::new()));
-    }
-
     let order = significance_order(table, metric_ids, significance_top_n);
     let metric_count = metric_ids.len();
     let mut observed_flat = Vec::with_capacity(order.len() * metric_count);
+    let metric_values = T::metric_values(table)?;
     for &row in &order {
-        observed_flat.extend(metric_values_from_table(table, row).ok_or_else(|| {
-            PyBoundaryError::InvalidInput("significance metric row out of range".to_string())
-        })?);
+        let base = row.checked_mul(metric_count).ok_or_else(|| {
+            PyBoundaryError::InvalidInput("significance metric offset overflow".to_string())
+        })?;
+        observed_flat.extend_from_slice(metric_values.get(base..base + metric_count).ok_or_else(
+            || PyBoundaryError::InvalidInput("significance metric row out of range".to_string()),
+        )?);
     }
-    let original_target = host_matrix.target().to_vec();
+    let original_target = match host_matrix.target() {
+        CpuPrecisionSlice::F32(target) => CpuPrecisionValues::F32(target.to_vec()),
+        CpuPrecisionSlice::F64(target) => CpuPrecisionValues::F64(target.to_vec()),
+    };
     let rows = host_matrix.rows();
     let cols = host_matrix.cols();
     let mut permutation_config = config.clone();
@@ -1002,13 +1753,13 @@ fn compute_host_orchestrated_gpu_permutation_pvalues(
     let permutation_result = (|| -> Result<Vec<u32>, PyBoundaryError> {
         let mut counts = vec![0u32; observed_flat.len()];
         for permutation_index in 0..config.permutation_tests {
-            let target = significance::permutation_target(
+            let target = permutation_target_precision(
                 &original_target,
                 config.random_seed,
                 permutation_index,
             );
-            update_gpu_target(&state.backend, &target)?;
-            let mut maxima = vec![f32::NEG_INFINITY; metric_count];
+            update_gpu_target(&state.backend, precision_values_slice(&target))?;
+            let mut maxima = vec![T::NEG_INFINITY; metric_count];
             if adaptive_search {
                 let run = prepare_screened_continuous_execution(
                     &permutation_config,
@@ -1021,15 +1772,15 @@ fn compute_host_orchestrated_gpu_permutation_pvalues(
                         "adaptive GPU significance did not produce a screened plan".to_string(),
                     )
                 })?;
-                update_table_maxima(&screened.unary_table, metric_ids, &mut maxima)?;
-                update_ranked_plan_maxima(
+                update_table_maxima::<T>(&screened.unary_table, metric_ids, &mut maxima)?;
+                update_ranked_plan_maxima::<T>(
                     &state.backend,
                     &screened.higher,
                     metric_ids,
                     &mut maxima,
                 )?;
             } else {
-                update_ranked_plan_maxima(
+                update_ranked_plan_maxima::<T>(
                     &state.backend,
                     state.complete_family()?,
                     metric_ids,
@@ -1040,7 +1791,7 @@ fn compute_host_orchestrated_gpu_permutation_pvalues(
                 for metric_index in 0..metric_count {
                     let flat_index = candidate_index * metric_count + metric_index;
                     let observed =
-                        metric_extremeness(metric_ids[metric_index], observed_flat[flat_index]);
+                        T::metric_extremeness(metric_ids[metric_index], observed_flat[flat_index]);
                     if maxima[metric_index] >= observed {
                         counts[flat_index] += 1;
                     }
@@ -1049,7 +1800,8 @@ fn compute_host_orchestrated_gpu_permutation_pvalues(
         }
         Ok(counts)
     })();
-    let restore_result = update_gpu_target(&state.backend, &original_target);
+    let restore_result =
+        update_gpu_target(&state.backend, precision_values_slice(&original_target));
     let counts = match (permutation_result, restore_result) {
         (Ok(counts), Ok(())) => counts,
         (Err(error), Ok(())) => return Err(error),
@@ -1067,7 +1819,6 @@ fn compute_host_orchestrated_gpu_permutation_pvalues(
         metric_builds: null_family_rows,
         candidate_table_hits: order.len() as u64,
     };
-    let denominator = config.permutation_tests as f32 + 1.0;
     Ok(Some(
         order
             .into_iter()
@@ -1076,12 +1827,16 @@ fn compute_host_orchestrated_gpu_permutation_pvalues(
                 let base = position * metric_count;
                 SignificanceEntry {
                     row,
-                    pvalues: counts[base..base + metric_count]
-                        .iter()
-                        .map(|&count| (count as f32 + 1.0) / denominator)
-                        .collect(),
-                    means: observed_flat[base..base + metric_count].to_vec(),
-                    stds: vec![0.0; metric_count],
+                    pvalues: T::into_precision_values(
+                        counts[base..base + metric_count]
+                            .iter()
+                            .map(|&count| T::pvalue(count, config.permutation_tests))
+                            .collect(),
+                    ),
+                    means: T::into_precision_values(
+                        observed_flat[base..base + metric_count].to_vec(),
+                    ),
+                    stds: T::into_precision_values(vec![T::ZERO; metric_count]),
                 }
             })
             .collect(),
@@ -1095,7 +1850,7 @@ fn compute_gpu_permutation_pvalues(
     significance_top_n: u32,
     runtime_cache_counters: &RefCell<RuntimeCacheCounters>,
     state: &ContinuousRunState,
-    table: &OwnedResultTable,
+    table: &PrecisionOwnedResultTable,
 ) -> Result<Option<Vec<SignificanceEntry>>, PyBoundaryError> {
     if config.permutation_tests == 0 {
         return Ok(None);
@@ -1106,7 +1861,9 @@ fn compute_gpu_permutation_pvalues(
     if !device_permutation_pvalues_are_valid(
         config,
         cols,
-        backend.borrow().supports_permutation_pvalues(),
+        backend
+            .borrow()
+            .supports_precision_permutation_pvalues(config.precision),
     ) {
         return Ok(None);
     }
@@ -1119,13 +1876,8 @@ fn compute_gpu_permutation_pvalues(
 
     let metric_count = metric_ids.len();
     let mut candidate_ids = Vec::with_capacity(order.len());
-    let mut observed_flat = Vec::with_capacity(order.len() * metric_count);
     for &row in &order {
-        let metrics = metric_values_from_table(table, row).ok_or_else(|| {
-            PyBoundaryError::InvalidInput("significance metric row out of range".to_string())
-        })?;
         candidate_ids.push(table.candidate_ids()[row]);
-        observed_flat.extend(metrics);
     }
 
     let handle = matrix.handle();
@@ -1136,44 +1888,95 @@ fn compute_gpu_permutation_pvalues(
         metric_builds: null_family_rows,
         candidate_table_hits: candidate_ids.len() as u64,
     };
-    let protocol = complete_family.try_launch_protocol()?;
+    let base_protocol = complete_family.try_launch_protocol()?;
+    let protocol = GafimePrecisionLaunchProtocol {
+        abi_version: GAFIME_PRECISION_ABI_VERSION,
+        profile: config.precision as u32,
+        base: &base_protocol,
+        reserved: [0; 8],
+    };
     let device_budget_bytes = (config.budget.vram_budget_mb != 0)
         .then(|| config.budget.vram_budget_mb.saturating_mul(1024 * 1024));
-    let Some(pvalues) = backend.borrow_mut().permutation_pvalues_with_budget(
-        handle,
-        &protocol,
-        &candidate_ids,
-        &observed_flat,
-        metric_count as u32,
-        device_budget_bytes,
-    )?
-    else {
-        // Older same-ABI payloads may provide native p-values without the
-        // state-aware significance preflight. The caller will use the normal
-        // budgeted host-orchestrated maxT path instead.
-        return Ok(None);
-    };
-    if pvalues.len() != observed_flat.len() {
-        return Err(PyBoundaryError::InvalidInput(
-            "GPU p-value grid length does not match observed metrics".to_string(),
-        ));
+    match table {
+        PrecisionOwnedResultTable::Fp32(table) => {
+            let mut observed = Vec::with_capacity(order.len() * metric_count);
+            for &row in &order {
+                let base = row * metric_count;
+                observed.extend_from_slice(&table.metric_values()[base..base + metric_count]);
+            }
+            let Some(pvalues) = backend
+                .borrow_mut()
+                .permutation_pvalues_fp32_v2_with_budget(
+                    handle,
+                    &protocol,
+                    &candidate_ids,
+                    &observed,
+                    metric_count as u32,
+                    device_budget_bytes,
+                )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(
+                order
+                    .into_iter()
+                    .enumerate()
+                    .map(|(position, row)| {
+                        let base = position * metric_count;
+                        SignificanceEntry {
+                            row,
+                            pvalues: CpuPrecisionValues::F32(
+                                pvalues[base..base + metric_count].to_vec(),
+                            ),
+                            means: CpuPrecisionValues::F32(
+                                observed[base..base + metric_count].to_vec(),
+                            ),
+                            stds: CpuPrecisionValues::F32(vec![0.0; metric_count]),
+                        }
+                    })
+                    .collect(),
+            ))
+        }
+        PrecisionOwnedResultTable::F64 { table, .. } => {
+            let mut observed = Vec::with_capacity(order.len() * metric_count);
+            for &row in &order {
+                let base = row * metric_count;
+                observed.extend_from_slice(&table.metric_values()[base..base + metric_count]);
+            }
+            let Some(pvalues) = backend
+                .borrow_mut()
+                .permutation_pvalues_f64_v2_with_budget(
+                    handle,
+                    &protocol,
+                    &candidate_ids,
+                    &observed,
+                    metric_count as u32,
+                    device_budget_bytes,
+                )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(
+                order
+                    .into_iter()
+                    .enumerate()
+                    .map(|(position, row)| {
+                        let base = position * metric_count;
+                        SignificanceEntry {
+                            row,
+                            pvalues: CpuPrecisionValues::F64(
+                                pvalues[base..base + metric_count].to_vec(),
+                            ),
+                            means: CpuPrecisionValues::F64(
+                                observed[base..base + metric_count].to_vec(),
+                            ),
+                            stds: CpuPrecisionValues::F64(vec![0.0; metric_count]),
+                        }
+                    })
+                    .collect(),
+            ))
+        }
     }
-
-    Ok(Some(
-        order
-            .into_iter()
-            .enumerate()
-            .map(|(position, row)| {
-                let base = position * metric_count;
-                SignificanceEntry {
-                    row,
-                    pvalues: pvalues[base..base + metric_count].to_vec(),
-                    means: observed_flat[base..base + metric_count].to_vec(),
-                    stds: vec![0.0; metric_count],
-                }
-            })
-            .collect(),
-    ))
 }
 
 /// Permutation + stability significance (P-A) for the top-N surfaced rows. The
@@ -1186,7 +1989,7 @@ fn compute_cpu_significance(
     significance_top_n: u32,
     runtime_cache_counters: &RefCell<RuntimeCacheCounters>,
     state: &ContinuousRunState,
-    table: &OwnedResultTable,
+    table: &PrecisionOwnedResultTable,
 ) -> Result<Vec<SignificanceEntry>, PyBoundaryError> {
     if config.permutation_tests == 0 && config.num_repeats <= 1 {
         return Ok(Vec::new());
@@ -1220,16 +2023,23 @@ fn compute_cpu_significance(
         })?;
 
     let mut combos = Vec::with_capacity(order.len());
+    let mut candidate_ids = Vec::with_capacity(order.len());
     let mut observed = Vec::with_capacity(order.len());
     for &row in &order {
         let combo = combo_from_table(table, row).ok_or_else(|| {
             PyBoundaryError::InvalidInput("significance combo row out of range".to_string())
         })?;
-        let metrics = metric_values_from_table(table, row).ok_or_else(|| {
-            PyBoundaryError::InvalidInput("significance metric row out of range".to_string())
-        })?;
         combos.push(combo);
-        observed.push(metrics);
+        candidate_ids.push(table.candidate_ids()[row]);
+        let metric_base = row * metric_ids.len();
+        observed.push(match table {
+            PrecisionOwnedResultTable::Fp32(table) => CpuPrecisionValues::F32(
+                table.metric_values()[metric_base..metric_base + metric_ids.len()].to_vec(),
+            ),
+            PrecisionOwnedResultTable::F64 { table, .. } => CpuPrecisionValues::F64(
+                table.metric_values()[metric_base..metric_base + metric_ids.len()].to_vec(),
+            ),
+        });
     }
 
     let complete_family = state.complete_family()?;
@@ -1267,70 +2077,127 @@ fn compute_cpu_significance(
             top_features_for_higher_arity: config.budget.top_features_for_higher_k,
             planning_seed_words: &planning_seed_words,
         };
-        significance::evaluate_with_adaptive_search(
+        significance::evaluate_precision_with_adaptive_search(
             matrix,
             &combos,
             &observed,
+            &candidate_ids,
             complete_family.plan(),
             &kernels,
             &params,
             &search,
         )?
     } else {
-        significance::evaluate_with_null_family(
+        significance::evaluate_precision_with_null_family(
             matrix,
             &combos,
             &observed,
+            &candidate_ids,
             complete_family.plan(),
             &kernels,
             &params,
         )?
     };
-    Ok(order
+    order
         .into_iter()
         .zip(evaluated)
-        .map(|(row, sig)| SignificanceEntry {
-            row,
-            pvalues: sig.pvalues,
-            means: sig.means,
-            stds: sig.stds,
+        .zip(candidate_ids)
+        .map(|((row, sig), expected_candidate_id)| {
+            if sig.candidate_id != expected_candidate_id {
+                return Err(PyBoundaryError::InvalidInput(
+                    "precision significance candidate identity changed".to_string(),
+                ));
+            }
+            Ok(SignificanceEntry {
+                row,
+                pvalues: sig.pvalues,
+                means: sig.means,
+                stds: sig.stds,
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>, PyBoundaryError>>()
 }
+
 fn rank_value_at(
     table: &impl ResultTableView,
     metric_ids: &[u32],
     row: usize,
     metric_index: Option<usize>,
-) -> Option<f32> {
+) -> Option<PrecisionRankValue> {
     if row >= table.row_count() {
         return None;
     }
     let metric_count = table.metric_count();
     let metric_base = row.checked_mul(metric_count)?;
-    let metrics = &table.metric_values()[metric_base..metric_base + metric_count];
-    if let Some(metric_index) = metric_index {
-        return metrics.get(metric_index).copied();
+    match table.metric_values() {
+        crate::common::MetricValuesRef::F32(values) => {
+            let metrics = &values[metric_base..metric_base + metric_count];
+            if let Some(metric_index) = metric_index {
+                return metrics
+                    .get(metric_index)
+                    .copied()
+                    .filter(|value| value.is_finite())
+                    .map(PrecisionRankValue::F32);
+            }
+            metrics
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| value.is_finite())
+                .map(|(idx, &value)| {
+                    if matches!(
+                        metric_ids.get(idx).copied().unwrap_or_default(),
+                        GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN
+                    ) {
+                        value.abs()
+                    } else {
+                        value
+                    }
+                })
+                .reduce(f32::max)
+                .map(PrecisionRankValue::F32)
+        }
+        crate::common::MetricValuesRef::F64(values) => {
+            let metrics = &values[metric_base..metric_base + metric_count];
+            if let Some(metric_index) = metric_index {
+                return metrics
+                    .get(metric_index)
+                    .copied()
+                    .filter(|value| value.is_finite())
+                    .map(PrecisionRankValue::F64);
+            }
+            metrics
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| value.is_finite())
+                .map(|(idx, &value)| {
+                    if matches!(
+                        metric_ids.get(idx).copied().unwrap_or_default(),
+                        GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN
+                    ) {
+                        value.abs()
+                    } else {
+                        value
+                    }
+                })
+                .reduce(f64::max)
+                .map(PrecisionRankValue::F64)
+        }
     }
-    metrics
-        .iter()
-        .enumerate()
-        .map(
-            |(idx, &value)| match metric_ids.get(idx).copied().unwrap_or_default() {
-                GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN => value.abs(),
-                _ => value,
-            },
-        )
-        .reduce(f32::max)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PrecisionRankValue {
+    F32(f32),
+    F64(f64),
 }
 
 fn compare_rank_values(
-    left: Option<f32>,
-    right: Option<f32>,
+    left: Option<PrecisionRankValue>,
+    right: Option<PrecisionRankValue>,
     descending: bool,
 ) -> std::cmp::Ordering {
     match (left, right) {
-        (Some(left), Some(right)) => {
+        (Some(PrecisionRankValue::F32(left)), Some(PrecisionRankValue::F32(right))) => {
             let ordering = left
                 .partial_cmp(&right)
                 .unwrap_or(std::cmp::Ordering::Equal);
@@ -1340,6 +2207,21 @@ fn compare_rank_values(
                 ordering
             }
         }
+        (Some(PrecisionRankValue::F64(left)), Some(PrecisionRankValue::F64(right))) => {
+            let ordering = left
+                .partial_cmp(&right)
+                .unwrap_or(std::cmp::Ordering::Equal);
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        }
+        (Some(PrecisionRankValue::F32(_)), Some(PrecisionRankValue::F64(_)))
+        | (Some(PrecisionRankValue::F64(_)), Some(PrecisionRankValue::F32(_))) => {
+            debug_assert!(false, "one result table cannot mix public score dtypes");
+            std::cmp::Ordering::Equal
+        }
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => std::cmp::Ordering::Equal,
@@ -1348,7 +2230,7 @@ fn compare_rank_values(
 
 pub(crate) enum CompiledContinuousBackend {
     Cpu {
-        matrix: CpuMatrix,
+        matrix: CpuPrecisionMatrix,
     },
     Cuda {
         backend: RefCell<GpuBackend>,
@@ -1365,19 +2247,22 @@ pub(crate) enum CompiledContinuousBackend {
 }
 
 impl CompiledContinuousBackend {
-    pub(crate) fn uses_fp64_mi_accumulation(&self) -> bool {
+    pub(crate) fn precision(&self) -> PrecisionProfile {
         match self {
-            Self::Cpu { .. } => true,
-            Self::Cuda { backend, .. } | Self::Rocm { backend, .. } => {
-                backend.borrow().uses_fp64_mi_accumulation()
+            Self::Cpu { matrix } => matrix.profile(),
+            Self::Cuda { matrix, .. } | Self::Rocm { matrix, .. } | Self::Metal { matrix, .. } => {
+                matrix.precision()
             }
-            Self::Metal { .. } => false,
         }
+    }
+
+    pub(crate) fn uses_fp64_mi_accumulation(&self) -> bool {
+        self.precision() != PrecisionProfile::Fp32
     }
 }
 
 pub(crate) struct ContinuousRunState {
-    pub(crate) significance_matrix: Option<CpuMatrix>,
+    pub(crate) significance_matrix: Option<CpuPrecisionMatrix>,
     pub(crate) backend: CompiledContinuousBackend,
     pub(crate) primary: Option<PreparedContinuousExecution>,
     screened: Option<ScreenedContinuousExecution>,
@@ -1421,10 +2306,65 @@ mod tests {
 
     #[test]
     fn screened_host_admission_counts_cached_and_combined_result_owners() {
-        let bytes = screened_candidate_storage_bytes(10_000_000, 0, 10_000_000, 5, 1, 0);
+        let bytes = screened_candidate_storage_bytes(
+            PrecisionProfile::Fp32,
+            10_000_000,
+            0,
+            10_000_000,
+            5,
+            1,
+            0,
+        );
 
         assert_eq!(bytes, 720_000_000);
         assert!(bytes > DEFAULT_UNRANKED_HOST_STORAGE_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn gpu_budget_preflight_rejects_before_payload_load_or_matrix_allocation() {
+        let rows = 1_024u64;
+        let cols = 512u32;
+        let mut config = EngineConfig {
+            precision: PrecisionProfile::Fp32,
+            backend_kind: GAFIME_BACKEND_CUDA,
+            metric_ids: vec![GAFIME_METRIC_PEARSON],
+            permutation_tests: 0,
+            num_repeats: 1,
+            ..EngineConfig::default()
+        };
+        config.budget.max_comb_size = 1;
+        config.budget.max_combinations_per_k = u64::from(cols);
+        config.budget.vram_budget_mb = 1;
+        let input = OwnedNumericInput::from_f32(
+            config.precision,
+            vec![0.0; rows as usize * cols as usize],
+            vec![0.0; rows as usize],
+        )
+        .unwrap();
+
+        let error = match build_continuous_state(&config, rows, cols, input) {
+            Ok(_) => panic!("oversized fp32 matrix unexpectedly passed static admission"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("continuous plan device footprint exceeds budget.vram_budget_mb"));
+    }
+
+    #[test]
+    fn zero_vram_budget_skips_duplicate_gpu_plan_preflight() {
+        let mut config = EngineConfig {
+            backend_kind: GAFIME_BACKEND_CUDA,
+            ..EngineConfig::default()
+        };
+        config.budget.vram_budget_mb = 0;
+        assert!(!requires_gpu_budget_preflight(&config));
+
+        config.budget.vram_budget_mb = 1;
+        assert!(requires_gpu_budget_preflight(&config));
+
+        config.backend_kind = GAFIME_BACKEND_CPU;
+        assert!(!requires_gpu_budget_preflight(&config));
     }
 
     #[test]
@@ -1440,13 +2380,104 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(report.precision, PrecisionProfile::Mixed);
         assert_eq!(report.rows, 4);
         assert_eq!(report.cols, 3);
         assert_eq!(report.len(), 3);
         assert_eq!(report.combo(0).unwrap(), vec![0]);
-        assert!((report.metric_values(0).unwrap()[0] - 1.0).abs() < 1e-6);
-        assert!((report.metric_values(1).unwrap()[0] + 1.0).abs() < 1e-6);
-        assert_eq!(report.metric_values(2).unwrap()[0], 0.0);
+        assert!((report.metric_values(0).unwrap().as_f64().unwrap()[0] - 1.0).abs() < 1e-6);
+        assert!((report.metric_values(1).unwrap().as_f64().unwrap()[0] + 1.0).abs() < 1e-6);
+        assert_eq!(report.metric_values(2).unwrap().as_f64().unwrap()[0], 0.0);
+    }
+
+    #[test]
+    fn profile_aware_cpu_boundary_routes_typed_inputs_and_results() {
+        for precision in [PrecisionProfile::Fp32, PrecisionProfile::Mixed] {
+            let report = analyze_continuous_cpu_rows_with_precision(
+                precision,
+                4,
+                1,
+                ContinuousCpuInput::F32 {
+                    features: vec![1.0, 2.0, 3.0, 4.0],
+                    target: vec![1.0, 2.0, 3.0, 4.0],
+                },
+                1,
+                1,
+                vec![GAFIME_METRIC_PEARSON],
+            )
+            .unwrap();
+
+            assert_eq!(report.precision, precision);
+            let metric_values = report.metric_values(0).unwrap();
+            let value = match precision {
+                PrecisionProfile::Fp32 => f64::from(metric_values.as_f32().unwrap()[0]),
+                PrecisionProfile::Mixed => metric_values.as_f64().unwrap()[0],
+                PrecisionProfile::Fp64 => unreachable!(),
+            };
+            assert!((value - 1.0).abs() < 1.0e-6);
+            match (precision, report.table) {
+                (PrecisionProfile::Fp32, PrecisionOwnedResultTable::Fp32(_))
+                | (
+                    PrecisionProfile::Mixed,
+                    PrecisionOwnedResultTable::F64 {
+                        profile: PrecisionProfile::Mixed,
+                        ..
+                    },
+                ) => {}
+                (precision, table) => {
+                    panic!("unexpected result lane for {precision:?}: {table:?}")
+                }
+            }
+        }
+
+        let delta = 2.0_f64.powi(-30);
+        let values = (0..16)
+            .map(|index| 1.0 + f64::from(index) * delta)
+            .collect::<Vec<_>>();
+        let report = analyze_continuous_cpu_rows_with_precision(
+            PrecisionProfile::Fp64,
+            16,
+            1,
+            ContinuousCpuInput::F64 {
+                features: values.clone(),
+                target: values,
+            },
+            1,
+            1,
+            vec![GAFIME_METRIC_PEARSON],
+        )
+        .unwrap();
+
+        assert_eq!(report.precision, PrecisionProfile::Fp64);
+        assert!((report.metric_values(0).unwrap().as_f64().unwrap()[0] - 1.0).abs() < 1.0e-12);
+        assert!(matches!(
+            report.table,
+            PrecisionOwnedResultTable::F64 {
+                profile: PrecisionProfile::Fp64,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn profile_aware_cpu_boundary_rejects_typed_lane_mismatch() {
+        let error = analyze_continuous_cpu_rows_with_precision(
+            PrecisionProfile::Fp64,
+            2,
+            1,
+            ContinuousCpuInput::F32 {
+                features: vec![1.0, 2.0],
+                target: vec![1.0, 2.0],
+            },
+            1,
+            1,
+            vec![GAFIME_METRIC_PEARSON],
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("fp64 precision cannot ingest an intermediate f32 buffer"));
     }
 
     #[test]
@@ -1575,6 +2606,7 @@ mod tests {
     #[test]
     fn ranked_extremum_uses_the_bounded_prepared_execution_api() {
         let mut config = EngineConfig {
+            precision: PrecisionProfile::Fp32,
             metric_ids: vec![GAFIME_METRIC_R2, GAFIME_METRIC_PEARSON],
             permutation_tests: 0,
             num_repeats: 1,
@@ -1582,25 +2614,34 @@ mod tests {
         };
         config.budget.max_comb_size = 1;
         config.budget.max_combinations_per_k = 8;
-        let state = build_continuous_state(
-            &config,
-            4,
-            2,
+        let input = OwnedNumericInput::from_f32(
+            config.precision,
             vec![1.0, 4.0, 2.0, 3.0, 3.0, 2.0, 4.0, 1.0],
             vec![1.0, 2.0, 3.0, 4.0],
         )
         .unwrap();
+        let state = build_continuous_state(&config, 4, 2, input).unwrap();
         let prepared = state.primary.as_ref().unwrap();
 
         assert_eq!(
-            execute_ranked_metric_extremum(&state.backend, prepared, GAFIME_METRIC_PEARSON, true,)
-                .unwrap(),
-            1.0
+            execute_ranked_metric_extremum::<f32>(
+                &state.backend,
+                prepared,
+                GAFIME_METRIC_PEARSON,
+                true,
+            )
+            .unwrap(),
+            1.0_f32
         );
         assert_eq!(
-            execute_ranked_metric_extremum(&state.backend, prepared, GAFIME_METRIC_PEARSON, false,)
-                .unwrap(),
-            -1.0
+            execute_ranked_metric_extremum::<f32>(
+                &state.backend,
+                prepared,
+                GAFIME_METRIC_PEARSON,
+                false,
+            )
+            .unwrap(),
+            -1.0_f32
         );
     }
 
@@ -1608,7 +2649,10 @@ mod tests {
     fn ranked_extremum_accepts_a_valid_empty_device_result() {
         let table = OwnedResultTable::new(1, 5, 1);
 
-        assert_eq!(ranked_metric_value(&table, 0).unwrap(), f32::NEG_INFINITY);
+        assert_eq!(
+            ranked_metric_value::<f32>(&table, 0).unwrap(),
+            f32::NEG_INFINITY
+        );
     }
 
     #[test]
@@ -1653,5 +2697,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn fp32_ranking_excludes_nonfinite_public_scores() {
+        let mut table = OwnedResultTable::new(3, 1, 2);
+        let raw = table.raw_mut();
+        // SAFETY: the owner allocated three rows of two f32 metrics and three
+        // candidate identifiers; these writes stay within those live buffers.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                [f32::NAN, f32::NAN, -0.25, f32::NAN, f32::NAN, 0.75].as_ptr(),
+                raw.metric_values,
+                6,
+            );
+            std::ptr::copy_nonoverlapping([30_u64, 20, 10].as_ptr(), raw.candidate_ids, 3);
+        }
+        raw.row_count = 3;
+
+        assert_eq!(
+            bounded_ranked_indices(
+                &table,
+                &[GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+                None,
+                true,
+                3,
+            ),
+            vec![2, 1]
+        );
+        assert_eq!(
+            bounded_ranked_indices(
+                &table,
+                &[GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+                Some(0),
+                true,
+                3,
+            ),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn f64_ranking_excludes_nonfinite_public_scores() {
+        let mut table = OwnedResultTableF64::new(3, 1, 1);
+        table
+            .metric_values_mut()
+            .copy_from_slice(&[f64::NAN, 0.5, f64::INFINITY]);
+        table.raw_mut().row_count = 3;
+
+        assert_eq!(
+            bounded_ranked_indices(&table, &[GAFIME_METRIC_R2], Some(0), true, 3),
+            vec![1]
+        );
+        assert!(rank_value_at(&table, &[GAFIME_METRIC_R2], 0, Some(0)).is_none());
+        assert!(rank_value_at(&table, &[GAFIME_METRIC_R2], 2, Some(0)).is_none());
     }
 }

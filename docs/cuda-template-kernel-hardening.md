@@ -4,14 +4,26 @@ This note documents the CUDA, HIP, and Metal hardening checkpoint for v1
 continuous GPU scoring. It does not change the public Python API or stable C
 ABI.
 
+> The size and timing tables below are historical evidence for the earlier
+> single-target hardening checkpoint. They are not the PR #70 ABI 1.1
+> before/after release comparison and must not be reported as current payload
+> performance or size. The current generic numeric-route architecture is
+> defined in [`abi-evolution.md`](abi-evolution.md); exact final all-target
+> artifacts are reported from the immutable release bundle.
+
 ## Scope
 
-The CUDA payload now emits compile-time specialized kernels for:
+The ABI 1.1 size-deduplication pass retains CUDA compile-time specialization by
+numeric route, covariance mode, and MI bin width, while sharing one bounded
+runtime-arity body across arities `1..5`. Physical ABI and precision smoke tests
+exercise every supported arity; this removes fivefold device-code cloning
+without adding a dtype branch inside a row hot loop. CUDA therefore emits:
 
-- continuous Pearson/R2 interaction arity `1..5`,
-- mutual information arity `1..5` crossed with bins
-  `2,4,8,12,16,24,32,48,64,96`,
-- Spearman arity `1..5`,
+- continuous Pearson/R2 route and covariance-mode specializations with shared
+  arity dispatch,
+- mutual information route specializations crossed with bins
+  `2,4,8,12,16,24,32,48,64,96`, with shared arity dispatch,
+- Spearman route/cached-target specializations with shared arity dispatch,
 - top-k rank direction with block-local partial selection plus a final merge.
 
 The HIP/ROCm payload now emits compile-time specialized kernels for:
@@ -39,15 +51,17 @@ ABI:
 
 - interaction arity `1..5` uses fixed inline switch cases instead of a runtime
   product loop,
-- host-side column means use f64 accumulation and the same NaN/Inf propagation
-  semantics as CPU, CUDA, and HIP before centered interactions reach the
-  shader,
+- ABI 1.1 host-side column means and shader arithmetic remain genuine fp32,
+  with the same NaN/Inf propagation semantics as the Core fp32 profile before
+  centered interactions reach the shader; the legacy ABI 1.0 path retains its
+  established host-side mean behavior,
 - continuous Pearson/R2 now uses one 64-lane threadgroup per candidate instead
   of one serial thread per candidate,
 - mutual-information range discovery is reduced across the 64-lane threadgroup
   instead of scanned by lane 0,
-- mutual-information final accumulation and active-bin counts are reduced across
-  the same threadgroup instead of accumulated by lane 0,
+- the mutual-information histogram is constructed in parallel across the
+  threadgroup, while probability, logarithm, and final-score arithmetic use
+  deterministic row-major fp32 accumulation in lane 0,
 - ranked execution uses block-local partial top-k selection, final merge, and
   selected metric-row gather at source level, so top-k plans do not need to copy
   the full metric table back to the host,
@@ -110,15 +124,18 @@ bootstrap significance passes resolve the same adaptive shape before building
 their null distributions, so observed MI is never compared with a different
 histogram resolution.
 
-The high-bin MI path parallelizes range discovery and MI accumulation on CUDA,
-HIP, and Metal. CUDA uses warp-shuffle block reductions. HIP can use
+The high-bin MI path parallelizes range discovery and histogram construction on
+CUDA, HIP, and Metal. CUDA uses warp-shuffle block reductions. HIP can use
 target-width wave reductions for min/max and integer counts, with a compact
 per-wave LDS merge. The production `gfx1150` build enables it only for the
 64-bin specialization; 96 bins retain the 256-thread shared tree. HIP also
 retains that tree for the floating MI sum in every mode, so its addition order
 does not change. Metal uses fixed 64-lane threadgroup reductions. These remove
 the old thread-0/lane-0 scalar range scans without applying fast math or
-reassociating the HIP floating MI accumulation.
+reassociating the HIP floating MI accumulation. Metal retains a parallel exact
+integer histogram but serializes its fp32 probability/logarithm/final-score
+pass in deterministic row-major bin order, and its shader is compiled with
+`-fno-fast-math`.
 
 `GAFIME_HIP_WAVE_MI_MODE` selects exact HIP specializations at build time:
 `off`, `64`, `96`, or `64-96`. The distribution default is `64`; CMake rejects
@@ -180,10 +197,14 @@ python3 tests/release_measure/gpu_static_kernel_report.py \
   --require-no-spills
 ```
 
-The required checks fail if resource metadata is incomplete, an arity/bin
-specialization is absent, either rank direction is absent, the merge/gather
-stages are absent, the old single-block selector remains, or generated kernels
-use CUDA local/stack storage or HIP private/register spills.
+The required checks fail if resource metadata is incomplete, neither an exact
+arity specialization nor the corresponding shared runtime-arity body exists,
+an MI bin specialization is absent, either rank direction is absent, the
+merge/gather stages are absent, the old single-block selector remains, or
+generated kernels use CUDA local/stack storage or HIP private/register spills.
+Independent ABI CTests physically exercise CUDA arities `1..5` and the frozen
+ABI 1.0 arity-6 compatibility path, so the static sentinel is not accepted as
+coverage evidence by itself.
 
 The measurements below are from the final local rebuild after the launcher and
 production-mode decisions. They are static artifact evidence; runtime
@@ -605,7 +626,7 @@ and a provenance-checked ROCm A/B. Metal now has a direct ABI test for
 multi-block top-k, ascending/descending direction, ties, gathered rows, and
 oversized `top_k`, plus a CPU-oracle test for every continuous metric on
 high-dynamic and non-finite inputs. Both passed on Apple hardware in Actions run
-`29112217686` without skipping. Maintainer approval of the provisional Metal
-tolerance and Metal runtime performance evidence remain open. A display-free
-CUDA rerun is required before publishing the local CUDA rates as a formal
-benchmark.
+`29112217686` without skipping. The current ABI 1.1 correction and approved
+tolerance are recorded in `docs/evidence/metal-parity-macos26.md`; physical
+Metal performance is recorded by Beast run `30770777790`. A display-free CUDA
+rerun is required before publishing the local CUDA rates as a formal benchmark.

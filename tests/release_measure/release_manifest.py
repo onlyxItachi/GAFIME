@@ -11,6 +11,9 @@ import re
 from typing import Any
 
 
+CANONICAL_PRECISION_PROFILES = ("fp32", "mixed", "fp64")
+
+
 @dataclass(frozen=True)
 class WheelSpec:
     platform: str
@@ -20,6 +23,7 @@ class WheelSpec:
     validation_label: str
     python_versions: tuple[str, ...]
     embedded_backends: tuple[str, ...]
+    embedded_backend_profiles: tuple[tuple[str, tuple[str, ...]], ...]
     filename_template: str
 
     @property
@@ -37,6 +41,14 @@ class WheelSpec:
     def filename_patterns(self) -> tuple[str, ...]:
         return tuple(self.filename_pattern(version) for version in self.python_versions)
 
+    def profiles_for_backend(self, backend: str) -> tuple[str, ...]:
+        for candidate, profiles in self.embedded_backend_profiles:
+            if candidate == backend:
+                return profiles
+        raise AssertionError(
+            f"{self.platform} has no embedded precision contract for {backend!r}"
+        )
+
 
 @dataclass(frozen=True)
 class DistributionSpec:
@@ -46,6 +58,7 @@ class DistributionSpec:
     kind: str
     backend: str | None
     policy: str
+    precision_profiles: tuple[str, ...]
     standard_bundle: bool
     pypi_wheels: bool
     pypi_sdist: bool
@@ -58,6 +71,10 @@ class DistributionSpec:
     @property
     def artifact_count(self) -> int:
         return sum(len(wheel.python_versions) for wheel in self.wheels) + 1
+
+    @property
+    def execution_backend(self) -> str:
+        return self.backend or "core"
 
 
 @dataclass(frozen=True)
@@ -91,6 +108,7 @@ class ReleaseManifest:
             if item.name == name:
                 return item
         raise AssertionError(f"release manifest has no standard distribution {name!r}")
+
 
 def python_tag(version: str) -> str:
     match = re.fullmatch(r"([0-9]+)\.([0-9]+)", version)
@@ -136,6 +154,7 @@ def _parse_wheel(
         "validation_label",
         "python_versions",
         "embedded_backends",
+        "embedded_backend_profiles",
         "filename_template",
     }
     _exact_keys(data, fields, context)
@@ -167,14 +186,35 @@ def _parse_wheel(
         len(embedded_backends) == len(set(embedded_backends)),
         f"{context}.embedded_backends must be unique",
     )
+    embedded_profiles_data = _object(
+        data["embedded_backend_profiles"],
+        f"{context}.embedded_backend_profiles",
+    )
+    _require(
+        set(embedded_profiles_data) == set(embedded_backends),
+        f"{context}.embedded_backend_profiles must cover exactly embedded_backends",
+    )
+    embedded_backend_profiles = []
+    for backend in embedded_backends:
+        profiles = embedded_profiles_data[backend]
+        _require(
+            isinstance(profiles, list)
+            and bool(profiles)
+            and all(profile in CANONICAL_PRECISION_PROFILES for profile in profiles)
+            and len(profiles) == len(set(profiles)),
+            f"{context}.embedded_backend_profiles.{backend} is invalid",
+        )
+        embedded_backend_profiles.append((backend, tuple(profiles)))
     string_fields = fields - {
         "python_versions",
         "embedded_backends",
+        "embedded_backend_profiles",
     }
     wheel = WheelSpec(
         **{name: _string(data[name], f"{context}.{name}") for name in string_fields},
         python_versions=resolved_python,
         embedded_backends=tuple(embedded_backends),
+        embedded_backend_profiles=tuple(embedded_backend_profiles),
     )
     _require(
         wheel.filename_template.count("{python_tag}") == 2,
@@ -197,6 +237,7 @@ def _parse_distribution(
             "kind",
             "backend",
             "policy",
+            "precision_profiles",
             "standard_bundle",
             "pypi",
             "extra",
@@ -212,6 +253,12 @@ def _parse_distribution(
     _require(
         isinstance(data["standard_bundle"], bool),
         f"{context}.standard_bundle is invalid",
+    )
+    precision_profiles = data["precision_profiles"]
+    _require(
+        isinstance(precision_profiles, list)
+        and tuple(precision_profiles) == CANONICAL_PRECISION_PROFILES,
+        f"{context}.precision_profiles must be {list(CANONICAL_PRECISION_PROFILES)!r}",
     )
     pypi = _object(data["pypi"], f"{context}.pypi")
     _exact_keys(pypi, {"wheels", "sdist"}, f"{context}.pypi")
@@ -255,6 +302,7 @@ def _parse_distribution(
         kind=_string(data["kind"], f"{context}.kind"),
         backend=backend,
         policy=_string(data["policy"], f"{context}.policy"),
+        precision_profiles=tuple(precision_profiles),
         standard_bundle=data["standard_bundle"],
         pypi_wheels=pypi["wheels"],
         pypi_sdist=pypi["sdist"],
@@ -287,7 +335,7 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
         },
         "release manifest",
     )
-    _require(data["schema_version"] == 2, "release manifest schema_version must be 2")
+    _require(data["schema_version"] == 3, "release manifest schema_version must be 3")
     bundle = _object(data["bundle"], "release manifest bundle")
     _exact_keys(
         bundle, {"artifact_name", "download_pattern"}, "release manifest bundle"
@@ -359,6 +407,7 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
             },
             "pypi": (True, True),
             "policy": "core-with-metal-on-apple-silicon",
+            "precision_profiles": CANONICAL_PRECISION_PROFILES,
         },
         "gafime-cuda": {
             "package": "gafime_cuda",
@@ -368,6 +417,7 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
             "platforms": {"manylinux_2_28_x86_64", "win_amd64"},
             "pypi": (True, True),
             "policy": "system",
+            "precision_profiles": CANONICAL_PRECISION_PROFILES,
         },
         "gafime-rocm": {
             "package": "gafime_rocm",
@@ -377,6 +427,7 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
             "platforms": {"linux_x86_64"},
             "pypi": (False, True),
             "policy": "system",
+            "precision_profiles": CANONICAL_PRECISION_PROFILES,
         },
     }
     for distribution in distributions:
@@ -397,13 +448,11 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
             f"{distribution.name} identity violates pinned distribution policy",
         )
         _require(
-            {wheel.platform for wheel in distribution.wheels}
-            == expected["platforms"],
+            {wheel.platform for wheel in distribution.wheels} == expected["platforms"],
             f"{distribution.name} wheel platforms violate pinned distribution policy",
         )
         _require(
-            (distribution.pypi_wheels, distribution.pypi_sdist)
-            == expected["pypi"],
+            (distribution.pypi_wheels, distribution.pypi_sdist) == expected["pypi"],
             f"{distribution.name} PyPI policy violates pinned distribution policy",
         )
         _require(
@@ -411,21 +460,23 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
             f"{distribution.name} build policy violates pinned distribution policy",
         )
         _require(
+            distribution.precision_profiles == expected["precision_profiles"],
+            f"{distribution.name} precision profiles violate pinned distribution policy",
+        )
+        _require(
             distribution.extra_name is None and distribution.extra_marker is None,
             f"{distribution.name} must not be exposed through Core extras",
         )
     manifest = ReleaseManifest(
         path=path,
-        schema_version=2,
+        schema_version=3,
         bundle_artifact=_string(
             bundle["artifact_name"], "release manifest bundle.artifact_name"
         ),
         bundle_download_pattern=_string(
             bundle["download_pattern"], "release manifest bundle.download_pattern"
         ),
-        abi_policy=_string(
-            python["abi_policy"], "release manifest python.abi_policy"
-        ),
+        abi_policy=_string(python["abi_policy"], "release manifest python.abi_policy"),
         supported_python=tuple(supported),
         distributions=distributions,
     )
@@ -434,15 +485,28 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
         "release manifest must build dedicated per-CPython wheels",
     )
     embedded = [
-        (distribution.name, wheel.platform, backend)
+        (
+            distribution.name,
+            wheel.platform,
+            backend,
+            wheel.profiles_for_backend(backend),
+        )
         for distribution in manifest.standard_distributions
         for wheel in distribution.wheels
         for backend in wheel.embedded_backends
     ]
     _require(
-        embedded == [("gafime", "macosx_11_0_arm64", "metal")],
-        "Metal must be embedded only in the Apple Silicon core wheel",
+        embedded == [("gafime", "macosx_11_0_arm64", "metal", ("fp32",))],
+        "Metal fp32 must be embedded only in the Apple Silicon core wheel",
     )
+    for distribution in manifest.standard_distributions:
+        _require(
+            not any(
+                token in distribution.name.lower()
+                for token in CANONICAL_PRECISION_PROFILES
+            ),
+            f"precision-specific distribution identity is forbidden: {distribution.name}",
+        )
     return manifest
 
 
@@ -470,15 +534,19 @@ def render_release_matrix(manifest: ReleaseManifest) -> str:
             pypi.append("wheels")
         if distribution.pypi_sdist:
             pypi.append("sdist")
+        profiles = ", ".join(
+            f"`{profile}`" for profile in distribution.precision_profiles
+        )
         embedded = ", ".join(
-            f"`{backend}` in `{wheel.platform}`"
+            f"`{backend}` ({', '.join(f'`{profile}`' for profile in wheel.profiles_for_backend(backend))}) "
+            f"in `{wheel.platform}`"
             for wheel in distribution.wheels
             for backend in wheel.embedded_backends
         )
         rows.append(
             f"| `{distribution.name}` | {distribution.kind} | "
             f"{policy_label} | {wheel_platforms} | "
-            f"{embedded or 'none'} | yes | {', '.join(pypi) or 'none'} | "
+            f"{profiles} | {embedded or 'none'} | yes | {', '.join(pypi) or 'none'} | "
             f"{distribution.artifact_count} |"
         )
     versions = ", ".join(f"`{version}`" for version in manifest.supported_python)
@@ -494,11 +562,17 @@ def render_release_matrix(manifest: ReleaseManifest) -> str:
         f"Dedicated wheels are built and tested for CPython {versions}; "
         "every declared platform covers this complete matrix. "
         "Python's Stable ABI is not used.\n\n"
+        "Every listed profile is compiled into each wheel of its distribution; "
+        "profiles do not create additional distributions or wheel families.\n\n"
+        "| Backend | `fp32` | `mixed` | `fp64` |\n"
+        "|---|---:|---:|---:|\n"
+        "| Core | yes | yes | yes |\n"
+        "| CUDA | yes | yes | yes |\n"
+        "| ROCm | yes | yes | yes |\n"
+        "| Metal | yes | no | no |\n\n"
         "| Distribution | Kind | Runtime policy | Wheel platforms | "
-        "Embedded backends | Sdist | PyPI publication | Count |\n"
-        "|---|---|---|---|---|---:|---|---:|\n"
-        + "\n".join(rows)
-        + "\n"
+        "Primary profiles | Embedded backends and profiles | Sdist | PyPI publication | Count |\n"
+        "|---|---|---|---|---|---|---:|---|---:|\n" + "\n".join(rows) + "\n"
     )
 
 

@@ -2,15 +2,16 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import importlib
+import warnings
 from typing import Any, Mapping
 
 from ._precision import (
-    SUPPORTED_COMPUTE_POLICIES,
-    SUPPORTED_STORAGE_DTYPES,
-    normalize_compute_policy,
-    normalize_storage_dtype,
-    unsupported_precision_reason,
+    SUPPORTED_PRECISIONS,
+    backend_precision_error,
+    normalize_precision,
+    precision_from_legacy_pair,
 )
+from .config import _LEGACY_PRECISION_WARNING
 from ._payloads import installed_payload_build_policy
 from .families import BOOTSTRAP_STABILITY_SCOPE, FamilyCapability, available_families
 
@@ -27,6 +28,13 @@ _BACKEND_ALIASES = {
     "metal": "metal",
 }
 _MI_TEMPLATE_LEVELS = (2, 4, 8, 12, 16, 24, 32, 48, 64, 96)
+
+
+class _DefaultPrecision(str):
+    """String-compatible sentinel that distinguishes an omitted default."""
+
+
+_DEFAULT_PRECISION = _DefaultPrecision("mixed")
 
 
 @dataclass(frozen=True)
@@ -86,8 +94,8 @@ def backend_capabilities(
     probe: bool = False,
     mi_bins: int = 96,
     mi_approximate: bool = False,
-    storage_dtype: str = "float32",
-    compute_policy: str = "stable",
+    precision: str = _DEFAULT_PRECISION,
+    **legacy_precision: object,
 ) -> BackendCapabilities:
     """Return truthful static and, when requested, runtime backend facts.
 
@@ -102,10 +110,53 @@ def backend_capabilities(
         raise ValueError("device_id must be a non-negative integer.")
     if not isinstance(mi_bins, int) or isinstance(mi_bins, bool) or mi_bins < 2:
         raise ValueError("mi_bins must be an integer greater than or equal to 2.")
-    storage_dtype = normalize_storage_dtype(storage_dtype)
-    compute_policy = normalize_compute_policy(compute_policy)
-
-    snapshot, boundary, boundary_error = _runtime_snapshot(configured, device_id, probe)
+    if legacy_precision:
+        unexpected = set(legacy_precision) - {"storage_dtype", "compute_policy"}
+        if unexpected:
+            raise TypeError(
+                f"unexpected precision keyword(s): {', '.join(sorted(unexpected))}"
+            )
+        if set(legacy_precision) != {"storage_dtype", "compute_policy"}:
+            raise TypeError(
+                "deprecated storage_dtype and compute_policy must be supplied together."
+            )
+        if precision is not _DEFAULT_PRECISION:
+            raise TypeError(
+                "precision cannot be combined with deprecated storage_dtype/compute_policy."
+            )
+        precision = precision_from_legacy_pair(
+            legacy_precision["storage_dtype"], legacy_precision["compute_policy"]
+        )
+        warnings.warn(_LEGACY_PRECISION_WARNING, DeprecationWarning, stacklevel=2)
+    precision = normalize_precision(precision)
+    unsupported_reason = backend_precision_error(configured, precision)
+    if unsupported_reason is not None and probe:
+        raise ValueError(
+            f"unsupported precision request precision={precision!r}: {unsupported_reason}"
+        )
+    if unsupported_reason is not None:
+        # A static capability query must be able to report a rejected request,
+        # but it must not load the native boundary or discover payloads merely
+        # to learn that the profile/backend pair is impossible.
+        snapshot = {
+            "configured_backend": configured,
+            "selected_backend": None,
+            "status": "unsupported",
+            "detail": unsupported_reason,
+            "probe_performed": False,
+            "runtime": None,
+            "candidates": {
+                configured: {"status": "unsupported", "detail": unsupported_reason}
+            },
+        }
+        boundary = None
+        boundary_error = (
+            "native boundary was not loaded for an unsupported precision request"
+        )
+    else:
+        snapshot, boundary, boundary_error = _runtime_snapshot(
+            configured, device_id, probe, precision
+        )
     selected = _string_or_none(snapshot.get("selected_backend"))
     selection_status = str(snapshot.get("status", "unknown"))
     selection_detail = _string_or_none(snapshot.get("detail"))
@@ -155,15 +206,18 @@ def backend_capabilities(
             effective_backend,
             selected,
             runtime,
-            storage_dtype,
-            compute_policy,
+            precision,
         ),
         payload_build_policy=_payload_build_policy(effective_backend),
         arrow_ingest_mode=CapabilityValue(
             {
                 "protocol": "Arrow C stream",
                 "record_batches": "exactly one required",
-                "compute_buffer": "native row-major f32 copy",
+                "compute_buffer": (
+                    "native row-major f64 copy"
+                    if precision == "fp64"
+                    else "native row-major f32 copy"
+                ),
                 "zero_copy_into_compute": False,
             },
             "static",
@@ -205,6 +259,7 @@ def _runtime_snapshot(
     backend: str,
     device_id: int,
     probe: bool,
+    precision: str,
 ) -> tuple[Mapping[str, object], object | None, str | None]:
     try:
         boundary = _load_boundary(backend)
@@ -219,7 +274,9 @@ def _runtime_snapshot(
                     "status": "unavailable",
                     "detail": detail,
                     "probe_performed": probe,
-                    "candidates": {candidate: {"status": "unavailable", "detail": detail}},
+                    "candidates": {
+                        candidate: {"status": "unavailable", "detail": detail}
+                    },
                 },
                 base_boundary,
                 None,
@@ -248,7 +305,12 @@ def _runtime_snapshot(
             None,
         )
     try:
-        snapshot = runtime_capabilities(backend=backend, device_id=device_id, probe=probe)
+        snapshot = runtime_capabilities(
+            backend=backend,
+            device_id=device_id,
+            probe=probe,
+            precision=precision,
+        )
     except Exception as exc:
         return (
             {
@@ -297,13 +359,19 @@ def _load_base_boundary() -> object | None:
     return None
 
 
-def _graph_support(backend: str | None, runtime: Mapping[str, object]) -> CapabilityValue:
+def _graph_support(
+    backend: str | None, runtime: Mapping[str, object]
+) -> CapabilityValue:
     graph = _mapping_or_empty(runtime.get("graph"))
     if graph:
         return CapabilityValue(graph, "runtime")
     if backend == "core":
-        return CapabilityValue(False, "static", "Core has no graph capture/replay path.")
-    return CapabilityValue(None, "unknown", "Graph support requires a validated payload probe.")
+        return CapabilityValue(
+            False, "static", "Core has no graph capture/replay path."
+        )
+    return CapabilityValue(
+        None, "unknown", "Graph support requires a validated payload probe."
+    )
 
 
 def _payload_build_policy(backend: str | None) -> CapabilityValue:
@@ -339,7 +407,9 @@ def _payload_build_policy(backend: str | None) -> CapabilityValue:
             "unknown",
             f"installed payload policy could not be validated: {exc}",
         )
-    return CapabilityValue(policy, "package" if policy is not None else "unknown", detail)
+    return CapabilityValue(
+        policy, "package" if policy is not None else "unknown", detail
+    )
 
 
 def _device_significance(
@@ -443,7 +513,9 @@ def _stability_significance(backend: str | None) -> CapabilityValue:
 
 def _mi_estimator(backend: str | None, mi_approximate: bool) -> CapabilityValue:
     if backend is None:
-        return CapabilityValue(None, "unknown", "Estimator depends on the selected backend.")
+        return CapabilityValue(
+            None, "unknown", "Estimator depends on the selected backend."
+        )
     if backend == "core" and not mi_approximate:
         return CapabilityValue("adaptive_quantile", "static")
     return CapabilityValue("fixed_equal_width_adaptive_template", "static")
@@ -451,7 +523,9 @@ def _mi_estimator(backend: str | None, mi_approximate: bool) -> CapabilityValue:
 
 def _mi_bin_ceiling(backend: str | None, requested: int) -> CapabilityValue:
     if backend is None:
-        return CapabilityValue(None, "unknown", "Bin ceiling depends on the selected backend.")
+        return CapabilityValue(
+            None, "unknown", "Bin ceiling depends on the selected backend."
+        )
     backend_ceiling = 48 if backend == "metal" else 96
     capped = min(max(requested, 2), backend_ceiling)
     effective = max(level for level in _MI_TEMPLATE_LEVELS if level <= capped)
@@ -471,55 +545,58 @@ def _precision_contract(
     backend: str | None,
     selected_backend: str | None,
     runtime: Mapping[str, object],
-    storage_dtype: str,
-    compute_policy: str,
+    precision: str,
 ) -> CapabilityValue:
-    requested = {
-        "storage_dtype": storage_dtype,
-        "compute_policy": compute_policy,
-    }
-    rejection_reason = unsupported_precision_reason(storage_dtype, compute_policy)
+    requested = precision
+    rejection_reason = backend_precision_error(backend or "auto", precision)
     runtime_precision = _mapping_or_empty(runtime.get("precision"))
 
     if backend == "core":
-        storage_dtypes = SUPPORTED_STORAGE_DTYPES
-        compute_policies = SUPPORTED_COMPUTE_POLICIES
-        interaction_arithmetic = "float32"
+        supported_profiles = SUPPORTED_PRECISIONS
+        interaction_arithmetic = "float64" if precision == "fp64" else "float32"
+        reduction_dtype = "float32" if precision == "fp32" else "float64"
         accumulators = {
-            "pearson": "float64",
-            "r2": "float64",
-            "spearman": "float64",
-            "mutual_info": "float64",
+            metric: reduction_dtype
+            for metric in ("pearson", "r2", "spearman", "mutual_info")
         }
-        result_dtype = "float32"
-        scale_normalization = "centered_float64_reduction"
+        result_dtype = reduction_dtype
+        scale_normalization = f"centered_{reduction_dtype}_reduction"
         compensated_summation = False
         interaction_overflow_diagnostics = True
         source = "static"
     elif backend in {"cuda", "rocm", "metal"}:
-        storage_dtypes = tuple(runtime_precision.get("storage_dtypes", ("float32",)))
-        compute_policies = tuple(runtime_precision.get("compute_policies", ("stable",)))
-        interaction_arithmetic = runtime_precision.get(
-            "interaction_arithmetic", "float32"
+        default_profiles = ("fp32",) if backend == "metal" else SUPPORTED_PRECISIONS
+        supported_profiles = tuple(runtime_precision.get("profiles", default_profiles))
+        profile_domains = _mapping_or_empty(runtime_precision.get("profile_domains"))
+        requested_domains = _mapping_or_empty(profile_domains.get(precision))
+        reduction_dtype = "float32" if precision == "fp32" else "float64"
+        interaction_arithmetic = requested_domains.get(
+            "interaction_arithmetic",
+            runtime_precision.get(
+                "interaction_arithmetic",
+                "float64" if precision == "fp64" else "float32",
+            ),
         )
-        if runtime_precision:
-            accumulators = dict(_mapping_or_empty(runtime_precision.get("accumulators")))
+        if requested_domains:
+            accumulators = dict(
+                _mapping_or_empty(requested_domains.get("accumulators"))
+            )
             source = "runtime"
-        elif backend == "metal":
+        elif runtime_precision.get("accumulators"):
+            accumulators = dict(
+                _mapping_or_empty(runtime_precision.get("accumulators"))
+            )
+            source = "runtime"
+        else:
             accumulators = {
-                metric: "float32"
+                metric: reduction_dtype
                 for metric in ("pearson", "r2", "spearman", "mutual_info")
             }
             source = "static"
-        else:
-            accumulators = {
-                "pearson": "float32",
-                "r2": "float32",
-                "spearman": "float64",
-                "mutual_info": None,
-            }
-            source = "static"
-        result_dtype = runtime_precision.get("result_dtype", "float32")
+        reduction_dtype = requested_domains.get("reduction_dtype", reduction_dtype)
+        result_dtype = requested_domains.get(
+            "result_dtype", runtime_precision.get("result_dtype", reduction_dtype)
+        )
         scale_normalization = runtime_precision.get(
             "scale_normalization", "adaptive_high_dynamic"
         )
@@ -530,9 +607,9 @@ def _precision_contract(
             runtime_precision.get("interaction_overflow_diagnostics", False)
         )
     else:
-        storage_dtypes = SUPPORTED_STORAGE_DTYPES
-        compute_policies = SUPPORTED_COMPUTE_POLICIES
+        supported_profiles = SUPPORTED_PRECISIONS
         interaction_arithmetic = None
+        reduction_dtype = None
         accumulators = {}
         result_dtype = None
         scale_normalization = None
@@ -540,11 +617,14 @@ def _precision_contract(
         interaction_overflow_diagnostics = False
         source = "unknown"
 
+    if rejection_reason is None and precision not in supported_profiles:
+        rejection_reason = (
+            f"backend={backend!r} does not advertise precision={precision!r}; "
+            f"supported profiles are {', '.join(supported_profiles)}."
+        )
     request_supported = rejection_reason is None
     effective = (
-        {"storage_dtype": storage_dtype, "compute_policy": compute_policy}
-        if request_supported and selected_backend is not None
-        else None
+        precision if request_supported and selected_backend is not None else None
     )
     detail = rejection_reason
     if detail is None and selected_backend is None:
@@ -555,9 +635,10 @@ def _precision_contract(
             "effective": effective,
             "request_supported": request_supported,
             "rejection_reason": rejection_reason,
-            "supported_storage_dtypes": storage_dtypes,
-            "supported_compute_policies": compute_policies,
+            "supported_profiles": supported_profiles,
+            "storage_dtype": "float64" if precision == "fp64" else "float32",
             "interaction_arithmetic": interaction_arithmetic,
+            "reduction_dtype": reduction_dtype,
             "accumulators": accumulators,
             "result_dtype": result_dtype,
             "scale_normalization": scale_normalization,

@@ -1,7 +1,9 @@
 use core::ffi::c_void;
 
 use gafime_types::{
-    BackendKind, GafimeGpuMatrix, GafimeLaunchProtocol, GafimeResultTable, GafimeStatus,
+    BackendKind, GafimeGpuMatrix, GafimeLaunchProtocol, GafimePrecisionLaunchProtocol,
+    GafimeResultTable, GafimeResultTableF64, GafimeStatus, PrecisionProfile, GAFIME_ABI_VERSION,
+    GAFIME_PRECISION_ABI_VERSION,
 };
 
 pub type OrchestratorResult<T> = Result<T, OrchestratorError>;
@@ -23,6 +25,8 @@ pub struct BackendExecutionStats {
 #[derive(Debug, PartialEq, Eq)]
 pub struct MatrixHandle {
     backend_kind: BackendKind,
+    precision: PrecisionProfile,
+    native_abi_version: Option<u32>,
     raw: GafimeGpuMatrix,
     rows: u64,
     cols: u32,
@@ -30,8 +34,19 @@ pub struct MatrixHandle {
 
 impl MatrixHandle {
     pub fn host(backend_kind: BackendKind, rows: u64, cols: u32) -> Self {
+        Self::host_with_precision(backend_kind, PrecisionProfile::Mixed, rows, cols)
+    }
+
+    pub fn host_with_precision(
+        backend_kind: BackendKind,
+        precision: PrecisionProfile,
+        rows: u64,
+        cols: u32,
+    ) -> Self {
         Self {
             backend_kind,
+            precision,
+            native_abi_version: None,
             raw: core::ptr::null_mut(),
             rows,
             cols,
@@ -65,6 +80,31 @@ impl MatrixHandle {
     ) -> Self {
         Self {
             backend_kind,
+            precision: PrecisionProfile::Mixed,
+            native_abi_version: Some(GAFIME_ABI_VERSION),
+            raw,
+            rows,
+            cols,
+        }
+    }
+
+    /// Construct a profile-keyed handle for an ABI 1.1 backend matrix.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must identify a live matrix allocated for `precision` by
+    /// `backend_kind` and must outlive every borrow of the returned handle.
+    pub unsafe fn native_with_precision(
+        backend_kind: BackendKind,
+        precision: PrecisionProfile,
+        raw: *mut c_void,
+        rows: u64,
+        cols: u32,
+    ) -> Self {
+        Self {
+            backend_kind,
+            precision,
+            native_abi_version: Some(GAFIME_PRECISION_ABI_VERSION),
             raw,
             rows,
             cols,
@@ -73,6 +113,16 @@ impl MatrixHandle {
 
     pub fn backend_kind(&self) -> BackendKind {
         self.backend_kind
+    }
+
+    pub fn precision(&self) -> PrecisionProfile {
+        self.precision
+    }
+
+    /// Return the native allocation ABI that owns this handle. Host-only
+    /// handles have no native ABI identity.
+    pub fn native_abi_version(&self) -> Option<u32> {
+        self.native_abi_version
     }
 
     pub fn raw(&self) -> GafimeGpuMatrix {
@@ -104,5 +154,33 @@ pub trait ComputeBackend {
         matrix: &MatrixHandle,
         protocol: &GafimeLaunchProtocol,
         result: &mut GafimeResultTable,
+    ) -> OrchestratorResult<BackendExecutionStats>;
+}
+
+/// Additive ABI 1.1 execution trait. Implementations dispatch once per plan to
+/// a profile-specialized function table; structural planning remains shared.
+pub trait PrecisionComputeBackend {
+    fn backend_kind(&self) -> BackendKind;
+
+    fn execution_device_memory_peak_bytes_v2(
+        &mut self,
+        _matrix: &MatrixHandle,
+        _protocol: &GafimePrecisionLaunchProtocol,
+    ) -> OrchestratorResult<Option<u64>> {
+        Ok(None)
+    }
+
+    fn execute_fp32(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimePrecisionLaunchProtocol,
+        result: &mut GafimeResultTable,
+    ) -> OrchestratorResult<BackendExecutionStats>;
+
+    fn execute_f64(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimePrecisionLaunchProtocol,
+        result: &mut GafimeResultTableF64,
     ) -> OrchestratorResult<BackendExecutionStats>;
 }

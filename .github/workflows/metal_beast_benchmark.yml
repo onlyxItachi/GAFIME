@@ -3,16 +3,20 @@ name: Metal Beast Benchmark
 on:
   workflow_dispatch:
     inputs:
+      expected_candidate_sha:
+        description: "Exact full PR #70 head SHA to validate and benchmark"
+        required: true
+        type: string
       preset:
         description: "Benchmark preset: smoke, beast, absurd"
         required: false
         default: "beast"
       n_samples:
-        description: "Override sample count; 0 uses preset default"
+        description: "Override native-decomposition row count; 0 uses preset default"
         required: false
         default: "0"
       n_features:
-        description: "Override feature count; 0 uses preset default"
+        description: "Override native-decomposition unary candidate count; 0 uses preset default"
         required: false
         default: "0"
       python_version:
@@ -26,6 +30,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   metal_beast:
@@ -36,7 +41,7 @@ jobs:
         runner_label:
           - macos-26
     runs-on: ${{ matrix.runner_label }}
-    timeout-minutes: 120
+    timeout-minutes: 240
 
     env:
       BENCH_PRESET: ${{ github.event.inputs.preset || 'beast' }}
@@ -44,10 +49,109 @@ jobs:
       BENCH_N_FEATURES: ${{ github.event.inputs.n_features || '0' }}
       CIBW_SELECTOR: ${{ github.event.inputs.cibw_build || 'cp311-*' }}
       PYTHON_VERSION: ${{ github.event.inputs.python_version || '3.11' }}
+      METAL_RUNNER_LABEL: ${{ matrix.runner_label }}
       RUST_VERSION: '1.97.1'
+      BASELINE_COMMIT: '8dfcd20a148d90917f654aea707c324535474b0a'
+      EXPECTED_CANDIDATE_SHA: ${{ github.event.inputs.expected_candidate_sha }}
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.expected_candidate_sha }}
+
+      - name: Require exact live PR head before builds
+        shell: bash
+        env:
+          GITHUB_READ_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import urllib.request
+
+          expected = os.environ["EXPECTED_CANDIDATE_SHA"]
+          if re.fullmatch(r"[0-9a-f]{40}", expected) is None:
+              raise SystemExit("expected_candidate_sha must be a full lowercase commit SHA")
+          checkout = subprocess.run(
+              ["git", "rev-parse", "HEAD"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.strip()
+          if checkout != expected:
+              raise SystemExit(
+                  f"checked-out candidate {checkout} does not match expected {expected}"
+              )
+          if subprocess.run(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout:
+              raise SystemExit("candidate checkout is not clean before the build")
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          request = urllib.request.Request(
+              f"{os.environ['GITHUB_API_URL']}/repos/{repository}/pulls/70",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GITHUB_READ_TOKEN']}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              pull = json.load(response)
+          live_head = pull.get("head", {})
+          live_sha = live_head.get("sha")
+          if live_sha != expected:
+              raise SystemExit(
+                  f"live PR #70 head {live_sha!r} does not match expected {expected}"
+              )
+          if live_head.get("repo", {}).get("full_name") != repository:
+              raise SystemExit("PR #70 head is not owned by the expected repository")
+          if live_head.get("ref") != "codex/issue-25-three-precision-profiles":
+              raise SystemExit(
+                  f"unexpected PR #70 branch: {live_head.get('ref')!r}"
+              )
+          if pull.get("state") != "open":
+              raise SystemExit(f"PR #70 is not open: {pull.get('state')!r}")
+
+          record = {
+              "schema": "gafime.hosted-exact-pr-head.v1",
+              "pull_request": 70,
+              "repository": repository,
+              "branch": live_head["ref"],
+              "expected_candidate_sha": expected,
+              "checkout_sha": checkout,
+              "live_pr_head_sha": live_sha,
+              "status": "pass",
+          }
+          evidence_path = Path(os.environ["RUNNER_TEMP"]) / "gafime-pr70-exact-head.json"
+          evidence_path.write_text(
+              json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(record, indent=2, sort_keys=True))
+          PY
+
+      - name: Prepare external benchmark paths
+        shell: bash
+        run: |
+          {
+            echo "METAL_RESULTS_DIR=$RUNNER_TEMP/gafime-metal-beast-results"
+            echo "METAL_WHEELHOUSE=$RUNNER_TEMP/gafime-metal-candidate-wheelhouse"
+            echo "METAL_BASELINE_WHEELHOUSE=$RUNNER_TEMP/gafime-metal-baseline-wheelhouse"
+            echo "METAL_BASELINE_SOURCE=$RUNNER_TEMP/gafime-metal-baseline-source"
+            echo "METAL_VENV=$RUNNER_TEMP/gafime-metal-candidate-venv"
+            echo "METAL_BASELINE_VENV=$RUNNER_TEMP/gafime-metal-baseline-venv"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/gafime-metal-beast-results"
+          cp "$RUNNER_TEMP/gafime-pr70-exact-head.json" \
+            "$RUNNER_TEMP/gafime-metal-beast-results/exact-pr-head.json"
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -59,9 +163,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p metal-beast-results
+          mkdir -p "$METAL_RESULTS_DIR"
           python - <<'PY'
           import json
+          import os
           import platform
           import subprocess
           import sys
@@ -79,7 +184,7 @@ jobs:
                   return {"error_type": type(exc).__name__, "error": str(exc)}
 
           specs = {
-              "runner_label": "${{ matrix.runner_label }}",
+              "runner_label": os.environ["METAL_RUNNER_LABEL"],
               "python": sys.version,
               "executable": sys.executable,
               "platform": platform.platform(),
@@ -96,7 +201,9 @@ jobs:
                   "system_profiler": run(["system_profiler", "-json", "SPHardwareDataType", "SPDisplaysDataType", "SPSoftwareDataType"], timeout=120),
               },
           }
-          Path("metal-beast-results/runner-specs.json").write_text(json.dumps(specs, indent=2, sort_keys=True), encoding="utf-8")
+          (Path(os.environ["METAL_RESULTS_DIR"]) / "runner-specs.json").write_text(
+              json.dumps(specs, indent=2, sort_keys=True), encoding="utf-8"
+          )
           print(json.dumps(specs, indent=2, sort_keys=True))
           PY
 
@@ -151,7 +258,7 @@ jobs:
           MM
           clang++ -std=c++17 -fobjc-arc -framework Foundation -framework Metal \
             "$probe_src" -o "$probe_bin"
-          "$probe_bin" | tee metal-beast-results/metal-device.json
+          "$probe_bin" | tee "$METAL_RESULTS_DIR/metal-device.json"
 
       - name: Install build tooling
         shell: bash
@@ -179,15 +286,60 @@ jobs:
             metal-beast-rust-${{ env.RUST_VERSION }}-${{ matrix.runner_label }}-${{ runner.os }}-${{ runner.arch }}-
             metal-lab-rust-${{ env.RUST_VERSION }}-${{ runner.os }}-${{ runner.arch }}-
 
+      - name: Prepare exact clean baseline source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$BASELINE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "baseline commit must be a full lowercase SHA" >&2
+            exit 2
+          fi
+          git cat-file -e "$BASELINE_COMMIT^{commit}"
+          if [[ -e "$METAL_BASELINE_SOURCE" ]]; then
+            echo "baseline source path already exists: $METAL_BASELINE_SOURCE" >&2
+            exit 2
+          fi
+          git worktree add --detach "$METAL_BASELINE_SOURCE" "$BASELINE_COMMIT"
+          test "$(git -C "$METAL_BASELINE_SOURCE" rev-parse HEAD)" = "$BASELINE_COMMIT"
+          test -z "$(git -C "$METAL_BASELINE_SOURCE" status --porcelain=v1 --untracked-files=all)"
+
+      - name: Stage baseline Metal payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$METAL_BASELINE_SOURCE"
+          python .github/scripts/stage_metal_payload.py
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+      - name: Build exact baseline core wheel with Metal
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$METAL_BASELINE_SOURCE"
+          python -m cibuildwheel --output-dir "$METAL_BASELINE_WHEELHOUSE"
+          test "$(git rev-parse HEAD)" = "$BASELINE_COMMIT"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+        env:
+          CIBW_BUILD: ${{ env.CIBW_SELECTOR }}
+          CIBW_ARCHS_MACOS: arm64
+          CIBW_BUILD_VERBOSITY: "1"
+          CIBW_BEFORE_ALL_MACOS: "source $HOME/.cargo/env || true"
+          CIBW_ENVIRONMENT_MACOS: "GAFIME_SKIP_CUDA=1 STRICT_CPU=1 PATH=$HOME/.cargo/bin:$PATH"
+          CIBW_TEST_REQUIRES: ""
+          CIBW_TEST_COMMAND: >-
+            python -m gafime.cli --check &&
+            python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend metal --execute-metal
+
       - name: Stage bundled Metal payload
         shell: bash
         run: python .github/scripts/stage_metal_payload.py
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
 
-      - name: Build benchmark core wheel with Metal
+      - name: Build candidate core wheel with Metal
         shell: bash
-        run: python -m cibuildwheel --output-dir wheelhouse
+        run: python -m cibuildwheel --output-dir "$METAL_WHEELHOUSE"
         env:
           CIBW_BUILD: ${{ env.CIBW_SELECTOR }}
           CIBW_ARCHS_MACOS: arm64
@@ -204,31 +356,941 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for whl in wheelhouse/*.whl; do
-            echo "=== $(basename "$whl") ===" | tee -a metal-beast-results/wheel-contents.txt
+          for whl in "$METAL_BASELINE_WHEELHOUSE"/*.whl "$METAL_WHEELHOUSE"/*.whl; do
+            echo "=== $(basename "$whl") ===" | tee -a "$METAL_RESULTS_DIR/wheel-contents.txt"
             python -m zipfile -l "$whl" \
-              | grep -E '\.(so|dylib|metallib|pyd)$' \
-              | tee -a metal-beast-results/wheel-contents.txt \
-              || echo "  (no native binaries found!)" | tee -a metal-beast-results/wheel-contents.txt
-            echo | tee -a metal-beast-results/wheel-contents.txt
+              | grep -E '\.(so|dylib|metallib|pyd)[[:space:]]' \
+              | tee -a "$METAL_RESULTS_DIR/wheel-contents.txt" \
+              || echo "  (no native binaries found!)" | tee -a "$METAL_RESULTS_DIR/wheel-contents.txt"
+            echo | tee -a "$METAL_RESULTS_DIR/wheel-contents.txt"
           done
+
+      - name: Build and validate native Metal event evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$BENCH_PRESET" in
+            smoke)
+              native_rows=256
+              native_candidates=8
+              native_mi_bins=8
+              ;;
+            beast)
+              native_rows=1024
+              native_candidates=12
+              native_mi_bins=24
+              ;;
+            absurd)
+              native_rows=2048
+              native_candidates=16
+              native_mi_bins=32
+              ;;
+            *)
+              echo "unknown Metal benchmark preset: $BENCH_PRESET" >&2
+              exit 2
+              ;;
+          esac
+          if [[ ! "$BENCH_N_SAMPLES" =~ ^[0-9]+$ || ! "$BENCH_N_FEATURES" =~ ^[0-9]+$ ]]; then
+            echo "n_samples and n_features must be non-negative integers" >&2
+            exit 2
+          fi
+          if [[ "$BENCH_N_SAMPLES" != "0" ]]; then
+            native_rows="$BENCH_N_SAMPLES"
+          fi
+          if [[ "$BENCH_N_FEATURES" != "0" ]]; then
+            native_candidates="$BENCH_N_FEATURES"
+          fi
+          if (( native_rows < 128 || native_rows > 4096 )); then
+            echo "native row count must be 128..4096 for the cached Spearman phase" >&2
+            exit 2
+          fi
+          if (( native_candidates < 2 )); then
+            echo "native candidate count must be at least 2 for the Spearman rank phase" >&2
+            exit 2
+          fi
+          native_top_k="$native_candidates"
+          if (( native_top_k > 8 )); then
+            native_top_k=8
+          fi
+
+          cmake -S src/metal -B "$METAL_RESULTS_DIR/native-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DGAFIME_METAL_BUILD_BENCHMARKS=ON \
+            -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="$METAL_RESULTS_DIR/native-bin"
+          cmake --build "$METAL_RESULTS_DIR/native-build" --config Release \
+            --target gafime_metal_precision_native_timing --parallel 2
+
+          baseline_wheels=("$METAL_BASELINE_WHEELHOUSE"/gafime-*.whl)
+          candidate_wheels=("$METAL_WHEELHOUSE"/gafime-*.whl)
+          if [[ "${#baseline_wheels[@]}" -ne 1 || ! -f "${baseline_wheels[0]}" ]]; then
+            echo "expected exactly one baseline Core wheel" >&2
+            exit 2
+          fi
+          if [[ "${#candidate_wheels[@]}" -ne 1 || ! -f "${candidate_wheels[0]}" ]]; then
+            echo "expected exactly one candidate Core wheel" >&2
+            exit 2
+          fi
+          baseline_wheel="$(cd "$(dirname "${baseline_wheels[0]}")" && pwd)/$(basename "${baseline_wheels[0]}")"
+          candidate_wheel="$(cd "$(dirname "${candidate_wheels[0]}")" && pwd)/$(basename "${candidate_wheels[0]}")"
+          native_binary="$METAL_RESULTS_DIR/native-bin/gafime_metal_precision_native_timing"
+          if (( 16#${EXPECTED_CANDIDATE_SHA:0:2} % 2 == 0 )); then
+            first_variant_order=(baseline candidate)
+          else
+            first_variant_order=(candidate baseline)
+          fi
+          FIRST_VARIANT_ORDER="${first_variant_order[*]}" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          first = os.environ["FIRST_VARIANT_ORDER"].split()
+          assert set(first) == {"baseline", "candidate"} and len(first) == 2
+          path = Path(os.environ["METAL_RESULTS_DIR"]) / "metal-native-run-order.json"
+          path.write_text(json.dumps({
+              "schema": "gafime.metal.native-ab-order.v1",
+              "seed_source": os.environ["EXPECTED_CANDIDATE_SHA"],
+              "input_policies": ["common-f64", "native"],
+              "blocks": [
+                  {"ab_block": 0, "variant_sequence": first},
+                  {"ab_block": 1, "variant_sequence": list(reversed(first))},
+              ],
+              "process_isolation": "fresh_helper_process_per_variant_trial",
+          }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+          for variant in baseline candidate; do
+            if [[ "$variant" == baseline ]]; then
+              wheel_path="$baseline_wheel"
+            else
+              wheel_path="$candidate_wheel"
+            fi
+            installed_payload_root="$METAL_RESULTS_DIR/installed-payload-$variant"
+            WHEEL_PATH="$wheel_path" PAYLOAD_ROOT="$installed_payload_root" python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import zipfile
+
+          wheel = Path(os.environ["WHEEL_PATH"]).resolve()
+          root = Path(os.environ["PAYLOAD_ROOT"]).resolve()
+          members = (
+              "gafime/_metal/libgafime_metal_v1.dylib",
+              "gafime/_metal/gafime_metal_v1.metallib",
+          )
+          root.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+              missing = [member for member in members if member not in names]
+              if missing:
+                  raise SystemExit(f"wheel is missing exact Metal payload members: {missing}")
+              for member in members:
+                  destination = root / member
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.write_bytes(archive.read(member))
+                  digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+                  print(f"{member}: {digest} ({destination.stat().st_size} bytes)")
+          PY
+          done
+
+          baseline_payload_path="$METAL_RESULTS_DIR/installed-payload-baseline/gafime/_metal/libgafime_metal_v1.dylib"
+          test -f "$baseline_payload_path"
+          cmake -S "$GITHUB_WORKSPACE/tests/gpu/abi_consumers" \
+            -B "$METAL_RESULTS_DIR/typed-baseline-abi-build" \
+            -DGAFIME_ABI_CONSUMER_PAYLOAD_PATH="$baseline_payload_path" \
+            -DGAFIME_ABI_CONSUMER_BACKEND_KIND=4 \
+            -DGAFIME_ABI_CONSUMER_EXPECTED_ROUTE_COUNT=1 \
+            -DGAFIME_ABI_CONSUMER_TEST_SUFFIX=metal_baseline \
+            -DGAFIME_ABI_CONSUMER_ENABLE_TYPED_BASELINE=ON
+          cmake --build "$METAL_RESULTS_DIR/typed-baseline-abi-build" \
+            --target gafime_abi_1_1_typed_c_consumer_metal_baseline --parallel 2
+          ctest --test-dir "$METAL_RESULTS_DIR/typed-baseline-abi-build" \
+            --output-on-failure \
+            --tests-regex '^gafime_abi_1_1_typed_c_consumer_metal_baseline$'
+
+          for input_policy in common-f64 native; do
+            for ab_block in 0 1; do
+              if [[ "$ab_block" == 0 ]]; then
+                variant_order=("${first_variant_order[@]}")
+              else
+                variant_order=("${first_variant_order[1]}" "${first_variant_order[0]}")
+              fi
+              variant_sequence="${variant_order[0]},${variant_order[1]}"
+              for variant in "${variant_order[@]}"; do
+                if [[ "$variant" == baseline ]]; then
+                  wheel_path="$baseline_wheel"
+                  product_root="$METAL_BASELINE_SOURCE"
+                  product_commit="$BASELINE_COMMIT"
+                else
+                  wheel_path="$candidate_wheel"
+                  product_root="$GITHUB_WORKSPACE"
+                  product_commit="$EXPECTED_CANDIDATE_SHA"
+                fi
+                installed_payload_root="$METAL_RESULTS_DIR/installed-payload-$variant"
+                payload_path="$installed_payload_root/gafime/_metal/libgafime_metal_v1.dylib"
+                metallib_path="$installed_payload_root/gafime/_metal/gafime_metal_v1.metallib"
+                native_json="$METAL_RESULTS_DIR/metal-native-timing-$input_policy-block-$ab_block-$variant-$METAL_RUNNER_LABEL.json"
+                GAFIME_WHEEL_PATH="$wheel_path" \
+                GAFIME_METAL_V1_LIB="$payload_path" \
+                GAFIME_METAL_V1_METALLIB="$metallib_path" \
+                "$native_binary" \
+                  --variant "$variant" \
+                  --ab-block "$ab_block" \
+                  --variant-sequence "$variant_sequence" \
+                  --input-policy "$input_policy" \
+                  --rows "$native_rows" \
+                  --candidates "$native_candidates" \
+                  --mi-bins "$native_mi_bins" \
+                  --top-k "$native_top_k" \
+                  --warmups 10 \
+                  --repeats 30 \
+                  --metallib "$metallib_path" \
+                  --shader-source "$product_root/src/metal/shader.metal" \
+                  --payload "$payload_path" \
+                  --wheel "$wheel_path" \
+                  --source-root "$product_root" \
+                  --source-commit "$product_commit" \
+                  --harness-source-root "$GITHUB_WORKSPACE" \
+                  --harness-source-commit "$EXPECTED_CANDIDATE_SHA" \
+                  --json "$native_json"
+              done
+            done
+          done
+
+          python - <<'PY'
+          import hashlib
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import zipfile
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with Path(path).open("rb") as handle:
+                  for block in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(block)
+              return digest.hexdigest()
+
+          required_file_identities = {
+              "benchmark_source",
+              "shader_source",
+              "benchmark_binary",
+              "harness_source",
+              "metallib",
+              "payload",
+              "python_executable",
+              "wheel",
+          }
+          expected_symbols = {
+              "candidate": {
+              "gafime_gpu_numeric_routes_v2",
+              "gafime_gpu_matrix_alloc_v2",
+              "gafime_gpu_matrix_upload_v2",
+              "gafime_gpu_matrix_update_target_v2",
+              "gafime_gpu_execute_v2",
+              "gafime_gpu_execution_memory_peak_v2",
+              "gafime_gpu_permutation_memory_peak_v2",
+              "gafime_gpu_permutation_pvalues_v2",
+              "gafime_gpu_interaction_diagnostics_v2",
+              "gafime_gpu_matrix_free_v2",
+              },
+              "baseline": {
+                  "gafime_gpu_precision_capabilities",
+                  "gafime_gpu_matrix_alloc_v2",
+                  "gafime_gpu_matrix_upload_f32_v2",
+                  "gafime_gpu_matrix_upload_f64_v2",
+                  "gafime_gpu_matrix_update_target_f32_v2",
+                  "gafime_gpu_matrix_update_target_f64_v2",
+                  "gafime_gpu_execute_f32_v2",
+                  "gafime_gpu_execute_f64_v2",
+                  "gafime_gpu_execution_memory_peak_v2",
+                  "gafime_gpu_interaction_diagnostics",
+                  "gafime_gpu_matrix_free",
+              },
+          }
+          expected_surface = {
+              "baseline": "precision-typed-v1.1",
+              "candidate": "numeric-route-v2",
+          }
+          expected_commit = {
+              "baseline": os.environ["BASELINE_COMMIT"],
+              "candidate": os.environ["EXPECTED_CANDIDATE_SHA"],
+          }
+          expected_metric_records = {
+              ("metric_kernel", "pearson"),
+              ("metric_kernel", "r2"),
+              ("metric_kernel", "mutual_info"),
+              ("metric_kernel", "spearman"),
+              ("ranking_kernel", "spearman_target_ranks"),
+              ("ranking_topk_and_gather", "spearman"),
+          }
+          expected_phases = {
+              "matrix_allocation",
+              "h2d_upload_or_unified_write",
+              "planning_and_descriptor_materialization",
+              "metric_kernel",
+              "ranking_kernel",
+              "ranking_topk_and_gather",
+              "d2h_result_readback",
+              "report_construction",
+          }
+          expected_host_operations = {
+              "matrix_allocation",
+              "h2d_upload_or_unified_write",
+              "planning_and_descriptor_materialization",
+              "d2h_result_readback",
+              "report_construction",
+          }
+          results = Path(os.environ["METAL_RESULTS_DIR"])
+          order_document = json.loads(
+              (results / "metal-native-run-order.json").read_text(encoding="utf-8")
+          )
+          assert order_document["schema"] == "gafime.metal.native-ab-order.v1"
+          assert order_document["process_isolation"] == (
+              "fresh_helper_process_per_variant_trial"
+          )
+          assert order_document["input_policies"] == ["common-f64", "native"]
+          expected_sequences = {
+              item["ab_block"]: tuple(item["variant_sequence"])
+              for item in order_document["blocks"]
+          }
+          assert set(expected_sequences) == {0, 1}
+          assert expected_sequences[1] == tuple(reversed(expected_sequences[0]))
+          assert set(expected_sequences[0]) == {"baseline", "candidate"}
+          input_policies = ("common-f64", "native")
+          artifact_cells = [
+              (input_policy, ab_block, variant)
+              for input_policy in input_policies
+              for ab_block in (0, 1)
+              for variant in expected_sequences[ab_block]
+          ]
+          artifacts = {}
+          for input_policy, ab_block, variant in artifact_cells:
+              native_path = results / (
+                  f"metal-native-timing-{input_policy}-block-{ab_block}-{variant}-"
+                  f"{os.environ['METAL_RUNNER_LABEL']}.json"
+              )
+              data = json.loads(native_path.read_text(encoding="utf-8"))
+              assert data["schema"] == "gafime.metal.native_timing.v1"
+              assert data["status"] == "pass" and data["variant"] == variant
+              assert data["ab_block"] == ab_block
+              assert tuple(data["variant_sequence"]) == expected_sequences[ab_block]
+              assert data["process_isolation"] == (
+                  "fresh_helper_process_per_variant_trial"
+              )
+              assert data["backend"] == "metal" and data["profile"] == "fp32"
+              assert data["input_policy"] == input_policy
+              assert isinstance(data.get("input_identity"), dict)
+              assert data["input_identity"]
+              assert data["source_commit"] == expected_commit[variant]
+              assert data["product_source_commit"] == expected_commit[variant]
+              assert data["harness_source_commit"] == os.environ["EXPECTED_CANDIDATE_SHA"]
+              git_provenance = data.get("git_provenance")
+              assert isinstance(git_provenance, dict)
+              git_executable = Path(git_provenance["executable"])
+              assert git_executable.is_absolute() and git_executable.is_file()
+              assert git_executable.stat().st_size > 0
+              assert sha256(git_executable) == git_provenance["sha256"]
+              assert git_provenance["version"].startswith("git version ")
+              assert git_provenance["path_lookup_ignored"] is True
+              assert all(
+                  isinstance(name, str) and name.startswith("GIT_")
+                  for name in git_provenance["sanitized_environment_variables"]
+              )
+              assert git_provenance["controlled_environment_variables"] == [
+                  "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"
+              ]
+              assert data["precision_domains"] == {
+                  "storage": "fp32", "pointwise": "fp32",
+                  "reduction": "fp32", "result": "fp32",
+              }
+              assert data["warmups"] >= 10 and data["repeats"] >= 30
+              assert data["gpu_timing_supported"] is True
+              environment = data.get("environment")
+              assert isinstance(environment, dict)
+              assert all(isinstance(key, str) and isinstance(value, str)
+                         for key, value in environment.items())
+              assert data["clock_and_power_capture_point"] == (
+                  "before and after all timed benchmark regions"
+              )
+              for phase in ("before", "after"):
+                  state = data["clock_and_power_state"][phase]
+                  assert state["system_profiler"]["status"] == "pass"
+                  assert state["system_profiler"]["output"]
+                  assert state["cpu_power_management"]["status"] in {"pass", "unavailable"}
+                  assert state["cpu_governor"]["status"] == "unavailable"
+                  assert state["cpu_governor"].get("detail")
+                  assert state["metal_gpu_clock_power"]["status"] == "unavailable"
+                  assert state["metal_gpu_clock_power"].get("detail")
+
+              provenance = data["provenance"]
+              assert set(provenance) == required_file_identities | {
+                  "product_source_binding", "harness_source_binding"
+              }
+              for label in required_file_identities:
+                  identity = provenance[label]
+                  path = Path(identity["path"])
+                  assert path.is_file()
+                  assert path.stat().st_size == identity["size_bytes"] > 0
+                  assert sha256(path) == identity["sha256"]
+              product_binding = provenance["product_source_binding"]
+              harness_binding = provenance["harness_source_binding"]
+              assert product_binding["commit"] == expected_commit[variant]
+              assert Path(product_binding["root"]).is_absolute()
+              assert Path(product_binding["git_dir"]).is_absolute()
+              assert Path(product_binding["git_dir"]).is_dir()
+              assert Path(product_binding["git_common_dir"]).is_absolute()
+              assert Path(product_binding["git_common_dir"]).is_dir()
+              assert product_binding["tree_state"]["status"] == "clean"
+              assert product_binding == data["product_source_binding"]
+              assert data["product_source_tree_state"]["status"] == "clean"
+              assert Path(provenance["shader_source"]["path"]).resolve() == (
+                  Path(product_binding["root"]) / "src" / "metal" / "shader.metal"
+              ).resolve()
+              assert harness_binding["commit"] == os.environ["EXPECTED_CANDIDATE_SHA"]
+              assert Path(harness_binding["root"]).is_absolute()
+              assert Path(harness_binding["git_dir"]).is_absolute()
+              assert Path(harness_binding["git_dir"]).is_dir()
+              assert Path(harness_binding["git_common_dir"]).is_absolute()
+              assert Path(harness_binding["git_common_dir"]).is_dir()
+              assert harness_binding["tree_state"]["status"] == "clean"
+              assert harness_binding["current_git_blob"] == harness_binding["head_git_blob"]
+              assert harness_binding["source_sha256"] == provenance["harness_source"]["sha256"]
+              assert harness_binding == data["harness_source_binding"]
+              harness_blob = data["harness_source_blob"]
+              assert set(harness_blob) == {
+                  "relative_path", "source_sha256", "current_git_blob", "head_git_blob"
+              }
+              assert harness_blob["relative_path"] == harness_binding["relative_path"]
+              assert harness_blob["source_sha256"] == provenance["harness_source"]["sha256"]
+              assert harness_blob["current_git_blob"] == harness_blob["head_git_blob"]
+              assert provenance["harness_source"]["sha256"] == (
+                  provenance["benchmark_source"]["sha256"]
+              )
+
+              payload_path = Path(provenance["payload"]["path"]).resolve()
+              assert payload_path.is_relative_to((results / f"installed-payload-{variant}").resolve())
+              with zipfile.ZipFile(provenance["wheel"]["path"]) as archive:
+                  wheel_payload = archive.read("gafime/_metal/libgafime_metal_v1.dylib")
+                  wheel_metallib = archive.read("gafime/_metal/gafime_metal_v1.metallib")
+              assert hashlib.sha256(wheel_payload).hexdigest() == provenance["payload"]["sha256"]
+              assert hashlib.sha256(wheel_metallib).hexdigest() == provenance["metallib"]["sha256"]
+
+              lifecycle = data["canonical_payload_lifecycle"]
+              assert data["execution_mode"] == "supplemental_internal_kernel"
+              assert lifecycle["status"] == "validated"
+              assert lifecycle["execution_layer"] == "installed_payload_dylib"
+              assert lifecycle["abi"] == "1.1"
+              assert lifecycle["abi_surface"] == expected_surface[variant]
+              assert lifecycle["route_count"] == 1
+              assert lifecycle["profile_mask"] == 1
+              assert lifecycle["storage_dtype_mask"] == 1
+              assert lifecycle["result_dtype_mask"] == 1
+              assert lifecycle["mixed_route_rejected"] is True
+              assert lifecycle["fp64_route_rejected"] is True
+              assert lifecycle["records_field"] == "canonical_payload_records"
+              assert set(lifecycle["symbols"]) == expected_symbols[variant]
+              operation_status = lifecycle["operation_status"]
+              for operation in (
+                  "matrix_update_target",
+                  "execution_memory_peak",
+                  "interaction_diagnostics",
+              ):
+                  assert operation_status[operation]["status"] == "pass"
+                  assert operation_status[operation]["abi_status"] == 0
+              assert operation_status["execution_memory_peak"]["bytes"] > 0
+              assert operation_status["interaction_diagnostics"]["overflow_rows"] == 0
+              assert operation_status["interaction_diagnostics"]["row_flags"] == 0
+              optional_symbols = set(lifecycle.get("optional_symbols", ()))
+              typed_optional_symbols = {
+                  "gafime_gpu_permutation_memory_peak_v2",
+                  "gafime_gpu_permutation_pvalues_f32_v2",
+                  "gafime_gpu_permutation_pvalues_f64_v2",
+              }
+              if variant == "candidate":
+                  assert not optional_symbols
+                  assert operation_status["permutation_memory_peak"]["status"] == "pass"
+                  assert operation_status["permutation_pvalues"]["status"] == "pass"
+                  assert operation_status["permutation_memory_peak"]["abi_status"] == 0
+                  assert operation_status["permutation_pvalues"]["abi_status"] == 0
+                  assert operation_status["permutation_memory_peak"]["bytes"] > 0
+                  assert operation_status["permutation_pvalues"]["row_count"] == 1
+              else:
+                  assert optional_symbols in (set(), typed_optional_symbols)
+                  if optional_symbols:
+                      assert operation_status["permutation_memory_peak"]["status"] == "pass"
+                      assert operation_status["permutation_pvalues"]["status"] == "pass"
+                      assert operation_status["permutation_memory_peak"]["abi_status"] == 0
+                      assert operation_status["permutation_pvalues"]["abi_status"] == 0
+                      assert operation_status["permutation_pvalues"]["row_count"] == 1
+                  else:
+                      assert operation_status["permutation_memory_peak"]["status"] == "unsupported"
+                      assert operation_status["permutation_pvalues"]["status"] == "unsupported"
+                      assert operation_status["permutation_memory_peak"]["abi_status"] == -2
+                      assert operation_status["permutation_pvalues"]["abi_status"] == -2
+
+              records = data["records"]
+              observed_metric_records = {
+                  (record["operation"], record["metric"])
+                  for record in records
+                  if record["operation"] in {
+                      "metric_kernel", "ranking_kernel", "ranking_topk_and_gather"
+                  }
+              }
+              assert observed_metric_records == expected_metric_records
+              assert expected_host_operations <= {record["operation"] for record in records}
+              for record in records:
+                  assert len(record["samples_us"]) == data["repeats"]
+                  assert len(record["raw_samples_us"]) == data["repeats"]
+                  assert all(math.isfinite(value) and value > 0.0
+                             for value in record["samples_us"])
+                  assert record["sample_region_target_met"] is True
+                  if record["operation"] in {
+                      "metric_kernel", "ranking_kernel", "ranking_topk_and_gather",
+                      "d2h_managed_resource_synchronize",
+                  }:
+                      assert record["clock"] == "metal_command_buffer_gpu_timestamps"
+                      assert record["gpu_timestamp_valid_samples"] == data["repeats"]
+                      assert len(record["host_synchronized_samples_us"]) == data["repeats"]
+                      assert record["synchronization"] == (
+                          "commit_then_waitUntilCompleted_before_timestamp_read"
+                      )
+              canonical_records = data["canonical_payload_records"]
+              assert len(canonical_records) >= 11
+              assert expected_phases <= {record["operation"] for record in canonical_records}
+              assert {record["metric"] for record in canonical_records
+                      if record["operation"] == "metric_kernel"} >= {
+                  "pearson", "r2", "mutual_info", "spearman"
+              }
+              assert all(
+                  record["clock"] == "host_steady_clock_canonical_abi1_1"
+                  and record["synchronization"] ==
+                  "canonical_abi1_1_payload_call_returns_after_device_completion"
+                  and len(record["samples_us"]) == data["repeats"]
+                  and len(record["raw_samples_us"]) == data["repeats"]
+                  for record in canonical_records
+              )
+              artifacts[(input_policy, ab_block, variant)] = (native_path, data)
+
+          assert len(artifacts) == 8
+          all_data = [data for _, data in artifacts.values()]
+          assert len({data["provenance"]["benchmark_binary"]["sha256"] for data in all_data}) == 1
+          assert len({data["provenance"]["benchmark_source"]["sha256"] for data in all_data}) == 1
+          assert len({json.dumps(data["harness_source_binding"], sort_keys=True) for data in all_data}) == 1
+          assert len({json.dumps(data["harness_source_blob"], sort_keys=True) for data in all_data}) == 1
+          for variant in ("baseline", "candidate"):
+              variant_data = [
+                  artifacts[(policy, block, variant)][1]
+                  for policy in input_policies
+                  for block in (0, 1)
+              ]
+              assert len({json.dumps(data["product_source_binding"], sort_keys=True) for data in variant_data}) == 1
+              assert len({json.dumps(data["provenance"]["wheel"], sort_keys=True) for data in variant_data}) == 1
+              assert len({json.dumps(data["provenance"]["payload"], sort_keys=True) for data in variant_data}) == 1
+              assert len({json.dumps(data["provenance"]["metallib"], sort_keys=True) for data in variant_data}) == 1
+          for input_policy in input_policies:
+              for variant in ("baseline", "candidate"):
+                  block_data = [
+                      artifacts[(input_policy, block, variant)][1]
+                      for block in (0, 1)
+                  ]
+                  assert block_data[0]["input_identity"] == block_data[1]["input_identity"]
+              assert artifacts[(input_policy, 0, "baseline")][1]["input_identity"] == (
+                  artifacts[(input_policy, 0, "candidate")][1]["input_identity"]
+              )
+          assert json.dumps(
+              artifacts[("common-f64", 0, "baseline")][1]["input_identity"],
+              sort_keys=True,
+          ) != json.dumps(
+              artifacts[("native", 0, "baseline")][1]["input_identity"],
+              sort_keys=True,
+          )
+          assert artifacts[("common-f64", 0, "baseline")][1]["product_source_binding"]["root"] != (
+              artifacts[("common-f64", 0, "candidate")][1]["product_source_binding"]["root"]
+          )
+          assert artifacts[("common-f64", 0, "baseline")][1]["product_source_commit"] != (
+              artifacts[("common-f64", 0, "candidate")][1]["product_source_commit"]
+          )
+
+          for variant in ("baseline", "candidate"):
+              variant_artifacts = [
+                  (input_policy, block, artifacts[(input_policy, block, variant)])
+                  for input_policy in input_policies
+                  for block in (0, 1)
+              ]
+              data = variant_artifacts[0][2][1]
+              manifest = {
+                  "schema": "gafime.precision-profile-native-evidence.v1",
+                  "status": "validated",
+                  "arithmetic_claims_valid": True,
+                  "source_commit": expected_commit[variant],
+                  "validation": {
+                      "artifact_schema": data["schema"],
+                      "abi_surface": expected_surface[variant],
+                      "gpu_timestamps_complete": True,
+                      "warmups": data["warmups"],
+                      "repeats": data["repeats"],
+                      "common_harness_sha256": data["provenance"]["benchmark_binary"]["sha256"],
+                      "provenance_hashes_verified": sorted(required_file_identities),
+                  },
+                  "artifacts": [
+                      {
+                          "variant": variant,
+                          "backend": "metal",
+                          "kind": "metal_events",
+                          "input_policy": input_policy,
+                          "path": native_path.name,
+                          "sha256": sha256(native_path),
+                          "schedule": {
+                              "ab_block": block,
+                              "input_policy": input_policy,
+                              "variant_sequence": list(expected_sequences[block]),
+                              "process_isolation": "fresh_helper_process_per_variant_trial",
+                          },
+                      }
+                      for input_policy, block, (native_path, _) in variant_artifacts
+                  ],
+              }
+              manifest_path = results / f"metal-native-evidence-{variant}.json"
+              manifest_path.write_text(
+                  json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+              print(json.dumps(manifest, indent=2, sort_keys=True))
+          PY
 
       - name: Run installed-wheel Metal beast benchmark
         shell: bash
         run: |
           set -euo pipefail
-          python -m venv .metal-beast-venv
-          . .metal-beast-venv/bin/activate
-          python -m pip install --upgrade pip
-          python -m pip install wheelhouse/gafime-*.whl
+          python -m venv "$METAL_VENV"
+          python -m venv "$METAL_BASELINE_VENV"
+          "$METAL_VENV/bin/python" -m pip install --upgrade pip
+          "$METAL_BASELINE_VENV/bin/python" -m pip install --upgrade pip
+          "$METAL_VENV/bin/python" -m pip install numpy "$METAL_WHEELHOUSE"/gafime-*.whl
+          "$METAL_BASELINE_VENV/bin/python" -m pip install numpy "$METAL_BASELINE_WHEELHOUSE"/gafime-*.whl
+          for python_executable in \
+            "$METAL_BASELINE_VENV/bin/python" "$METAL_VENV/bin/python"; do
+            "$python_executable" - <<'PY'
+          import gafime
+
+          for precision in ("mixed", "fp64"):
+              try:
+                  gafime.backend_capabilities(
+                      "metal", probe=True, precision=precision
+                  )
+              except ValueError as exc:
+                  message = str(exc)
+                  assert "Metal supports precision='fp32' only" in message, message
+              else:
+                  raise AssertionError(
+                      f"explicit Metal precision={precision!r} did not fail closed"
+                  )
+          print("installed-wheel explicit Metal mixed/fp64 rejection: pass")
+          PY
+          done
           (
             cd /tmp
-            GAFIME_METAL_BENCHMARK_OUTPUT="$GITHUB_WORKSPACE/metal-beast-results/metal-hardcore-${{ matrix.runner_label }}.json" \
-              python "$GITHUB_WORKSPACE/tests/metal_hardcore_benchmark.py" \
-                --preset "$BENCH_PRESET" \
-                --n-samples "$BENCH_N_SAMPLES" \
-                --n-features "$BENCH_N_FEATURES"
+            case "$BENCH_PRESET" in
+              smoke)
+                workload_args=(--workload small-latency)
+                ;;
+              beast)
+                workload_args=(--workload release)
+                ;;
+              absurd)
+                workload_args=(--workload release)
+                ;;
+              *)
+                echo "unknown Metal benchmark preset: $BENCH_PRESET" >&2
+                exit 2
+                ;;
+            esac
+            baseline_wheels=("$METAL_BASELINE_WHEELHOUSE"/gafime-*.whl)
+            candidate_wheels=("$METAL_WHEELHOUSE"/gafime-*.whl)
+            test "${#baseline_wheels[@]}" -eq 1
+            test "${#candidate_wheels[@]}" -eq 1
+            python "$GITHUB_WORKSPACE/tests/release_measure/perf_13_precision_profiles.py" \
+              --variant baseline="$METAL_BASELINE_VENV/bin/python" \
+              --variant candidate="$METAL_VENV/bin/python" \
+              --source-root baseline="$METAL_BASELINE_SOURCE" \
+              --source-root candidate="$GITHUB_WORKSPACE" \
+              --wheel baseline="${baseline_wheels[0]}" \
+              --wheel candidate="${candidate_wheels[0]}" \
+              --native-evidence baseline="$METAL_RESULTS_DIR/metal-native-evidence-baseline.json" \
+              --native-evidence candidate="$METAL_RESULTS_DIR/metal-native-evidence-candidate.json" \
+              --backend metal \
+              --profile fp32 \
+              --input-policy common-f64,native \
+              --warmups 10 \
+              --repetitions 30 \
+              --min-sample-ms 100 \
+              --bootstrap-resamples 2000 \
+              --ab-blocks 2 \
+              --seed 20260809 \
+              "${workload_args[@]}" \
+              --output "$METAL_RESULTS_DIR/metal-precision-profiles-$METAL_RUNNER_LABEL.json"
           )
+
+      - name: Run exact-head canonical cold A/B gate
+        shell: bash
+        env:
+          GITHUB_READ_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # A moved PR head cannot be represented as exact-head hosted evidence,
+          # even if this job began on the expected commit.
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import urllib.request
+
+          expected = os.environ["EXPECTED_CANDIDATE_SHA"]
+          checkout = subprocess.run(
+              ["git", "rev-parse", "HEAD"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.strip()
+          if checkout != expected:
+              raise SystemExit(
+                  f"candidate checkout moved from exact head: {checkout} != {expected}"
+              )
+          request = urllib.request.Request(
+              f"{os.environ['GITHUB_API_URL']}/repos/"
+              f"{os.environ['GITHUB_REPOSITORY']}/pulls/70",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GITHUB_READ_TOKEN']}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              live_sha = json.load(response).get("head", {}).get("sha")
+          if live_sha != expected:
+              raise SystemExit(
+                  f"live PR #70 head moved during the build: {live_sha!r} != {expected}"
+              )
+          PY
+
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test "$(git -C "$METAL_BASELINE_SOURCE" rev-parse HEAD)" = "$BASELINE_COMMIT"
+          test -z "$(git -C "$METAL_BASELINE_SOURCE" status --porcelain=v1 --untracked-files=all)"
+
+          cold_harness="$GITHUB_WORKSPACE/tests/release_measure/cold_lifecycle.py"
+          cold_relative="tests/release_measure/cold_lifecycle.py"
+          test -f "$cold_harness"
+          cold_harness_sha="$(shasum -a 256 "$cold_harness" | awk '{print $1}')"
+          cold_harness_blob="$(git hash-object "$cold_harness")"
+          cold_head_blob="$(git rev-parse "HEAD:$cold_relative")"
+          test "$cold_harness_blob" = "$cold_head_blob"
+
+          baseline_wheels=("$METAL_BASELINE_WHEELHOUSE"/gafime-*.whl)
+          candidate_wheels=("$METAL_WHEELHOUSE"/gafime-*.whl)
+          test "${#baseline_wheels[@]}" -eq 1
+          test "${#candidate_wheels[@]}" -eq 1
+          baseline_wheel="$(cd "$(dirname "${baseline_wheels[0]}")" && pwd)/$(basename "${baseline_wheels[0]}")"
+          candidate_wheel="$(cd "$(dirname "${candidate_wheels[0]}")" && pwd)/$(basename "${candidate_wheels[0]}")"
+          baseline_payload="$METAL_RESULTS_DIR/installed-payload-baseline/gafime/_metal/libgafime_metal_v1.dylib"
+          candidate_payload="$METAL_RESULTS_DIR/installed-payload-candidate/gafime/_metal/libgafime_metal_v1.dylib"
+          test -x "$METAL_BASELINE_VENV/bin/python"
+          test -x "$METAL_VENV/bin/python"
+          test -f "$baseline_payload"
+          test -f "$candidate_payload"
+
+          for ab_block in 0 1; do
+            if [[ "$ab_block" == 0 ]]; then
+              variant_order=(baseline candidate)
+            else
+              variant_order=(candidate baseline)
+            fi
+            variant_sequence="${variant_order[0]},${variant_order[1]}"
+            for variant in "${variant_order[@]}"; do
+              if [[ "$variant" == baseline ]]; then
+                python_executable="$METAL_BASELINE_VENV/bin/python"
+                payload_path="$baseline_payload"
+                source_root="$METAL_BASELINE_SOURCE"
+                wheel_path="$baseline_wheel"
+              else
+                python_executable="$METAL_VENV/bin/python"
+                payload_path="$candidate_payload"
+                source_root="$GITHUB_WORKSPACE"
+                wheel_path="$candidate_wheel"
+              fi
+              cold_output="$METAL_RESULTS_DIR/metal-cold-lifecycle-block-$ab_block-$variant-$METAL_RUNNER_LABEL.json"
+              (
+                cd "$RUNNER_TEMP"
+                "$python_executable" "$cold_harness" \
+                  --backend metal \
+                  --payload "$payload_path" \
+                  --profile fp32 \
+                  --repetitions 30 \
+                  --bootstrap-resamples 2000 \
+                  --seed 20260809 \
+                  --source-root "$source_root" \
+                  --wheel "$wheel_path" \
+                  --variant "$variant" \
+                  --ab-block "$ab_block" \
+                  --variant-sequence "$variant_sequence" \
+                  --timeout-seconds 300 \
+                  --output "$cold_output"
+              )
+            done
+          done
+
+          COLD_HARNESS_SHA="$cold_harness_sha" \
+          COLD_HARNESS_BLOB="$cold_harness_blob" \
+          COLD_HARNESS_HEAD_BLOB="$cold_head_blob" \
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with Path(path).open("rb") as handle:
+                  for block in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(block)
+              return digest.hexdigest()
+
+          results = Path(os.environ["METAL_RESULTS_DIR"])
+          sequences = {0: ["baseline", "candidate"], 1: ["candidate", "baseline"]}
+          artifacts = []
+          for ab_block in (0, 1):
+              for variant in sequences[ab_block]:
+                  path = results / (
+                      f"metal-cold-lifecycle-block-{ab_block}-{variant}-"
+                      f"{os.environ['METAL_RUNNER_LABEL']}.json"
+                  )
+                  record = json.loads(path.read_text(encoding="utf-8"))
+                  assert record["schema"] == "gafime.cold-lifecycle.v1"
+                  assert record["status"] == "pass"
+                  assert record["backend"] == "metal"
+                  assert record["profiles"] == ["fp32"]
+                  assert record["repetitions_per_profile"] == 30
+                  assert record["fresh_subprocess_per_sample"] is True
+                  assert record["variant"] == variant
+                  assert record["ab_block"] == ab_block
+                  assert record["variant_sequence"] == sequences[ab_block]
+                  expected_surface = (
+                      "precision-typed-v1.1"
+                      if variant == "baseline"
+                      else "numeric-route-v2"
+                  )
+                  assert {item["abi_surface"] for item in record["records"]} == {
+                      expected_surface
+                  }
+                  expected_commit = (
+                      os.environ["BASELINE_COMMIT"]
+                      if variant == "baseline"
+                      else os.environ["EXPECTED_CANDIDATE_SHA"]
+                  )
+                  assert record["provenance"]["source"]["commit"] == expected_commit
+                  assert record["provenance"]["benchmark_script"]["sha256"] == (
+                      os.environ["COLD_HARNESS_SHA"]
+                  )
+                  artifacts.append(
+                      {
+                          "variant": variant,
+                          "ab_block": ab_block,
+                          "variant_sequence": sequences[ab_block],
+                          "path": path.name,
+                          "sha256": sha256(path),
+                      }
+                  )
+
+          manifest = {
+              "schema": "gafime.cold-lifecycle-comparison-manifest.v1",
+              "backend": "metal",
+              "profile": "fp32",
+              "baseline_commit": os.environ["BASELINE_COMMIT"],
+              "candidate_commit": os.environ["EXPECTED_CANDIDATE_SHA"],
+              "harness": {
+                  "source_commit": os.environ["EXPECTED_CANDIDATE_SHA"],
+                  "relative_path": "tests/release_measure/cold_lifecycle.py",
+                  "sha256": os.environ["COLD_HARNESS_SHA"],
+                  "current_git_blob": os.environ["COLD_HARNESS_BLOB"],
+                  "head_git_blob": os.environ["COLD_HARNESS_HEAD_BLOB"],
+              },
+              "schedule": [
+                  {"ab_block": block, "variant_sequence": sequences[block]}
+                  for block in (0, 1)
+              ],
+              "process_isolation": "fresh_worker_process_per_profile_sample",
+              "artifacts": artifacts,
+          }
+          assert manifest["harness"]["current_git_blob"] == manifest["harness"]["head_git_blob"]
+          manifest_path = results / "metal-cold-lifecycle-comparison-manifest.json"
+          manifest_path.write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(manifest, indent=2, sort_keys=True))
+          PY
+
+          "$METAL_VENV/bin/python" "$cold_harness" \
+            --compare-manifest "$METAL_RESULTS_DIR/metal-cold-lifecycle-comparison-manifest.json" \
+            --bootstrap-resamples 2000 \
+            --seed 20260809 \
+            --output "$METAL_RESULTS_DIR/metal-cold-lifecycle-comparison-$METAL_RUNNER_LABEL.json"
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import urllib.request
+
+          comparison = json.loads(
+              (
+                  Path(os.environ["METAL_RESULTS_DIR"])
+                  / f"metal-cold-lifecycle-comparison-{os.environ['METAL_RUNNER_LABEL']}.json"
+              ).read_text(encoding="utf-8")
+          )
+          assert comparison["schema"] == "gafime.cold-lifecycle-comparison.v1"
+          assert comparison["status"] == "pass", comparison.get("failures")
+          assert comparison["valid_for_canonical_cold_lifecycle_claims"] is True
+          assert comparison["backend"] == "metal"
+          assert comparison["profiles"] == ["fp32"]
+          assert comparison["provenance"]["baseline_commit"] == os.environ["BASELINE_COMMIT"]
+          assert comparison["provenance"]["candidate_commit"] == os.environ["EXPECTED_CANDIDATE_SHA"]
+          assert comparison["schedule"]["blocks"] == [
+              {"ab_block": 0, "variant_sequence": ["baseline", "candidate"]},
+              {"ab_block": 1, "variant_sequence": ["candidate", "baseline"]},
+          ]
+          assert comparison["schedule"]["process_isolation"] == (
+              "fresh_worker_process_per_profile_sample"
+          )
+          assert not comparison["failures"]
+          request = urllib.request.Request(
+              f"{os.environ['GITHUB_API_URL']}/repos/"
+              f"{os.environ['GITHUB_REPOSITORY']}/pulls/70",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GITHUB_READ_TOKEN']}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              live_sha = json.load(response).get("head", {}).get("sha")
+          if live_sha != os.environ["EXPECTED_CANDIDATE_SHA"]:
+              raise SystemExit(
+                  f"live PR #70 head moved during cold evidence: {live_sha!r}"
+              )
+          exact_head_path = Path(os.environ["METAL_RESULTS_DIR"]) / "exact-pr-head.json"
+          exact_head = json.loads(exact_head_path.read_text(encoding="utf-8"))
+          exact_head["post_evidence_live_pr_head_sha"] = live_sha
+          exact_head["post_evidence_status"] = "pass"
+          exact_head_path.write_text(
+              json.dumps(exact_head, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(comparison, indent=2, sort_keys=True))
+          PY
 
       - name: Summarize benchmark
         if: always()
@@ -237,29 +1299,150 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import json
+          import os
           from pathlib import Path
 
-          result_paths = sorted(Path("metal-beast-results").glob("metal-hardcore-*.json"))
+          results_dir = Path(os.environ["METAL_RESULTS_DIR"])
+          result_paths = sorted(results_dir.glob("metal-precision-profiles-*.json"))
           if not result_paths:
-              print("No benchmark result JSON found.")
-              raise SystemExit(0)
+              raise AssertionError("No benchmark result JSON found")
           result = json.loads(result_paths[0].read_text(encoding="utf-8"))
-          direct = result.get("direct_backend", {})
-          total = direct.get("total", {})
-          engine = result.get("engine", {})
-          rows_per_second = float(total.get("candidate_rows_per_second", 0.0))
-          with open(Path("metal-beast-results") / "summary.md", "w", encoding="utf-8") as fh:
-              fh.write(f"# Metal Beast Benchmark: ${{ matrix.runner_label }}\n\n")
-              fh.write(f"- status: `{result.get('status')}`\n")
-              fh.write(f"- backend: `{result.get('backend')}`\n")
-              fh.write(f"- direct candidate rows/s: `{rows_per_second:,.0f}`\n")
-              fh.write(f"- direct seconds: `{float(total.get('seconds', 0.0)):.3f}`\n")
-              fh.write(f"- engine seconds: `{float(engine.get('seconds', 0.0)):.3f}`\n")
-              fh.write(f"- engine families: `{engine.get('families')}`\n")
-          print((Path("metal-beast-results") / "summary.md").read_text(encoding="utf-8"))
-          import os
+          if result.get("schema") != "gafime.precision-profile-performance.v2":
+              raise AssertionError(f"unexpected perf13 schema: {result.get('schema')!r}")
+          if result.get("status") != "pass":
+              raise AssertionError(f"perf13 claim gate did not pass: {result.get('status')!r}")
+          if result.get("valid_for_performance_claims") is not True:
+              raise AssertionError("perf13 result is not valid for performance claims")
+          if result.get("valid_for_e2e_performance_claims") is not True:
+              raise AssertionError("perf13 result is not valid for E2E performance claims")
+          if result.get("valid_for_native_arithmetic_claims") is not True:
+              raise AssertionError("perf13 result is not valid for native arithmetic claims")
+          if result.get("native_evidence_backend_readiness", {}).get("complete") is not True:
+              raise AssertionError("validated Metal native evidence was not accepted")
+          if result.get("ab_schedule_readiness", {}).get("complete") is not True:
+              raise AssertionError("randomized alternating Metal A/B and B/A schedule was incomplete")
+          if result.get("native_ab_schedule_readiness", {}).get("complete") is not True:
+              raise AssertionError(
+                  "fresh-process native Metal A/B and reversed B/A schedule was incomplete"
+              )
+          if result.get("comparative_input_readiness", {}).get("complete") is not True:
+              raise AssertionError("Metal baseline/candidate inputs or runtime controls were not comparable")
+          cold_path = (
+              results_dir
+              / f"metal-cold-lifecycle-comparison-{os.environ['METAL_RUNNER_LABEL']}.json"
+          )
+          if not cold_path.is_file():
+              raise AssertionError("canonical Metal cold A/B comparison is missing")
+          cold = json.loads(cold_path.read_text(encoding="utf-8"))
+          if cold.get("valid_for_canonical_cold_lifecycle_claims") is not True:
+              raise AssertionError(
+                  f"canonical Metal cold A/B gate failed: {cold.get('failures')}"
+              )
+          exact_head = json.loads(
+              (results_dir / "exact-pr-head.json").read_text(encoding="utf-8")
+          )
+          if (
+              exact_head.get("expected_candidate_sha")
+              != os.environ["EXPECTED_CANDIDATE_SHA"]
+              or exact_head.get("checkout_sha")
+              != os.environ["EXPECTED_CANDIDATE_SHA"]
+              or exact_head.get("live_pr_head_sha")
+              != os.environ["EXPECTED_CANDIDATE_SHA"]
+              or exact_head.get("post_evidence_live_pr_head_sha")
+              != os.environ["EXPECTED_CANDIDATE_SHA"]
+              or exact_head.get("post_evidence_status") != "pass"
+          ):
+              raise AssertionError(f"exact PR-head evidence is incomplete: {exact_head}")
+          public_cells = []
+          for worker in result.get("results", []):
+              if worker.get("kind") != "public" or worker.get("status") != "pass":
+                  continue
+              workload = worker.get("workload", {}).get("name", "unknown")
+              policy = worker.get("input_policy", "unknown")
+              for cell in worker.get("cells", []):
+                  if cell.get("status") == "pass":
+                      public_cells.append((workload, policy, cell))
+          if not public_cells:
+              raise AssertionError("no passing perf13 Metal public cells")
+          native_paths = sorted(results_dir.glob("metal-native-timing-*.json"))
+          if len(native_paths) != 8:
+              raise AssertionError(
+                  "expected two policies times fresh A/B+B/A Metal helper artifacts, "
+                  f"got {native_paths}"
+              )
+          natives = [json.loads(path.read_text(encoding="utf-8")) for path in native_paths]
+          if {item.get("input_policy") for item in natives} != {
+              "common-f64", "native"
+          }:
+              raise AssertionError("Metal native input-policy coverage is incomplete")
+          summary_path = results_dir / "summary.md"
+          with open(summary_path, "w", encoding="utf-8") as fh:
+              fh.write(
+                  f"# Metal Beast Benchmark: {os.environ['METAL_RUNNER_LABEL']}\n\n"
+              )
+              fh.write(f"- perf13 status: `{result.get('status')}`\n")
+              fh.write(f"- backend/profile: `metal/fp32`\n")
+              fh.write(
+                  f"- exact candidate/live PR #70 head: "
+                  f"`{os.environ['EXPECTED_CANDIDATE_SHA']}`\n"
+              )
+              fh.write(f"- valid for E2E claims: `{result.get('valid_for_e2e_performance_claims')}`\n")
+              fh.write(
+                  "- valid canonical cold lifecycle A/B+B/A gate: "
+                  f"`{cold['valid_for_canonical_cold_lifecycle_claims']}`\n"
+              )
+              fh.write(
+                  "- canonical cold samples: `30 fresh subprocesses per "
+                  "variant/block/profile`\n"
+              )
+              fh.write(f"- randomized A/B+B/A schedule: `{result['ab_schedule_readiness']['complete']}`\n")
+              fh.write(
+                  "- fresh-process native A/B+B/A schedule: "
+                  f"`{result['native_ab_schedule_readiness']['complete']}`\n"
+              )
+              fh.write(f"- comparative inputs: `{result['comparative_input_readiness']['complete']}`\n")
+              fh.write(f"- native evidence accepted: `{result['native_evidence_backend_readiness']['complete']}`\n")
+              fh.write(f"- combined E2E/native claim ready: `{result.get('valid_for_native_arithmetic_claims')}`\n")
+              fh.write(f"- warmups/repetitions: `{result['arguments']['warmups']}/{result['arguments']['repetitions']}`\n")
+              fh.write(f"- native GPU timestamp support: `{all(item['gpu_timing_supported'] for item in natives)}`\n")
+              fh.write(f"- native rows/candidates: `{natives[0]['workload']['rows']}/{natives[0]['workload']['candidates']}`\n")
+              fh.write("- public wall-clock median latency by workload/input/surface:\n")
+              for workload, policy, cell in sorted(public_cells, key=lambda item: (item[0], item[1], item[2]["surface"])):
+                  median_ms = float(cell["distribution"]["median_ns"]) / 1.0e6
+                  fh.write(f"  - `{workload}/{policy}/{cell['surface']}`: `{median_ms:.3f} ms`\n")
+              fh.write("- native synchronized Metal timings:\n")
+              for native in sorted(
+                  natives,
+                  key=lambda item: (
+                      item["input_policy"], item["ab_block"], item["variant"]
+                  ),
+              ):
+                  for record in native["records"]:
+                      fh.write(
+                          f"  - `{native['input_policy']}/block-{native['ab_block']}/"
+                          f"{native['variant']}/"
+                          f"{record['operation']}/{record['metric']}` "
+                          f"({record['clock']}): `{float(record['median_us']):.3f} us`\n"
+                      )
+              fh.write("- canonical cold lifecycle candidate latency deltas:\n")
+              for comparison in cold["comparisons"]:
+                  aggregate = comparison.get("aggregate")
+                  if not aggregate:
+                      continue
+                  delta = float(aggregate["candidate_latency_delta_percent"])
+                  low, high = aggregate[
+                      "bootstrap_candidate_latency_delta_95_ci_percent"
+                  ]
+                  fh.write(
+                      f"  - `{comparison['profile']}/{comparison['phase']}` "
+                      f"({comparison['comparability']}): `{delta:+.3f}%` "
+                      f"(95% bootstrap CI `{float(low):+.3f}%..{float(high):+.3f}%`)\n"
+                  )
+              if result.get("claim_failures"):
+                  fh.write("- claim-gate limitations are retained in the raw perf13 JSON; subset presets are not mislabeled as the full release workload matrix.\n")
+          print(summary_path.read_text(encoding="utf-8"))
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
-              fh.write((Path("metal-beast-results") / "summary.md").read_text(encoding="utf-8"))
+              fh.write(summary_path.read_text(encoding="utf-8"))
           PY
 
       - name: Upload Metal beast artifacts
@@ -268,5 +1451,6 @@ jobs:
         with:
           name: metal-beast-${{ matrix.runner_label }}
           path: |
-            metal-beast-results/**
-            wheelhouse/*.whl
+            ${{ env.METAL_RESULTS_DIR }}/**
+            ${{ env.METAL_WHEELHOUSE }}/*.whl
+            ${{ env.METAL_BASELINE_WHEELHOUSE }}/*.whl

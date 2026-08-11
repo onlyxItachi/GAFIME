@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from array import array
 from collections.abc import Iterator, Sequence as SequenceABC
 from dataclasses import asdict, dataclass, field, is_dataclass
+from numbers import Integral, Real
 from typing import Any, Dict, List, Tuple
 import warnings as _warnings
 
+from .._precision import normalize_precision
 from ..config import EngineConfig
 
 
@@ -17,12 +20,12 @@ class BackendInfo:
     memory_free_mb: int | None
     selected_backend: str | None = None
     execution_placement: str | None = None
-    requested_storage_dtype: str = "float32"
-    effective_storage_dtype: str = "float32"
-    requested_compute_policy: str = "stable"
-    effective_compute_policy: str = "stable"
+    requested_precision: str = "mixed"
+    effective_precision: str = "mixed"
+    storage_dtype: str = "float32"
     interaction_arithmetic: str = "float32"
-    result_dtype: str = "float32"
+    reduction_dtype: str = "float64"
+    result_dtype: str = "float64"
     metric_accumulators: Dict[str, str] = field(default_factory=dict)
     scale_normalization: str | None = None
     compensated_summation: bool = False
@@ -253,6 +256,7 @@ class NativeContinuousInteractions(SequenceABC):
         metric_names: SequenceABC[str],
         indices: Tuple[int, ...] | None = None,
         *,
+        precision: str | None = None,
         generated_feature_start: int | None = None,
         generated_family: str | None = None,
     ) -> None:
@@ -279,6 +283,11 @@ class NativeContinuousInteractions(SequenceABC):
         )
         self._metric_names = tuple(str(name) for name in metric_names)
         self._indices = indices
+        self._precision = normalize_precision(
+            precision
+            if precision is not None
+            else getattr(native_report, "precision", "mixed")
+        )
         self._precision_diagnostics_available = bool(
             getattr(native_report, "interaction_diagnostics_available", False)
         )
@@ -352,10 +361,7 @@ class NativeContinuousInteractions(SequenceABC):
     ):
         if coerce:
             combo = tuple(int(value) for value in combo_values)
-            metrics = {
-                name: float(value)
-                for name, value in zip(self._metric_names, metric_values)
-            }
+            metrics = dict(zip(self._metric_names, metric_values))
         else:
             combo = tuple(combo_values)
             metrics = dict(zip(self._metric_names, metric_values))
@@ -391,12 +397,16 @@ class NativeContinuousInteractions(SequenceABC):
             expression="*".join(feature_names),
             candidate_id=f"{family}:{native_candidate_id}",
             interaction_overflow_rows=overflow_rows,
-            interaction_overflow_ratio=(
-                overflow_rows / self._sample_rows if self._sample_rows else 0.0
-            ),
+            interaction_overflow_ratio=self._overflow_ratio(overflow_rows),
             source_nonfinite=source_nonfinite,
             precision_diagnostics_available=self._precision_diagnostics_available,
         )
+
+    def _overflow_ratio(self, overflow_rows: int) -> float:
+        ratio = overflow_rows / self._sample_rows if self._sample_rows else 0.0
+        if self._precision == "fp32":
+            return array("f", (ratio,))[0]
+        return ratio
 
     def __iter__(self) -> Iterator[InteractionResult]:
         batch = getattr(self._native_report, "interaction_components_batch", None)
@@ -417,7 +427,9 @@ class NativeContinuousInteractions(SequenceABC):
                     raise RuntimeError(
                         "native diagnostic batch does not align with interaction rows"
                     )
-            for offset, (combo_values, metric_values, candidate_id) in enumerate(components):
+            for offset, (combo_values, metric_values, candidate_id) in enumerate(
+                components
+            ):
                 yield self._result_from_components(
                     combo_values,
                     metric_values,
@@ -452,28 +464,39 @@ class NativeContinuousInteractions(SequenceABC):
                 )
             )
         else:
-            source_indices = (
-                tuple(range(len(self._native_report)))
-                if self._indices is None
-                else self._indices
-            )
-            indices = tuple(
-                sorted(
-                    source_indices,
-                    key=lambda index: _native_continuous_rank_key(
-                        self._native_report,
-                        self._metric_names,
-                        index,
-                        requested_metric,
-                        descending=descending,
-                    ),
-                )[:limit]
-            )
+            rank_subset = getattr(self._native_report, "ranked_indices_subset", None)
+            if callable(rank_subset):
+                indices = tuple(
+                    int(value)
+                    for value in rank_subset(
+                        list(self._indices),
+                        metric_index=metric_index,
+                        descending=bool(descending),
+                        limit=limit,
+                    )
+                )
+            else:
+                # Compatibility for third-party/older boundaries that do not
+                # expose typed subset ranking. Shipped ABI 1.1 reports always
+                # take the native path above, preserving fp32 comparisons.
+                indices = tuple(
+                    sorted(
+                        self._indices,
+                        key=lambda index: _native_continuous_rank_key(
+                            self._native_report,
+                            self._metric_names,
+                            index,
+                            requested_metric,
+                            descending=descending,
+                        ),
+                    )[:limit]
+                )
         return type(self)(
             self._native_report,
             self._feature_names,
             self._metric_names,
             indices,
+            precision=self._precision,
             generated_feature_start=self._generated_feature_start,
             generated_family=self._generated_family,
         )
@@ -504,25 +527,20 @@ def _native_continuous_rank_key(
     *,
     descending: bool,
 ) -> tuple[int, float, int]:
-    metrics = {
-        name: float(value)
-        for name, value in zip(metric_names, native_report.metric_values(index))
-    }
+    metrics = dict(zip(metric_names, native_report.metric_values(index)))
     if metric_name is not None:
         value = metrics.get(metric_name)
     elif not metrics:
         value = None
     else:
         value = max(
-            abs(metric_value)
-            if name in {"pearson", "spearman"}
-            else metric_value
+            abs(metric_value) if name in {"pearson", "spearman"} else metric_value
             for name, metric_value in metrics.items()
         )
     candidate_id = int(native_report.candidate_id(index))
     if value is None:
         return (1, 0.0, candidate_id)
-    rank_value = -float(value) if descending else float(value)
+    rank_value = -value if descending else value
     return (0, rank_value, candidate_id)
 
 
@@ -551,9 +569,7 @@ def _python_result_rank_key(
         value = -min(metrics.values())
     else:
         value = max(
-            abs(metric_value)
-            if name in {"pearson", "spearman"}
-            else metric_value
+            abs(metric_value) if name in {"pearson", "spearman"} else metric_value
             for name, metric_value in metrics.items()
         )
 
@@ -570,6 +586,10 @@ def _python_result_rank_key(
 def _jsonable(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, Real):
+        return float(value)
     if is_dataclass(value):
         return _jsonable(asdict(value))
     if isinstance(value, dict):

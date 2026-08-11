@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 from pathlib import Path
@@ -333,9 +334,10 @@ def test_adapter_discovers_payloads_before_importing_native_boundary(monkeypatch
             (
                 "cuda_api.hpp",
                 "cuda_internal.hpp",
-                "kernels.cu",
                 "kernels.cuh",
-                "launcher.cu",
+                "precision_kernels.cu",
+                "precision_kernels.cuh",
+                "precision_launcher.cu",
             ),
         ),
         ("rocm", ("kernels.hip", "kernels.hpp", "launcher.hip", "rocm_api.hpp")),
@@ -412,6 +414,52 @@ def test_staged_rocm_defaults_to_pinned_system_policy(tmp_path):
     )
     assert policy["wheel_policy"] == "system"
     assert policy["userspace_bundled"] is False
+
+
+def test_staged_rocm_arch_marker_is_a_quoted_resolved_target_list(tmp_path):
+    output = tmp_path / "gafime-rocm"
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
+            "rocm",
+            str(output),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+    setup_source = (output / "setup.py").read_text(encoding="utf-8")
+    assert 'f"-DGAFIME_HIP_TARGET_ARCH_TAG={_hip_target_arch_tag(archs)}"' in (
+        setup_source
+    )
+    assert 'return json.dumps(",".join(archs), ensure_ascii=True)' in setup_source
+    assert '"-DGAFIME_HIP_PRECISION_PROFILE_MASK=7"' in setup_source
+
+    module = ast.parse(setup_source)
+    helper = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_hip_target_arch_tag"
+    )
+    namespace: dict[str, object] = {"json": json}
+    exec(
+        compile(ast.Module(body=[helper], type_ignores=[]), "setup.py", "exec"),
+        namespace,
+    )
+
+    release_targets = json.loads(
+        (output / "gafime_rocm" / "build_policy.json").read_text(encoding="utf-8")
+    )["gfx_targets"]
+    release_literal = namespace["_hip_target_arch_tag"](release_targets)
+    assert len(release_targets) == 13
+    assert json.loads(release_literal) == ",".join(release_targets)
+
+    resolved_archs = ["gfx90a", 'gfx"quoted', r"gfx\escaped", "gfx\nline"]
+    literal = namespace["_hip_target_arch_tag"](resolved_archs)
+    assert literal == json.dumps(",".join(resolved_archs), ensure_ascii=True)
+    assert literal.startswith('"') and literal.endswith('"')
+    assert json.loads(literal) == ",".join(resolved_archs)
 
 
 @pytest.mark.parametrize("policy", ("amd-wheels", "unknown"))
@@ -572,6 +620,11 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     assert "refs/tags/" not in build
     assert "release_bundle.py create" in build
     assert "--scope full-release" in build
+    assert "Bind built and authoritative source identities" in build
+    assert "git rev-parse HEAD" in build
+    assert "github.event.pull_request.head.sha" in build
+    assert "--built-source-sha" in build
+    assert "--authoritative-source-sha" in build
     assert (
         "auditwheel repair --plat manylinux_2_28_x86_64 "
         "--exclude libcudart.so.13"

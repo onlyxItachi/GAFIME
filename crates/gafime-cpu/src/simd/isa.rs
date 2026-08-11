@@ -7,31 +7,12 @@ pub enum IsaLevel {
     Neon,
 }
 
+#[inline]
 pub fn detect_isa() -> IsaLevel {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx512f") {
-            return IsaLevel::Avx512;
-        }
-        if std::is_x86_feature_detected!("avx2") {
-            return IsaLevel::Avx2;
-        }
-        if std::is_x86_feature_detected!("sse4.2") {
-            return IsaLevel::Sse42;
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        IsaLevel::Neon
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        IsaLevel::Scalar
-    }
+    finite_dispatch_isa()
 }
 
+#[inline]
 pub fn finite_dispatch_isa() -> IsaLevel {
     #[cfg(target_arch = "x86_64")]
     {

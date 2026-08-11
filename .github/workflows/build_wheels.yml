@@ -115,7 +115,7 @@ jobs:
         run: |
           for whl in wheelhouse/*.whl; do
             echo "=== $(basename "$whl") ==="
-            python -m zipfile -l "$whl" | grep -E '\.(so|dll|dylib|pyd|metallib)$' || echo '  (no native binaries found!)'
+            python -m zipfile -l "$whl" | grep -E '\.(so|dll|dylib|pyd|metallib)[[:space:]]' || echo '  (no native binaries found!)'
             if python -m zipfile -l "$whl" | grep -E 'gafime_cuda|gafime_rocm|libgafime_cuda|libgafime_rocm'; then
               echo "Base gafime wheel must not contain CUDA or ROCm payload packages"
               exit 1
@@ -190,7 +190,7 @@ jobs:
         run: |
           for whl in wheelhouse/*.whl; do
             echo "=== $(basename "$whl") ==="
-            python -m zipfile -l "$whl" | grep -E '\.(so|dll|dylib|pyd|metallib)$' || echo '  (no native binaries found!)'
+            python -m zipfile -l "$whl" | grep -E '\.(so|dll|dylib|pyd|metallib)[[:space:]]' || echo '  (no native binaries found!)'
             if python -m zipfile -l "$whl" | grep -E 'gafime_cuda|gafime_rocm|libgafime_cuda|libgafime_rocm'; then
               echo "ARM Linux wheel must not contain CUDA or ROCm payload packages"
               exit 1
@@ -264,7 +264,7 @@ jobs:
         run: |
           for whl in wheelhouse/*.whl; do
             echo "=== $(basename "$whl") ==="
-            python -m zipfile -l "$whl" | grep -E '\.(so|dll|dylib|pyd|metallib)$' || echo '  (no native binaries found!)'
+            python -m zipfile -l "$whl" | grep -E '\.(so|dll|dylib|pyd|metallib)[[:space:]]' || echo '  (no native binaries found!)'
             if python -m zipfile -l "$whl" | grep -E 'gafime_cuda|gafime_rocm|libgafime_cuda|libgafime_rocm'; then
               echo "ARM Windows wheel must not contain CUDA or ROCm payload packages"
               exit 1
@@ -329,7 +329,7 @@ jobs:
         with:
           path: |
             C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
-          key: cuda-windows-${{ env.CUDA_VERSION }}-cudart-${{ env.CUDA_CUDART_WINDOWS_SHA256 }}
+          key: cuda-windows-${{ env.CUDA_VERSION }}-components-nvcc-crt-nvvm-cuobjdump-nvdisasm-v1-cudart-${{ env.CUDA_CUDART_WINDOWS_SHA256 }}
 
       - name: Setup CUDA Toolkit (Windows)
         if: runner.os == 'Windows' && steps.cuda-cache.outputs.cache-hit != 'true'
@@ -344,7 +344,9 @@ jobs:
             "-s",
             "nvcc_$componentVersion",
             "crt_$componentVersion",
-            "nvvm_$componentVersion"
+            "nvvm_$componentVersion",
+            "cuobjdump_$componentVersion",
+            "nvdisasm_$componentVersion"
           ) -Wait -PassThru -NoNewWindow
           if ($process.ExitCode -ne 0) {
             throw "CUDA Toolkit installer exited with code $($process.ExitCode)"
@@ -402,6 +404,8 @@ jobs:
           }
           $requiredFiles = @(
             "$cudaRoot\bin\nvcc.exe",
+            "$cudaRoot\bin\cuobjdump.exe",
+            "$cudaRoot\bin\nvdisasm.exe",
             "$cudaRoot\bin\cudart64_13.dll",
             "$cudaRoot\include\crt\host_config.h",
             "$cudaRoot\nvvm\bin\cicc.exe",
@@ -438,15 +442,17 @@ jobs:
           CIBW_ARCHS_LINUX: "x86_64"
           CIBW_ARCHS_WINDOWS: "AMD64"
           CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
-          CIBW_BEFORE_ALL_LINUX: "rpm --import https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/D42D0685.pub && curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo -o /etc/yum.repos.d/cuda-rhel8.repo && dnf clean all && dnf install -y cuda-nvcc-13-3 cuda-cudart-devel-13-3 && ln -sfn /usr/local/cuda-13.3 /usr/local/cuda"
+          CIBW_BEFORE_ALL_LINUX: "rpm --import https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/D42D0685.pub && curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo -o /etc/yum.repos.d/cuda-rhel8.repo && dnf clean all && dnf install -y cuda-nvcc-13-3 cuda-cudart-devel-13-3 cuda-cuobjdump-13-3 cuda-nvdisasm-13-3 && ln -sfn /usr/local/cuda-13.3 /usr/local/cuda"
           CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair --plat manylinux_2_28_x86_64 --exclude libcudart.so.13 -w {dest_dir} {wheel}"
           CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: 'delvewheel repair --exclude "cudart64_13.dll;nvcudart_hybrid64.dll" -w {dest_dir} {wheel}'
           CIBW_BUILD_VERBOSITY: "1"
           CIBW_ENVIRONMENT_LINUX: "CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
           CIBW_ENVIRONMENT_WINDOWS: 'CUDA_PATH=C:\cuda-13.3'
-          CIBW_BEFORE_TEST: 'python "{project}/.github/scripts/install_local_core_wheel.py" "{project}/base-wheelhouse"'
-          CIBW_TEST_COMMAND: 'python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend cuda'
+          CIBW_BEFORE_TEST_LINUX: 'command -v cuobjdump && command -v nvdisasm && python "{project}/.github/scripts/install_local_core_wheel.py" "{project}/base-wheelhouse"'
+          CIBW_BEFORE_TEST_WINDOWS: 'where.exe cuobjdump.exe && where.exe nvdisasm.exe && python "{project}/.github/scripts/install_local_core_wheel.py" "{project}/base-wheelhouse"'
+          CIBW_TEST_COMMAND_LINUX: 'python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend cuda --machine-code-evidence-dir /output --machine-code-wheel "{wheel}"'
+          CIBW_TEST_COMMAND_WINDOWS: 'python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend cuda --machine-code-evidence-dir "{project}/precision-evidence" --machine-code-wheel "{wheel}"'
 
       - name: List CUDA payload wheel contents
         shell: bash
@@ -473,6 +479,15 @@ jobs:
           python tests/release_measure/artifact_01_release_composition.py
           --scope cuda-wheel
           --artifacts wheelhouse
+
+      - name: Upload CUDA profile machine-code evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cuda-profile-evidence-${{ runner.os }}
+          if-no-files-found: error
+          path: |
+            ./precision-evidence/*.precision-evidence.json
+            ./wheelhouse/*.precision-evidence.json
 
       - name: Upload CUDA payload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -527,9 +542,9 @@ jobs:
             dnf clean all
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: "cp {wheel} {dest_dir}/"
           CIBW_BUILD_VERBOSITY: "1"
-          CIBW_ENVIRONMENT_LINUX: "ROCM_PATH=/opt/rocm-7.2.3 HIP_PATH=/opt/rocm-7.2.3 PATH=/opt/rocm-7.2.3/bin:$PATH LD_LIBRARY_PATH=/opt/rocm-7.2.3/lib:$LD_LIBRARY_PATH GAFIME_ROCM_ARCHS=linux-release GAFIME_ROCM_WHEEL_POLICY=system"
-          CIBW_BEFORE_TEST: 'python "{project}/.github/scripts/install_local_core_wheel.py" "{project}/base-wheelhouse"'
-          CIBW_TEST_COMMAND: 'python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend rocm'
+          CIBW_ENVIRONMENT_LINUX: "ROCM_PATH=/opt/rocm-7.2.3 HIP_PATH=/opt/rocm-7.2.3 PATH=/opt/rocm-7.2.3/lib/llvm/bin:/opt/rocm-7.2.3/bin:$PATH LD_LIBRARY_PATH=/opt/rocm-7.2.3/lib:$LD_LIBRARY_PATH GAFIME_ROCM_ARCHS=linux-release GAFIME_ROCM_WHEEL_POLICY=system"
+          CIBW_BEFORE_TEST: 'command -v llvm-objcopy && command -v clang-offload-bundler && command -v llvm-readelf && python "{project}/.github/scripts/install_local_core_wheel.py" "{project}/base-wheelhouse"'
+          CIBW_TEST_COMMAND: 'python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend rocm --machine-code-evidence-dir /output --machine-code-wheel "{wheel}"'
 
       - name: List ROCm payload wheel contents
         shell: bash
@@ -574,6 +589,13 @@ jobs:
         with:
           name: rocm-wheel-policy-report
           path: ./wheelhouse/rocm-wheel-policy-report.json
+
+      - name: Upload ROCm profile machine-code evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rocm-profile-evidence
+          if-no-files-found: error
+          path: ./wheelhouse/*.precision-evidence.json
 
   validate_wheels:
     name: Validate installed wheel on ${{ matrix.platform.label }} / Python ${{ matrix.python_version }}
@@ -646,6 +668,24 @@ jobs:
           cp tests/release_measure/installed_wheel_smoke.py "$RUNNER_TEMP/installed_wheel_smoke.py"
           cd "$RUNNER_TEMP"
           python installed_wheel_smoke.py --source-root "$GITHUB_WORKSPACE"
+
+      - name: Run full Python suite from the fresh Core wheel
+        if: matrix.platform.label == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install numpy pyarrow polars scikit-learn pytest
+          cd "$RUNNER_TEMP"
+          GAFIME_TEST_INSTALLED_PACKAGE=1 python - <<'PY'
+          import os
+          import gafime
+          import gafime.gafime_py
+          import pytest
+
+          raise SystemExit(
+              pytest.main(["-q", os.path.join(os.environ["GITHUB_WORKSPACE"], "tests", "python")])
+          )
+          PY
 
       - name: Execute bundled Metal discovery and public API
         if: matrix.platform.label == 'macos-arm64'
@@ -1021,9 +1061,16 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install release filename validator
+      - name: Install cross-format ABI inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes llvm
+          command -v llvm-nm
+          command -v llvm-readobj
+
+      - name: Install release filename and archive validators
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.core_wheel_build_tag != '' }}
-        run: python -m pip install "packaging==25.0"
+        run: python -m pip install "installer==0.7.0" "packaging==25.0"
 
       - name: Validate SemVer and PEP 440 release identities
         run: python .github/scripts/release_version.py --check-project
@@ -1033,6 +1080,13 @@ jobs:
         with:
           pattern: cibw-*
           path: dist
+          merge-multiple: true
+
+      - name: Download CUDA and ROCm profile machine-code evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: '*-profile-evidence*'
+          path: precision-evidence
           merge-multiple: true
 
       - name: Apply requested core wheel build tag before release freeze
@@ -1047,17 +1101,65 @@ jobs:
             --remove-original \
             dist/gafime-*.whl
 
+      - name: Verify requested retagged Core wheels install as exact archives
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.core_wheel_build_tag != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for wheel in dist/gafime-*.whl; do
+            install_root="$(mktemp -d "$RUNNER_TEMP/gafime-retag-install-XXXXXX")"
+            python -m installer --destdir "$install_root" "$wheel"
+            sha256sum "$wheel"
+          done
+
+      - name: Bind profile machine code to exact downloaded payload wheels
+        run: >-
+          python tests/release_measure/gpu_static_kernel_report.py
+          --verify-wheel-evidence dist
+          --evidence-dir precision-evidence
+
       - name: Validate complete release bundle
         run: >-
           python tests/release_measure/artifact_01_release_composition.py
           --scope full-release
           --artifacts dist
 
+      - name: Bind built and authoritative source identities
+        id: source_identity
+        shell: bash
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          built_source_sha="$(git rev-parse HEAD)"
+          if [[ "$built_source_sha" != "$GITHUB_SHA" ]]; then
+            echo "checked-out build tree is $built_source_sha, not GITHUB_SHA $GITHUB_SHA"
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            authoritative_source_sha="$PR_HEAD_SHA"
+            if [[ -z "$authoritative_source_sha" ]]; then
+              echo "pull_request event did not provide head.sha"
+              exit 1
+            fi
+          else
+            authoritative_source_sha="$GITHUB_SHA"
+          fi
+          for source_sha in "$built_source_sha" "$authoritative_source_sha"; do
+            if [[ ! "$source_sha" =~ ^[0-9a-f]{40,64}$ ]]; then
+              echo "invalid source SHA: $source_sha"
+              exit 1
+            fi
+          done
+          echo "built_source_sha=$built_source_sha" >>"$GITHUB_OUTPUT"
+          echo "authoritative_source_sha=$authoritative_source_sha" >>"$GITHUB_OUTPUT"
+
       - name: Write immutable bundle provenance and checksums
         run: >-
           python .github/scripts/release_bundle.py create
           --artifacts dist
-          --source-sha "$GITHUB_SHA"
+          --built-source-sha "${{ steps.source_identity.outputs.built_source_sha }}"
+          --authoritative-source-sha "${{ steps.source_identity.outputs.authoritative_source_sha }}"
           --run-id "$GITHUB_RUN_ID"
           --repository "$GITHUB_REPOSITORY"
 

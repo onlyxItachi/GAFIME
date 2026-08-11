@@ -23,6 +23,10 @@ _DISABLED_DISCRETE_CONFIG_WARNING = (
     "enable_discrete_functions=False is a deprecated v0.4.7 option and is "
     "ignored by the v1 runtime. Remove it from EngineConfig."
 )
+_LEGACY_PRECISION_WARNING = (
+    "storage_dtype and compute_policy are deprecated; use the single keyword-only "
+    "precision profile instead."
+)
 _MISSING = object()
 
 
@@ -67,8 +71,7 @@ class EngineConfig:
     backend: str = "auto"
     device_id: int = 0
     _: KW_ONLY
-    storage_dtype: str = "float32"
-    compute_policy: str = "stable"
+    precision: str = "mixed"
     enable_time_series_functions: bool = False
     time_series_lags: Tuple[int, ...] = (1, 2, 4, 8, 16)
     time_series_windows: Tuple[int, ...] = (4, 8, 16, 32)
@@ -89,6 +92,22 @@ _generated_engine_config_init = EngineConfig.__init__
 
 @wraps(_generated_engine_config_init)
 def _compatible_engine_config_init(self, *args, **kwargs) -> None:
+    legacy_storage = kwargs.pop("storage_dtype", _MISSING)
+    legacy_policy = kwargs.pop("compute_policy", _MISSING)
+    if legacy_storage is not _MISSING or legacy_policy is not _MISSING:
+        if legacy_storage is _MISSING or legacy_policy is _MISSING:
+            raise TypeError(
+                "deprecated storage_dtype and compute_policy must be supplied together."
+            )
+        if "precision" in kwargs:
+            raise TypeError(
+                "precision cannot be combined with deprecated storage_dtype/compute_policy."
+            )
+        from ._precision import precision_from_legacy_pair
+
+        kwargs["precision"] = precision_from_legacy_pair(legacy_storage, legacy_policy)
+        warnings.warn(_LEGACY_PRECISION_WARNING, DeprecationWarning, stacklevel=2)
+
     positional_mi_approximate = _MISSING
     origin_main_layout = len(args) >= 9 and isinstance(args[8], bool)
     if origin_main_layout:
@@ -103,7 +122,9 @@ def _compatible_engine_config_init(self, *args, **kwargs) -> None:
 
     if positional_mi_approximate is not _MISSING:
         if "mi_approximate" in kwargs:
-            raise TypeError("mi_approximate was provided both positionally and by keyword.")
+            raise TypeError(
+                "mi_approximate was provided both positionally and by keyword."
+            )
         kwargs["mi_approximate"] = positional_mi_approximate
 
     legacy_discrete = _MISSING
@@ -125,6 +146,9 @@ def _compatible_engine_config_init(self, *args, **kwargs) -> None:
             stacklevel=2,
         )
     _generated_engine_config_init(self, *args, **kwargs)
+    from ._precision import normalize_precision
+
+    object.__setattr__(self, "precision", normalize_precision(self.precision))
 
 
 EngineConfig.__init__ = _compatible_engine_config_init

@@ -1,39 +1,50 @@
 use std::ffi::CString;
 
-use arrow::array::{Array, Float32Array, StructArray};
+use arrow::array::{Array, Float32Array, Float64Array, StructArray};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use gafime_cpu::precision::CpuPrecisionValues;
+use gafime_types::PrecisionProfile;
 use pyo3::{
     exceptions::PyValueError,
     prelude::*,
     types::{PyAny, PyBytes, PyCapsule, PyDict},
 };
 
-use crate::artifact::{compile_continuous_rows, PyCompiledContinuousArtifact};
+use crate::artifact::{compile_continuous_input, PyCompiledContinuousArtifact};
 use crate::common::{
-    combo_from_table, decode_f32_le, flatten_continuous_rows, metric_values_from_table,
+    combo_from_table, decode_precision_input, flatten_continuous_rows, flatten_continuous_rows_f64,
+    metric_values_from_table, precision_scalar_to_python, precision_values_to_python_array,
     result_table_view_to_arrow, ContinuousReport, DecisionPathResultParams,
-    InteractionPrecisionDiagnostic, ResultTableView, SendOwnedResultTable, SignificanceEntry,
+    InteractionPrecisionDiagnostic, OwnedNumericInput, ResultTableView, SendOwnedResultTable,
+    SignificanceEntry,
 };
 use crate::continuous::{
-    analyze_continuous_cpu_rows, analyze_continuous_rows_once, bounded_ranked_indices,
-    compare_ranked_rows,
+    analyze_continuous_cpu_input_rows, analyze_continuous_input_once, bounded_ranked_indices,
+    compare_ranked_rows, continuous_config_for_cpu, row_is_rankable,
 };
 use crate::runtime::{
     backend_capability_name_for_kind, backend_device_for_kind, backend_is_gpu,
     backend_name_for_kind, execution_placement_for_kind, parse_engine_config,
 };
 
-type InteractionComponents = (Vec<u32>, Vec<f32>, u64);
+type InteractionComponents = (Vec<u32>, Py<PyAny>, u64);
 
 #[pyclass(name = "ContinuousRecord")]
 #[derive(Clone)]
 pub(crate) struct PyContinuousRecord {
     #[pyo3(get)]
     combo: Vec<u32>,
-    #[pyo3(get)]
-    metrics: Vec<f32>,
+    metrics: CpuPrecisionValues,
     #[pyo3(get)]
     candidate_id: u64,
+}
+
+#[pymethods]
+impl PyContinuousRecord {
+    #[getter]
+    fn metrics(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        precision_values_to_python_array(py, &self.metrics)
+    }
 }
 
 #[pyclass(name = "ContinuousReport")]
@@ -50,6 +61,7 @@ pub(crate) struct PyContinuousReport {
     backend_kind: u32,
     #[pyo3(get)]
     graph_replayed: bool,
+    precision: PrecisionProfile,
     mi_accumulation_fp64: bool,
     interaction_diagnostics: Option<Vec<InteractionPrecisionDiagnostic>>,
     table: SendOwnedResultTable,
@@ -85,23 +97,31 @@ impl PyContinuousReport {
     }
 
     #[getter]
-    fn storage_dtype(&self) -> &'static str {
-        "float32"
+    fn precision(&self) -> &'static str {
+        precision_name(self.precision)
     }
 
     #[getter]
-    fn compute_policy(&self) -> &'static str {
-        "stable"
+    fn storage_dtype(&self) -> &'static str {
+        if self.precision == PrecisionProfile::Fp64 {
+            "float64"
+        } else {
+            "float32"
+        }
     }
 
     #[getter]
     fn interaction_arithmetic(&self) -> &'static str {
-        "float32"
+        self.storage_dtype()
     }
 
     #[getter]
     fn result_dtype(&self) -> &'static str {
-        "float32"
+        if self.precision == PrecisionProfile::Fp32 {
+            "float32"
+        } else {
+            "float64"
+        }
     }
 
     #[getter]
@@ -192,7 +212,8 @@ impl PyContinuousReport {
     fn record(&self, index: usize) -> PyResult<PyContinuousRecord> {
         Ok(PyContinuousRecord {
             combo: self.combo(index)?,
-            metrics: self.metric_values(index)?,
+            metrics: metric_values_from_table(&self.table, index)
+                .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))?,
             candidate_id: self.candidate_id(index)?,
         })
     }
@@ -202,9 +223,10 @@ impl PyContinuousReport {
             .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))
     }
 
-    fn metric_values(&self, index: usize) -> PyResult<Vec<f32>> {
-        metric_values_from_table(&self.table, index)
-            .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))
+    fn metric_values(&self, py: Python<'_>, index: usize) -> PyResult<Py<PyAny>> {
+        let values = metric_values_from_table(&self.table, index)
+            .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))?;
+        precision_values_to_python_array(py, &values)
     }
 
     fn candidate_id(&self, index: usize) -> PyResult<u64> {
@@ -215,7 +237,11 @@ impl PyContinuousReport {
             .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))
     }
 
-    fn interaction_components(&self, index: usize) -> PyResult<InteractionComponents> {
+    fn interaction_components(
+        &self,
+        py: Python<'_>,
+        index: usize,
+    ) -> PyResult<InteractionComponents> {
         let combo = combo_from_table(&self.table, index)
             .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))?;
         let metrics = metric_values_from_table(&self.table, index)
@@ -226,11 +252,16 @@ impl PyContinuousReport {
             .get(index)
             .copied()
             .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))?;
-        Ok((combo, metrics, candidate_id))
+        Ok((
+            combo,
+            precision_values_to_python_array(py, &metrics)?,
+            candidate_id,
+        ))
     }
 
     fn interaction_components_batch(
         &self,
+        py: Python<'_>,
         start: usize,
         limit: usize,
     ) -> PyResult<Vec<InteractionComponents>> {
@@ -242,9 +273,12 @@ impl PyContinuousReport {
         let end = start.saturating_add(limit).min(self.table.row_count());
         let mut components = Vec::with_capacity(end - start);
         for index in start..end {
+            let values = metric_values_from_table(&self.table, index).ok_or_else(|| {
+                PyValueError::new_err("continuous report batch row is out of range")
+            })?;
             components.push((
                 combo_from_table(&self.table, index).unwrap_or_default(),
-                metric_values_from_table(&self.table, index).unwrap_or_default(),
+                precision_values_to_python_array(py, &values)?,
                 self.table.candidate_ids()[index],
             ));
         }
@@ -272,7 +306,9 @@ impl PyContinuousReport {
                 limit,
             ));
         }
-        let mut indices = (0..self.table.row_count()).collect::<Vec<_>>();
+        let mut indices = (0..self.table.row_count())
+            .filter(|&row| row_is_rankable(&self.table, &self.metric_ids, row, metric_index))
+            .collect::<Vec<_>>();
         indices.sort_by(|&left, &right| {
             compare_ranked_rows(
                 &self.table,
@@ -286,11 +322,54 @@ impl PyContinuousReport {
         Ok(indices)
     }
 
+    #[pyo3(signature = (indices, *, metric_index=None, descending=true, limit=None))]
+    fn ranked_indices_subset(
+        &self,
+        indices: Vec<usize>,
+        metric_index: Option<usize>,
+        descending: bool,
+        limit: Option<usize>,
+    ) -> PyResult<Vec<usize>> {
+        if let Some(metric_index) = metric_index {
+            if metric_index >= self.metric_ids.len() {
+                return Err(PyValueError::new_err("metric_index is out of range"));
+            }
+        }
+        let mut seen = std::collections::HashSet::with_capacity(indices.len());
+        if indices
+            .iter()
+            .any(|&index| index >= self.table.row_count() || !seen.insert(index))
+        {
+            return Err(PyValueError::new_err(
+                "ranked subset indices must be unique and in range",
+            ));
+        }
+        let mut ranked = indices
+            .into_iter()
+            .filter(|&row| row_is_rankable(&self.table, &self.metric_ids, row, metric_index))
+            .collect::<Vec<_>>();
+        ranked.sort_by(|&left, &right| {
+            compare_ranked_rows(
+                &self.table,
+                &self.metric_ids,
+                left,
+                right,
+                metric_index,
+                descending,
+            )
+        });
+        if let Some(limit) = limit {
+            ranked.truncate(limit);
+        }
+        Ok(ranked)
+    }
+
     fn records(&self) -> Vec<PyContinuousRecord> {
         (0..self.table.row_count())
             .map(|index| PyContinuousRecord {
                 combo: combo_from_table(&self.table, index).unwrap_or_default(),
-                metrics: metric_values_from_table(&self.table, index).unwrap_or_default(),
+                metrics: metric_values_from_table(&self.table, index)
+                    .expect("records() iterates only in-range result rows"),
                 candidate_id: self.table.candidate_ids()[index],
             })
             .collect()
@@ -308,24 +387,24 @@ impl PyContinuousReport {
         self.significance.iter().map(|entry| entry.row).collect()
     }
 
-    fn significance_pvalues(&self) -> Vec<Vec<f32>> {
+    fn significance_pvalues(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         self.significance
             .iter()
-            .map(|entry| entry.pvalues.clone())
+            .map(|entry| precision_values_to_python_array(py, &entry.pvalues))
             .collect()
     }
 
-    fn significance_means(&self) -> Vec<Vec<f32>> {
+    fn significance_means(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         self.significance
             .iter()
-            .map(|entry| entry.means.clone())
+            .map(|entry| precision_values_to_python_array(py, &entry.means))
             .collect()
     }
 
-    fn significance_stds(&self) -> Vec<Vec<f32>> {
+    fn significance_stds(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         self.significance
             .iter()
-            .map(|entry| entry.stds.clone())
+            .map(|entry| precision_values_to_python_array(py, &entry.stds))
             .collect()
     }
 
@@ -344,9 +423,12 @@ impl PyContinuousReport {
         let out = PyDict::new(py);
         out.set_item("kind", "decision_path")?;
         out.set_item("features", &params.features)?;
-        out.set_item("thresholds", &params.thresholds)?;
+        out.set_item(
+            "thresholds",
+            precision_values_to_python_array(py, &params.thresholds)?,
+        )?;
         out.set_item("signs", &params.signs)?;
-        out.set_item("gain", params.gain)?;
+        out.set_item("gain", precision_scalar_to_python(py, params.gain)?)?;
         out.set_item("support", params.support)?;
         out.set_item("round_id", params.round_id)?;
         Ok(Some(out))
@@ -382,6 +464,7 @@ impl From<ContinuousReport> for PyContinuousReport {
             metric_ids: value.metric_ids,
             backend_kind: value.backend_kind,
             graph_replayed: value.graph_replayed,
+            precision: value.precision,
             mi_accumulation_fp64: value.mi_accumulation_fp64,
             interaction_diagnostics: value.interaction_diagnostics,
             table: SendOwnedResultTable::new(value.table),
@@ -391,28 +474,100 @@ impl From<ContinuousReport> for PyContinuousReport {
     }
 }
 
+fn precision_name(precision: PrecisionProfile) -> &'static str {
+    match precision {
+        PrecisionProfile::Fp32 => "fp32",
+        PrecisionProfile::Mixed => "mixed",
+        PrecisionProfile::Fp64 => "fp64",
+    }
+}
+
+fn parse_precision_name(value: &str) -> PyResult<PrecisionProfile> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fp32" => Ok(PrecisionProfile::Fp32),
+        "mixed" => Ok(PrecisionProfile::Mixed),
+        "fp64" => Ok(PrecisionProfile::Fp64),
+        _ => Err(PyValueError::new_err(
+            "precision must be one of: fp32, mixed, fp64",
+        )),
+    }
+}
+
+fn extract_flat_input(
+    precision: PrecisionProfile,
+    features: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
+) -> PyResult<OwnedNumericInput> {
+    match precision {
+        PrecisionProfile::Fp32 | PrecisionProfile::Mixed => OwnedNumericInput::from_f32(
+            precision,
+            features.extract::<Vec<f32>>()?,
+            target.extract::<Vec<f32>>()?,
+        )
+        .map_err(PyErr::from),
+        PrecisionProfile::Fp64 => OwnedNumericInput::from_f64(
+            precision,
+            features.extract::<Vec<f64>>()?,
+            target.extract::<Vec<f64>>()?,
+        )
+        .map_err(PyErr::from),
+    }
+}
+
+fn extract_nested_input(
+    precision: PrecisionProfile,
+    features: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
+) -> PyResult<(u64, u32, OwnedNumericInput)> {
+    match precision {
+        PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+            let (rows, cols, features, target) = flatten_continuous_rows(
+                features.extract::<Vec<Vec<f32>>>()?,
+                target.extract::<Vec<f32>>()?,
+            )?;
+            Ok((
+                rows,
+                cols,
+                OwnedNumericInput::from_f32(precision, features, target)?,
+            ))
+        }
+        PrecisionProfile::Fp64 => {
+            let (rows, cols, features, target) = flatten_continuous_rows_f64(
+                features.extract::<Vec<Vec<f64>>>()?,
+                target.extract::<Vec<f64>>()?,
+            )?;
+            Ok((
+                rows,
+                cols,
+                OwnedNumericInput::from_f64(precision, features, target)?,
+            ))
+        }
+    }
+}
+
 #[pyfunction]
 #[pyo3(signature = (config, features, target, *, rows, cols))]
 pub(crate) fn compile_continuous(
     config: &Bound<'_, PyDict>,
-    features: Vec<f32>,
-    target: Vec<f32>,
+    features: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
     rows: u64,
     cols: u32,
 ) -> PyResult<PyCompiledContinuousArtifact> {
     let config = parse_engine_config(config)?;
-    compile_continuous_rows(config, rows, cols, features, target).map_err(PyErr::from)
+    let input = extract_flat_input(config.precision, features, target)?;
+    compile_continuous_input(config, rows, cols, input).map_err(PyErr::from)
 }
 
 #[pyfunction(name = "compile_continuous_rows")]
 pub(crate) fn compile_continuous_nested(
     config: &Bound<'_, PyDict>,
-    features: Vec<Vec<f32>>,
-    target: Vec<f32>,
+    features: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
 ) -> PyResult<PyCompiledContinuousArtifact> {
     let config = parse_engine_config(config)?;
-    let (rows, cols, features, target) = flatten_continuous_rows(features, target)?;
-    compile_continuous_rows(config, rows, cols, features, target).map_err(PyErr::from)
+    let (rows, cols, input) = extract_nested_input(config.precision, features, target)?;
+    compile_continuous_input(config, rows, cols, input).map_err(PyErr::from)
 }
 
 #[pyfunction]
@@ -425,22 +580,22 @@ pub(crate) fn compile_continuous_buffers(
     cols: u32,
 ) -> PyResult<PyCompiledContinuousArtifact> {
     let config = parse_engine_config(config)?;
-    let features = decode_f32_le(features.as_bytes(), "feature")?;
-    let target = decode_f32_le(target.as_bytes(), "target")?;
-    compile_continuous_rows(config, rows, cols, features, target).map_err(PyErr::from)
+    let input = decode_precision_input(config.precision, features.as_bytes(), target.as_bytes())?;
+    compile_continuous_input(config, rows, cols, input).map_err(PyErr::from)
 }
 
 #[pyfunction]
 #[pyo3(signature = (config, features, target, *, rows, cols))]
 pub(crate) fn analyze_continuous(
     config: &Bound<'_, PyDict>,
-    features: Vec<f32>,
-    target: Vec<f32>,
+    features: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
     rows: u64,
     cols: u32,
 ) -> PyResult<PyContinuousReport> {
     let config = parse_engine_config(config)?;
-    analyze_continuous_rows_once(config, rows, cols, features, target)
+    let input = extract_flat_input(config.precision, features, target)?;
+    analyze_continuous_input_once(config, rows, cols, input)
         .map(PyContinuousReport::from)
         .map_err(PyErr::from)
 }
@@ -448,12 +603,12 @@ pub(crate) fn analyze_continuous(
 #[pyfunction(name = "analyze_continuous_rows")]
 pub(crate) fn analyze_continuous_nested(
     config: &Bound<'_, PyDict>,
-    features: Vec<Vec<f32>>,
-    target: Vec<f32>,
+    features: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
 ) -> PyResult<PyContinuousReport> {
     let config = parse_engine_config(config)?;
-    let (rows, cols, features, target) = flatten_continuous_rows(features, target)?;
-    analyze_continuous_rows_once(config, rows, cols, features, target)
+    let (rows, cols, input) = extract_nested_input(config.precision, features, target)?;
+    analyze_continuous_input_once(config, rows, cols, input)
         .map(PyContinuousReport::from)
         .map_err(PyErr::from)
 }
@@ -468,36 +623,30 @@ pub(crate) fn analyze_continuous_buffers(
     cols: u32,
 ) -> PyResult<PyContinuousReport> {
     let config = parse_engine_config(config)?;
-    let features = decode_f32_le(features.as_bytes(), "feature")?;
-    let target = decode_f32_le(target.as_bytes(), "target")?;
-    analyze_continuous_rows_once(config, rows, cols, features, target)
+    let input = decode_precision_input(config.precision, features.as_bytes(), target.as_bytes())?;
+    analyze_continuous_input_once(config, rows, cols, input)
         .map(PyContinuousReport::from)
         .map_err(PyErr::from)
 }
 
 #[pyfunction]
-#[pyo3(signature = (features, target, max_arity=2, max_combinations_per_k=5000, metric_ids=None))]
+#[pyo3(signature = (features, target, max_arity=2, max_combinations_per_k=5000, metric_ids=None, *, precision="mixed"))]
 pub(crate) fn analyze_continuous_cpu(
-    _py: Python<'_>,
-    features: Vec<Vec<f32>>,
-    target: Vec<f32>,
+    features: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
     max_arity: u32,
     max_combinations_per_k: u64,
     metric_ids: Option<Vec<u32>>,
+    precision: &str,
 ) -> PyResult<PyContinuousReport> {
-    let rows = features.len() as u64;
-    let cols = features.first().map_or(0u32, |row| row.len() as u32);
-    if features.iter().any(|row| row.len() != cols as usize) {
-        return Err(PyValueError::new_err(
-            "feature rows must all have the same length",
-        ));
-    }
-    let flat_features = features.into_iter().flatten().collect::<Vec<_>>();
-    analyze_continuous_cpu_rows(
+    // Parse the profile before extracting or converting caller-owned values.
+    let precision = parse_precision_name(precision)?;
+    let (rows, cols, input) = extract_nested_input(precision, features, target)?;
+    analyze_continuous_cpu_input_rows(
+        precision,
         rows,
         cols,
-        flat_features,
-        target,
+        input,
         max_arity,
         max_combinations_per_k,
         metric_ids.unwrap_or_default(),
@@ -517,6 +666,7 @@ mod tests {
     };
     use gafime_types::GAFIME_METRIC_PEARSON;
 
+    use crate::common::MetricValuesRef;
     use crate::continuous::analyze_continuous_cpu_rows;
 
     #[test]
@@ -532,6 +682,25 @@ mod tests {
         assert_eq!((rows, cols), (3, 2));
         // row-major: [r0c0, r0c1, r1c0, r1c1, ...]
         assert_eq!(flat, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn arrow_struct_imports_to_row_major_f64_without_fp32_collapse() {
+        let base = 1.0f64;
+        let adjacent = f64::from_bits(base.to_bits() + 1);
+        assert_eq!(base as f32, adjacent as f32);
+        let c0 = Arc::new(Float64Array::from(vec![base, adjacent])) as ArrayRef;
+        let c1 = Arc::new(Float64Array::from(vec![2.0f64, 3.0])) as ArrayRef;
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Float64, false),
+            Field::new("b", DataType::Float64, false),
+        ]);
+        let sa = StructArray::new(fields, vec![c0, c1], None);
+        let (rows, cols, flat) = struct_to_row_major_f64(&sa).unwrap();
+
+        assert_eq!((rows, cols), (2, 2));
+        assert_eq!(flat[0].to_bits(), base.to_bits());
+        assert_eq!(flat[2].to_bits(), adjacent.to_bits());
     }
 
     #[test]
@@ -551,14 +720,21 @@ mod tests {
         )
         .unwrap();
         let combo_ptr = report.table.combo_indices().as_ptr();
-        let metric_ptr = report.table.metric_values().as_ptr();
+        let metric_ptr = match report.table.metric_values() {
+            MetricValuesRef::F32(values) => values.as_ptr().cast::<()>(),
+            MetricValuesRef::F64(values) => values.as_ptr().cast::<()>(),
+        };
         let rank_ptr = report.table.ranks().as_ptr();
         let candidate_id_ptr = report.table.candidate_ids().as_ptr();
 
         let python_report = PyContinuousReport::from(report);
 
         assert_eq!(python_report.table.combo_indices().as_ptr(), combo_ptr);
-        assert_eq!(python_report.table.metric_values().as_ptr(), metric_ptr);
+        let python_metric_ptr = match python_report.table.metric_values() {
+            MetricValuesRef::F32(values) => values.as_ptr().cast::<()>(),
+            MetricValuesRef::F64(values) => values.as_ptr().cast::<()>(),
+        };
+        assert_eq!(python_metric_ptr, metric_ptr);
         assert_eq!(python_report.table.ranks().as_ptr(), rank_ptr);
         assert_eq!(
             python_report.table.candidate_ids().as_ptr(),
@@ -635,51 +811,131 @@ fn struct_to_row_major_f32(sa: &StructArray) -> PyResult<(u64, u32, Vec<f32>)> {
     Ok((rows as u64, cols as u32, flat))
 }
 
+/// Transpose Arrow Float64 columns directly into row-major f64 storage. This
+/// path intentionally has no f32 staging allocation, so adjacent binary64
+/// values remain distinct through fp64 ingest.
+fn struct_to_row_major_f64(sa: &StructArray) -> PyResult<(u64, u32, Vec<f64>)> {
+    let rows = sa.len();
+    let cols = sa.num_columns();
+    if cols == 0 || rows == 0 {
+        return Err(PyValueError::new_err("empty Arrow input"));
+    }
+    let mut columns: Vec<&Float64Array> = Vec::with_capacity(cols);
+    for c in 0..cols {
+        let col = sa
+            .column(c)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| {
+                PyValueError::new_err("feature columns must be Float64 for precision=\"fp64\"")
+            })?;
+        if col.null_count() != 0 {
+            return Err(PyValueError::new_err(
+                "null feature values are not supported",
+            ));
+        }
+        columns.push(col);
+    }
+    let mut flat = vec![0.0f64; rows * cols];
+    for (c, column) in columns.iter().enumerate() {
+        for r in 0..rows {
+            flat[r * cols + c] = column.value(r);
+        }
+    }
+    Ok((rows as u64, cols as u32, flat))
+}
+
 #[pyfunction]
-#[pyo3(signature = (features, target, max_arity=2, max_combinations_per_k=5000, metric_ids=None))]
+#[pyo3(signature = (features, target, *, precision="mixed", max_arity=2, max_combinations_per_k=5000, metric_ids=None))]
 pub(crate) fn analyze_continuous_arrow(
     _py: Python<'_>,
     features: &Bound<'_, PyAny>,
     target: &Bound<'_, PyAny>,
+    precision: &str,
     max_arity: u32,
     max_combinations_per_k: u64,
     metric_ids: Option<Vec<u32>>,
 ) -> PyResult<PyContinuousReport> {
+    // Validate the profile before importing an Arrow stream. This ordering is
+    // important: a rejected request must not trigger conversion or allocation.
+    let precision = parse_precision_name(precision)?;
     let features = import_arrow_struct(features)?;
-    let (rows, cols, flat) = struct_to_row_major_f32(&features)?;
     let target = import_arrow_struct(target)?;
     if target.num_columns() != 1 {
         return Err(PyValueError::new_err(
             "target must contain exactly one column",
         ));
     }
-    let target_col = target
-        .column(0)
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| PyValueError::new_err("target column must be Float32"))?;
-    if target_col.null_count() != 0 {
-        return Err(PyValueError::new_err(
-            "null target values are not supported",
-        ));
-    }
-    if target_col.len() as u64 != rows {
-        return Err(PyValueError::new_err(
-            "target length must match feature rows",
-        ));
-    }
-    let y = (0..target_col.len())
-        .map(|i| target_col.value(i))
-        .collect::<Vec<f32>>();
-    analyze_continuous_cpu_rows(
-        rows,
-        cols,
-        flat,
-        y,
-        max_arity,
-        max_combinations_per_k,
-        metric_ids.unwrap_or_default(),
-    )
-    .map(PyContinuousReport::from)
-    .map_err(PyErr::from)
+
+    let (rows, cols, input) = match precision {
+        PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+            let (rows, cols, flat) = struct_to_row_major_f32(&features)?;
+            let target_col = target
+                .column(0)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    PyValueError::new_err(
+                        "target column must be Float32 for precision=\"fp32\" or \"mixed\"",
+                    )
+                })?;
+            if target_col.null_count() != 0 {
+                return Err(PyValueError::new_err(
+                    "null target values are not supported",
+                ));
+            }
+            if target_col.len() as u64 != rows {
+                return Err(PyValueError::new_err(
+                    "target length must match feature rows",
+                ));
+            }
+            let target = (0..target_col.len())
+                .map(|index| target_col.value(index))
+                .collect::<Vec<f32>>();
+            (
+                rows,
+                cols,
+                OwnedNumericInput::from_f32(precision, flat, target)?,
+            )
+        }
+        PrecisionProfile::Fp64 => {
+            let (rows, cols, flat) = struct_to_row_major_f64(&features)?;
+            let target_col = target
+                .column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    PyValueError::new_err("target column must be Float64 for precision=\"fp64\"")
+                })?;
+            if target_col.null_count() != 0 {
+                return Err(PyValueError::new_err(
+                    "null target values are not supported",
+                ));
+            }
+            if target_col.len() as u64 != rows {
+                return Err(PyValueError::new_err(
+                    "target length must match feature rows",
+                ));
+            }
+            let target = (0..target_col.len())
+                .map(|index| target_col.value(index))
+                .collect::<Vec<f64>>();
+            (
+                rows,
+                cols,
+                OwnedNumericInput::from_f64(precision, flat, target)?,
+            )
+        }
+    };
+    let metric_ids = metric_ids.unwrap_or_else(|| {
+        vec![
+            gafime_types::GAFIME_METRIC_PEARSON,
+            gafime_types::GAFIME_METRIC_R2,
+        ]
+    });
+    let mut config = continuous_config_for_cpu(max_arity, max_combinations_per_k, metric_ids)?;
+    config.precision = precision;
+    analyze_continuous_input_once(config, rows, cols, input)
+        .map(PyContinuousReport::from)
+        .map_err(PyErr::from)
 }

@@ -36,14 +36,10 @@ jobs:
                 -DGAFIME_CUDA_BUILD_TESTS=ON \
                 -DGAFIME_CUDA_ARCHITECTURES=89-real
               cmake --build build/ci-cuda-native --parallel 2
-              ctest --test-dir build/ci-cuda-native --output-on-failure
-              cmake -S src/cuda -B build/ci-cuda-mi-fp64 \
-                -DGAFIME_CUDA_RT_BUILD_MODE=off \
-                -DGAFIME_CUDA_ARCHITECTURES=89-real \
-                -DGAFIME_CUDA_BUILD_TESTS=ON \
-                -DGAFIME_CUDA_MI_ACCUMULATION_MODE=fp64
-              cmake --build build/ci-cuda-mi-fp64 --parallel 2
-              ctest --test-dir build/ci-cuda-mi-fp64 --output-on-failure
+              ctest --test-dir build/ci-cuda-native --show-only \
+                | grep gafime_cuda_precision_abi_smoke
+              ctest --test-dir build/ci-cuda-native --output-on-failure \
+                --exclude-regex '^gafime_cuda_precision_abi_smoke$'
             '
 
   contract_and_numpy_parity:
@@ -195,6 +191,7 @@ jobs:
           cargo test -p gafime-gpu-sys metal_descriptor_cache_generation_refreshes_reused_addresses_when_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_device_topk_covers_split_directions_ties_and_large_k_when_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available -- --nocapture
+          cargo test -p gafime-gpu-sys metal_fp32_precision_metrics_match_core_fp32_on_high_dynamic_and_nonfinite_inputs_when_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_nonfinite_correlation_is_not_laundered_when_library_is_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_scaled_covariance_matches_cpu_across_dynamic_range_when_available -- --nocapture
 

@@ -52,7 +52,9 @@ FORBIDDEN_AGENT_IGNORE_PATTERNS = (
 def normalized_agent_text(path: Path) -> str:
     lines = path.read_text(encoding="utf-8").splitlines()
     if len(lines) >= 3 and lines[2].startswith("This file mirrors `"):
-        lines[2] = "This file mirrors `<mirror>`. Keep both files synchronized except for agent-specific notes that are explicitly needed."
+        lines[2] = (
+            "This file mirrors `<mirror>`. Keep both files synchronized except for agent-specific notes that are explicitly needed."
+        )
     if path.name == "AGENT.md" and AGENT_ONLY_SECTION in lines:
         start = lines.index(AGENT_ONLY_SECTION)
         end = next(
@@ -102,7 +104,9 @@ def main() -> None:
         *crate_manifests,
     ):
         if not path.exists():
-            raise AssertionError(f"required contract artifact is missing: {path.relative_to(ROOT)}")
+            raise AssertionError(
+                f"required contract artifact is missing: {path.relative_to(ROOT)}"
+            )
 
     stale_root_artifacts = [
         name for name in FORBIDDEN_ROOT_AGENT_ARTIFACTS if (ROOT / name).exists()
@@ -130,8 +134,8 @@ def main() -> None:
         if section not in contract_text:
             raise AssertionError(f"docs/contract.md missing section: {section}")
     for phrase in (
-        "Standard CUDA payloads compile only `kernels.cu` and `launcher.cu`",
-        "standard ROCm payloads compile both `kernels.hip` and `launcher.hip`",
+        "Standard CUDA payloads compile only `precision_kernels.cu` and `precision_launcher.cu`",
+        "Standard ROCm payloads compile both `kernels.hip` and `launcher.hip`",
         "GPU payload staging and release packaging must source backend files from this root `src/` layout",
         "Packaging must not reintroduce `gpu/`, crate-local native source homes",
         "CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation",
@@ -153,7 +157,9 @@ def main() -> None:
         "Prerelease classification is parser-derived",
     ):
         if phrase not in contract_text:
-            raise AssertionError(f"docs/contract.md missing GPU packaging rule: {phrase}")
+            raise AssertionError(
+                f"docs/contract.md missing GPU packaging rule: {phrase}"
+            )
 
     agent_text = agent.read_text(encoding="utf-8")
     claude_text = claude.read_text(encoding="utf-8")
@@ -191,9 +197,7 @@ def main() -> None:
                 f"{path.relative_to(ROOT)} retains obsolete every-commit CI policy"
             )
     if AGENT_ONLY_SECTION not in agent_text or AGENT_ONLY_SECTION in claude_text:
-        raise AssertionError(
-            "Codex delegation rules must exist only in AGENT.md"
-        )
+        raise AssertionError("Codex delegation rules must exist only in AGENT.md")
     for path, policy_text in ((agent, agent_text), (claude, claude_text)):
         if HANDOFF_ROUTING_SECTION not in policy_text:
             raise AssertionError(
@@ -287,7 +291,7 @@ def main() -> None:
     for decision in (
         "MSRV:             1.89",
         "release compiler: exact 1.97.1",
-        "RUSTFLAGS=\"-C linker-features=-lld\"",
+        'RUSTFLAGS="-C linker-features=-lld"',
         "312 passed, 13 skipped",
     ):
         if decision not in rust_evidence_text:
@@ -302,7 +306,9 @@ def main() -> None:
 
     gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     if any(line.strip() == "CLAUDE.md" for line in gitignore):
-        raise AssertionError("CLAUDE.md must not be ignored; it is tracked project contract, not scratch memory")
+        raise AssertionError(
+            "CLAUDE.md must not be ignored; it is tracked project contract, not scratch memory"
+        )
 
     print("contract policy files verified")
 
