@@ -305,7 +305,6 @@ else:
             "unique_output": str(output),
         }],
     }
-output.parent.mkdir(parents=True, exist_ok=True)
 output.write_text(json.dumps(payload), encoding="utf-8")
 """
     path.write_text(script + f"\n# lane-helper-marker: {marker}\n", encoding="utf-8")
@@ -367,6 +366,8 @@ def test_fake_helpers_execute_every_cell_in_fresh_processes(
     summary = runner.run(config)
 
     assert summary["status"] == "pass"
+    assert (config.output_dir / "calibration").is_dir()
+    assert (config.output_dir / "artifacts").is_dir()
     assert summary["calibration_process_count"] == 12
     assert summary["recorded_process_count"] == 24
     assert len(summary["artifacts"]) == 24

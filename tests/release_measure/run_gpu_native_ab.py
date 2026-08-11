@@ -1740,6 +1740,11 @@ def run(config: RunnerConfig, *, dry_run: bool = False) -> dict[str, object]:
     )
     expected_outputs.append(config.output_dir / f"{config.backend}-native-ab-run.json")
     _reject_stale_outputs(expected_outputs, dry_run=dry_run)
+    # The native helpers open their output paths directly.  Create the
+    # runner-owned layout before launching the first calibration process so a
+    # fresh evidence root behaves the same as an existing one.
+    (config.output_dir / "calibration").mkdir(parents=True, exist_ok=True)
+    (config.output_dir / "artifacts").mkdir(parents=True, exist_ok=True)
     expected_affinity = (
         list(config.affinity) if config.affinity is not None else _affinity()
     )
