@@ -5,6 +5,49 @@ use crate::local_cmake_experiment::{
 use gafime_cpu::decision_path::{path_membership, PathNode, SplitSign};
 use std::sync::Barrier;
 
+#[test]
+fn raw_local_experiment_result_routes_remain_unsafe_function_items() {
+    #[allow(dead_code)]
+    #[deny(unused_unsafe)]
+    fn require_unsafe_calls(
+        backend: &mut GpuBackend,
+        matrix: &MatrixHandle,
+        result: &mut GafimeResultTable,
+    ) {
+        // SAFETY: compile-only API assertion; this function is never called.
+        let _ = unsafe { backend.decision_path_score(matrix, &[], &[0], &[], result) };
+        // SAFETY: compile-only API assertion; this function is never called.
+        let _ = unsafe {
+            backend.decision_path_score_with_policy(
+                matrix,
+                &[],
+                &[0],
+                &[],
+                result,
+                DecisionPathRtPolicy::AllowSmFallback,
+            )
+        };
+    }
+
+    let _: unsafe fn(
+        &mut GpuBackend,
+        &MatrixHandle,
+        &[GafimeDecisionPathTerm],
+        &[u32],
+        &[u32],
+        &mut GafimeResultTable,
+    ) -> Result<bool, GpuSysError> = GpuBackend::decision_path_score;
+    let _: unsafe fn(
+        &mut GpuBackend,
+        &MatrixHandle,
+        &[GafimeDecisionPathTerm],
+        &[u32],
+        &[u32],
+        &mut GafimeResultTable,
+        DecisionPathRtPolicy,
+    ) -> Result<bool, GpuSysError> = GpuBackend::decision_path_score_with_policy;
+}
+
 pub(crate) static TEST_DECISION_PATH_FLAGS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static TEST_RT_RELEASE_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static TEST_RT_RELEASE_DEVICE_MASK: AtomicU32 = AtomicU32::new(0);
