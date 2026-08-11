@@ -594,10 +594,16 @@ def _canonical_child_environment(child: dict[str, object]) -> dict[str, str]:
         raise RuntimeError("production child must report its actual nonempty PATH")
     if "RAYON_NUM_THREADS" in raw:
         raise RuntimeError("production child inherited forbidden RAYON_NUM_THREADS")
-    canonical = {
-        key: str(raw[key]) if key in raw else "<unset>"
-        for key in _COMPARABLE_ENVIRONMENT_KEYS
-    }
+    canonical: dict[str, str] = {}
+    for key in _COMPARABLE_ENVIRONMENT_KEYS:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if not isinstance(value, str):
+            raise RuntimeError(
+                "production child environment values must be strings"
+            )
+        canonical[key] = value
     canonical.update(
         {
             "RAYON_NUM_THREADS": "<scrubbed>",
@@ -607,6 +613,51 @@ def _canonical_child_environment(child: dict[str, object]) -> dict[str, str]:
         }
     )
     return canonical
+
+
+def _canonical_child_device(child: dict[str, object]) -> dict[str, object]:
+    raw = child.get("device")
+    if not isinstance(raw, dict):
+        raise RuntimeError("production child CPU hardware provenance is malformed")
+    kind = raw.get("kind")
+    identity = raw.get("identity")
+    logical = raw.get("logical_cpu_count")
+    physical = raw.get("physical_cpu_count")
+    if (
+        kind != "cpu"
+        or not isinstance(identity, str)
+        or not identity.strip()
+        or not isinstance(logical, int)
+        or isinstance(logical, bool)
+        or logical < 1
+        or (
+            physical is not None
+            and (
+                not isinstance(physical, int)
+                or isinstance(physical, bool)
+                or physical < 1
+                or physical > logical
+            )
+        )
+    ):
+        raise RuntimeError("production child CPU hardware provenance is malformed")
+    return {
+        "kind": kind,
+        "identity": identity,
+        "logical_cpu_count": logical,
+        "physical_cpu_count": physical,
+    }
+
+
+def _canonical_common_child_device(
+    children: Sequence[dict[str, object]],
+) -> dict[str, object]:
+    devices = [_canonical_child_device(child) for child in children]
+    if not devices or any(device != devices[0] for device in devices[1:]):
+        raise RuntimeError(
+            "fresh production children observed inconsistent CPU hardware provenance"
+        )
+    return devices[0]
 
 
 def _static_clock_power_view(state: object) -> dict[str, object]:
@@ -1451,20 +1502,7 @@ def _validate_child_contract(
         != "all_visible_result_metadata_structural_arrays_and_metric_bits"
     ):
         raise RuntimeError("timed result digest does not authenticate untimed snapshot")
-    device = child.get("device")
-    if (
-        not isinstance(device, dict)
-        or not isinstance(device.get("logical_cpu_count"), int)
-        or device["logical_cpu_count"] < 1
-        or (
-            device.get("physical_cpu_count") is not None
-            and (
-                not isinstance(device.get("physical_cpu_count"), int)
-                or device["physical_cpu_count"] < 1
-            )
-        )
-    ):
-        raise RuntimeError("production child CPU topology provenance is malformed")
+    _canonical_child_device(child)
     clock_power = child.get("clock_and_power_state")
     if (
         child.get("clock_and_power_capture_point")
@@ -1721,6 +1759,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         raise RuntimeError(
             "fresh production children observed inconsistent canonical environments"
         )
+    canonical_device = _canonical_common_child_device(records)
     thread_scaling_tables = _thread_scaling_tables(records)
     primary_record_indexes = [
         index
@@ -1900,6 +1939,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
         "process_isolation": PROCESS_ISOLATION,
         "process_affinity": observed_affinities[0],
         "observed_process_affinities": observed_affinities,
+        "device": canonical_device,
+        "device_scope": (
+            "canonical identical CPU identity and logical/physical topology "
+            "reported by every fresh child"
+        ),
         "environment": canonical_environments[0],
         "environment_scope": (
             "canonical actual child environment shared by every fresh process; "

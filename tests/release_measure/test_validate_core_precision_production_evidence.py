@@ -6,6 +6,7 @@ These exercise the comparison policy only; they do not compile or run GAFIME.
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
@@ -109,6 +110,75 @@ def test_informational_diagnostics_can_be_complete_without_publishing_claims() -
 
     assert set(informational.values()) == {False}
     assert set(stable.values()) == {True}
+
+
+def test_informational_ab_ba_diagnostics_never_self_promote_claims(
+    tmp_path: Path,
+) -> None:
+    variants = (
+        validator.Variant("baseline", sys.executable, None, ()),
+        validator.Variant("candidate", sys.executable, None, ()),
+    )
+    artifacts: list[dict[str, object]] = []
+    for variant, samples in (("baseline", [10.0, 11.0]), ("candidate", [9.0, 10.0])):
+        for block, sequence in (
+            (0, ["baseline", "candidate"]),
+            (1, ["candidate", "baseline"]),
+        ):
+            artifact = tmp_path / f"{variant}-block-{block}.json"
+            artifact.write_text(
+                json.dumps(
+                    {
+                        "schema": "gafime.core-production-executor.v1",
+                        "records": [
+                            {
+                                "profile": "fp32",
+                                "operation": "production_executor_metric",
+                                "metric": "pearson",
+                                "workload": {"name": "latency", "rows": 512},
+                                "input_policy": "common-f64",
+                                "input_identity": {"matrix_sha256": "a" * 64},
+                                "variant_sequence": sequence,
+                                "ab_block": block,
+                                "execution_topology": {"worker_mode": "default"},
+                                "samples_ns": samples,
+                                "loop_count_per_sample": 8,
+                                "clock": "std::time::Instant monotonic clock",
+                                "timing_scope": "production_executor_metric",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            artifacts.append(
+                {
+                    "variant": variant,
+                    "backend": "core",
+                    "kind": "core_production_executor",
+                    "path": str(artifact),
+                    "validation": {
+                        "complete": True,
+                        "evidence_integrity_valid": True,
+                        "raw_measurement_claim_ready": True,
+                        "performance_claim_ready": False,
+                        "measurement_mode": "informational",
+                    },
+                }
+            )
+    evidence = {"valid": True, "arithmetic_claims_valid": False, "artifacts": artifacts}
+
+    comparisons = validator._native_ab_comparisons(
+        evidence, variants, bootstrap_resamples=25, seed=7
+    )
+    published = validator._published_claim_readiness(
+        mode="informational",
+        diagnostic_ready=bool(comparisons),
+        stable_ready=True,
+    )
+
+    assert {comparison["ab_block"] for comparison in comparisons} == {0, 1}
+    assert set(published.values()) == {False}
 
 
 def test_exact_commit_pair_requires_the_frozen_distinct_baseline() -> None:

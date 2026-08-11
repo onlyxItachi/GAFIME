@@ -209,7 +209,12 @@ def _valid_child(
         },
         "clock_and_power_capture_point": "before and after all timed benchmark regions",
         "clock_and_power_state": {"before": {}, "after": {}},
-        "device": {"logical_cpu_count": 8, "physical_cpu_count": 4},
+        "device": {
+            "kind": "cpu",
+            "identity": "test-cpu",
+            "logical_cpu_count": 8,
+            "physical_cpu_count": 4,
+        },
         "execution_topology": {
             "candidate_parallelism": (
                 "rayon_candidate_level"
@@ -647,10 +652,45 @@ def test_canonical_environment_is_nonempty_and_rayon_is_scrubbed() -> None:
     canonical = runner._canonical_child_environment(child)
 
     assert canonical["PATH"] == "/bin"
+    assert "VIRTUAL_ENV" not in canonical
     assert canonical["RAYON_NUM_THREADS"] == "<scrubbed>"
+    child["environment"]["VIRTUAL_ENV"] = "/tmp/real-venv"
+    assert runner._canonical_child_environment(child)["VIRTUAL_ENV"] == (
+        "/tmp/real-venv"
+    )
     child["environment"] = {}
     with pytest.raises(RuntimeError, match="nonempty PATH"):
         runner._canonical_child_environment(child)
+
+
+def test_canonical_device_requires_and_preserves_stable_cpu_identity() -> None:
+    child = _valid_child(worker_mode="default", effective_workers=4, allowed=4)
+
+    assert runner._canonical_child_device(child) == {
+        "kind": "cpu",
+        "identity": "test-cpu",
+        "logical_cpu_count": 8,
+        "physical_cpu_count": 4,
+    }
+
+    child["device"] = {
+        "kind": "cpu",
+        "identity": "",
+        "logical_cpu_count": 8,
+        "physical_cpu_count": 4,
+    }
+    with pytest.raises(RuntimeError, match="CPU hardware provenance"):
+        runner._canonical_child_device(child)
+
+    first = _valid_child(worker_mode="1", effective_workers=1, allowed=4)
+    second = _valid_child(worker_mode="4", effective_workers=4, allowed=4)
+    assert runner._canonical_common_child_device([first, second])["identity"] == (
+        "test-cpu"
+    )
+    second["device"] = dict(second["device"])
+    second["device"]["identity"] = "different-cpu"
+    with pytest.raises(RuntimeError, match="inconsistent CPU hardware provenance"):
+        runner._canonical_common_child_device([first, second])
 
 
 def test_compiler_command_links_exact_product_and_route_dependencies(
@@ -719,6 +759,7 @@ def test_leaf_and_production_claim_boundaries_are_structurally_distinct() -> Non
         .with_name("core_precision_production_benchmark.rs")
         .read_text(encoding="utf-8")
     )
+    production_runner = _SCRIPT.read_text(encoding="utf-8")
 
     assert "gafime.core-leaf-kernel-diagnostic.v1" in leaf
     assert "eligible_for_core_production_throughput" in leaf
@@ -742,6 +783,8 @@ def test_leaf_and_production_claim_boundaries_are_structurally_distinct() -> Non
     assert "loop_count_for_calibration_target" in production
     assert "calibration_preflight_samples_ns" in production
     assert ".clamp(1, MAX_LOOP_COUNT)" not in production
+    assert '"device": canonical_device' in production_runner
+    assert '"VIRTUAL_ENV": "<unset>"' not in production_runner
 
 
 def test_workflow_uses_the_compatible_before_fix_precision_head_and_tracks_the_runner() -> (

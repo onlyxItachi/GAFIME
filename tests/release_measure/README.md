@@ -543,8 +543,11 @@ The stable workflow runs only on the pinned
 `self-hosted,linux,x64,gafime-core-stable` runner label; ordinary PR
 comparisons remain informational on GitHub-hosted Ubuntu. The informational
 workflow's declared reduced workload/input-policy matrix is validated exactly
-as raw diagnostic evidence, while all public release/comparative-claim booleans
-remain false; stable mode requires the complete canonical matrix.
+as raw diagnostic evidence and may emit normalized A/B diagnostics, while all
+public release/comparative-claim booleans remain false; stable mode requires
+the complete canonical matrix. Aggregate records preserve the identical CPU
+identity reported by every fresh child and omit environment variables that
+were genuinely absent instead of encoding them as truthy placeholders.
 
 Metal event evidence is produced by the test-only
 `gafime_metal_precision_native_timing` CMake target. It records allocation,

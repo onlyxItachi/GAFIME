@@ -4089,6 +4089,30 @@ def _cold_comparisons(
     return comparisons
 
 
+def _native_validation_allows_comparison_samples(
+    validation: Mapping[str, object],
+    *,
+    production_core_executor: bool,
+    supplemental_core_leaf: bool = False,
+) -> bool:
+    """Separate integrity-valid diagnostics from release-claim readiness.
+
+    Production-Core informational artifacts deliberately cannot carry a
+    release performance claim. Their authenticated raw cells still feed the
+    diagnostic A/B table; the later Core comparison validator keeps every
+    publication/stable flag false unless stable-mode gates also pass.
+    """
+
+    if validation.get("performance_claim_ready") is True or supplemental_core_leaf:
+        return True
+    return bool(
+        production_core_executor
+        and validation.get("evidence_integrity_valid") is True
+        and validation.get("raw_measurement_claim_ready") is True
+        and validation.get("measurement_mode") in {"informational", "stable"}
+    )
+
+
 def _native_ab_comparisons(
     native_evidence: Mapping[str, object],
     variants: Sequence[Variant],
@@ -4269,9 +4293,10 @@ def _native_ab_comparisons(
                     or family_assessment.get("claim_ready") is not True
                 ):
                     continue
-            elif (
-                validation.get("performance_claim_ready") is not True
-                and not supplemental_core_leaf
+            elif not _native_validation_allows_comparison_samples(
+                validation,
+                production_core_executor=production_core_executor,
+                supplemental_core_leaf=supplemental_core_leaf,
             ):
                 continue
             # ``samples_us``/``samples_ns`` are normalized to one operation.
@@ -4566,7 +4591,10 @@ def _native_ab_loop_count_failures(
                     or family_assessment.get("claim_ready") is not True
                 ):
                     continue
-            elif validation.get("performance_claim_ready") is not True:
+            elif not _native_validation_allows_comparison_samples(
+                validation,
+                production_core_executor=production_core_executor,
+            ):
                 continue
             samples = record.get("samples_us", record.get("samples_ns"))
             if not isinstance(samples, list) or not samples:

@@ -6140,6 +6140,95 @@ def test_core_production_raw_payload_comparison_allows_only_derived_fields() -> 
     assert perf13._core_production_payload_without_derived_fields(tampered) != authenticated
 
 
+def test_informational_core_production_raw_cells_remain_diagnostic_only(
+    tmp_path: Path,
+) -> None:
+    variants = (
+        perf13.Variant("baseline", sys.executable, None, ()),
+        perf13.Variant("candidate", sys.executable, None, ()),
+    )
+    artifacts: list[dict[str, object]] = []
+    for variant, samples in (("baseline", [10.0, 11.0]), ("candidate", [9.0, 10.0])):
+        artifact = tmp_path / f"{variant}.json"
+        artifact.write_text(
+            json.dumps(
+                {
+                    "schema": "gafime.core-production-executor.v1",
+                    "records": [
+                        {
+                            "profile": "fp32",
+                            "operation": "production_executor_metric",
+                            "metric": "pearson",
+                            "workload": {"name": "latency", "rows": 512},
+                            "input_policy": "common-f64",
+                            "input_identity": {"matrix_sha256": "a" * 64},
+                            "variant_sequence": ["baseline", "candidate"],
+                            "ab_block": 0,
+                            "execution_topology": {"worker_mode": "default"},
+                            "samples_ns": samples,
+                            "loop_count_per_sample": 8,
+                            "clock": "std::time::Instant monotonic clock",
+                            "timing_scope": "production_executor_metric",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        artifacts.append(
+            {
+                "variant": variant,
+                "backend": "core",
+                "kind": "core_production_executor",
+                "path": str(artifact),
+                "validation": {
+                    "complete": True,
+                    "evidence_integrity_valid": True,
+                    "raw_measurement_claim_ready": True,
+                    "performance_claim_ready": False,
+                    "measurement_mode": "informational",
+                },
+            }
+        )
+    evidence = {"valid": True, "arithmetic_claims_valid": False, "artifacts": artifacts}
+
+    comparisons = perf13._native_ab_comparisons(
+        evidence, variants, bootstrap_resamples=25, seed=7
+    )
+
+    assert len(comparisons) == 1
+    assert comparisons[0]["operation"] == "production_executor_metric"
+    assert perf13._native_ab_loop_count_failures(evidence, variants, ("core",)) == []
+    assert all(
+        artifact["validation"]["performance_claim_ready"] is False
+        for artifact in artifacts
+    )
+
+    artifacts[0]["validation"]["evidence_integrity_valid"] = False
+    assert (
+        perf13._native_ab_comparisons(
+            evidence, variants, bootstrap_resamples=25, seed=7
+        )
+        == []
+    )
+    artifacts[0]["validation"]["evidence_integrity_valid"] = True
+    artifacts[0]["validation"]["measurement_mode"] = "unsupported"
+    assert (
+        perf13._native_ab_comparisons(
+            evidence, variants, bootstrap_resamples=25, seed=7
+        )
+        == []
+    )
+    artifacts[0]["validation"]["measurement_mode"] = "informational"
+    artifacts[0]["validation"]["raw_measurement_claim_ready"] = False
+    assert (
+        perf13._native_ab_comparisons(
+            evidence, variants, bootstrap_resamples=25, seed=7
+        )
+        == []
+    )
+
+
 def test_core_production_affinity_cardinality_is_fail_closed() -> None:
     assert perf13._core_production_cpu_list_cardinality("0-3,8,10-11") == 7
     assert perf13._core_production_cpu_list_cardinality("0-3,2-5") == 6
