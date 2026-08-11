@@ -141,7 +141,15 @@ impl MatrixHandle {
 pub trait ComputeBackend {
     fn backend_kind(&self) -> BackendKind;
 
-    fn execution_device_memory_peak_bytes(
+    /// Query the peak device memory for a raw ABI 1.0 launch descriptor.
+    ///
+    /// # Safety
+    ///
+    /// Every non-empty pointer/length pair reachable from `protocol` must be
+    /// properly aligned, initialized, and live for this synchronous call. The
+    /// pointed-to descriptor storage must not be mutated for the duration of
+    /// the call.
+    unsafe fn execution_device_memory_peak_bytes(
         &mut self,
         _matrix: &MatrixHandle,
         _protocol: &GafimeLaunchProtocol,
@@ -149,7 +157,17 @@ pub trait ComputeBackend {
         Ok(None)
     }
 
-    fn execute(
+    /// Execute one raw ABI 1.0 launch descriptor.
+    ///
+    /// # Safety
+    ///
+    /// In addition to the protocol requirements documented by
+    /// [`Self::execution_device_memory_peak_bytes`], every non-null output
+    /// pointer in `result` must reference uniquely borrowed, writable storage
+    /// covering its declared capacity and strides. The matrix handle and all
+    /// referenced storage must remain live for this synchronous call, and the
+    /// backend must not retain any borrowed pointer after returning.
+    unsafe fn execute(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimeLaunchProtocol,
@@ -162,7 +180,15 @@ pub trait ComputeBackend {
 pub trait PrecisionComputeBackend {
     fn backend_kind(&self) -> BackendKind;
 
-    fn execution_device_memory_peak_bytes_v2(
+    /// Query peak device memory for a raw ABI 1.1 precision descriptor.
+    ///
+    /// # Safety
+    ///
+    /// `protocol.base` must be null only where the operation explicitly
+    /// permits it. Otherwise it must point to a live ABI 1.0 launch descriptor
+    /// whose complete pointer graph satisfies the safety contract of
+    /// [`ComputeBackend::execution_device_memory_peak_bytes`].
+    unsafe fn execution_device_memory_peak_bytes_v2(
         &mut self,
         _matrix: &MatrixHandle,
         _protocol: &GafimePrecisionLaunchProtocol,
@@ -170,14 +196,30 @@ pub trait PrecisionComputeBackend {
         Ok(None)
     }
 
-    fn execute_fp32(
+    /// Execute a raw ABI 1.1 fp32 launch descriptor.
+    ///
+    /// # Safety
+    ///
+    /// The precision wrapper and its base descriptor must satisfy
+    /// [`Self::execution_device_memory_peak_bytes_v2`]. Every output pointer in
+    /// `result` must reference uniquely borrowed, writable storage covering the
+    /// declared capacity and f32 strides for this synchronous call.
+    unsafe fn execute_fp32(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimePrecisionLaunchProtocol,
         result: &mut GafimeResultTable,
     ) -> OrchestratorResult<BackendExecutionStats>;
 
-    fn execute_f64(
+    /// Execute a raw ABI 1.1 mixed/fp64 launch descriptor.
+    ///
+    /// # Safety
+    ///
+    /// The precision wrapper and its base descriptor must satisfy
+    /// [`Self::execution_device_memory_peak_bytes_v2`]. Every output pointer in
+    /// `result` must reference uniquely borrowed, writable storage covering the
+    /// declared capacity and f64 strides for this synchronous call.
+    unsafe fn execute_f64(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimePrecisionLaunchProtocol,

@@ -238,15 +238,19 @@ fn require_rt_policy_rejects_an_unsupported_payload_in_rust() {
     assert_eq!(TEST_DECISION_PATH_FLAGS.load(Ordering::SeqCst), u32::MAX);
 
     let mut result = GafimeResultTable::default();
+    // SAFETY: term/offset/metric slices are live; the instrumented payload
+    // rejects the RT policy before touching the zero-capacity result table.
     assert!(matches!(
-        sm_only_backend.decision_path_score_with_policy(
-            sm_only_matrix.handle(),
-            &terms,
-            &offsets,
-            &[GAFIME_METRIC_PEARSON],
-            &mut result,
-            DecisionPathRtPolicy::RequireRt,
-        ),
+        unsafe {
+            sm_only_backend.decision_path_score_with_policy(
+                sm_only_matrix.handle(),
+                &terms,
+                &offsets,
+                &[GAFIME_METRIC_PEARSON],
+                &mut result,
+                DecisionPathRtPolicy::RequireRt,
+            )
+        },
         Err(GpuSysError::BackendStatus {
             operation: "gafime_gpu_decision_path_score",
             status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
@@ -296,8 +300,10 @@ fn rust_decision_path_policy_sets_the_approved_abi_flag() {
     );
 
     let mut result = GafimeResultTable::default();
-    backend
-        .decision_path_score_with_policy(
+    // SAFETY: all input slices are live; the instrumented payload only records
+    // flags and does not dereference the zero-capacity result descriptor.
+    unsafe {
+        backend.decision_path_score_with_policy(
             matrix.handle(),
             &terms,
             &offsets,
@@ -305,7 +311,8 @@ fn rust_decision_path_policy_sets_the_approved_abi_flag() {
             &mut result,
             DecisionPathRtPolicy::RequireRt,
         )
-        .unwrap();
+    }
+    .unwrap();
     assert_eq!(
         TEST_DECISION_PATH_FLAGS.load(Ordering::SeqCst),
         GAFIME_DECISION_PATH_FLAG_REQUIRE_RT
@@ -682,15 +689,18 @@ fn cuda_decision_path_score_matches_cpu_when_library_is_available() {
     let offsets = vec![0u32, 2, 5];
     let metrics = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
     let mut result = TestResultTable::new(2, 1, 2);
-    let executed = backend
-        .decision_path_score(
+    // SAFETY: all input slices are live and `result` owns correctly sized,
+    // uniquely borrowed output buffers for the synchronous call.
+    let executed = unsafe {
+        backend.decision_path_score(
             matrix.handle(),
             &terms,
             &offsets,
             &metrics,
             result.raw_mut(),
         )
-        .unwrap();
+    }
+    .unwrap();
     assert!(executed);
     assert_eq!(result.raw.row_count, 2);
     assert_eq!(result.combo_indices(), &[0, 1]);
@@ -800,15 +810,18 @@ fn cuda_decision_path_direct_score_matches_cpu_when_library_is_available() {
     let offsets = vec![0u32, 2, 5];
     let metrics = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
     let mut result = TestResultTable::new(2, 1, 2);
-    let executed = backend
-        .decision_path_score(
+    // SAFETY: all input slices are live and `result` owns correctly sized,
+    // uniquely borrowed output buffers for the synchronous call.
+    let executed = unsafe {
+        backend.decision_path_score(
             matrix.handle(),
             &terms,
             &offsets,
             &metrics,
             result.raw_mut(),
         )
-        .unwrap();
+    }
+    .unwrap();
     assert!(executed);
     assert_eq!(result.raw.row_count, 2);
 
@@ -2161,15 +2174,18 @@ fn cuda_decision_path_score_rejects_unsupported_metrics_when_library_is_availabl
     let offsets = vec![0u32, 1];
     let metrics = vec![GAFIME_METRIC_MUTUAL_INFO];
     let mut result = TestResultTable::new(1, 1, 1);
-    let err = backend
-        .decision_path_score(
+    // SAFETY: all input slices are live and `result` owns correctly sized
+    // output buffers; the payload rejects the unsupported metric.
+    let err = unsafe {
+        backend.decision_path_score(
             matrix.handle(),
             &terms,
             &offsets,
             &metrics,
             result.raw_mut(),
         )
-        .expect_err("MI must be unsupported for compact decision-path score");
+    }
+    .expect_err("MI must be unsupported for compact decision-path score");
     assert!(matches!(
         err,
         GpuSysError::BackendStatus {

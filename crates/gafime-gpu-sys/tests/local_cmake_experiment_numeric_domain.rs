@@ -309,14 +309,18 @@ fn execute_score_with_policy(
 ) -> Result<(), GpuSysError> {
     let (terms, offsets) = flatten_paths(paths);
     let metrics = [GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
-    let executed = backend.decision_path_score_with_policy(
-        matrix.handle(),
-        &terms,
-        &offsets,
-        &metrics,
-        result.raw_mut(),
-        policy,
-    )?;
+    // SAFETY: all input vectors and the resident matrix live through the
+    // synchronous call, and `result` owns correctly sized output buffers.
+    let executed = unsafe {
+        backend.decision_path_score_with_policy(
+            matrix.handle(),
+            &terms,
+            &offsets,
+            &metrics,
+            result.raw_mut(),
+            policy,
+        )
+    }?;
     assert!(
         executed,
         "configured OptiX payload must execute compact scoring"

@@ -57,6 +57,10 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
+          if [[ ! "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Build run ID must be a positive decimal integer."
+            exit 1
+          fi
           run_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID")"
           run_path="$(jq -r '.path' <<<"$run_json")"
           run_conclusion="$(jq -r '.conclusion' <<<"$run_json")"
@@ -69,7 +73,12 @@ jobs:
             echo "Run $BUILD_RUN_ID conclusion is $run_conclusion, not success."
             exit 1
           fi
-          tag_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          tag_ref="refs/tags/$RELEASE_TAG"
+          if ! git check-ref-format "$tag_ref"; then
+            echo "Release tag is not a canonical Git tag name."
+            exit 1
+          fi
+          tag_sha="$(git rev-parse --verify "${tag_ref}^{commit}")"
           if [ -z "$tag_sha" ] || [ "$tag_sha" != "$run_sha" ]; then
             echo "Tag $RELEASE_TAG resolves to $tag_sha but build run used $run_sha."
             exit 1
@@ -83,10 +92,12 @@ jobs:
 
       - name: Validate canonical SemVer and PEP 440 identities
         id: release_version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: >-
           python .github/scripts/release_version.py
           --check-project
-          --github-ref "refs/tags/${{ inputs.release_tag }}"
+          --github-ref "refs/tags/$RELEASE_TAG"
           --github-output "$GITHUB_OUTPUT"
 
       - name: Download immutable frozen bundle
@@ -98,19 +109,23 @@ jobs:
           github-token: ${{ github.token }}
 
       - name: Verify frozen bundle provenance and checksums
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
         run: >-
           python .github/scripts/release_bundle.py verify
           --artifacts dist
           --source-sha "${{ steps.bind.outputs.source_sha }}"
-          --run-id "${{ inputs.build_run_id }}"
+          --run-id "$BUILD_RUN_ID"
           --repository "$GITHUB_REPOSITORY"
 
       - name: Revalidate full release composition without mutation
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: >-
           python tests/release_measure/artifact_01_release_composition.py
           --scope full-release
           --artifacts dist
-          --github-ref "refs/tags/${{ inputs.release_tag }}"
+          --github-ref "refs/tags/$RELEASE_TAG"
           --git-sha "${{ steps.bind.outputs.source_sha }}"
           --require-release-tag
 
@@ -154,12 +169,14 @@ jobs:
 
       - name: Verify and select byte-identical Core artifacts
         shell: bash
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
         run: |
           set -euo pipefail
           python .github/scripts/release_bundle.py verify \
             --artifacts dist \
             --source-sha "${{ needs.publication_preflight.outputs.source_sha }}" \
-            --run-id "${{ inputs.build_run_id }}" \
+            --run-id "$BUILD_RUN_ID" \
             --repository "$GITHUB_REPOSITORY"
           mkdir publish
           cp --preserve=mode,timestamps dist/gafime-*.whl dist/gafime-*.tar.gz publish/
@@ -200,12 +217,14 @@ jobs:
 
       - name: Verify and select byte-identical CUDA artifacts
         shell: bash
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
         run: |
           set -euo pipefail
           python .github/scripts/release_bundle.py verify \
             --artifacts dist \
             --source-sha "${{ needs.publication_preflight.outputs.source_sha }}" \
-            --run-id "${{ inputs.build_run_id }}" \
+            --run-id "$BUILD_RUN_ID" \
             --repository "$GITHUB_REPOSITORY"
           mkdir publish
           cp --preserve=mode,timestamps dist/gafime_cuda-*.whl dist/gafime_cuda-*.tar.gz publish/
@@ -246,12 +265,14 @@ jobs:
 
       - name: Verify and select byte-identical ROCm sdist
         shell: bash
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
         run: |
           set -euo pipefail
           python .github/scripts/release_bundle.py verify \
             --artifacts dist \
             --source-sha "${{ needs.publication_preflight.outputs.source_sha }}" \
-            --run-id "${{ inputs.build_run_id }}" \
+            --run-id "$BUILD_RUN_ID" \
             --repository "$GITHUB_REPOSITORY"
           mkdir publish
           cp --preserve=mode,timestamps dist/gafime_rocm-*.tar.gz publish/
@@ -558,11 +579,13 @@ jobs:
           github-token: ${{ github.token }}
 
       - name: Final immutable bundle verification
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
         run: >-
           python .github/scripts/release_bundle.py verify
           --artifacts dist
           --source-sha "${{ needs.publication_preflight.outputs.source_sha }}"
-          --run-id "${{ inputs.build_run_id }}"
+          --run-id "$BUILD_RUN_ID"
           --repository "$GITHUB_REPOSITORY"
 
       - name: Publish GitHub Release

@@ -23,7 +23,15 @@ pub use plan::CompiledPlan;
 
 use gafime_types::GafimeResultTable;
 
-pub fn execute_plan<B: ComputeBackend>(
+/// Execute a compiled plan into a caller-provided raw ABI result table.
+///
+/// # Safety
+///
+/// Every output pointer in `result` must reference uniquely borrowed,
+/// writable storage covering the table's declared capacity and strides for
+/// the duration of this synchronous call. The backend and matrix handle must
+/// satisfy [`ComputeBackend::execute`].
+pub unsafe fn execute_plan<B: ComputeBackend>(
     backend: &mut B,
     matrix: &MatrixHandle,
     plan: &CompiledPlan,
@@ -39,6 +47,7 @@ mod tests {
     use gafime_types::{GAFIME_BACKEND_CPU, GAFIME_FAMILY_CONTINUOUS, GAFIME_METRIC_PEARSON};
 
     #[test]
+    #[deny(unused_unsafe)]
     fn execute_plan_validates_before_backend_call() {
         struct CountingBackend {
             calls: usize,
@@ -49,7 +58,7 @@ mod tests {
                 GAFIME_BACKEND_CPU
             }
 
-            fn execute(
+            unsafe fn execute(
                 &mut self,
                 _matrix: &MatrixHandle,
                 _protocol: &gafime_types::GafimeLaunchProtocol,
@@ -73,7 +82,23 @@ mod tests {
         let matrix = MatrixHandle::host(GAFIME_BACKEND_CPU, 32, 3);
         let mut result = GafimeResultTable::default();
 
-        execute_plan(&mut backend, &matrix, &plan, &mut result).unwrap();
+        let _: unsafe fn(
+            &mut CountingBackend,
+            &MatrixHandle,
+            &gafime_types::GafimeLaunchProtocol,
+            &mut GafimeResultTable,
+        ) -> OrchestratorResult<BackendExecutionStats> =
+            <CountingBackend as ComputeBackend>::execute;
+        let _: unsafe fn(
+            &mut CountingBackend,
+            &MatrixHandle,
+            &CompiledPlan,
+            &mut GafimeResultTable,
+        ) -> OrchestratorResult<BackendExecutionStats> = execute_plan::<CountingBackend>;
+
+        // SAFETY: the zero-capacity result table has no non-null output
+        // buffers, and the counting backend does not inspect ABI pointers.
+        unsafe { execute_plan(&mut backend, &matrix, &plan, &mut result) }.unwrap();
         assert_eq!(backend.calls, 1);
     }
 }

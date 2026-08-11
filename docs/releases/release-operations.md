@@ -154,6 +154,26 @@ base/candidate CPU sets identical. Single-core leaf-kernel measurements may be
 retained for code-generation and arithmetic diagnostics, but they are
 supplemental and cannot satisfy the Core product-throughput prerequisite.
 
+## Pre-RC Security Baseline
+
+Before tagging a release candidate:
+
+- verify `SECURITY.md` and `docs/security/threat-model.md` match the exact candidate;
+- verify `docs/security/pre-rc-baseline.md` records the standard scan and finding
+  dispositions;
+- verify GitHub Private Vulnerability Reporting is enabled and its private report
+  form is available;
+- record one standard repository security scan against the exact candidate;
+- require no unresolved Critical/High or release-blocking Medium finding;
+- require targeted regression evidence for every fixed release-blocking finding;
+- verify the frozen bundle's provenance, checksums, package composition, and
+  RT/OptiX exclusion; and
+- retain the current-head AI Review Record, required checks, and resolved review
+  threads.
+
+The later stable-release deep security qualification is separate from this
+pre-RC baseline.
+
 ## Normal Publication
 
 After the reviewed commit is on `main` and the build run succeeds:

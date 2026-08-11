@@ -224,3 +224,6 @@ Historical release records remain available under `docs/releases/`, including
 Maintainer: Hamza Usta
 
 Email: <hamzausta2222@gmail.com>
+
+Security reports: follow [SECURITY.md](SECURITY.md) and do not disclose
+suspected vulnerabilities through public issues.

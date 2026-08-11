@@ -392,7 +392,9 @@ fn execute_prepared_continuous_into(
 ) -> Result<gafime_orchestrator::BackendExecutionStats, PyBoundaryError> {
     match result {
         PrecisionOwnedResultTable::Fp32(table) => {
-            execute_prepared_fp32_into(backend, prepared, table.raw_mut())
+            // SAFETY: `table` owns all fp32 ABI output buffers and keeps them
+            // uniquely borrowed for the synchronous prepared execution.
+            unsafe { execute_prepared_fp32_into(backend, prepared, table.raw_mut()) }
         }
         PrecisionOwnedResultTable::F64 { profile, table } => {
             if *profile != backend.precision() {
@@ -400,12 +402,20 @@ fn execute_prepared_continuous_into(
                     "result profile does not match resident backend identity".to_string(),
                 ));
             }
-            execute_prepared_f64_into(backend, prepared, table.raw_mut())
+            // SAFETY: `table` owns all f64 ABI output buffers and keeps them
+            // uniquely borrowed for the synchronous prepared execution.
+            unsafe { execute_prepared_f64_into(backend, prepared, table.raw_mut()) }
         }
     }
 }
 
-fn execute_prepared_fp32_into(
+/// Execute into a caller-provided raw fp32 result descriptor.
+///
+/// # Safety
+///
+/// `result` must point only into uniquely borrowed live allocations covering
+/// its declared capacity and strides for this synchronous call.
+unsafe fn execute_prepared_fp32_into(
     backend: &CompiledContinuousBackend,
     prepared: &PreparedContinuousExecution,
     result: &mut gafime_types::GafimeResultTable,
@@ -413,17 +423,29 @@ fn execute_prepared_fp32_into(
     match backend {
         CompiledContinuousBackend::Cpu { matrix } => {
             let mut cpu = CpuBackend;
-            Ok(prepared.execute_precision_fp32(&mut cpu, &matrix.handle(), result)?)
+            // SAFETY: upheld by this helper's caller; the CPU matrix guard and
+            // prepared descriptor storage remain live for the call.
+            Ok(unsafe { prepared.execute_precision_fp32(&mut cpu, &matrix.handle(), result) }?)
         }
         CompiledContinuousBackend::Cuda { backend, matrix }
         | CompiledContinuousBackend::Rocm { backend, matrix }
-        | CompiledContinuousBackend::Metal { backend, matrix } => Ok(
-            prepared.execute_precision_fp32(&mut *backend.borrow_mut(), matrix.handle(), result)?
-        ),
+        | CompiledContinuousBackend::Metal { backend, matrix } => {
+            // SAFETY: upheld by this helper's caller; the resident matrix and
+            // prepared descriptor storage remain live for the call.
+            Ok(unsafe {
+                prepared.execute_precision_fp32(&mut *backend.borrow_mut(), matrix.handle(), result)
+            }?)
+        }
     }
 }
 
-fn execute_prepared_f64_into(
+/// Execute into a caller-provided raw f64 result descriptor.
+///
+/// # Safety
+///
+/// `result` must point only into uniquely borrowed live allocations covering
+/// its declared capacity and strides for this synchronous call.
+unsafe fn execute_prepared_f64_into(
     backend: &CompiledContinuousBackend,
     prepared: &PreparedContinuousExecution,
     result: &mut gafime_types::GafimeResultTableF64,
@@ -431,12 +453,18 @@ fn execute_prepared_f64_into(
     match backend {
         CompiledContinuousBackend::Cpu { matrix } => {
             let mut cpu = CpuBackend;
-            Ok(prepared.execute_precision_f64(&mut cpu, &matrix.handle(), result)?)
+            // SAFETY: upheld by this helper's caller; the CPU matrix guard and
+            // prepared descriptor storage remain live for the call.
+            Ok(unsafe { prepared.execute_precision_f64(&mut cpu, &matrix.handle(), result) }?)
         }
         CompiledContinuousBackend::Cuda { backend, matrix }
-        | CompiledContinuousBackend::Rocm { backend, matrix } => Ok(
-            prepared.execute_precision_f64(&mut *backend.borrow_mut(), matrix.handle(), result)?
-        ),
+        | CompiledContinuousBackend::Rocm { backend, matrix } => {
+            // SAFETY: upheld by this helper's caller; the resident matrix and
+            // prepared descriptor storage remain live for the call.
+            Ok(unsafe {
+                prepared.execute_precision_f64(&mut *backend.borrow_mut(), matrix.handle(), result)
+            }?)
+        }
         CompiledContinuousBackend::Metal { .. } => Err(PyBoundaryError::UnsupportedFeature(
             "Metal supports precision=\"fp32\" only".to_string(),
         )),
@@ -552,7 +580,9 @@ fn combine_screened_results(
             let start = unary.row_count() as u64;
             let (execution, row_count) = combined
                 .with_raw_rows_mut(start, screened.higher.result_capacity(), |raw| {
-                    execute_prepared_fp32_into(backend, &screened.higher, raw)
+                    // SAFETY: `with_raw_rows_mut` binds this descriptor to a
+                    // checked, uniquely borrowed window of `combined`.
+                    unsafe { execute_prepared_fp32_into(backend, &screened.higher, raw) }
                 })
                 .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
             finish_combined_rows(&mut combined, start, execution?, row_count)?;
@@ -570,7 +600,9 @@ fn combine_screened_results(
             let start = unary.row_count() as u64;
             let (execution, row_count) = combined
                 .with_raw_rows_mut(start, screened.higher.result_capacity(), |raw| {
-                    execute_prepared_f64_into(backend, &screened.higher, raw)
+                    // SAFETY: `with_raw_rows_mut` binds this descriptor to a
+                    // checked, uniquely borrowed window of `combined`.
+                    unsafe { execute_prepared_f64_into(backend, &screened.higher, raw) }
                 })
                 .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
             let execution = execution?;
@@ -1503,12 +1535,16 @@ fn execute_ranked_precision_into(
     match (backend, result) {
         (CompiledContinuousBackend::Cpu { matrix }, PrecisionOwnedResultTable::Fp32(table)) => {
             let mut cpu = CpuBackend;
-            prepared.execute_precision_ranked_fp32(
-                rank,
-                &mut cpu,
-                &matrix.handle(),
-                table.raw_mut(),
-            )?;
+            // SAFETY: `table` owns all declared output buffers and is uniquely
+            // borrowed for this synchronous prepared execution.
+            unsafe {
+                prepared.execute_precision_ranked_fp32(
+                    rank,
+                    &mut cpu,
+                    &matrix.handle(),
+                    table.raw_mut(),
+                )
+            }?;
         }
         (
             CompiledContinuousBackend::Cuda { backend, matrix }
@@ -1516,36 +1552,48 @@ fn execute_ranked_precision_into(
             | CompiledContinuousBackend::Metal { backend, matrix },
             PrecisionOwnedResultTable::Fp32(table),
         ) => {
-            prepared.execute_precision_ranked_fp32(
-                rank,
-                &mut *backend.borrow_mut(),
-                matrix.handle(),
-                table.raw_mut(),
-            )?;
+            // SAFETY: `table` owns all declared output buffers and is uniquely
+            // borrowed for this synchronous prepared execution.
+            unsafe {
+                prepared.execute_precision_ranked_fp32(
+                    rank,
+                    &mut *backend.borrow_mut(),
+                    matrix.handle(),
+                    table.raw_mut(),
+                )
+            }?;
         }
         (
             CompiledContinuousBackend::Cpu { matrix },
             PrecisionOwnedResultTable::F64 { table, .. },
         ) => {
             let mut cpu = CpuBackend;
-            prepared.execute_precision_ranked_f64(
-                rank,
-                &mut cpu,
-                &matrix.handle(),
-                table.raw_mut(),
-            )?;
+            // SAFETY: `table` owns all declared typed output buffers and is
+            // uniquely borrowed for this synchronous prepared execution.
+            unsafe {
+                prepared.execute_precision_ranked_f64(
+                    rank,
+                    &mut cpu,
+                    &matrix.handle(),
+                    table.raw_mut(),
+                )
+            }?;
         }
         (
             CompiledContinuousBackend::Cuda { backend, matrix }
             | CompiledContinuousBackend::Rocm { backend, matrix },
             PrecisionOwnedResultTable::F64 { table, .. },
         ) => {
-            prepared.execute_precision_ranked_f64(
-                rank,
-                &mut *backend.borrow_mut(),
-                matrix.handle(),
-                table.raw_mut(),
-            )?;
+            // SAFETY: `table` owns all declared typed output buffers and is
+            // uniquely borrowed for this synchronous prepared execution.
+            unsafe {
+                prepared.execute_precision_ranked_f64(
+                    rank,
+                    &mut *backend.borrow_mut(),
+                    matrix.handle(),
+                    table.raw_mut(),
+                )
+            }?;
         }
         (CompiledContinuousBackend::Metal { .. }, PrecisionOwnedResultTable::F64 { .. }) => {
             return Err(PyBoundaryError::UnsupportedFeature(
@@ -1904,16 +1952,21 @@ fn compute_gpu_permutation_pvalues(
                 let base = row * metric_count;
                 observed.extend_from_slice(&table.metric_values()[base..base + metric_count]);
             }
-            let Some(pvalues) = backend
-                .borrow_mut()
-                .permutation_pvalues_fp32_v2_with_budget(
-                    handle,
-                    &protocol,
-                    &candidate_ids,
-                    &observed,
-                    metric_count as u32,
-                    device_budget_bytes,
-                )?
+            // SAFETY: `base_protocol` is materialized from `complete_family`,
+            // which stays live and immutable through this synchronous call;
+            // `protocol.base` points to that stack-local descriptor.
+            let Some(pvalues) = (unsafe {
+                backend
+                    .borrow_mut()
+                    .permutation_pvalues_fp32_v2_with_budget(
+                        handle,
+                        &protocol,
+                        &candidate_ids,
+                        &observed,
+                        metric_count as u32,
+                        device_budget_bytes,
+                    )
+            })?
             else {
                 return Ok(None);
             };
@@ -1943,16 +1996,19 @@ fn compute_gpu_permutation_pvalues(
                 let base = row * metric_count;
                 observed.extend_from_slice(&table.metric_values()[base..base + metric_count]);
             }
-            let Some(pvalues) = backend
-                .borrow_mut()
-                .permutation_pvalues_f64_v2_with_budget(
+            // SAFETY: `base_protocol` is materialized from `complete_family`,
+            // which stays live and immutable through this synchronous call;
+            // `protocol.base` points to that stack-local descriptor.
+            let Some(pvalues) = (unsafe {
+                backend.borrow_mut().permutation_pvalues_f64_v2_with_budget(
                     handle,
                     &protocol,
                     &candidate_ids,
                     &observed,
                     metric_count as u32,
                     device_budget_bytes,
-                )?
+                )
+            })?
             else {
                 return Ok(None);
             };

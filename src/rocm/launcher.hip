@@ -891,6 +891,38 @@ int hip_status(hipError_t status) {
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
+class ScopedHipDevice {
+public:
+    explicit ScopedHipDevice(uint32_t device_id) {
+        if (device_id > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+            status_ = hipErrorInvalidDevice;
+            return;
+        }
+        status_ = hipGetDevice(&previous_device_);
+        if (status_ != hipSuccess) return;
+        restore_previous_ = true;
+        status_ = hipSetDevice(static_cast<int>(device_id));
+    }
+
+    ScopedHipDevice(const ScopedHipDevice&) = delete;
+    ScopedHipDevice& operator=(const ScopedHipDevice&) = delete;
+
+    ~ScopedHipDevice() {
+        if (restore_previous_) {
+            static_cast<void>(hipSetDevice(previous_device_));
+        }
+    }
+
+    hipError_t status() const {
+        return status_;
+    }
+
+private:
+    int previous_device_ = 0;
+    bool restore_previous_ = false;
+    hipError_t status_ = hipSuccess;
+};
+
 bool checked_add_u64(uint64_t lhs, uint64_t rhs, uint64_t* result) {
     if (rhs > std::numeric_limits<uint64_t>::max() - lhs) {
         return false;
@@ -2005,7 +2037,8 @@ int precision_interaction_diagnostics_typed(
     if (scan_plan.output_rows.size() > std::numeric_limits<unsigned int>::max()) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    status = hip_status(hipSetDevice(static_cast<int>(matrix->device_id)));
+    ScopedHipDevice device(matrix->device_id);
+    status = hip_status(device.status());
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -2203,7 +2236,8 @@ int precision_upload_typed(
         !checked_allocation_bytes(cols, sizeof(AccumT), &mean_bytes)) {
         return GAFIME_STATUS_OUT_OF_MEMORY;
     }
-    int status = hip_status(hipSetDevice(static_cast<int>(matrix->device_id)));
+    ScopedHipDevice device(matrix->device_id);
+    int status = hip_status(device.status());
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -2288,7 +2322,8 @@ int precision_update_target_typed(
     if (!checked_allocation_bytes(rows, sizeof(StorageT), &target_bytes)) {
         return GAFIME_STATUS_OUT_OF_MEMORY;
     }
-    int status = hip_status(hipSetDevice(static_cast<int>(matrix->device_id)));
+    ScopedHipDevice device(matrix->device_id);
+    int status = hip_status(device.status());
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -2863,7 +2898,8 @@ int precision_execute_typed(
         matrix->feature_stats_profile != matrix->profile) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    int status = hip_status(hipSetDevice(static_cast<int>(matrix->device_id)));
+    ScopedHipDevice device(matrix->device_id);
+    int status = hip_status(device.status());
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -3083,7 +3119,7 @@ void precision_matrix_free(PrecisionHipMatrix* matrix) {
     if (matrix == nullptr) {
         return;
     }
-    static_cast<void>(hipSetDevice(static_cast<int>(matrix->device_id)));
+    ScopedHipDevice device(matrix->device_id);
     precision_destroy_graph_cache(matrix);
     if (matrix->graph_stream != nullptr) {
         static_cast<void>(hipStreamDestroy(matrix->graph_stream));
@@ -3123,7 +3159,8 @@ int precision_matrix_alloc(
     if (dispatch == nullptr || dispatch->storage_dtype != desc->dtype) {
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
-    status = hip_status(hipSetDevice(static_cast<int>(device_id)));
+    ScopedHipDevice device(device_id);
+    status = hip_status(device.status());
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -3459,7 +3496,8 @@ GAFIME_GPU_API int gafime_gpu_device_info(uint32_t device_id, GafimeGpuDeviceInf
     if (device_id > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    int status = hip_status(hipSetDevice(static_cast<int>(device_id)));
+    ScopedHipDevice device(device_id);
+    int status = hip_status(device.status());
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -3520,7 +3558,8 @@ static int rocm_precision_capabilities_internal(
         device_id > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    int status = hip_status(hipSetDevice(static_cast<int>(device_id)));
+    ScopedHipDevice device(device_id);
+    int status = hip_status(device.status());
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -3685,8 +3724,8 @@ GAFIME_GPU_API int gafime_gpu_numeric_routes_v2(
     uint32_t route_capacity,
     uint32_t* route_count_out
 ) {
-    if (device_id > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
-        hipSetDevice(static_cast<int>(device_id)) != hipSuccess) {
+    ScopedHipDevice device(device_id);
+    if (device.status() != hipSuccess) {
         return GAFIME_STATUS_DEVICE_ERROR;
     }
     constexpr uint32_t profiles[] = {

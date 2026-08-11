@@ -754,9 +754,17 @@ fn execute_result(case: &PreparedCase) -> OwnedPrecisionResult {
                 case.prepared.result_max_arity(),
                 case.prepared.result_metric_count(),
             );
-            case.prepared
-                .execute_precision_ranked_fp32(case.rank, &mut backend, &matrix, result.raw_mut())
-                .unwrap_or_else(|error| panic!("execute production fp32 Core path: {error:?}"));
+            // SAFETY: `case.prepared` owns the complete protocol graph and
+            // `result` owns output buffers sized from its ranked capacity.
+            unsafe {
+                case.prepared.execute_precision_ranked_fp32(
+                    case.rank,
+                    &mut backend,
+                    &matrix,
+                    result.raw_mut(),
+                )
+            }
+            .unwrap_or_else(|error| panic!("execute production fp32 Core path: {error:?}"));
             OwnedPrecisionResult::F32(result)
         }
         Profile::Mixed | Profile::Fp64 => {
@@ -765,9 +773,17 @@ fn execute_result(case: &PreparedCase) -> OwnedPrecisionResult {
                 case.prepared.result_max_arity(),
                 case.prepared.result_metric_count(),
             );
-            case.prepared
-                .execute_precision_ranked_f64(case.rank, &mut backend, &matrix, result.raw_mut())
-                .unwrap_or_else(|error| panic!("execute production f64 Core path: {error:?}"));
+            // SAFETY: `case.prepared` owns the complete protocol graph and
+            // `result` owns output buffers sized from its ranked capacity.
+            unsafe {
+                case.prepared.execute_precision_ranked_f64(
+                    case.rank,
+                    &mut backend,
+                    &matrix,
+                    result.raw_mut(),
+                )
+            }
+            .unwrap_or_else(|error| panic!("execute production f64 Core path: {error:?}"));
             OwnedPrecisionResult::F64(result)
         }
     }

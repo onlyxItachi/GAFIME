@@ -206,6 +206,76 @@ def _require_function_markers(
     return body
 
 
+def _check_scoped_gpu_device_restoration(
+    cuda_launcher: str, rocm_launcher: str
+) -> None:
+    cuda_guard = cuda_launcher.split("class ScopedCudaDevice", 1)[1].split("};", 1)[0]
+    for marker in (
+        "cudaGetDevice(&previous_device_)",
+        "restore_previous_ = true",
+        "cudaSetDevice(static_cast<int>(device_id))",
+        "cudaSetDevice(previous_device_)",
+    ):
+        assert marker in cuda_guard
+    assert (
+        cuda_guard.index("cudaGetDevice(&previous_device_)")
+        < cuda_guard.index("restore_previous_ = true")
+        < cuda_guard.index("cudaSetDevice(static_cast<int>(device_id))")
+        < cuda_guard.index("cudaSetDevice(previous_device_)")
+    )
+    assert cuda_launcher.count("cudaGetDevice(") == 1
+    assert cuda_launcher.count("cudaSetDevice(") == 2
+    for function in (
+        "upload_precision",
+        "update_precision_target",
+        "execute_precision",
+        "permutation_precision",
+        "precision_interaction_diagnostics",
+        "free_precision_matrix",
+        "cuda_matrix_alloc_internal",
+        "gafime_gpu_device_info",
+        "gafime_gpu_numeric_routes_v2",
+    ):
+        body = _require_function_markers(
+            cuda_launcher, function, "ScopedCudaDevice device("
+        )
+        if function != "free_precision_matrix":
+            assert "device.status()" in body
+
+    hip_guard = rocm_launcher.split("class ScopedHipDevice", 1)[1].split("};", 1)[0]
+    for marker in (
+        "hipGetDevice(&previous_device_)",
+        "restore_previous_ = true",
+        "hipSetDevice(static_cast<int>(device_id))",
+        "hipSetDevice(previous_device_)",
+    ):
+        assert marker in hip_guard
+    assert (
+        hip_guard.index("hipGetDevice(&previous_device_)")
+        < hip_guard.index("restore_previous_ = true")
+        < hip_guard.index("hipSetDevice(static_cast<int>(device_id))")
+        < hip_guard.index("hipSetDevice(previous_device_)")
+    )
+    assert rocm_launcher.count("hipGetDevice(") == 1
+    assert rocm_launcher.count("hipSetDevice(") == 2
+    for function in (
+        "precision_interaction_diagnostics_typed",
+        "precision_upload_typed",
+        "precision_update_target_typed",
+        "precision_execute_typed",
+        "precision_matrix_free",
+        "precision_matrix_alloc",
+        "gafime_gpu_device_info",
+        "rocm_precision_capabilities_internal",
+        "gafime_gpu_numeric_routes_v2",
+    ):
+        body = _require_function_markers(
+            rocm_launcher, function, "ScopedHipDevice device("
+        )
+        if function != "precision_matrix_free":
+            assert "device.status()" in body
+
+
 def _skip_rust_comment_or_literal(text: str, offset: int) -> int:
     """Skip Rust trivia without mistaking a lifetime `'a` for a char literal."""
 
@@ -1017,6 +1087,7 @@ def check_native_kernel_structure() -> None:
     core_native_standalone = (
         ROOT / "tests" / "release_measure" / "core_precision_native_benchmark.rs"
     ).read_text()
+    _check_scoped_gpu_device_restoration(cuda_precision_launcher, rocm_launcher)
     core_native_runner = (
         ROOT / "tests" / "release_measure" / "run_core_precision_native_benchmark.py"
     ).read_text()

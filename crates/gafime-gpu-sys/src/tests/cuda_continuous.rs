@@ -45,7 +45,7 @@ fn cuda_adapter_executes_when_library_is_available() {
         vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
     );
     let mut result = TestResultTable::new(2, 1, 2);
-    let stats = execute_plan(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
+    let stats = execute_plan!(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
 
     assert_eq!(stats.launched_chunks, 1);
     assert_eq!(stats.rows_written, 2);
@@ -226,7 +226,7 @@ fn cuda_device_topk_returns_only_selected_rows_when_library_is_available() {
         reserved: [0; 4],
     });
     let mut result = TestResultTable::new(2, 1, 2);
-    let stats = execute_plan(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
+    let stats = execute_plan!(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
 
     assert_eq!(stats.launched_chunks, 1);
     assert_eq!(stats.rows_written, 2);
@@ -275,7 +275,7 @@ fn cuda_device_topk_keeps_large_rank_scratch_bounded_when_library_is_available()
         reserved: [0; 4],
     });
     let mut result = TestResultTable::new(400, 1, 1);
-    execute_plan(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
+    execute_plan!(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
 
     assert_eq!(result.raw.row_count, 400);
     assert_eq!(result.combo_indices(), (0..400).collect::<Vec<_>>());
@@ -323,7 +323,7 @@ fn cuda_permutation_protocol_preserves_observed_metrics_when_library_is_availabl
     .with_flags(GAFIME_LAUNCH_FLAG_GRAPH);
 
     let mut result = TestResultTable::new(4, 1, 2);
-    let stats = execute_plan(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
+    let stats = execute_plan!(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
 
     assert_eq!(stats.launched_chunks, 1);
     assert_eq!(stats.graph_replays, 1);
@@ -341,7 +341,7 @@ fn cuda_permutation_protocol_preserves_observed_metrics_when_library_is_availabl
         vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
     );
     let mut restored_result = TestResultTable::new(4, 1, 2);
-    execute_plan(
+    execute_plan!(
         &mut backend,
         matrix.handle(),
         &no_permutation_plan,
@@ -400,17 +400,20 @@ fn cuda_reports_permutation_pvalues_when_library_exposes_optional_abi() {
     .with_flags(GAFIME_LAUNCH_FLAG_GRAPH);
 
     let mut result = TestResultTable::new(2, 1, 2);
-    execute_plan(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
-    let pvalues = backend
-        .permutation_pvalues(
+    execute_plan!(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
+    // SAFETY: `plan` owns the protocol buffers, and `result` owns the selected
+    // candidate/metric slices for the duration of the synchronous call.
+    let pvalues = unsafe {
+        backend.permutation_pvalues(
             matrix.handle(),
             plan.protocol(),
             result.candidate_ids(),
             result.metric_values(),
             2,
         )
-        .unwrap()
-        .expect("CUDA payload should expose permutation p-value ABI");
+    }
+    .unwrap()
+    .expect("CUDA payload should expose permutation p-value ABI");
 
     assert_eq!(pvalues.len(), 4);
     assert!(pvalues.iter().all(|value| value.is_finite()));
@@ -465,14 +468,20 @@ fn cuda_permutation_maxt_includes_hidden_family_candidates_when_available() {
     )
     .with_permutations(permutations);
 
-    let selected_p = backend
-        .permutation_pvalues(matrix.handle(), selected_only.protocol(), &[0], &[0.1], 1)
-        .unwrap()
-        .unwrap()[0];
-    let family_p = backend
-        .permutation_pvalues(matrix.handle(), full_family.protocol(), &[0], &[0.1], 1)
-        .unwrap()
-        .unwrap()[0];
+    // SAFETY: `selected_only` owns its protocol buffers and the selected-row
+    // arrays are initialized and live for this synchronous call.
+    let selected_p = unsafe {
+        backend.permutation_pvalues(matrix.handle(), selected_only.protocol(), &[0], &[0.1], 1)
+    }
+    .unwrap()
+    .unwrap()[0];
+    // SAFETY: `full_family` owns its protocol buffers and the selected-row
+    // arrays are initialized and live for this synchronous call.
+    let family_p = unsafe {
+        backend.permutation_pvalues(matrix.handle(), full_family.protocol(), &[0], &[0.1], 1)
+    }
+    .unwrap()
+    .unwrap()[0];
 
     let floor = 1.0 / (permutations.permutation_count as f32 + 1.0);
     assert!((selected_p - floor).abs() <= f32::EPSILON);
@@ -503,7 +512,7 @@ fn cuda_matches_cpu_for_configured_continuous_plan_arity_1_to_5() {
         cpu_prepared.result_max_arity(),
         cpu_prepared.result_metric_count(),
     );
-    let cpu_stats = execute_plan(
+    let cpu_stats = execute_plan!(
         &mut cpu_backend,
         &cpu_matrix.handle(),
         cpu_prepared.plan(),
@@ -520,7 +529,7 @@ fn cuda_matches_cpu_for_configured_continuous_plan_arity_1_to_5() {
         cuda_prepared.result_max_arity(),
         cuda_prepared.result_metric_count(),
     );
-    let cuda_stats = execute_plan(
+    let cuda_stats = execute_plan!(
         &mut cuda_backend,
         cuda_matrix.handle(),
         cuda_prepared.plan(),

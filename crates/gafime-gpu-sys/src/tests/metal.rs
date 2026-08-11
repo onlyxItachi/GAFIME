@@ -31,27 +31,31 @@ fn metal_execution_memory_peak_tracks_descriptor_and_ranking_state_when_availabl
     protocol.flags |= GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
     protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 7_001;
 
-    let cold_peak = backend
-        .execution_device_memory_peak_bytes(matrix.handle(), &protocol)
-        .unwrap()
-        .expect("current Metal payload must export execution-memory preflight");
-    let repeated_peak = backend
-        .execution_device_memory_peak_bytes(matrix.handle(), &protocol)
-        .unwrap()
-        .expect("current Metal payload must keep execution-memory preflight available");
+    // SAFETY: `protocol` copies a descriptor whose pointed-to spans remain
+    // owned by `plan` for this synchronous query.
+    let cold_peak =
+        unsafe { backend.execution_device_memory_peak_bytes(matrix.handle(), &protocol) }
+            .unwrap()
+            .expect("current Metal payload must export execution-memory preflight");
+    // SAFETY: `plan` still owns every span referenced by `protocol`.
+    let repeated_peak =
+        unsafe { backend.execution_device_memory_peak_bytes(matrix.handle(), &protocol) }
+            .unwrap()
+            .expect("current Metal payload must keep execution-memory preflight available");
     assert_eq!(
         cold_peak, repeated_peak,
         "preflight must not mutate cache state"
     );
 
     let mut result = TestResultTable::new(cols as u64, 1, 1);
-    backend
-        .execute(matrix.handle(), &protocol, result.raw_mut())
-        .unwrap();
-    let warm_peak = backend
-        .execution_device_memory_peak_bytes(matrix.handle(), &protocol)
-        .unwrap()
-        .unwrap();
+    // SAFETY: `plan` owns every input span and `result` owns correctly sized,
+    // uniquely borrowed output buffers for the synchronous execution.
+    unsafe { backend.execute(matrix.handle(), &protocol, result.raw_mut()) }.unwrap();
+    // SAFETY: `plan` still owns every span referenced by `protocol`.
+    let warm_peak =
+        unsafe { backend.execution_device_memory_peak_bytes(matrix.handle(), &protocol) }
+            .unwrap()
+            .unwrap();
     assert!(warm_peak <= cold_peak);
 
     let mut ranked_protocol = protocol;
@@ -62,19 +66,21 @@ fn metal_execution_memory_peak_tracks_descriptor_and_ranking_state_when_availabl
         include_ties: 0,
         reserved: [0; 4],
     };
-    let ranked_peak = backend
-        .execution_device_memory_peak_bytes(matrix.handle(), &ranked_protocol)
-        .unwrap()
-        .unwrap();
+    // SAFETY: ranking changes only inline fields; all pointed-to spans remain
+    // owned by `plan` and live for this query.
+    let ranked_peak =
+        unsafe { backend.execution_device_memory_peak_bytes(matrix.handle(), &ranked_protocol) }
+            .unwrap()
+            .unwrap();
     assert!(ranked_peak > warm_peak, "ranking buffers must be admitted");
     let mut ranked_result = TestResultTable::new(2, 1, 1);
-    backend
-        .execute(matrix.handle(), &ranked_protocol, ranked_result.raw_mut())
-        .unwrap();
+    // SAFETY: `plan` owns every input span and `ranked_result` owns correctly
+    // sized, uniquely borrowed output buffers.
+    unsafe { backend.execute(matrix.handle(), &ranked_protocol, ranked_result.raw_mut()) }.unwrap();
     assert_eq!(ranked_result.raw.row_count, 2);
     assert_eq!(
-        backend
-            .execution_device_memory_peak_bytes(matrix.handle(), &ranked_protocol)
+        // SAFETY: `plan` still owns every span referenced by `ranked_protocol`.
+        unsafe { backend.execution_device_memory_peak_bytes(matrix.handle(), &ranked_protocol) }
             .unwrap(),
         Some(ranked_peak)
     );
@@ -115,9 +121,9 @@ fn metal_descriptor_cache_generation_refreshes_reused_addresses_when_available()
     first_protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 101;
 
     let mut first_result = TestResultTable::new(1, 1, 1);
-    backend
-        .execute(matrix.handle(), &first_protocol, first_result.raw_mut())
-        .unwrap();
+    // SAFETY: `first_protocol` points into live `plan` storage plus the live
+    // `descriptors` array, and `first_result` owns its output buffers.
+    unsafe { backend.execute(matrix.handle(), &first_protocol, first_result.raw_mut()) }.unwrap();
     assert_eq!(first_result.combo_indices(), &[0]);
     assert!(first_result.metric_values()[0] > 0.999);
 
@@ -126,18 +132,18 @@ fn metal_descriptor_cache_generation_refreshes_reused_addresses_when_available()
     let mut second_protocol = first_protocol;
     second_protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 102;
     let mut second_result = TestResultTable::new(1, 1, 1);
-    backend
-        .execute(matrix.handle(), &second_protocol, second_result.raw_mut())
-        .unwrap();
+    // SAFETY: the updated descriptor array and all plan-owned spans are live;
+    // `second_result` uniquely owns correctly sized output buffers.
+    unsafe { backend.execute(matrix.handle(), &second_protocol, second_result.raw_mut()) }.unwrap();
     assert_eq!(second_result.combo_indices(), &[1]);
     assert!(second_result.metric_values()[0] < -0.999);
 
     descriptors[0] = 0;
     assert_eq!(descriptors.as_ptr(), descriptor_address);
     let mut replay_result = TestResultTable::new(1, 1, 1);
-    backend
-        .execute(matrix.handle(), &second_protocol, replay_result.raw_mut())
-        .unwrap();
+    // SAFETY: `second_protocol` still references live descriptor/plan storage,
+    // and `replay_result` uniquely owns correctly sized output buffers.
+    unsafe { backend.execute(matrix.handle(), &second_protocol, replay_result.raw_mut()) }.unwrap();
     assert!(replay_result.metric_values()[0] < -0.999);
     assert!((replay_result.metric_values()[0] - second_result.metric_values()[0]).abs() < 1.0e-5);
 }
@@ -186,7 +192,7 @@ fn metal_device_topk_covers_split_directions_ties_and_large_k_when_available() {
                 reserved: [0; 4],
             });
             let mut result = TestResultTable::new(2, 1, 1);
-            execute_plan(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
+            execute_plan!(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
 
             assert_eq!(result.combo_indices(), &expected);
             assert_eq!(result.candidate_ids(), &expected.map(u64::from));
@@ -230,7 +236,7 @@ fn metal_device_topk_covers_split_directions_ties_and_large_k_when_available() {
             reserved: [0; 4],
         });
         let mut result = TestResultTable::new(400, 1, 1);
-        execute_plan(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
+        execute_plan!(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
 
         assert_eq!(result.raw.row_count, 400);
         assert_eq!(result.combo_indices(), (0..400).collect::<Vec<_>>());
@@ -255,7 +261,7 @@ fn metal_device_topk_covers_split_directions_ties_and_large_k_when_available() {
         reserved: [0; 4],
     });
     let mut oversized_result = TestResultTable::new(700, 1, 1);
-    execute_plan(
+    execute_plan!(
         &mut backend,
         matrix.handle(),
         &oversized_plan,
@@ -324,7 +330,7 @@ fn metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_
             cpu_prepared.result_max_arity(),
             cpu_prepared.result_metric_count(),
         );
-        execute_plan(
+        execute_plan!(
             &mut cpu_backend,
             &cpu_matrix.handle(),
             cpu_prepared.plan(),
@@ -340,7 +346,7 @@ fn metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_
             metal_prepared.result_max_arity(),
             metal_prepared.result_metric_count(),
         );
-        execute_plan(
+        execute_plan!(
             &mut metal_backend,
             metal_matrix.handle(),
             metal_prepared.plan(),
@@ -456,13 +462,16 @@ fn metal_fp32_precision_metrics_match_core_fp32_on_high_dynamic_and_nonfinite_in
                 cpu_prepared.result_max_arity(),
                 cpu_prepared.result_metric_count(),
             );
-            cpu_prepared
-                .execute_precision_fp32(
+            // SAFETY: `cpu_prepared` owns the protocol graph and `cpu_result`
+            // owns result buffers sized from that prepared execution.
+            unsafe {
+                cpu_prepared.execute_precision_fp32(
                     &mut cpu_backend,
                     &cpu_matrix.handle(),
                     cpu_result.raw_mut(),
                 )
-                .unwrap();
+            }
+            .unwrap();
 
             let metal_prepared = prepare(GAFIME_BACKEND_METAL);
             let metal_matrix = metal_backend
@@ -474,13 +483,16 @@ fn metal_fp32_precision_metrics_match_core_fp32_on_high_dynamic_and_nonfinite_in
                 metal_prepared.result_max_arity(),
                 metal_prepared.result_metric_count(),
             );
-            metal_prepared
-                .execute_precision_fp32(
+            // SAFETY: `metal_prepared` owns the protocol graph and
+            // `metal_result` owns result buffers sized from it.
+            unsafe {
+                metal_prepared.execute_precision_fp32(
                     &mut metal_backend,
                     metal_matrix.handle(),
                     metal_result.raw_mut(),
                 )
-                .unwrap();
+            }
+            .unwrap();
 
             assert_eq!(cpu_result.raw.row_count, 31);
             assert_eq!(cpu_result.raw.row_count, metal_result.raw.row_count);

@@ -105,7 +105,13 @@ impl PreparedContinuousExecution {
     /// General callers should use `execute_plan`, which validates arbitrary
     /// plans on every call; compiled artifacts keep this immutable trusted path.
     /// GPU adapters remove the hint unless the loaded payload advertises it.
-    pub fn execute<B: ComputeBackend>(
+    /// Execute the prepared plan into a raw ABI 1.0 result table.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy [`ComputeBackend::execute`] for `matrix` and
+    /// every pointer and declared extent in `result`.
+    pub unsafe fn execute<B: ComputeBackend>(
         &self,
         backend: &mut B,
         matrix: &MatrixHandle,
@@ -121,7 +127,13 @@ impl PreparedContinuousExecution {
         )
     }
 
-    pub fn execute_precision_fp32<B: PrecisionComputeBackend>(
+    /// Execute the prepared fp32 plan into a raw ABI 1.1 result table.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy [`PrecisionComputeBackend::execute_fp32`] for
+    /// `matrix` and every pointer and declared extent in `result`.
+    pub unsafe fn execute_precision_fp32<B: PrecisionComputeBackend>(
         &self,
         backend: &mut B,
         matrix: &MatrixHandle,
@@ -143,7 +155,13 @@ impl PreparedContinuousExecution {
         )
     }
 
-    pub fn execute_precision_f64<B: PrecisionComputeBackend>(
+    /// Execute the prepared mixed/fp64 plan into a raw ABI 1.1 result table.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy [`PrecisionComputeBackend::execute_f64`] for
+    /// `matrix` and every pointer and declared extent in `result`.
+    pub unsafe fn execute_precision_f64<B: PrecisionComputeBackend>(
         &self,
         backend: &mut B,
         matrix: &MatrixHandle,
@@ -171,7 +189,13 @@ impl PreparedContinuousExecution {
     /// the generated-plan path for host-orchestrated maxT extrema: descriptors
     /// are streamed, only K rows are retained, and the plan's permutation
     /// schedule is disabled because the caller supplies the target being scored.
-    pub fn execute_ranked<B: ComputeBackend>(
+    /// Execute a ranked prepared plan into a raw ABI 1.0 result table.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy [`ComputeBackend::execute`] for `matrix` and
+    /// every pointer and declared extent in `result`.
+    pub unsafe fn execute_ranked<B: ComputeBackend>(
         &self,
         rank: GafimeRankSpec,
         backend: &mut B,
@@ -193,7 +217,13 @@ impl PreparedContinuousExecution {
         )
     }
 
-    pub fn execute_precision_ranked_fp32<B: PrecisionComputeBackend>(
+    /// Execute a ranked prepared fp32 plan into a raw ABI 1.1 result table.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy [`PrecisionComputeBackend::execute_fp32`] for
+    /// `matrix` and every pointer and declared extent in `result`.
+    pub unsafe fn execute_precision_ranked_fp32<B: PrecisionComputeBackend>(
         &self,
         rank: GafimeRankSpec,
         backend: &mut B,
@@ -221,7 +251,13 @@ impl PreparedContinuousExecution {
         )
     }
 
-    pub fn execute_precision_ranked_f64<B: PrecisionComputeBackend>(
+    /// Execute a ranked prepared mixed/fp64 plan into a raw ABI 1.1 table.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy [`PrecisionComputeBackend::execute_f64`] for
+    /// `matrix` and every pointer and declared extent in `result`.
+    pub unsafe fn execute_precision_ranked_f64<B: PrecisionComputeBackend>(
         &self,
         rank: GafimeRankSpec,
         backend: &mut B,
@@ -277,7 +313,7 @@ impl<B: PrecisionComputeBackend> ComputeBackend for PrecisionFp32BackendAdapter<
         PrecisionComputeBackend::backend_kind(self.backend)
     }
 
-    fn execution_device_memory_peak_bytes(
+    unsafe fn execution_device_memory_peak_bytes(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimeLaunchProtocol,
@@ -288,11 +324,15 @@ impl<B: PrecisionComputeBackend> ComputeBackend for PrecisionFp32BackendAdapter<
             base: protocol,
             reserved: [0; 8],
         };
-        self.backend
-            .execution_device_memory_peak_bytes_v2(matrix, &precision_protocol)
+        // SAFETY: this adapter preserves the caller's raw protocol lifetime and
+        // only adds a stack-local precision wrapper for the synchronous call.
+        unsafe {
+            self.backend
+                .execution_device_memory_peak_bytes_v2(matrix, &precision_protocol)
+        }
     }
 
-    fn execute(
+    unsafe fn execute(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimeLaunchProtocol,
@@ -304,8 +344,12 @@ impl<B: PrecisionComputeBackend> ComputeBackend for PrecisionFp32BackendAdapter<
             base: protocol,
             reserved: [0; 8],
         };
-        self.backend
-            .execute_fp32(matrix, &precision_protocol, result)
+        // SAFETY: the adapter forwards the caller-provided result storage and
+        // the same live base protocol through a stack-local precision wrapper.
+        unsafe {
+            self.backend
+                .execute_fp32(matrix, &precision_protocol, result)
+        }
     }
 }
 
@@ -390,7 +434,10 @@ fn execute_compiled_plan_with_protocol<B: ComputeBackend>(
             protocol.reserved[DESCRIPTOR_GENERATION_RESERVED_SLOT] = generation;
         }
         validate_execution_device_budget(backend, matrix, &protocol, device_budget_bytes)?;
-        return backend.execute(matrix, &protocol, result);
+        // SAFETY: `protocol` is rebound exclusively to storage owned by `plan`
+        // for this synchronous call. The public raw execution entry point makes
+        // the caller responsible for the result-table allocation contract.
+        return unsafe { backend.execute(matrix, &protocol, result) };
     }
 
     if rank.top_k == 0 {
@@ -469,7 +516,9 @@ fn execute_streamed_ranked_plan<B: ComputeBackend>(
             OwnedBatchResultTable::new(batch_capacity, plan.max_arity(), plan.metric_count())?;
         result_metadata.bind_batch(&mut batch_result.raw);
         validate_execution_device_budget(backend, matrix, &protocol, device_budget_bytes)?;
-        let stats = backend.execute(matrix, &protocol, &mut batch_result.raw)?;
+        // SAFETY: the batch owns every descriptor and output allocation, and
+        // both remain live and uniquely borrowed for this synchronous call.
+        let stats = unsafe { backend.execute(matrix, &protocol, &mut batch_result.raw) }?;
         if batch_result.raw.row_count > batch_capacity
             || stats.rows_written != batch_result.raw.row_count
         {
@@ -561,7 +610,10 @@ fn execute_compiled_plan_f64_with_protocol<B: PrecisionComputeBackend>(
             &protocol,
             device_budget_bytes,
         )?;
-        return backend.execute_f64(matrix, &protocol, result);
+        // SAFETY: `base` and the precision wrapper are stack-local views over
+        // live plan storage. The public raw execution entry point establishes
+        // the caller's f64 result-table allocation contract.
+        return unsafe { backend.execute_f64(matrix, &protocol, result) };
     }
 
     if rank.top_k == 0 {
@@ -648,7 +700,9 @@ fn execute_streamed_ranked_plan_f64<B: PrecisionComputeBackend>(
             &protocol,
             device_budget_bytes,
         )?;
-        let stats = backend.execute_f64(matrix, &protocol, &mut batch_result.raw)?;
+        // SAFETY: the batch owns every descriptor and typed output allocation,
+        // and both remain live and uniquely borrowed for this call.
+        let stats = unsafe { backend.execute_f64(matrix, &protocol, &mut batch_result.raw) }?;
         if batch_result.raw.row_count > batch_capacity
             || stats.rows_written != batch_result.raw.row_count
         {
@@ -717,8 +771,9 @@ fn validate_precision_execution_device_budget<B: PrecisionComputeBackend>(
     let Some(device_budget_bytes) = device_budget_bytes else {
         return Ok(());
     };
-    if backend
-        .execution_device_memory_peak_bytes_v2(matrix, protocol)?
+    // SAFETY: callers construct `protocol` from the live compiled-plan storage;
+    // this query is synchronous and cannot outlive those descriptor borrows.
+    if unsafe { backend.execution_device_memory_peak_bytes_v2(matrix, protocol) }?
         .is_some_and(|peak| peak > device_budget_bytes)
     {
         return Err(OrchestratorError::Unsupported(
@@ -737,8 +792,9 @@ fn validate_execution_device_budget<B: ComputeBackend>(
     let Some(device_budget_bytes) = device_budget_bytes else {
         return Ok(());
     };
-    if backend
-        .execution_device_memory_peak_bytes(matrix, protocol)?
+    // SAFETY: callers construct `protocol` from the live compiled-plan storage;
+    // this query is synchronous and cannot outlive those descriptor borrows.
+    if unsafe { backend.execution_device_memory_peak_bytes(matrix, protocol) }?
         .is_some_and(|peak| peak > device_budget_bytes)
     {
         return Err(OrchestratorError::Unsupported(
@@ -2095,7 +2151,7 @@ mod tests {
             GAFIME_BACKEND_CPU
         }
 
-        fn execution_device_memory_peak_bytes(
+        unsafe fn execution_device_memory_peak_bytes(
             &mut self,
             _matrix: &MatrixHandle,
             _protocol: &GafimeLaunchProtocol,
@@ -2104,7 +2160,7 @@ mod tests {
             Ok(self.device_memory_peak_bytes)
         }
 
-        fn execute(
+        unsafe fn execute(
             &mut self,
             _matrix: &MatrixHandle,
             protocol: &gafime_types::GafimeLaunchProtocol,
@@ -2230,7 +2286,7 @@ mod tests {
             GAFIME_BACKEND_CPU
         }
 
-        fn execute_fp32(
+        unsafe fn execute_fp32(
             &mut self,
             _matrix: &MatrixHandle,
             _protocol: &GafimePrecisionLaunchProtocol,
@@ -2239,7 +2295,7 @@ mod tests {
             panic!("precision identity validation must run before fp32 dispatch")
         }
 
-        fn execute_f64(
+        unsafe fn execute_f64(
             &mut self,
             _matrix: &MatrixHandle,
             _protocol: &GafimePrecisionLaunchProtocol,
@@ -2257,6 +2313,95 @@ mod tests {
         families: Vec<u32>,
         candidate_ids: Vec<u64>,
         row_flags: Vec<u32>,
+    }
+
+    #[test]
+    fn raw_prepared_execution_routes_remain_unsafe_function_items() {
+        #[allow(dead_code)]
+        #[deny(unused_unsafe)]
+        fn require_unsafe_calls(
+            prepared: &PreparedContinuousExecution,
+            compute: &mut RecordingBackend,
+            precision: &mut PanicPrecisionBackend,
+            matrix: &MatrixHandle,
+            result_f32: &mut GafimeResultTable,
+            result_f64: &mut GafimeResultTableF64,
+        ) {
+            // SAFETY: compile-only API assertion; this function is never called.
+            let _ = unsafe { prepared.execute(compute, matrix, result_f32) };
+            // SAFETY: compile-only API assertion; this function is never called.
+            let _ = unsafe { prepared.execute_precision_fp32(precision, matrix, result_f32) };
+            // SAFETY: compile-only API assertion; this function is never called.
+            let _ = unsafe { prepared.execute_precision_f64(precision, matrix, result_f64) };
+            // SAFETY: compile-only API assertion; this function is never called.
+            let _ = unsafe {
+                prepared.execute_ranked(GafimeRankSpec::default(), compute, matrix, result_f32)
+            };
+            // SAFETY: compile-only API assertion; this function is never called.
+            let _ = unsafe {
+                prepared.execute_precision_ranked_fp32(
+                    GafimeRankSpec::default(),
+                    precision,
+                    matrix,
+                    result_f32,
+                )
+            };
+            // SAFETY: compile-only API assertion; this function is never called.
+            let _ = unsafe {
+                prepared.execute_precision_ranked_f64(
+                    GafimeRankSpec::default(),
+                    precision,
+                    matrix,
+                    result_f64,
+                )
+            };
+        }
+
+        let _: unsafe fn(
+            &PreparedContinuousExecution,
+            &mut RecordingBackend,
+            &MatrixHandle,
+            &mut GafimeResultTable,
+        ) -> OrchestratorResult<BackendExecutionStats> =
+            PreparedContinuousExecution::execute::<RecordingBackend>;
+        let _: unsafe fn(
+            &PreparedContinuousExecution,
+            &mut PanicPrecisionBackend,
+            &MatrixHandle,
+            &mut GafimeResultTable,
+        ) -> OrchestratorResult<BackendExecutionStats> =
+            PreparedContinuousExecution::execute_precision_fp32::<PanicPrecisionBackend>;
+        let _: unsafe fn(
+            &PreparedContinuousExecution,
+            &mut PanicPrecisionBackend,
+            &MatrixHandle,
+            &mut GafimeResultTableF64,
+        ) -> OrchestratorResult<BackendExecutionStats> =
+            PreparedContinuousExecution::execute_precision_f64::<PanicPrecisionBackend>;
+        let _: unsafe fn(
+            &PreparedContinuousExecution,
+            GafimeRankSpec,
+            &mut RecordingBackend,
+            &MatrixHandle,
+            &mut GafimeResultTable,
+        ) -> OrchestratorResult<BackendExecutionStats> =
+            PreparedContinuousExecution::execute_ranked::<RecordingBackend>;
+        let _: unsafe fn(
+            &PreparedContinuousExecution,
+            GafimeRankSpec,
+            &mut PanicPrecisionBackend,
+            &MatrixHandle,
+            &mut GafimeResultTable,
+        ) -> OrchestratorResult<BackendExecutionStats> =
+            PreparedContinuousExecution::execute_precision_ranked_fp32::<PanicPrecisionBackend>;
+        let _: unsafe fn(
+            &PreparedContinuousExecution,
+            GafimeRankSpec,
+            &mut PanicPrecisionBackend,
+            &MatrixHandle,
+            &mut GafimeResultTableF64,
+        ) -> OrchestratorResult<BackendExecutionStats> =
+            PreparedContinuousExecution::execute_precision_ranked_f64::<PanicPrecisionBackend>;
     }
 
     impl TestResultTable {
@@ -2413,7 +2558,11 @@ mod tests {
         let mut backend = PanicPrecisionBackend;
 
         assert_eq!(
-            fp32_prepared.execute_precision_f64(&mut backend, &fp32_matrix, &mut f64_result,),
+            // SAFETY: the prepared/base descriptors are live and the empty result
+            // has no non-null output spans; profile validation rejects pre-dispatch.
+            unsafe {
+                fp32_prepared.execute_precision_f64(&mut backend, &fp32_matrix, &mut f64_result)
+            },
             Err(OrchestratorError::InvalidPlan(
                 "prepared execution precision does not match resident matrix identity"
             ))
@@ -2424,7 +2573,11 @@ mod tests {
         let fp64_matrix =
             MatrixHandle::host_with_precision(GAFIME_BACKEND_CPU, PrecisionProfile::Fp64, 8, 2);
         assert_eq!(
-            mixed_prepared.execute_precision_f64(&mut backend, &fp64_matrix, &mut f64_result,),
+            // SAFETY: the prepared/base descriptors are live and the empty result
+            // has no non-null output spans; profile validation rejects pre-dispatch.
+            unsafe {
+                mixed_prepared.execute_precision_f64(&mut backend, &fp64_matrix, &mut f64_result)
+            },
             Err(OrchestratorError::InvalidPlan(
                 "prepared execution precision does not match resident matrix identity"
             ))
@@ -2444,9 +2597,9 @@ mod tests {
         let mut result = GafimeResultTable::default();
         let mut backend = RecordingBackend::default();
 
-        prepared
-            .execute(&mut backend, &matrix, &mut result)
-            .unwrap();
+        // SAFETY: `prepared` owns every protocol span; the recording backend
+        // deliberately does not dereference this zero-capacity result table.
+        unsafe { prepared.execute(&mut backend, &matrix, &mut result) }.unwrap();
 
         assert_ne!(
             backend.launch_flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
@@ -2454,9 +2607,9 @@ mod tests {
         );
         let first_generation = backend.descriptor_generation;
         assert_ne!(first_generation, 0);
-        prepared
-            .execute(&mut backend, &matrix, &mut result)
-            .unwrap();
+        // SAFETY: the same prepared owner remains live and the recording
+        // backend does not dereference the zero-capacity result table.
+        unsafe { prepared.execute(&mut backend, &matrix, &mut result) }.unwrap();
         assert_eq!(backend.descriptor_generation, first_generation);
         assert_eq!(
             prepared.plan().protocol().flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
@@ -2468,7 +2621,9 @@ mod tests {
         );
 
         let second = prepare_continuous_execution(&config, 8, 2).unwrap();
-        second.execute(&mut backend, &matrix, &mut result).unwrap();
+        // SAFETY: `second` owns its protocol graph and the recording backend
+        // does not dereference the zero-capacity result table.
+        unsafe { second.execute(&mut backend, &matrix, &mut result) }.unwrap();
         assert_ne!(backend.descriptor_generation, first_generation);
     }
 
@@ -2704,9 +2859,9 @@ mod tests {
         let mut backend = RecordingBackend::default();
 
         assert_eq!(prepared.ranked_result_capacity(rank).unwrap(), 2);
-        prepared
-            .execute_ranked(rank, &mut backend, &matrix, &mut result.raw)
-            .unwrap();
+        // SAFETY: `prepared` owns every input descriptor and `result` owns all
+        // output buffers described by its rebound raw table.
+        unsafe { prepared.execute_ranked(rank, &mut backend, &matrix, &mut result.raw) }.unwrap();
 
         assert_eq!(result.raw.row_count, 2);
         assert_eq!(&result.candidate_ids[..2], &[4, 0]);
@@ -2999,7 +3154,9 @@ mod tests {
         let mut result = GafimeResultTable::default();
         let mut backend = RecordingBackend::default();
         assert_eq!(
-            prepared.execute_ranked(oversized_rank, &mut backend, &matrix, &mut result),
+            // SAFETY: `prepared` owns every protocol span and the empty result has
+            // no non-null spans; footprint validation rejects before execution.
+            unsafe { prepared.execute_ranked(oversized_rank, &mut backend, &matrix, &mut result) },
             Err(OrchestratorError::Unsupported(
                 "rank override device footprint exceeds budget.vram_budget_mb"
             ))
@@ -3586,7 +3743,9 @@ mod tests {
         };
 
         assert_eq!(
-            prepared.execute(&mut backend, &matrix, &mut result),
+            // SAFETY: `prepared` owns every protocol span and the empty result has
+            // no non-null spans; memory preflight rejects before execution.
+            unsafe { prepared.execute(&mut backend, &matrix, &mut result) },
             Err(OrchestratorError::Unsupported(
                 "continuous execution device-memory peak exceeds budget.vram_budget_mb"
             ))

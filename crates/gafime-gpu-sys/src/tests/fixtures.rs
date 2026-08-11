@@ -645,7 +645,7 @@ pub(crate) fn assert_adaptive_mi_templates_match_cpu_for_arity_1_to_5(
             cpu_prepared.result_max_arity(),
             cpu_prepared.result_metric_count(),
         );
-        execute_plan(
+        execute_plan!(
             &mut cpu_backend,
             &cpu_matrix.handle(),
             cpu_prepared.plan(),
@@ -658,7 +658,7 @@ pub(crate) fn assert_adaptive_mi_templates_match_cpu_for_arity_1_to_5(
             gpu_prepared.result_max_arity(),
             gpu_prepared.result_metric_count(),
         );
-        execute_plan(
+        execute_plan!(
             gpu_backend,
             gpu_matrix.handle(),
             gpu_prepared.plan(),
@@ -731,7 +731,7 @@ pub(crate) fn assert_low_signal_mi_matches_cpu(gpu_backend: &mut GpuBackend, bac
         CpuMatrix::from_row_major(rows, cols, features.clone(), target.clone()).unwrap();
     let mut cpu_backend = CpuBackend;
     let mut cpu_result = TestResultTable::new(136, 2, 1);
-    execute_plan(
+    execute_plan!(
         &mut cpu_backend,
         &cpu_matrix.handle(),
         cpu_prepared.plan(),
@@ -742,7 +742,7 @@ pub(crate) fn assert_low_signal_mi_matches_cpu(gpu_backend: &mut GpuBackend, bac
     let gpu_matrix = gpu_backend.alloc_matrix(rows, cols).unwrap();
     gpu_matrix.upload(&features, &target).unwrap();
     let mut gpu_result = TestResultTable::new(136, 2, 1);
-    execute_plan(
+    execute_plan!(
         gpu_backend,
         gpu_matrix.handle(),
         gpu_prepared.plan(),
@@ -818,7 +818,7 @@ pub(crate) fn assert_nonfinite_correlation_is_not_laundered(
             vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
         );
         let mut result = TestResultTable::new(1, arity, 2);
-        execute_plan(backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
+        execute_plan!(backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
 
         assert_eq!(result.raw.row_count, 1);
         let expected = if arity == 1 { [0.0, 0.0] } else { [1.0, 1.0] };
@@ -911,14 +911,14 @@ pub(crate) fn assert_scaled_covariance_matches_cpu_across_dynamic_range(
         );
         let mut cpu_result = TestResultTable::new(1, arity, 2);
         let mut gpu_result = TestResultTable::new(1, arity, 2);
-        execute_plan(
+        execute_plan!(
             &mut CpuBackend,
             &cpu_matrix.handle(),
             &cpu_plan,
             cpu_result.raw_mut(),
         )
         .unwrap();
-        execute_plan(
+        execute_plan!(
             backend,
             gpu_matrix.handle(),
             &gpu_plan,
@@ -979,7 +979,7 @@ pub(crate) fn continuous_cached_target_stats_refresh_after_target_update(
     );
 
     let mut first_graph_result = TestResultTable::new(2, 1, 2);
-    execute_plan(
+    execute_plan!(
         backend,
         matrix.handle(),
         &graph_plan,
@@ -994,7 +994,7 @@ pub(crate) fn continuous_cached_target_stats_refresh_after_target_update(
     matrix.update_target(&target_b).unwrap();
 
     let mut updated_graph_result = TestResultTable::new(2, 1, 2);
-    execute_plan(
+    execute_plan!(
         backend,
         matrix.handle(),
         &graph_plan,
@@ -1007,7 +1007,7 @@ pub(crate) fn continuous_cached_target_stats_refresh_after_target_update(
     );
 
     let mut updated_normal_result = TestResultTable::new(2, 1, 2);
-    execute_plan(
+    execute_plan!(
         backend,
         matrix.handle(),
         &normal_plan,
