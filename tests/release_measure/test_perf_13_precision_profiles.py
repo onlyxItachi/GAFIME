@@ -286,6 +286,21 @@ def test_native_loop_plan_counts_must_be_derived_from_both_calibrations(
     assert "native_loop_plan_entry_not_derived_from_calibration" in failures
 
 
+def test_native_calibration_count_above_fixed_ceiling_is_rejected() -> None:
+    calibration = {
+        "entries": [
+            {
+                "key": "host/fp32/candidate_materialization/",
+                "loop_count": perf13.NATIVE_CALIBRATION_LOOP_COUNT_CEILING + 1,
+            }
+        ],
+        "entry_count": 1,
+    }
+    parsed, failures = perf13._native_calibration_entry_map(calibration)
+    assert parsed is None
+    assert "entry_0_invalid" in failures
+
+
 def test_native_loop_plan_paths_cannot_escape_explicit_evidence_root(
     tmp_path: Path,
 ) -> None:
@@ -371,6 +386,16 @@ def test_independent_loop_plan_verifier_enforces_root_contract(tmp_path: Path) -
             "root-binding",
             "native_loop_plan_binding_source_commits_root_mismatch",
             lambda plan: plan.__setitem__("source_commits", ["3" * 40, "4" * 40]),
+        ),
+        (
+            "headroom-factor",
+            "native_loop_plan_headroom_factor_invalid",
+            lambda plan: plan.__setitem__("headroom_factor", 1),
+        ),
+        (
+            "plan-cap",
+            "native_loop_plan_max_loop_count_invalid",
+            lambda plan: plan.__setitem__("max_loop_count", 1 << 20),
         ),
     )
     for name, expected, mutate in cases:

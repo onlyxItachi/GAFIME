@@ -233,7 +233,7 @@ if calibration:
             "removed_environment": [key for key in os.environ if key.startswith("GIT_")],
         },
         "entry_count": 1,
-        "entries": [{"key": "payload/fp32/execute/pearson", "loop_count": 2}],
+        "entries": [{"key": "payload/fp32/execute/pearson", "loop_count": 1048576}],
     }
 else:
     sequence = value("--variant-sequence").split(",")
@@ -382,6 +382,40 @@ def test_fake_helpers_execute_every_cell_in_fresh_processes(
         assert manifest["process_isolation"] == "fresh_helper_process_per_variant_trial"
         assert len(manifest["artifacts"]) == 12
 
+    plan_paths = sorted((config.output_dir / "calibration").glob("*-plan.json"))
+    assert len(plan_paths) == len(runner.LANES) * len(runner.INPUT_POLICIES)
+    for plan_path in plan_paths:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        assert plan["headroom_factor"] == runner.NATIVE_LOOP_PLAN_HEADROOM_FACTOR
+        assert plan["max_loop_count"] == runner.NATIVE_LOOP_PLAN_MAX_LOOP_COUNT
+        assert {item["loop_count"] for item in plan["entries"]} == {
+            runner.NATIVE_LOOP_PLAN_MAX_LOOP_COUNT
+        }
+
+    plan_path = plan_paths[0]
+    original_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    scope = original_plan["scope"]
+    calibration_paths = [
+        Path(binding["path"]) for binding in original_plan["bindings"]
+    ]
+    for field, value in (
+        ("headroom_factor", 1),
+        ("max_loop_count", runner.NATIVE_CALIBRATION_LOOP_COUNT_CEILING),
+    ):
+        tampered = json.loads(json.dumps(original_plan))
+        tampered[field] = value
+        tampered["plan_sha256"] = runner._plan_digest(tampered)
+        plan_path.write_text(runner._canonical_json(tampered), encoding="utf-8")
+        with pytest.raises(runner.RunnerError, match="headroom policy"):
+            runner._validate_plan(
+                plan_path,
+                config=config,
+                lane=scope["evidence_lane"],
+                policy=scope["input_policy"],
+                calibration_paths=calibration_paths,
+            )
+    plan_path.write_text(runner._canonical_json(original_plan), encoding="utf-8")
+
     observations = [
         json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()
     ]
@@ -427,6 +461,21 @@ def test_strict_machine_json_rejects_nonfinite_values(tmp_path: Path) -> None:
     path.write_text('{"value": NaN}', encoding="utf-8")
     with pytest.raises(runner.RunnerError, match="non-finite"):
         runner._strict_load(path)
+
+
+def test_native_loop_calibration_ceiling_is_fail_closed(tmp_path: Path) -> None:
+    path = tmp_path / "calibration.json"
+    payload = {
+        "entries": [
+            {
+                "key": "host/fp32/candidate_materialization/",
+                "loop_count": runner.NATIVE_CALIBRATION_LOOP_COUNT_CEILING + 1,
+            }
+        ],
+        "entry_count": 1,
+    }
+    with pytest.raises(runner.RunnerError, match="calibration entry 0 is invalid"):
+        runner._calibration_entry_map(path, payload)
 
 
 def test_git_identity_ignores_path_wrapper_and_git_redirection(

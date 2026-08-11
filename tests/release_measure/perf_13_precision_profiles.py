@@ -68,6 +68,11 @@ import zipfile
 SCHEMA = "gafime.precision-profile-performance.v2"
 WORKER_SCHEMA = "gafime.precision-profile-performance.worker.v2"
 NATIVE_EVIDENCE_SCHEMA = "gafime.precision-profile-native-evidence.v1"
+NATIVE_CALIBRATION_LOOP_COUNT_CEILING = 1 << 20
+NATIVE_LOOP_PLAN_HEADROOM_FACTOR = 2
+NATIVE_LOOP_PLAN_MAX_LOOP_COUNT = (
+    NATIVE_CALIBRATION_LOOP_COUNT_CEILING * NATIVE_LOOP_PLAN_HEADROOM_FACTOR
+)
 NATIVE_EVIDENCE_KINDS = frozenset(
     {
         "native_decomposition",
@@ -12119,6 +12124,7 @@ def _native_calibration_entry_map(
             or not isinstance(count, int)
             or isinstance(count, bool)
             or count < 1
+            or count > NATIVE_CALIBRATION_LOOP_COUNT_CEILING
         ):
             failures.append(f"entry_{index}_invalid")
             continue
@@ -12613,16 +12619,14 @@ def _native_loop_plan_failures(
                             )
                         factor = plan.get("headroom_factor")
                         cap = plan.get("max_loop_count")
-                        if (
-                            isinstance(factor, bool)
-                            or not isinstance(factor, int)
-                            or factor < 1
-                            or isinstance(cap, bool)
-                            or not isinstance(cap, int)
-                            or cap < 1
-                        ):
+                        if factor != NATIVE_LOOP_PLAN_HEADROOM_FACTOR:
                             failures.append("native_loop_plan_headroom_factor_invalid")
-                        else:
+                        if cap != NATIVE_LOOP_PLAN_MAX_LOOP_COUNT:
+                            failures.append("native_loop_plan_max_loop_count_invalid")
+                        if (
+                            factor == NATIVE_LOOP_PLAN_HEADROOM_FACTOR
+                            and cap == NATIVE_LOOP_PLAN_MAX_LOOP_COUNT
+                        ):
                             if set(entry_map) != set(baseline):
                                 failures.append(
                                     "native_loop_plan_entry_calibration_key_set_mismatch"
@@ -12639,6 +12643,8 @@ def _native_loop_plan_failures(
                                         "native_loop_plan_entry_not_derived_from_calibration"
                                     )
                                     break
+                        else:
+                            failures.append("native_loop_plan_fixed_policy_required")
                     elif calibration_payloads:
                         failures.append(
                             "native_loop_plan_calibration_reauthentication_incomplete"

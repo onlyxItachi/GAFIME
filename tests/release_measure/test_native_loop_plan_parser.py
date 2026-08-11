@@ -85,7 +85,12 @@ def _calibration(path: Path, variant: str, commit: str) -> Path:
             "git_common_dir": "/tmp/gafime-product/.git",
             "removed_environment": ["GIT_DIR"],
         },
-        "entries": [{"key": "direct/fp32/pearson/pearson", "loop_count": 4}],
+        "entries": [
+            {
+                "key": "host/fp32/candidate_materialization/",
+                "loop_count": native_loop_plan.CALIBRATION_LOOP_COUNT_CEILING,
+            }
+        ],
         "entry_count": 1,
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -143,6 +148,16 @@ def _run(
     )
 
 
+def _write_tampered_plan(path: Path, payload: dict[str, object]) -> tuple[str, str]:
+    payload["plan_sha256"] = "0" * 64
+    payload["plan_sha256"] = native_loop_plan._plan_digest(payload)
+    path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    return str(payload["plan_sha256"]), hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def test_native_parser_accepts_real_generator_output_and_rejects_adversaries(
     parser_binary: Path, tmp_path: Path
 ) -> None:
@@ -192,3 +207,21 @@ def test_native_parser_accepts_real_generator_output_and_rejects_adversaries(
     )
 
     assert _run(parser_binary, plan, "0" * 64, file_digest).returncode != 0
+
+    wrong_factor = json.loads(plan.read_text(encoding="utf-8"))
+    wrong_factor["headroom_factor"] = 1
+    wrong_factor_path = tmp_path / "wrong-factor.json"
+    semantic, file_sha = _write_tampered_plan(wrong_factor_path, wrong_factor)
+    assert _run(parser_binary, wrong_factor_path, semantic, file_sha).returncode != 0
+
+    wrong_cap = json.loads(plan.read_text(encoding="utf-8"))
+    wrong_cap["max_loop_count"] = 1 << 20
+    wrong_cap_path = tmp_path / "wrong-cap.json"
+    semantic, file_sha = _write_tampered_plan(wrong_cap_path, wrong_cap)
+    assert _run(parser_binary, wrong_cap_path, semantic, file_sha).returncode != 0
+
+    over_cap = json.loads(plan.read_text(encoding="utf-8"))
+    over_cap["entries"][0]["loop_count"] = (1 << 21) + 1
+    over_cap_path = tmp_path / "over-cap.json"
+    semantic, file_sha = _write_tampered_plan(over_cap_path, over_cap)
+    assert _run(parser_binary, over_cap_path, semantic, file_sha).returncode != 0

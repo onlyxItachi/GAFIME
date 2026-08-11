@@ -814,12 +814,15 @@ semantic digest of canonical unsigned contents; the separate `file_sha256` is
 the raw serialized-file digest. The runner and perf13 rehash both, reopen each
 plan-bound calibration file, compare its binding metadata, require trusted
 Git/source/harness provenance, and prove every loop count equals
-`max(baseline,candidate) * headroom_factor` under the plan cap. Perf13 resolves
-the plan and calibration bindings only inside the explicit manifest evidence
-root; the runner's `artifacts/../calibration` sibling path is accepted only
-while it remains inside that root, and absolute or traversal escapes are
-rejected even when their hashes match. The independent verifier also requires
-plan version 1, exactly two sources and the exact baseline/candidate variants,
+`max(baseline,candidate) * headroom_factor` under the plan cap. The helper
+calibration search remains bounded at 2^20 loops, while the plan and
+recorded-helper ceiling reserves the required 2x headroom at 2^21; every
+recorded region must still independently satisfy the 5 ms raw-time floor.
+Perf13 resolves the plan and calibration bindings only inside the explicit
+manifest evidence root; the runner's `artifacts/../calibration` sibling path
+is accepted only while it remains inside that root, and absolute or traversal
+escapes are rejected even when their hashes match. The independent verifier
+also requires plan version 1, exactly two sources and the exact baseline/candidate variants,
 distinct full product commits, and equality between root and binding commit
 sets. When a manifest schedule is present, its `input_policy` and all other
 schedule fields must exactly match the hash-verified payload; the payload is

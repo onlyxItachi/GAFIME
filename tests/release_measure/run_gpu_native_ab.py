@@ -55,6 +55,11 @@ ARTIFACT_SCHEMAS = {
 }
 EXPECTED_RECORDED_PROCESSES = len(LANES) * len(INPUT_POLICIES) * 2 * 2
 EXPECTED_CALIBRATION_PROCESSES = len(LANES) * len(INPUT_POLICIES) * 2
+NATIVE_CALIBRATION_LOOP_COUNT_CEILING = 1 << 20
+NATIVE_LOOP_PLAN_HEADROOM_FACTOR = 2
+NATIVE_LOOP_PLAN_MAX_LOOP_COUNT = (
+    NATIVE_CALIBRATION_LOOP_COUNT_CEILING * NATIVE_LOOP_PLAN_HEADROOM_FACTOR
+)
 
 # Git identity is part of the evidence boundary.  Never resolve it through
 # PATH: a repository-local or temporary ``git`` wrapper must not be able to
@@ -857,6 +862,7 @@ def _validate_calibration(
             or isinstance(count, bool)
             or not isinstance(count, int)
             or count < 1
+            or count > NATIVE_CALIBRATION_LOOP_COUNT_CEILING
         ):
             raise RunnerError(f"calibration entry {index} is invalid: {path}")
         keys.add(key)
@@ -888,6 +894,7 @@ def _calibration_entry_map(path: Path, payload: Mapping[str, object]) -> dict[st
             or isinstance(count, bool)
             or not isinstance(count, int)
             or count < 1
+            or count > NATIVE_CALIBRATION_LOOP_COUNT_CEILING
         ):
             raise RunnerError(f"calibration entry {index} is invalid: {path}")
         result[key] = count
@@ -1130,12 +1137,8 @@ def _reauthenticate_plan_calibrations(
     factor = plan.get("headroom_factor")
     cap = plan.get("max_loop_count")
     if (
-        isinstance(factor, bool)
-        or not isinstance(factor, int)
-        or factor < 1
-        or isinstance(cap, bool)
-        or not isinstance(cap, int)
-        or cap < 1
+        factor != NATIVE_LOOP_PLAN_HEADROOM_FACTOR
+        or cap != NATIVE_LOOP_PLAN_MAX_LOOP_COUNT
     ):
         raise RunnerError(f"loop plan headroom policy is invalid: {plan_path}")
     baseline = calibration_maps["baseline"]
@@ -1272,6 +1275,7 @@ def _validate_plan(
             or isinstance(count, bool)
             or not isinstance(count, int)
             or count < 1
+            or count > NATIVE_LOOP_PLAN_MAX_LOOP_COUNT
         ):
             raise RunnerError(f"loop plan entry {index} is invalid: {path}")
         keys.add(key)

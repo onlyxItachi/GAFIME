@@ -114,7 +114,10 @@ constexpr double kPreconditionDeviceBatchTargetUs = 1000.0;
 constexpr uint32_t kMaxPreconditionBatchIterations = 4096;
 constexpr uint32_t kMaxDevicePreconditionIterations = 1u << 20;
 constexpr uint32_t kMaxHostPreconditionIterations = 1u << 24;
-constexpr uint32_t kMaxLoopCount = 1u << 20;
+// Calibration stays bounded, while an immutable recorded plan must be able to
+// apply the repository-required fixed 2x headroom to a ceiling observation.
+constexpr uint32_t kMaxCalibrationLoopCount = 1u << 20;
+constexpr uint32_t kMaxPlannedLoopCount = kMaxCalibrationLoopCount * 2u;
 constexpr uint32_t kBootstrapResamples = 2000;
 constexpr uint64_t kBootstrapSeed = 20260809ULL;
 constexpr uint32_t kMinimumOrderRepetitions = 30;
@@ -1165,7 +1168,7 @@ ImmutableLoopPlan load_loop_plan(const Options& options) {
     if (!input.good() && !input.eof()) throw BenchmarkError("cannot read loop plan: " + plan.path);
     try {
         plan = gafime_native_loop_plan::parse_plan(
-            contents.str(), kMaxLoopCount,
+            contents.str(), kMaxPlannedLoopCount,
             [](const void* data, size_t size) { return sha256_bytes(data, size); });
     } catch (const gafime_native_loop_plan::ParseError& error) {
         throw BenchmarkError(error.what());
@@ -2109,8 +2112,10 @@ uint32_t fixed_loop_count(
     uint32_t loop_count = 1;
     double calibration_us = measure(loop_count);
     while (calibration_us < kSampleRegionCalibrationTargetUs &&
-           loop_count < kMaxLoopCount) {
-        loop_count = loop_count > kMaxLoopCount / 2 ? kMaxLoopCount : loop_count * 2;
+           loop_count < kMaxCalibrationLoopCount) {
+        loop_count = loop_count > kMaxCalibrationLoopCount / 2
+            ? kMaxCalibrationLoopCount
+            : loop_count * 2;
         calibration_us = measure(loop_count);
     }
     cache.loop_counts.emplace(std::string(key), loop_count);

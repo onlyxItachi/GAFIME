@@ -743,8 +743,12 @@ Plan parse_plan(std::string_view text, uint32_t max_loop_count, DigestFn&& diges
 
     const uint64_t plan_cap = uint_member(root, "max_loop_count", "plan", true);
     const uint64_t helper_cap = std::min<uint64_t>(plan_cap, max_loop_count);
-    if (plan_cap > max_loop_count) throw ParseError("loop-plan max_loop_count exceeds helper cap");
-    static_cast<void>(uint_member(root, "headroom_factor", "plan", true));
+    if (plan_cap != max_loop_count) {
+        throw ParseError("loop-plan max_loop_count does not match fixed helper cap");
+    }
+    if (uint_member(root, "headroom_factor", "plan", true) != 2) {
+        throw ParseError("loop-plan headroom_factor does not match fixed policy");
+    }
 
     const JsonValue& variants = member(root, "variants", "plan");
     if (variants.kind != JsonValue::Kind::Array || variants.array.size() != 2 ||

@@ -18,7 +18,7 @@ int main(int argc, char** argv) {
         const std::string unsigned_marker =
             "\"plan_sha256\":\"" + std::string(64, '0') + "\"";
         const auto plan = gafime_native_loop_plan::parse_plan(
-            contents.str(), 1u << 20,
+            contents.str(), 1u << 21,
             [semantic = std::string(argv[2]), file = std::string(argv[3]), unsigned_marker](
                 const void* data, size_t size) {
                 const std::string_view text(static_cast<const char*>(data), size);

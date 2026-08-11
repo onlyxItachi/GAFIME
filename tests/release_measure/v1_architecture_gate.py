@@ -1023,6 +1023,12 @@ def check_native_kernel_structure() -> None:
     gpu_native_runner = (
         ROOT / "tests" / "release_measure" / "run_gpu_native_ab.py"
     ).read_text()
+    native_loop_plan = (
+        ROOT / "tests" / "release_measure" / "native_loop_plan.py"
+    ).read_text()
+    native_loop_plan_parser = (
+        ROOT / "tests" / "gpu" / "native_loop_plan_parser.hpp"
+    ).read_text()
     precision_profile_perf = (
         ROOT / "tests" / "release_measure" / "perf_13_precision_profiles.py"
     ).read_text()
@@ -2479,6 +2485,37 @@ def check_native_kernel_structure() -> None:
     assert 'f"gafime_cpu={product_rlib}"' in core_native_runner
     assert "_tracked_source_identity" in core_native_runner
     assert "_compiler_environment" in core_native_runner
+    for helper in (cuda_native_timing, rocm_native_timing):
+        assert "kSampleRegionTargetUs = 5000.0" in helper
+        assert (
+            "kSampleRegionCalibrationTargetUs = kSampleRegionTargetUs * 2.0"
+            in helper
+        )
+        assert "kMaxCalibrationLoopCount = 1u << 20" in helper
+        assert "kMaxPlannedLoopCount = kMaxCalibrationLoopCount * 2u" in helper
+        assert "contents.str(), kMaxPlannedLoopCount" in helper
+        assert "loop_count < kMaxCalibrationLoopCount" in helper
+    assert "CALIBRATION_LOOP_COUNT_CEILING = 1 << 20" in native_loop_plan
+    assert (
+        "DEFAULT_MAX_LOOP_COUNT = CALIBRATION_LOOP_COUNT_CEILING * DEFAULT_HEADROOM_FACTOR"
+        in native_loop_plan
+    )
+    assert 'uint_member(root, "headroom_factor", "plan", true) != 2' in (
+        native_loop_plan_parser
+    )
+    assert "plan_cap != max_loop_count" in native_loop_plan_parser
+    assert (
+        "record.raw_samples_us[index] < kSampleRegionTargetUs"
+        in cuda_native_timing
+    )
+    assert "raw_min < kSampleRegionTargetUs" in rocm_native_timing
+    for policy_consumer in (gpu_native_runner, precision_profile_perf):
+        assert "NATIVE_CALIBRATION_LOOP_COUNT_CEILING = 1 << 20" in policy_consumer
+        assert "NATIVE_LOOP_PLAN_HEADROOM_FACTOR = 2" in policy_consumer
+        assert (
+            "NATIVE_CALIBRATION_LOOP_COUNT_CEILING * NATIVE_LOOP_PLAN_HEADROOM_FACTOR"
+            in policy_consumer
+        )
     for core_provenance_marker in (
         "GAFIME_NATIVE_PRODUCT_SOURCE_ROOT",
         "GAFIME_NATIVE_HARNESS_SOURCE_ROOT",

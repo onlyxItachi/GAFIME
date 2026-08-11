@@ -22,8 +22,12 @@ from typing import Any, Mapping, Sequence
 
 SCHEMA = "gafime.native-loop-plan.v1"
 CALIBRATION_SCHEMA = "gafime.native-loop-calibration.v1"
-DEFAULT_MAX_LOOP_COUNT = 1 << 20
 DEFAULT_HEADROOM_FACTOR = 2
+CALIBRATION_LOOP_COUNT_CEILING = 1 << 20
+# Calibration helpers may legitimately stop at their bounded search ceiling.
+# The immutable recorded plan must still have room for the mandatory fixed 2x
+# guard band; recorded helpers independently reject a region below 5 ms.
+DEFAULT_MAX_LOOP_COUNT = CALIBRATION_LOOP_COUNT_CEILING * DEFAULT_HEADROOM_FACTOR
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-fA-F]{40}$")
 TRUSTED_GIT_PATHS = (Path("/usr/bin/git"), Path("/bin/git"))
@@ -168,6 +172,11 @@ def _calibration_entries(payload: Mapping[str, Any], path: Path) -> dict[str, in
         if not isinstance(key, str) or not key or "\n" in key:
             raise ValueError(f"{path}: entry {index} has an invalid key")
         count = _positive_int(count, f"{path}: entry {index} loop_count")
+        if count > CALIBRATION_LOOP_COUNT_CEILING:
+            raise ValueError(
+                f"{path}: entry {index} loop_count exceeds calibration ceiling "
+                f"{CALIBRATION_LOOP_COUNT_CEILING}"
+            )
         if key in result:
             raise ValueError(f"{path}: duplicate calibration key {key!r}")
         result[key] = count
@@ -357,6 +366,16 @@ def make_plan(
         )
     headroom_factor = _positive_int(headroom_factor, "headroom_factor")
     max_loop_count = _positive_int(max_loop_count, "max_loop_count")
+    if headroom_factor != DEFAULT_HEADROOM_FACTOR:
+        raise ValueError(
+            f"headroom_factor must equal the fixed policy value "
+            f"{DEFAULT_HEADROOM_FACTOR}"
+        )
+    if max_loop_count != DEFAULT_MAX_LOOP_COUNT:
+        raise ValueError(
+            f"max_loop_count must equal the fixed plan ceiling "
+            f"{DEFAULT_MAX_LOOP_COUNT}"
+        )
     combined: dict[str, int] = {}
     bindings: list[dict[str, Any]] = []
     scopes: list[dict[str, Any]] = []
@@ -460,9 +479,9 @@ def validate_plan(payload: Mapping[str, Any]) -> list[str]:
         failures.append("policy_mismatch")
     factor = payload.get("headroom_factor")
     cap = payload.get("max_loop_count")
-    if isinstance(factor, bool) or not isinstance(factor, int) or factor < 1:
+    if factor != DEFAULT_HEADROOM_FACTOR:
         failures.append("headroom_factor_invalid")
-    if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+    if cap != DEFAULT_MAX_LOOP_COUNT:
         failures.append("max_loop_count_invalid")
     entries = payload.get("entries")
     keys: set[str] = set()

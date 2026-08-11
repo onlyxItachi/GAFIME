@@ -131,6 +131,31 @@ def test_plan_is_deterministic_and_round_trips(tmp_path: Path) -> None:
     assert validate_plan(json.loads(first.read_text(encoding="utf-8"))) == []
 
 
+def test_calibration_ceiling_retains_the_fixed_plan_headroom(
+    tmp_path: Path,
+) -> None:
+    calibration_ceiling = native_loop_plan.CALIBRATION_LOOP_COUNT_CEILING
+    assert native_loop_plan.DEFAULT_HEADROOM_FACTOR == 2
+    assert native_loop_plan.DEFAULT_MAX_LOOP_COUNT == calibration_ceiling * 2
+    paths = _pair(
+        tmp_path,
+        entries=[
+            {
+                "key": "host/fp32/candidate_materialization/",
+                "loop_count": calibration_ceiling,
+            }
+        ],
+    )
+    plan = make_plan(paths)
+    assert plan["max_loop_count"] == calibration_ceiling * 2
+    assert plan["entries"] == [
+        {
+            "key": "host/fp32/candidate_materialization/",
+            "loop_count": calibration_ceiling * 2,
+        }
+    ]
+
+
 def test_duplicate_json_keys_are_rejected(tmp_path: Path) -> None:
     path = tmp_path / "duplicate.json"
     path.write_text('{"schema": "x", "schema": "y"}', encoding="utf-8")
@@ -173,10 +198,23 @@ def test_same_commit_and_cap_overflow_are_rejected(tmp_path: Path) -> None:
         make_plan(paths)
     paths = _pair(
         tmp_path,
-        entries=[{"key": "direct/fp32/pearson/pearson", "loop_count": 8}],
+        entries=[
+            {
+                "key": "direct/fp32/pearson/pearson",
+                "loop_count": native_loop_plan.CALIBRATION_LOOP_COUNT_CEILING + 1,
+            }
+        ],
     )
-    with pytest.raises(ValueError, match="cap exceeded"):
-        make_plan(paths, max_loop_count=8)
+    with pytest.raises(ValueError, match="calibration ceiling"):
+        make_plan(paths)
+
+
+def test_fixed_headroom_and_plan_ceiling_cannot_be_overridden(tmp_path: Path) -> None:
+    paths = _pair(tmp_path)
+    with pytest.raises(ValueError, match="headroom_factor must equal"):
+        make_plan(paths, headroom_factor=1)
+    with pytest.raises(ValueError, match="max_loop_count must equal"):
+        make_plan(paths, max_loop_count=1 << 20)
 
 
 def test_product_and_common_harness_commit_bindings_are_required(
@@ -208,3 +246,7 @@ def test_digest_tamper_and_noncanonical_plan_fail_validation(tmp_path: Path) -> 
     malformed = dict(plan)
     malformed["entries"] = [*plan["entries"], dict(plan["entries"][0])]
     assert "entry_2_duplicate_key" in validate_plan(malformed)
+    wrong_factor = dict(plan, headroom_factor=1)
+    assert "headroom_factor_invalid" in validate_plan(wrong_factor)
+    wrong_cap = dict(plan, max_loop_count=1 << 20)
+    assert "max_loop_count_invalid" in validate_plan(wrong_cap)
