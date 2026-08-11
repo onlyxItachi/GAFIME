@@ -183,6 +183,18 @@ def _valid_child(
         "samples_ns": [100_000_000.0],
         "loop_count_per_sample": 1,
         "target_region_ns": 100_000_000,
+        "calibration_target_region_ns": 200_000_000,
+        "calibration": {
+            "policy": (
+                "fixed_loop_count_selected_before_recording_"
+                "no_recorded_sample_rescaling_or_filtering"
+            ),
+            "initial_probe_median_ns": 100_000,
+            "refinement_rounds": 0,
+            "preflight_samples_ns": [200_000_000] * 3,
+            "preflight_min_observed_ns": 200_000_000,
+            "loop_count_limit": 1_048_576,
+        },
         "sample_region_min_observed_ns": 100_000_000,
         "sample_region_target_met": True,
         "environment": {"PATH": "/bin"},
@@ -413,6 +425,22 @@ def test_child_contract_rejects_runner_pid_reuse_and_forged_normalization() -> N
     child = _valid_child(worker_mode="default", effective_workers=4, allowed=4)
     child["samples_ns"] = [99_000_000.0]
     with pytest.raises(RuntimeError, match="normalized timings"):
+        _validate_child(child, worker_mode="default")
+
+
+def test_child_contract_requires_fixed_pre_recording_calibration_headroom() -> None:
+    child = _valid_child(worker_mode="default", effective_workers=4, allowed=4)
+    calibration = child["calibration"]
+    assert isinstance(calibration, dict)
+    calibration["preflight_samples_ns"] = [199_999_999, 220_000_000, 230_000_000]
+    calibration["preflight_min_observed_ns"] = 199_999_999
+
+    with pytest.raises(RuntimeError, match="calibration preflight"):
+        _validate_child(child, worker_mode="default")
+
+    child = _valid_child(worker_mode="default", effective_workers=4, allowed=4)
+    child["loop_count_per_sample"] = runner.MAX_LOOP_COUNT + 1
+    with pytest.raises(RuntimeError, match="raw timing contract"):
         _validate_child(child, worker_mode="default")
 
 
@@ -710,6 +738,10 @@ def test_leaf_and_production_claim_boundaries_are_structurally_distinct() -> Non
     assert "frozen_pre_repair_serial_candidate_loop" in production
     assert "rayon_candidate_level" in production
     assert "not_applicable_frozen_pre_repair_serial_baseline" in production
+    assert "MAX_LOOP_COUNT: usize = 1_048_576" in production
+    assert "loop_count_for_calibration_target" in production
+    assert "calibration_preflight_samples_ns" in production
+    assert ".clamp(1, MAX_LOOP_COUNT)" not in production
 
 
 def test_workflow_uses_the_compatible_before_fix_precision_head_and_tracks_the_runner() -> (

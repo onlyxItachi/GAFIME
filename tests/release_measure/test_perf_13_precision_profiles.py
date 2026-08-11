@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import copy
 import hashlib
 import importlib.util
 import itertools
@@ -6070,6 +6071,20 @@ def test_core_production_timing_contract_rederives_raw_floor_and_normalization()
         "samples_ns": [50_000_000.0, 60_000_000.0],
         "loop_count_per_sample": 2,
         "target_region_ns": perf13.CORE_MIN_MEASURED_REGION_NS,
+        "calibration_target_region_ns": (
+            perf13.CORE_PRODUCTION_CALIBRATION_TARGET_NS
+        ),
+        "calibration": {
+            "policy": (
+                "fixed_loop_count_selected_before_recording_"
+                "no_recorded_sample_rescaling_or_filtering"
+            ),
+            "initial_probe_median_ns": 100_000,
+            "refinement_rounds": 0,
+            "preflight_samples_ns": [200_000_000] * 3,
+            "preflight_min_observed_ns": 200_000_000,
+            "loop_count_limit": perf13.CORE_PRODUCTION_MAX_LOOP_COUNT,
+        },
         "sample_region_min_observed_ns": 100_000_000,
         "sample_region_target_met": True,
     }
@@ -6091,6 +6106,13 @@ def test_core_production_timing_contract_rederives_raw_floor_and_normalization()
     wrong_count["raw_samples_ns"] = [100_000_000]
     assert "raw_region_below_100ms_or_repetition_mismatch" in (
         perf13._core_production_timing_failures(wrong_count, 2)
+    )
+
+    under_target_preflight = copy.deepcopy(record)
+    under_target_preflight["calibration"]["preflight_samples_ns"][0] = 199_999_999
+    under_target_preflight["calibration"]["preflight_min_observed_ns"] = 199_999_999
+    assert "calibration_preflight_invalid" in (
+        perf13._core_production_timing_failures(under_target_preflight, 2)
     )
 
 

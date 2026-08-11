@@ -3050,9 +3050,14 @@ def check_core_production_benchmark_architecture() -> None:
         "primary_default_worker_production_result",
         "worker_os_cpu_ticks",
         "untimed_snapshot",
+        "loop_count_for_calibration_target",
+        "CALIBRATION_PREFLIGHT_SAMPLES: usize = 3",
+        "MAX_LOOP_COUNT: usize = 1_048_576",
+        "calibration_preflight_samples_ns",
     ):
         assert marker in harness
     assert "gafime.core-leaf-kernel-diagnostic.v1" not in harness
+    assert ".clamp(1, MAX_LOOP_COUNT)" not in harness
 
     for marker in (
         "seeded_balanced_profile_orders_v1",
@@ -3062,6 +3067,7 @@ def check_core_production_benchmark_architecture() -> None:
         '"performance_claim_ready": False',
         "_thread_scaling_tables",
         "raw_child_artifact",
+        "production child calibration preflight is malformed",
     ):
         assert marker in runner
     for marker in (

@@ -45,7 +45,9 @@ const MIN_RELEASE_WARMUPS: usize = 10;
 const MIN_RELEASE_REPETITIONS: usize = 30;
 const TARGET_REGION_NS: u128 = 100_000_000;
 const CALIBRATION_TARGET_REGION_NS: u128 = 200_000_000;
-const MAX_LOOP_COUNT: usize = 4_096;
+const CALIBRATION_PREFLIGHT_SAMPLES: usize = 3;
+const MAX_CALIBRATION_REFINEMENTS: usize = 4;
+const MAX_LOOP_COUNT: usize = 1_048_576;
 
 const COMPILED_HARNESS_SOURCE_SHA256: Option<&str> =
     option_env!("GAFIME_COMPILED_HARNESS_SOURCE_SHA256");
@@ -264,6 +266,9 @@ struct ProductionMeasurement {
     planner_protocol_ns: u128,
     resident_matrix_ns: u128,
     loops: usize,
+    calibration_initial_probe_median_ns: u128,
+    calibration_refinement_rounds: usize,
+    calibration_preflight_samples_ns: Vec<u128>,
     raw_samples: Vec<u128>,
     normalized_samples: Vec<f64>,
     final_digest: ExecutionDigest,
@@ -874,19 +879,71 @@ fn median_u128(mut values: Vec<u128>) -> u128 {
     values[values.len() / 2]
 }
 
-fn calibrate(case: &PreparedCase, warmups: usize) -> usize {
+struct Calibration {
+    loops: usize,
+    initial_probe_median_ns: u128,
+    refinement_rounds: usize,
+    preflight_samples_ns: Vec<u128>,
+}
+
+fn loop_count_for_calibration_target(current: usize, observed_ns: u128) -> Option<usize> {
+    let required = (current as u128)
+        .checked_mul(CALIBRATION_TARGET_REGION_NS)?
+        .div_ceil(observed_ns.max(1));
+    let required = usize::try_from(required).ok()?.max(current);
+    (required <= MAX_LOOP_COUNT).then_some(required)
+}
+
+fn calibrate(case: &PreparedCase, warmups: usize) -> Calibration {
     for _ in 0..warmups {
         black_box(measured_region(case, 1));
     }
-    let probe = median_u128(
+    let initial_probe_median_ns = median_u128(
         (0..5)
             .map(|_| measured_region(case, 1).0)
             .collect::<Vec<_>>(),
     )
     .max(1);
-    usize::try_from(CALIBRATION_TARGET_REGION_NS.div_ceil(probe))
-        .unwrap_or(MAX_LOOP_COUNT)
-        .clamp(1, MAX_LOOP_COUNT)
+    let mut loops = loop_count_for_calibration_target(1, initial_probe_median_ns)
+        .expect("initial calibration exceeds the bounded loop-count limit");
+    let mut refinement_rounds = 0;
+
+    loop {
+        // Warm the complete fixed-loop region before deciding whether it has
+        // enough headroom. These are untimed preconditions, never recorded
+        // samples. A changed loop count restarts this full warmup phase.
+        for _ in 0..warmups {
+            black_box(measured_region(case, loops));
+        }
+        let preflight_samples_ns = (0..CALIBRATION_PREFLIGHT_SAMPLES)
+            .map(|_| measured_region(case, loops).0)
+            .collect::<Vec<_>>();
+        let preflight_minimum = preflight_samples_ns
+            .iter()
+            .copied()
+            .min()
+            .expect("calibration preflight must contain samples");
+        if preflight_minimum >= CALIBRATION_TARGET_REGION_NS {
+            return Calibration {
+                loops,
+                initial_probe_median_ns,
+                refinement_rounds,
+                preflight_samples_ns,
+            };
+        }
+        assert!(
+            refinement_rounds < MAX_CALIBRATION_REFINEMENTS,
+            "calibration did not reach the 200 ms headroom target after bounded refinements"
+        );
+        let next_loops = loop_count_for_calibration_target(loops, preflight_minimum)
+            .expect("calibration exceeds the bounded loop-count limit");
+        assert!(
+            next_loops > loops,
+            "under-target calibration must increase the fixed loop count"
+        );
+        loops = next_loops;
+        refinement_rounds += 1;
+    }
 }
 
 /// Construct the ABI-bound plan and resident matrix inside the dedicated Rayon
@@ -904,10 +961,8 @@ fn measure_case_in_pool(
 ) -> ProductionMeasurement {
     pool.install(move || {
         let case = prepare_case(profile, metric, workload, policy);
-        let loops = calibrate(&case, warmups);
-        for _ in 0..warmups {
-            black_box(measured_region(&case, loops));
-        }
+        let calibration = calibrate(&case, warmups);
+        let loops = calibration.loops;
         let mut raw_samples = Vec::with_capacity(repetitions);
         let mut normalized_samples = Vec::with_capacity(repetitions);
         let mut final_digest = ExecutionDigest {
@@ -931,6 +986,9 @@ fn measure_case_in_pool(
             planner_protocol_ns: case.planner_protocol_ns,
             resident_matrix_ns: case.resident_matrix_ns,
             loops,
+            calibration_initial_probe_median_ns: calibration.initial_probe_median_ns,
+            calibration_refinement_rounds: calibration.refinement_rounds,
+            calibration_preflight_samples_ns: calibration.preflight_samples_ns,
             raw_samples,
             normalized_samples,
             final_digest,
@@ -1428,7 +1486,7 @@ fn main() {
         .map(|value| value.to_string())
         .unwrap_or_else(|| "null".to_owned());
     let report = format!(
-        "{{\"schema\":\"gafime.core-production-executor.child.v1\",\"status\":\"{}\",\"claim_ready\":{},\"backend\":\"core\",\"profile\":{},\"metric\":{},\"operation\":\"production_executor_metric\",\"execution_surface\":\"planner_protocol_resident_precision_compute_backend_ranked_result\",\"measurement_scope\":\"production_precision_compute_backend\",\"candidate_family_scope\":\"ranked_unary_candidates_only\",\"measurement_mode\":{},\"input_policy\":{},\"workload\":{{\"name\":{},\"class\":\"production_core_executor\",\"rows\":{},\"features\":{},\"candidates\":{},\"arity\":1,\"top_k\":{},\"mi_bins\":{},\"mi_approximate\":true,\"metric_set\":[{}]}},\"warmups\":{},\"repetitions\":{},\"loop_count_per_sample\":{},\"target_region_ns\":{},\"calibration_target_region_ns\":{},\"sample_region_min_observed_ns\":{},\"sample_region_target_met\":{},\"samples_ns\":[{}],\"raw_samples_ns\":[{}],\"setup\":{{\"planner_protocol_ns\":{},\"resident_matrix_ns\":{},\"timed_region\":\"real ranked PrecisionComputeBackend execution plus typed result table allocation/materialization; input generation, resident matrix construction, planner/protocol setup, and the complete result snapshot are outside the timed region\",\"untimed_post_measurement_snapshot\":true}},\"execution_topology\":{{\"candidate_parallelism\":{},\"worker_mode\":{},\"measurement_role\":{},\"requested_rayon_workers\":{},\"effective_rayon_workers\":{},\"allowed_parallelism\":{},\"allowed_parallelism_source\":\"std::thread::available_parallelism\",\"process_affinity\":{},\"process_affinity_cardinality\":{},\"affinity_matches_allowed_parallelism\":{},\"pool_start_worker_ids\":[{}],\"pool_start_worker_count\":{},\"pool_start_evidence_scope\":\"dedicated_pool_construction_only_not_candidate_work_participation\",\"worker_os_cpu_ticks\":[{}],\"worker_cpu_tick_status\":{},\"worker_cpu_ticks_observable\":{},\"every_effective_worker_positive_work_ticks\":{},\"worker_participation_evidence_scope\":\"per_worker_linux_os_tid_cpu_ticks_around_real_production_measurement\",\"semantic_candidate_participation_guard\":{}}},\"result\":{{\"rows_written\":{},\"visible_score_bits\":{},\"candidate_digest\":{},\"digest_scope\":\"all_visible_result_metadata_structural_arrays_and_metric_bits\",\"untimed_snapshot\":{{\"result_dtype\":{},\"row_count\":{},\"max_arity\":{},\"metric_count\":{},\"result_flags\":{},\"metric_ids\":[{}],\"combo_indices\":[{}],\"ranks\":[{}],\"families\":[{}],\"candidate_ids\":[{}],\"row_flags\":[{}],\"metric_value_bits\":[{}],\"metric_value_text\":{},\"metric_value_classes\":{}}}}},\"variant\":{},\"ab_block\":{},\"variant_sequence\":{},\"cell_schedule\":{{\"index\":{},\"seed\":{},\"sha256\":{},\"profile_order\":{}}},\"runner_pid\":{},\"process_id\":{},\"runner_invocation_id\":{},\"process_isolation\":\"fresh_helper_process_per_variant_trial\",\"source_commit\":{},\"product_source_commit\":{},\"product_source_tree\":{},\"product_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source_commit\":{},\"harness_source_tree\":{},\"harness_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source_blob\":{{\"relative_path\":{},\"source_sha256\":{},\"current_git_blob\":{},\"head_git_blob\":{}}},\"harness_runner_blob\":{{\"relative_path\":{},\"source_sha256\":{},\"current_git_blob\":{},\"head_git_blob\":{}}},\"compiled_harness\":{{\"product_rlib_sha256\":{},\"orchestrator_rlib_sha256\":{},\"types_rlib_sha256\":{},\"rayon_rlib_sha256\":{},\"command_sha256\":{}}},\"input_identity\":{{\"generator\":\"gafime-core-production-executor-v1\",\"byte_order\":\"native\",\"fp32_matrix_sha256\":{},\"fp32_target_sha256\":{},\"fp64_matrix_sha256\":{},\"fp64_target_sha256\":{}}},\"provenance\":{{\"product_source_root\":{},\"harness_source_root\":{},\"product_rlib\":{},\"orchestrator_rlib\":{},\"types_rlib\":{},\"rayon_rlib\":{},\"benchmark_binary\":{},\"wheel\":{}}},\"device\":{{\"kind\":\"cpu\",\"identity\":{},\"logical_cpu_count\":{},\"physical_cpu_count\":{}}},\"process_affinity\":{},\"environment\":{},\"command_line\":{},\"clock\":\"std::time::Instant monotonic clock\",\"clock_and_power_capture_point\":\"before and after all timed benchmark regions\",\"clock_and_power_state\":{{\"before\":{},\"after\":{}}}}}",
+        "{{\"schema\":\"gafime.core-production-executor.child.v1\",\"status\":\"{}\",\"claim_ready\":{},\"backend\":\"core\",\"profile\":{},\"metric\":{},\"operation\":\"production_executor_metric\",\"execution_surface\":\"planner_protocol_resident_precision_compute_backend_ranked_result\",\"measurement_scope\":\"production_precision_compute_backend\",\"candidate_family_scope\":\"ranked_unary_candidates_only\",\"measurement_mode\":{},\"input_policy\":{},\"workload\":{{\"name\":{},\"class\":\"production_core_executor\",\"rows\":{},\"features\":{},\"candidates\":{},\"arity\":1,\"top_k\":{},\"mi_bins\":{},\"mi_approximate\":true,\"metric_set\":[{}]}},\"warmups\":{},\"repetitions\":{},\"loop_count_per_sample\":{},\"target_region_ns\":{},\"calibration_target_region_ns\":{},\"calibration\":{{\"policy\":\"fixed_loop_count_selected_before_recording_no_recorded_sample_rescaling_or_filtering\",\"initial_probe_median_ns\":{},\"refinement_rounds\":{},\"preflight_samples_ns\":[{}],\"preflight_min_observed_ns\":{},\"loop_count_limit\":{}}},\"sample_region_min_observed_ns\":{},\"sample_region_target_met\":{},\"samples_ns\":[{}],\"raw_samples_ns\":[{}],\"setup\":{{\"planner_protocol_ns\":{},\"resident_matrix_ns\":{},\"timed_region\":\"real ranked PrecisionComputeBackend execution plus typed result table allocation/materialization; input generation, resident matrix construction, planner/protocol setup, and the complete result snapshot are outside the timed region\",\"untimed_post_measurement_snapshot\":true}},\"execution_topology\":{{\"candidate_parallelism\":{},\"worker_mode\":{},\"measurement_role\":{},\"requested_rayon_workers\":{},\"effective_rayon_workers\":{},\"allowed_parallelism\":{},\"allowed_parallelism_source\":\"std::thread::available_parallelism\",\"process_affinity\":{},\"process_affinity_cardinality\":{},\"affinity_matches_allowed_parallelism\":{},\"pool_start_worker_ids\":[{}],\"pool_start_worker_count\":{},\"pool_start_evidence_scope\":\"dedicated_pool_construction_only_not_candidate_work_participation\",\"worker_os_cpu_ticks\":[{}],\"worker_cpu_tick_status\":{},\"worker_cpu_ticks_observable\":{},\"every_effective_worker_positive_work_ticks\":{},\"worker_participation_evidence_scope\":\"per_worker_linux_os_tid_cpu_ticks_around_real_production_measurement\",\"semantic_candidate_participation_guard\":{}}},\"result\":{{\"rows_written\":{},\"visible_score_bits\":{},\"candidate_digest\":{},\"digest_scope\":\"all_visible_result_metadata_structural_arrays_and_metric_bits\",\"untimed_snapshot\":{{\"result_dtype\":{},\"row_count\":{},\"max_arity\":{},\"metric_count\":{},\"result_flags\":{},\"metric_ids\":[{}],\"combo_indices\":[{}],\"ranks\":[{}],\"families\":[{}],\"candidate_ids\":[{}],\"row_flags\":[{}],\"metric_value_bits\":[{}],\"metric_value_text\":{},\"metric_value_classes\":{}}}}},\"variant\":{},\"ab_block\":{},\"variant_sequence\":{},\"cell_schedule\":{{\"index\":{},\"seed\":{},\"sha256\":{},\"profile_order\":{}}},\"runner_pid\":{},\"process_id\":{},\"runner_invocation_id\":{},\"process_isolation\":\"fresh_helper_process_per_variant_trial\",\"source_commit\":{},\"product_source_commit\":{},\"product_source_tree\":{},\"product_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source_commit\":{},\"harness_source_tree\":{},\"harness_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source_blob\":{{\"relative_path\":{},\"source_sha256\":{},\"current_git_blob\":{},\"head_git_blob\":{}}},\"harness_runner_blob\":{{\"relative_path\":{},\"source_sha256\":{},\"current_git_blob\":{},\"head_git_blob\":{}}},\"compiled_harness\":{{\"product_rlib_sha256\":{},\"orchestrator_rlib_sha256\":{},\"types_rlib_sha256\":{},\"rayon_rlib_sha256\":{},\"command_sha256\":{}}},\"input_identity\":{{\"generator\":\"gafime-core-production-executor-v1\",\"byte_order\":\"native\",\"fp32_matrix_sha256\":{},\"fp32_target_sha256\":{},\"fp64_matrix_sha256\":{},\"fp64_target_sha256\":{}}},\"provenance\":{{\"product_source_root\":{},\"harness_source_root\":{},\"product_rlib\":{},\"orchestrator_rlib\":{},\"types_rlib\":{},\"rayon_rlib\":{},\"benchmark_binary\":{},\"wheel\":{}}},\"device\":{{\"kind\":\"cpu\",\"identity\":{},\"logical_cpu_count\":{},\"physical_cpu_count\":{}}},\"process_affinity\":{},\"environment\":{},\"command_line\":{},\"clock\":\"std::time::Instant monotonic clock\",\"clock_and_power_capture_point\":\"before and after all timed benchmark regions\",\"clock_and_power_state\":{{\"before\":{},\"after\":{}}}}}",
         if claim_ready { "pass" } else { "informational" },
         claim_ready,
         json_string(profile.name()),
@@ -1447,6 +1505,21 @@ fn main() {
         measurement.loops,
         TARGET_REGION_NS,
         CALIBRATION_TARGET_REGION_NS,
+        measurement.calibration_initial_probe_median_ns,
+        measurement.calibration_refinement_rounds,
+        measurement
+            .calibration_preflight_samples_ns
+            .iter()
+            .map(u128::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        measurement
+            .calibration_preflight_samples_ns
+            .iter()
+            .copied()
+            .min()
+            .expect("calibration preflight samples"),
+        MAX_LOOP_COUNT,
         raw_minimum,
         raw_minimum >= TARGET_REGION_NS,
         normalized_json,
@@ -1580,5 +1653,23 @@ mod tests {
             "production_precision_compute_backend",
             "supplemental_single_core_leaf_kernel_diagnostic"
         );
+    }
+
+    #[test]
+    fn calibration_can_escape_the_historical_fast_cell_cap() {
+        let corrected = loop_count_for_calibration_target(4_096, 93_291_974)
+            .expect("the production calibration cap must admit this fast cell");
+        assert!(corrected > 4_096);
+        assert!(corrected <= MAX_LOOP_COUNT);
+        assert!((corrected as u128) * 93_291_974 >= 4_096_u128 * CALIBRATION_TARGET_REGION_NS);
+    }
+
+    #[test]
+    fn calibration_is_fixed_after_headroom_and_fails_closed_at_the_bound() {
+        assert_eq!(
+            loop_count_for_calibration_target(8_192, CALIBRATION_TARGET_REGION_NS),
+            Some(8_192)
+        );
+        assert_eq!(loop_count_for_calibration_target(MAX_LOOP_COUNT, 1), None);
     }
 }

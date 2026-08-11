@@ -365,6 +365,10 @@ MIN_PUBLIC_ORDER_REPETITIONS = 5
 GPU_NATIVE_MIN_SAMPLE_REGION_US = 5_000.0
 CORE_MIN_UNTIMED_PRECONDITION_NS = 100_000_000
 CORE_MIN_MEASURED_REGION_NS = 100_000_000
+CORE_PRODUCTION_CALIBRATION_TARGET_NS = 200_000_000
+CORE_PRODUCTION_CALIBRATION_PREFLIGHT_SAMPLES = 3
+CORE_PRODUCTION_MAX_CALIBRATION_REFINEMENTS = 4
+CORE_PRODUCTION_MAX_LOOP_COUNT = 1_048_576
 CORE_PRODUCTION_FROZEN_BASELINE_SHA = (
     "d52199f44aa80ab8ef50c18db95dd1630961cdaf"
 )
@@ -11005,6 +11009,7 @@ def _core_production_timing_failures(
     raw_samples = record.get("raw_samples_ns")
     normalized_samples = record.get("samples_ns")
     loop_count = record.get("loop_count_per_sample")
+    calibration = record.get("calibration")
     valid_raw = (
         isinstance(raw_samples, list)
         and isinstance(repeats, int)
@@ -11034,6 +11039,7 @@ def _core_production_timing_failures(
         isinstance(loop_count, int)
         and not isinstance(loop_count, bool)
         and loop_count > 0
+        and loop_count <= CORE_PRODUCTION_MAX_LOOP_COUNT
     )
     if not valid_raw:
         failures.append("raw_region_below_100ms_or_repetition_mismatch")
@@ -11056,6 +11062,41 @@ def _core_production_timing_failures(
         or record.get("sample_region_min_observed_ns") != min(raw_samples)
     ):
         failures.append("sample_region_gate_not_clean")
+    if not isinstance(calibration, Mapping):
+        failures.append("calibration_preflight_missing")
+        return failures
+    preflight_samples = calibration.get("preflight_samples_ns")
+    preflight_minimum = calibration.get("preflight_min_observed_ns")
+    initial_probe = calibration.get("initial_probe_median_ns")
+    refinement_rounds = calibration.get("refinement_rounds")
+    if (
+        record.get("calibration_target_region_ns")
+        != CORE_PRODUCTION_CALIBRATION_TARGET_NS
+        or calibration.get("policy")
+        != (
+            "fixed_loop_count_selected_before_recording_"
+            "no_recorded_sample_rescaling_or_filtering"
+        )
+        or not isinstance(initial_probe, int)
+        or isinstance(initial_probe, bool)
+        or initial_probe < 1
+        or not isinstance(refinement_rounds, int)
+        or isinstance(refinement_rounds, bool)
+        or not 0
+        <= refinement_rounds
+        <= CORE_PRODUCTION_MAX_CALIBRATION_REFINEMENTS
+        or not isinstance(preflight_samples, list)
+        or len(preflight_samples) != CORE_PRODUCTION_CALIBRATION_PREFLIGHT_SAMPLES
+        or not all(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= CORE_PRODUCTION_CALIBRATION_TARGET_NS
+            for value in preflight_samples
+        )
+        or preflight_minimum != min(preflight_samples)
+        or calibration.get("loop_count_limit") != CORE_PRODUCTION_MAX_LOOP_COUNT
+    ):
+        failures.append("calibration_preflight_invalid")
     return failures
 
 

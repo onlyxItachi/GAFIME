@@ -42,6 +42,10 @@ FROZEN_PRE_REPAIR_BASELINE_SHA = "d52199f44aa80ab8ef50c18db95dd1630961cdaf"
 RELEASE_WARMUPS = 10
 RELEASE_REPETITIONS = 30
 MIN_MEASURED_REGION_NS = 100_000_000
+CALIBRATION_TARGET_REGION_NS = 200_000_000
+CALIBRATION_PREFLIGHT_SAMPLES = 3
+MAX_CALIBRATION_REFINEMENTS = 4
+MAX_LOOP_COUNT = 1_048_576
 METRIC_IDS = {"pearson": 1, "spearman": 2, "mutual_info": 3, "r2": 4}
 SNAPSHOT_PARITY_POLICY = {
     "structural_metadata": "exact",
@@ -1199,6 +1203,7 @@ def _validate_child_contract(
     normalized = child.get("samples_ns")
     loops = child.get("loop_count_per_sample")
     observed_minimum = child.get("sample_region_min_observed_ns")
+    calibration = child.get("calibration")
     if (
         not isinstance(raw_samples, list)
         or len(raw_samples) != repetitions
@@ -1213,8 +1218,41 @@ def _validate_child_contract(
         or not isinstance(loops, int)
         or isinstance(loops, bool)
         or loops < 1
+        or loops > MAX_LOOP_COUNT
     ):
         raise RuntimeError("production child raw timing contract is malformed")
+    if not isinstance(calibration, dict):
+        raise RuntimeError("production child calibration preflight is missing")
+    preflight_samples = calibration.get("preflight_samples_ns")
+    preflight_minimum = calibration.get("preflight_min_observed_ns")
+    initial_probe = calibration.get("initial_probe_median_ns")
+    refinement_rounds = calibration.get("refinement_rounds")
+    if (
+        child.get("calibration_target_region_ns")
+        != CALIBRATION_TARGET_REGION_NS
+        or calibration.get("policy")
+        != (
+            "fixed_loop_count_selected_before_recording_"
+            "no_recorded_sample_rescaling_or_filtering"
+        )
+        or not isinstance(initial_probe, int)
+        or isinstance(initial_probe, bool)
+        or initial_probe < 1
+        or not isinstance(refinement_rounds, int)
+        or isinstance(refinement_rounds, bool)
+        or not 0 <= refinement_rounds <= MAX_CALIBRATION_REFINEMENTS
+        or not isinstance(preflight_samples, list)
+        or len(preflight_samples) != CALIBRATION_PREFLIGHT_SAMPLES
+        or not all(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= CALIBRATION_TARGET_REGION_NS
+            for value in preflight_samples
+        )
+        or preflight_minimum != min(preflight_samples)
+        or calibration.get("loop_count_limit") != MAX_LOOP_COUNT
+    ):
+        raise RuntimeError("production child calibration preflight is malformed")
     if any(
         not isinstance(value, (int, float))
         or isinstance(value, bool)

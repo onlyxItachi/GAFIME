@@ -509,7 +509,16 @@ and Python runner blob even though their product commits, rlibs, wheels, and
 benchmark binaries differ. The 100 ms hard raw-region floor and 200 ms
 calibration target are reported as `target_region_ns` and
 `calibration_target_region_ns`; they are independently validated from perf13's
-public sample-region gate. Input generation, planner/protocol construction,
+public sample-region gate. Calibration is completed before recording: a
+bounded production-only loop ceiling permits fast cells beyond the former
+4,096-loop limit, three full-region preflight probes must each reach 200 ms,
+and an under-target preflight increases the one fixed loop count before the
+complete warmup phase is repeated. Recorded samples are never filtered,
+rescaled, retried, or used to adapt that count; any recorded region below 100
+ms still invalidates the artifact. The initial probe, bounded refinement count,
+final preflight durations, and loop ceiling are retained in every child JSON
+and independently revalidated by the runner and perf13. Input generation,
+planner/protocol construction,
 and resident-matrix construction happen before the timed region and are
 reported separately. The timed region includes the production executor's
 candidate interaction/scoring work plus typed ranked-result allocation and
