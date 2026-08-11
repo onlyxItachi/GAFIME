@@ -89,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           rustup toolchain install "$RUST_VERSION" --profile minimal
-          python -m pip install --upgrade pip 'maturin>=1.7,<2'
+          python -m pip install --upgrade pip 'maturin==1.9.6'
 
       - name: Resolve and bind exact base and head
         shell: bash
@@ -188,8 +188,10 @@ jobs:
             mkdir -p "$target" "$wheelhouse"
             (
               cd "$root"
-              CARGO_TARGET_DIR="$target" cargo +"$RUST_VERSION" build --release --locked -p gafime-cpu
-              CARGO_TARGET_DIR="$target" maturin build --release --locked --out "$wheelhouse" --interpreter python
+              RUSTUP_TOOLCHAIN="$RUST_VERSION" CARGO_TARGET_DIR="$target" \
+                cargo build --release --locked -p gafime-cpu
+              RUSTUP_TOOLCHAIN="$RUST_VERSION" CARGO_TARGET_DIR="$target" \
+                maturin build --release --locked --out "$wheelhouse" --interpreter python
             )
             local cpu orchestrator types rayon wheel
             cpu="$(find "$target/release/deps" -maxdepth 1 -type f -name 'libgafime_cpu-*.rlib' | sort | tail -n 1)"

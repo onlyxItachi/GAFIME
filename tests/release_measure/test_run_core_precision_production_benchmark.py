@@ -59,7 +59,14 @@ def test_defaults_preserve_full_profiles_metrics_matrix_and_scaling_labels() -> 
 
 def test_stable_mode_rejects_candidate_only_sequence() -> None:
     args = runner._parser().parse_args(
-        _arguments("--mode", "stable", "--variant", "candidate", "--variant-sequence", "candidate")
+        _arguments(
+            "--mode",
+            "stable",
+            "--variant",
+            "candidate",
+            "--variant-sequence",
+            "candidate",
+        )
     )
     with pytest.raises(ValueError, match="candidate-only raw artifact"):
         runner._validate_arguments(args)
@@ -99,7 +106,9 @@ def test_stable_mode_rejects_reduced_matrix_but_informational_accepts_it() -> No
         runner._validate_arguments(stable)
 
 
-def test_scaling_plan_skips_oversubscribing_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_scaling_plan_skips_oversubscribing_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(runner.os, "sched_getaffinity", lambda _pid: {7})
 
     plan = runner._scaling_execution_plan(("1", "2", "4", "default"))
@@ -113,7 +122,9 @@ def test_scaling_plan_skips_oversubscribing_labels(monkeypatch: pytest.MonkeyPat
     )
 
 
-def _valid_child(*, worker_mode: str, effective_workers: int, allowed: int) -> dict[str, object]:
+def _valid_child(
+    *, worker_mode: str, effective_workers: int, allowed: int
+) -> dict[str, object]:
     worker_ids = list(range(effective_workers))
     snapshot: dict[str, object] = {
         "result_dtype": "f32",
@@ -231,7 +242,9 @@ def _validate_child(child: dict[str, object], *, worker_mode: str) -> None:
     )
 
 
-def test_child_contract_requires_cpuset_aware_default_and_exact_explicit_workers() -> None:
+def test_child_contract_requires_cpuset_aware_default_and_exact_explicit_workers() -> (
+    None
+):
     _validate_child(
         _valid_child(worker_mode="default", effective_workers=4, allowed=4),
         worker_mode="default",
@@ -263,7 +276,9 @@ def test_child_contract_requires_pool_start_count_to_match_effective_workers() -
         _validate_child(child, worker_mode="2")
 
 
-def test_child_environment_scrubs_inherited_rayon_global_override(tmp_path: Path) -> None:
+def test_child_environment_scrubs_inherited_rayon_global_override(
+    tmp_path: Path,
+) -> None:
     identity = runner.RepositoryIdentity(
         root=tmp_path,
         commit="a" * 40,
@@ -343,9 +358,7 @@ def test_schedule_is_balanced_shared_within_block_and_varies_across_blocks() -> 
     replay, replay_seed, replay_hash, replay_counts = runner._cell_schedule(
         **kwargs, ab_block=0
     )
-    second, second_seed, second_hash, _ = runner._cell_schedule(
-        **kwargs, ab_block=1
-    )
+    second, second_seed, second_hash, _ = runner._cell_schedule(**kwargs, ab_block=1)
 
     assert first == replay
     assert (first_seed, first_hash, first_counts) == (
@@ -484,7 +497,9 @@ def test_static_clock_power_view_ignores_samples_but_preserves_policy() -> None:
 def test_static_clock_power_view_detects_policy_drift() -> None:
     before = {
         "cpu_governor": "performance",
-        "policy_clock_state": [{"policy": "policy0", "scaling_max_freq_khz": "5100000"}],
+        "policy_clock_state": [
+            {"policy": "policy0", "scaling_max_freq_khz": "5100000"}
+        ],
         "platform_power_profile": "performance",
         "macos_pmset_custom": None,
         "power_interface": "linux-cpufreq",
@@ -507,7 +522,9 @@ def test_canonical_environment_is_nonempty_and_rayon_is_scrubbed() -> None:
         runner._canonical_child_environment(child)
 
 
-def test_compiler_command_links_exact_product_and_route_dependencies(tmp_path: Path) -> None:
+def test_compiler_command_links_exact_product_and_route_dependencies(
+    tmp_path: Path,
+) -> None:
     command = runner._compiler_command(
         rustup="rustup",
         toolchain="1.97.1",
@@ -559,23 +576,32 @@ def test_manifest_uses_portable_path_within_one_evidence_root(tmp_path: Path) ->
 
 
 def test_leaf_and_production_claim_boundaries_are_structurally_distinct() -> None:
-    leaf = Path(__file__).with_name("core_precision_native_benchmark.rs").read_text(
-        encoding="utf-8"
+    leaf = (
+        Path(__file__)
+        .with_name("core_precision_native_benchmark.rs")
+        .read_text(encoding="utf-8")
     )
-    production = Path(__file__).with_name(
-        "core_precision_production_benchmark.rs"
-    ).read_text(encoding="utf-8")
+    production = (
+        Path(__file__)
+        .with_name("core_precision_production_benchmark.rs")
+        .read_text(encoding="utf-8")
+    )
 
     assert "gafime.core-leaf-kernel-diagnostic.v1" in leaf
     assert "eligible_for_core_production_throughput" in leaf
     assert "supplemental_single_core_leaf_kernel_diagnostic" in leaf
     assert "gafime.core-production-executor.child.v1" in production
     assert "production_executor_metric" in production
-    assert "planner_protocol_resident_precision_compute_backend_ranked_result" in production
+    assert (
+        "planner_protocol_resident_precision_compute_backend_ranked_result"
+        in production
+    )
     assert "pool_start_evidence_scope" in production
 
 
-def test_workflow_uses_the_compatible_before_fix_precision_head_and_tracks_the_runner() -> None:
+def test_workflow_uses_the_compatible_before_fix_precision_head_and_tracks_the_runner() -> (
+    None
+):
     workflow = (
         Path(__file__).parents[2]
         / ".github"
@@ -584,18 +610,39 @@ def test_workflow_uses_the_compatible_before_fix_precision_head_and_tracks_the_r
     ).read_text(encoding="utf-8")
 
     assert "d52199f44aa80ab8ef50c18db95dd1630961cdaf" in workflow
-    assert "github.event.pull_request.base.sha || inputs.expected_baseline_sha" not in workflow
-    assert "live.get(\"base\", {}).get(\"ref\") != \"main\"" in workflow
-    assert "git\", \"merge-base\", \"--is-ancestor\", baseline, candidate" in workflow
-    assert "tests/release_measure/run_core_precision_production_benchmark.py" in workflow
-    assert "tests/release_measure/test_run_core_precision_production_benchmark.py" in workflow
+    assert (
+        "github.event.pull_request.base.sha || inputs.expected_baseline_sha"
+        not in workflow
+    )
+    assert 'live.get("base", {}).get("ref") != "main"' in workflow
+    assert 'git", "merge-base", "--is-ancestor", baseline, candidate' in workflow
+    assert (
+        "tests/release_measure/run_core_precision_production_benchmark.py" in workflow
+    )
+    assert (
+        "tests/release_measure/test_run_core_precision_production_benchmark.py"
+        in workflow
+    )
     assert "tests/release_measure/test_perf_13_precision_profiles.py" in workflow
     assert "tests/release_measure/v1_architecture_gate.py" in workflow
     assert "gafime-core-stable" in workflow
-    assert 'fromJSON(\'["self-hosted","linux","x64","gafime-core-stable"]\')' in workflow
+    assert (
+        'fromJSON(\'["self-hosted","linux","x64","gafime-core-stable"]\')' in workflow
+    )
     assert "run_variant 0 baseline baseline,candidate" in workflow
     assert "run_variant 1 candidate candidate,baseline" in workflow
     assert "maturin build --release --locked" in workflow
-    assert "precision_executor_parallelism_contract_covers_every_profile_and_rank_mode" in workflow
+    assert "'maturin==1.9.6'" in workflow
+    assert (
+        workflow.count('RUSTUP_TOOLCHAIN="$RUST_VERSION" CARGO_TARGET_DIR="$target"')
+        == 2
+    )
+    assert (
+        "precision_executor_parallelism_contract_covers_every_profile_and_rank_mode"
+        in workflow
+    )
     assert '--binary "$CORE_PRODUCTION_RESULTS/core-production-$variant"' in workflow
-    assert '--binary "$CORE_PRODUCTION_RESULTS/core-production-$variant-ab$block"' not in workflow
+    assert (
+        '--binary "$CORE_PRODUCTION_RESULTS/core-production-$variant-ab$block"'
+        not in workflow
+    )
