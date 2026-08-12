@@ -860,7 +860,15 @@ impl GpuBackend {
 }
 
 impl GpuBackend {
-    pub fn permutation_pvalues(
+    /// Execute the optional ABI 1.0 permutation route with a raw launch
+    /// descriptor.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer/length pair reachable from `protocol` must be aligned,
+    /// initialized, immutable, and live for this synchronous call. The matrix
+    /// handle must identify a live allocation owned by this backend.
+    pub unsafe fn permutation_pvalues(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimeLaunchProtocol,
@@ -868,17 +876,29 @@ impl GpuBackend {
         observed_metric_values: &[f32],
         metric_count: u32,
     ) -> Result<Option<Vec<f32>>, GpuSysError> {
-        self.permutation_pvalues_with_budget(
-            matrix,
-            protocol,
-            candidate_ids,
-            observed_metric_values,
-            metric_count,
-            None,
-        )
+        // SAFETY: this convenience entry point forwards the caller's complete
+        // raw-protocol contract unchanged to the budget-aware implementation.
+        unsafe {
+            self.permutation_pvalues_with_budget(
+                matrix,
+                protocol,
+                candidate_ids,
+                observed_metric_values,
+                metric_count,
+                None,
+            )
+        }
     }
 
-    pub fn permutation_pvalues_with_budget(
+    /// Execute the optional ABI 1.0 permutation route with a raw launch
+    /// descriptor and an optional device-memory budget.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer/length pair reachable from `protocol` must be aligned,
+    /// initialized, immutable, and live for this synchronous call. The matrix
+    /// handle must identify a live allocation owned by this backend.
+    pub unsafe fn permutation_pvalues_with_budget(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimeLaunchProtocol,
@@ -958,7 +978,14 @@ impl GpuBackend {
         Ok(Some(p_values))
     }
 
-    pub fn permutation_pvalues_fp32_v2_with_budget(
+    /// Execute the ABI 1.1 fp32 permutation route with a raw precision wrapper.
+    ///
+    /// # Safety
+    ///
+    /// `protocol.base` must point to a live ABI 1.0 descriptor whose complete
+    /// pointer graph is aligned, initialized, immutable, and live for this
+    /// synchronous call. The matrix must be a live matching fp32 allocation.
+    pub unsafe fn permutation_pvalues_fp32_v2_with_budget(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimePrecisionLaunchProtocol,
@@ -1040,7 +1067,15 @@ impl GpuBackend {
         Ok(Some(p_values))
     }
 
-    pub fn permutation_pvalues_f64_v2_with_budget(
+    /// Execute the ABI 1.1 mixed/fp64 permutation route with a raw wrapper.
+    ///
+    /// # Safety
+    ///
+    /// `protocol.base` must point to a live ABI 1.0 descriptor whose complete
+    /// pointer graph is aligned, initialized, immutable, and live for this
+    /// synchronous call. The matrix must be a live matching mixed/fp64
+    /// allocation.
+    pub unsafe fn permutation_pvalues_f64_v2_with_budget(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimePrecisionLaunchProtocol,
@@ -1128,7 +1163,7 @@ impl ComputeBackend for GpuBackend {
         self.kind
     }
 
-    fn execution_device_memory_peak_bytes(
+    unsafe fn execution_device_memory_peak_bytes(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimeLaunchProtocol,
@@ -1162,7 +1197,7 @@ impl ComputeBackend for GpuBackend {
         Ok(Some(peak_bytes))
     }
 
-    fn execute(
+    unsafe fn execute(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimeLaunchProtocol,
@@ -1209,7 +1244,7 @@ impl PrecisionComputeBackend for GpuBackend {
         self.kind
     }
 
-    fn execution_device_memory_peak_bytes_v2(
+    unsafe fn execution_device_memory_peak_bytes_v2(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimePrecisionLaunchProtocol,
@@ -1240,7 +1275,7 @@ impl PrecisionComputeBackend for GpuBackend {
         Ok(Some(peak_bytes))
     }
 
-    fn execute_fp32(
+    unsafe fn execute_fp32(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimePrecisionLaunchProtocol,
@@ -1284,7 +1319,7 @@ impl PrecisionComputeBackend for GpuBackend {
         })
     }
 
-    fn execute_f64(
+    unsafe fn execute_f64(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimePrecisionLaunchProtocol,

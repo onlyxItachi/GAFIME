@@ -152,6 +152,38 @@ int cuda_status(cudaError_t status) {
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
+class ScopedCudaDevice {
+public:
+    explicit ScopedCudaDevice(uint32_t device_id) {
+        if (device_id > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+            status_ = cudaErrorInvalidDevice;
+            return;
+        }
+        status_ = cudaGetDevice(&previous_device_);
+        if (status_ != cudaSuccess) return;
+        restore_previous_ = true;
+        status_ = cudaSetDevice(static_cast<int>(device_id));
+    }
+
+    ScopedCudaDevice(const ScopedCudaDevice&) = delete;
+    ScopedCudaDevice& operator=(const ScopedCudaDevice&) = delete;
+
+    ~ScopedCudaDevice() {
+        if (restore_previous_) {
+            static_cast<void>(cudaSetDevice(previous_device_));
+        }
+    }
+
+    cudaError_t status() const {
+        return status_;
+    }
+
+private:
+    int previous_device_ = 0;
+    bool restore_previous_ = false;
+    cudaError_t status_ = cudaSuccess;
+};
+
 bool checked_add(uint64_t lhs, uint64_t rhs, uint64_t* out) {
     if (rhs > std::numeric_limits<uint64_t>::max() - lhs) return false;
     *out = lhs + rhs;
@@ -988,7 +1020,8 @@ int upload_precision(
         features_host == nullptr || target_host == nullptr || rows != matrix->rows || cols != matrix->cols) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    int status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
+    ScopedCudaDevice device(matrix->device_id);
+    int status = cuda_status(device.status());
     if (status != GAFIME_STATUS_OK) return status;
     std::vector<Storage> resident;
     std::vector<Storage> means;
@@ -1055,7 +1088,8 @@ template <GafimePrecisionProfile Profile, typename Storage, typename Accumulatio
 int update_precision_target(PrecisionCudaMatrix* matrix, const Storage* target_host, uint64_t rows) try {
     if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic || target_host == nullptr ||
         rows != matrix->rows || !matrix->content_valid) return GAFIME_STATUS_INVALID_ARGUMENT;
-    int status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
+    ScopedCudaDevice device(matrix->device_id);
+    int status = cuda_status(device.status());
     if (status != GAFIME_STATUS_OK) return status;
     const bool target_finite = all_finite_host(target_host, rows);
     const int target_exponent = host_abs_exponent(target_host, rows);
@@ -1101,7 +1135,8 @@ int execute_precision(
     if (status != GAFIME_STATUS_OK) return status;
     status = require_precision_matrix(matrix);
     if (status != GAFIME_STATUS_OK) return status;
-    status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
+    ScopedCudaDevice device(matrix->device_id);
+    status = cuda_status(device.status());
     if (status != GAFIME_STATUS_OK) return status;
 
     const uint64_t total_rows = planned_row_count(base);
@@ -1480,7 +1515,8 @@ int permutation_precision(
     status = validate_precision_significance<Storage, Result>(base, matrix, significance, total_rows);
     if (status != GAFIME_STATUS_OK) return status;
     if (total_rows == 0 || significance->row_count == 0) return GAFIME_STATUS_OK;
-    status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
+    ScopedCudaDevice device(matrix->device_id);
+    status = cuda_status(device.status());
     if (status != GAFIME_STATUS_OK) return status;
     uint64_t metric_values = 0;
     if (!checked_mul(total_rows, base->metric_ids.len, &metric_values)) return GAFIME_STATUS_OUT_OF_MEMORY;
@@ -1862,7 +1898,8 @@ int precision_interaction_diagnostics(
         diagnostics->flags,
         static_cast<size_t>(diagnostics->row_count),
         uint32_t{0});
-    status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
+    ScopedCudaDevice device(matrix->device_id);
+    status = cuda_status(device.status());
     if (status != GAFIME_STATUS_OK) return status;
 
     PrecisionCudaTransientBuffer<uint32_t> device_combos;
@@ -1917,9 +1954,7 @@ int precision_interaction_diagnostics(
 
 void free_precision_matrix(PrecisionCudaMatrix* matrix) {
     if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic) return;
-    int previous_device = 0;
-    const bool restore = cudaGetDevice(&previous_device) == cudaSuccess;
-    const cudaError_t selected = cudaSetDevice(static_cast<int>(matrix->device_id));
+    ScopedCudaDevice device(matrix->device_id);
     destroy_precision_graph(matrix);
     if (matrix->graph_stream != nullptr) static_cast<void>(cudaStreamDestroy(matrix->graph_stream));
     static_cast<void>(cudaFree(matrix->features));
@@ -1941,7 +1976,6 @@ void free_precision_matrix(PrecisionCudaMatrix* matrix) {
     static_cast<void>(cudaFreeHost(matrix->permutation_target_host));
     matrix->magic = 0;
     delete matrix;
-    if (restore && selected == cudaSuccess) static_cast<void>(cudaSetDevice(previous_device));
 }
 
 }  // namespace
@@ -2012,7 +2046,8 @@ static int cuda_matrix_alloc_internal(
     *matrix_out = nullptr;
     int status = validate_precision_matrix_desc(desc);
     if (status != GAFIME_STATUS_OK) return status;
-    status = cuda_status(cudaSetDevice(static_cast<int>(device_id)));
+    ScopedCudaDevice device(device_id);
+    status = cuda_status(device.status());
     if (status != GAFIME_STATUS_OK) return status;
     cudaDeviceProp props{};
     status = cuda_status(cudaGetDeviceProperties(&props, static_cast<int>(device_id)));
@@ -2197,9 +2232,8 @@ GAFIME_GPU_API int gafime_gpu_device_info(
     GafimeGpuDeviceInfo* info_out
 ) {
     if (info_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
-    if (cudaSetDevice(static_cast<int>(device_id)) != cudaSuccess) {
-        return GAFIME_STATUS_DEVICE_ERROR;
-    }
+    ScopedCudaDevice device(device_id);
+    if (device.status() != cudaSuccess) return cuda_status(device.status());
     cudaDeviceProp props{};
     if (cudaGetDeviceProperties(&props, static_cast<int>(device_id)) != cudaSuccess) {
         return GAFIME_STATUS_DEVICE_ERROR;
@@ -2403,9 +2437,8 @@ GAFIME_GPU_API int gafime_gpu_numeric_routes_v2(
     uint32_t route_capacity,
     uint32_t* route_count_out
 ) {
-    if (cudaSetDevice(static_cast<int>(device_id)) != cudaSuccess) {
-        return GAFIME_STATUS_DEVICE_ERROR;
-    }
+    ScopedCudaDevice device(device_id);
+    if (device.status() != cudaSuccess) return cuda_status(device.status());
     constexpr uint32_t profiles[] = {
         GAFIME_PRECISION_FP32,
         GAFIME_PRECISION_MIXED,

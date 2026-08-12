@@ -13,6 +13,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -267,6 +268,109 @@ def _require(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def _canonical_archive_member(
+    path: Path,
+    name: str,
+    *,
+    directory: bool,
+) -> str:
+    _require(
+        bool(name) and "\x00" not in name and "\\" not in name,
+        f"{path.name} contains a non-canonical archive member {name!r}",
+    )
+    _require(
+        not name.startswith("/")
+        and re.match(r"^[A-Za-z]:", name) is None
+        and not name.endswith("//"),
+        f"{path.name} contains a non-canonical archive member {name!r}",
+    )
+    if name.endswith("/"):
+        _require(
+            directory,
+            f"{path.name} contains a non-canonical archive member {name!r}",
+        )
+        canonical = name[:-1]
+    else:
+        canonical = name
+    components = canonical.split("/")
+    _require(
+        bool(canonical)
+        and all(component not in {"", ".", ".."} for component in components),
+        f"{path.name} contains a non-canonical archive member {name!r}",
+    )
+    _require(
+        "/".join(components) == canonical,
+        f"{path.name} contains a non-canonical archive member {name!r}",
+    )
+    return canonical
+
+
+def _validated_wheel_members(
+    path: Path, archive: zipfile.ZipFile
+) -> dict[str, zipfile.ZipInfo]:
+    members: dict[str, zipfile.ZipInfo] = {}
+    for info in archive.infolist():
+        _require(
+            info.orig_filename == info.filename,
+            f"{path.name} contains a non-canonical archive member "
+            f"{info.orig_filename!r}",
+        )
+        is_directory = info.is_dir()
+        if info.create_system == 3:
+            unix_mode = (info.external_attr >> 16) & 0xFFFF
+            file_type = stat.S_IFMT(unix_mode)
+            _require(
+                file_type in {0, stat.S_IFREG, stat.S_IFDIR}
+                and not (is_directory and file_type == stat.S_IFREG)
+                and not (not is_directory and file_type == stat.S_IFDIR),
+                f"{path.name} archive members must be regular files or directories: "
+                f"{info.filename!r}",
+            )
+        name = _canonical_archive_member(
+            path,
+            info.orig_filename,
+            directory=is_directory,
+        )
+        _require(
+            name not in members,
+            f"{path.name} contains duplicate archive member {name!r}",
+        )
+        members[name] = info
+    return members
+
+
+def _validated_sdist_members(
+    path: Path, archive: tarfile.TarFile
+) -> dict[str, tarfile.TarInfo]:
+    members: dict[str, tarfile.TarInfo] = {}
+    for info in archive.getmembers():
+        _require(
+            info.isfile() or info.isdir(),
+            f"{path.name} archive members must be regular files or directories: "
+            f"{info.name!r}",
+        )
+        name = _canonical_archive_member(path, info.name, directory=info.isdir())
+        _require(
+            name not in members,
+            f"{path.name} contains duplicate archive member {name!r}",
+        )
+        members[name] = info
+    return members
+
+
+def _validated_sdist_root(path: Path, members: Iterable[str]) -> str:
+    roots = {name.split("/", 1)[0] for name in members}
+    _require(len(roots) == 1, f"{path.name} must contain one top-level directory")
+    root = next(iter(roots))
+    expected_root = path.name.removesuffix(".tar.gz")
+    _require(
+        root == expected_root,
+        f"{path.name} root {root!r} does not match canonical archive filename stem "
+        f"{expected_root!r}",
+    )
+    return root
+
+
 def _assert_no_precision_distribution_identity(artifact: Artifact) -> None:
     identities = [artifact.path.name, *artifact.members]
     forbidden = sorted(
@@ -416,18 +520,16 @@ def _assert_native_precision_abi(
 
 def _sdist_member_bytes(artifact: Artifact, relative: str) -> bytes:
     with tarfile.open(artifact.path, "r:gz") as archive:
-        matches = [
-            member
-            for member in archive.getmembers()
-            if member.isfile()
-            and (member.name == relative or member.name.endswith(f"/{relative}"))
-        ]
+        members = _validated_sdist_members(artifact.path, archive)
+        root = _validated_sdist_root(artifact.path, members)
+        member_name = f"{root}/{relative}"
+        member = members.get(member_name)
         _require(
-            len(matches) == 1,
-            f"{artifact.path.name} expected one source member {relative!r}, "
-            f"found {[member.name for member in matches]}",
+            member is not None and member.isfile(),
+            f"{artifact.path.name} expected one source member {relative!r}",
         )
-        extracted = archive.extractfile(matches[0])
+        assert member is not None
+        extracted = archive.extractfile(member)
         _require(
             extracted is not None,
             f"unable to read {relative} from {artifact.path.name}",
@@ -740,19 +842,20 @@ def _read_wheel(path: Path) -> Artifact:
         f"invalid wheel filename: {path.name}: non-canonical build tag {build_tag!r}",
     )
     with zipfile.ZipFile(path) as archive:
-        members = frozenset(name.rstrip("/") for name in archive.namelist())
+        member_infos = _validated_wheel_members(path, archive)
+        members = frozenset(member_infos)
         _assert_wheel_rt_free(path, archive, members)
         candidates = sorted(
             name for name in members if name.endswith(".dist-info/METADATA")
         )
         _require(len(candidates) == 1, f"{path.name} must contain one METADATA file")
-        metadata_text = archive.read(candidates[0]).decode("utf-8")
+        metadata_text = archive.read(member_infos[candidates[0]]).decode("utf-8")
         wheel_candidates = sorted(
             name for name in members if name.endswith(".dist-info/WHEEL")
         )
         _require(len(wheel_candidates) == 1, f"{path.name} must contain one WHEEL file")
         wheel_metadata = Parser().parsestr(
-            archive.read(wheel_candidates[0]).decode("utf-8")
+            archive.read(member_infos[wheel_candidates[0]]).decode("utf-8")
         )
         policy_names = sorted(
             f"{package}/build_policy.json"
@@ -764,7 +867,7 @@ def _read_wheel(path: Path) -> Artifact:
             f"{path.name} contains multiple payload build policies: {policy_names}",
         )
         build_policy = (
-            json.loads(archive.read(policy_names[0]).decode("utf-8"))
+            json.loads(archive.read(member_infos[policy_names[0]]).decode("utf-8"))
             if policy_names
             else None
         )
@@ -779,7 +882,7 @@ def _read_wheel(path: Path) -> Artifact:
             f"{provenance_names}",
         )
         build_provenance = (
-            json.loads(archive.read(provenance_names[0]).decode("utf-8"))
+            json.loads(archive.read(member_infos[provenance_names[0]]).decode("utf-8"))
             if provenance_names
             else None
         )
@@ -843,12 +946,9 @@ def _read_wheel(path: Path) -> Artifact:
 
 def _read_sdist(path: Path) -> Artifact:
     with tarfile.open(path, "r:gz") as archive:
-        raw_members = frozenset(
-            member.name.rstrip("/") for member in archive.getmembers()
-        )
-        roots = {name.split("/", 1)[0] for name in raw_members if name}
-        _require(len(roots) == 1, f"{path.name} must contain one top-level directory")
-        root = next(iter(roots))
+        member_infos = _validated_sdist_members(path, archive)
+        raw_members = frozenset(member_infos)
+        root = _validated_sdist_root(path, raw_members)
         members = frozenset(
             name[len(root) + 1 :]
             for name in raw_members
@@ -857,7 +957,7 @@ def _read_sdist(path: Path) -> Artifact:
         _assert_sdist_rt_free(path, archive, root, raw_members)
         metadata_name = f"{root}/PKG-INFO"
         _require(metadata_name in raw_members, f"{path.name} has no root PKG-INFO")
-        extracted = archive.extractfile(metadata_name)
+        extracted = archive.extractfile(member_infos[metadata_name])
         _require(extracted is not None, f"unable to read {metadata_name}")
         metadata_text = extracted.read().decode("utf-8")
         policy_names = sorted(
@@ -869,7 +969,9 @@ def _read_sdist(path: Path) -> Artifact:
             len(policy_names) <= 1,
             f"{path.name} contains multiple payload build policies: {policy_names}",
         )
-        policy_file = archive.extractfile(policy_names[0]) if policy_names else None
+        policy_file = (
+            archive.extractfile(member_infos[policy_names[0]]) if policy_names else None
+        )
         build_policy = (
             json.loads(policy_file.read().decode("utf-8")) if policy_file else None
         )
@@ -885,7 +987,9 @@ def _read_sdist(path: Path) -> Artifact:
             f"{provenance_names}",
         )
         provenance_file = (
-            archive.extractfile(provenance_names[0]) if provenance_names else None
+            archive.extractfile(member_infos[provenance_names[0]])
+            if provenance_names
+            else None
         )
         build_provenance = (
             json.loads(provenance_file.read().decode("utf-8"))

@@ -38,7 +38,7 @@ impl ComputeBackend for CpuBackend {
         GAFIME_BACKEND_CPU
     }
 
-    fn execute(
+    unsafe fn execute(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimeLaunchProtocol,
@@ -129,7 +129,7 @@ impl PrecisionComputeBackend for CpuBackend {
         GAFIME_BACKEND_CPU
     }
 
-    fn execution_device_memory_peak_bytes_v2(
+    unsafe fn execution_device_memory_peak_bytes_v2(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimePrecisionLaunchProtocol,
@@ -142,7 +142,7 @@ impl PrecisionComputeBackend for CpuBackend {
         Ok(Some(0))
     }
 
-    fn execute_fp32(
+    unsafe fn execute_fp32(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimePrecisionLaunchProtocol,
@@ -161,7 +161,7 @@ impl PrecisionComputeBackend for CpuBackend {
         execute_precision_fp32(cpu_matrix, base, result)
     }
 
-    fn execute_f64(
+    unsafe fn execute_f64(
         &mut self,
         matrix: &MatrixHandle,
         protocol: &GafimePrecisionLaunchProtocol,
@@ -1598,6 +1598,41 @@ mod tests {
         }
     }
 
+    fn execute_owned_precision_fp32(
+        backend: &mut CpuBackend,
+        matrix: &MatrixHandle,
+        protocol: &GafimePrecisionLaunchProtocol,
+        result: &mut result::OwnedResultTable,
+    ) -> OrchestratorResult<BackendExecutionStats> {
+        // SAFETY: callers supply a live materialized protocol and the owned
+        // table rebinds all output pointers to its uniquely borrowed buffers.
+        unsafe {
+            PrecisionComputeBackend::execute_fp32(backend, matrix, protocol, result.raw_mut())
+        }
+    }
+
+    fn execute_owned_precision_f64(
+        backend: &mut CpuBackend,
+        matrix: &MatrixHandle,
+        protocol: &GafimePrecisionLaunchProtocol,
+        result: &mut result::OwnedResultTableF64,
+    ) -> OrchestratorResult<BackendExecutionStats> {
+        // SAFETY: callers supply a live materialized protocol and the owned
+        // table rebinds all output pointers to its uniquely borrowed buffers.
+        unsafe { PrecisionComputeBackend::execute_f64(backend, matrix, protocol, result.raw_mut()) }
+    }
+
+    fn execute_owned_plan(
+        backend: &mut CpuBackend,
+        matrix: &MatrixHandle,
+        plan: &CompiledPlan,
+        result: &mut result::OwnedResultTable,
+    ) -> OrchestratorResult<BackendExecutionStats> {
+        // SAFETY: `plan` owns the complete protocol pointer graph and the
+        // owned table rebinds outputs to correctly sized borrowed buffers.
+        unsafe { gafime_orchestrator::execute_plan(backend, matrix, plan, result.raw_mut()) }
+    }
+
     fn execute_precision_parallelism_case(
         profile: PrecisionProfile,
         ranked: bool,
@@ -1632,13 +1667,9 @@ mod tests {
                 };
                 let mut result =
                     result::OwnedResultTable::new(capacity, 1, PARALLELISM_TEST_METRICS);
-                let stats = PrecisionComputeBackend::execute_fp32(
-                    &mut backend,
-                    &handle,
-                    &protocol,
-                    result.raw_mut(),
-                )
-                .unwrap();
+                let stats =
+                    execute_owned_precision_fp32(&mut backend, &handle, &protocol, &mut result)
+                        .unwrap();
                 assert_eq!(stats.rows_written, result.raw().row_count);
                 assert!(result.metric_values()
                     [..result.raw().row_count as usize * PARALLELISM_TEST_METRICS as usize]
@@ -1674,13 +1705,9 @@ mod tests {
                 };
                 let mut result =
                     result::OwnedResultTableF64::new(capacity, 1, PARALLELISM_TEST_METRICS);
-                let stats = PrecisionComputeBackend::execute_f64(
-                    &mut backend,
-                    &handle,
-                    &protocol,
-                    result.raw_mut(),
-                )
-                .unwrap();
+                let stats =
+                    execute_owned_precision_f64(&mut backend, &handle, &protocol, &mut result)
+                        .unwrap();
                 assert_eq!(stats.rows_written, result.raw().row_count);
                 assert!(result.metric_values()
                     [..result.raw().row_count as usize * PARALLELISM_TEST_METRICS as usize]
@@ -2098,13 +2125,8 @@ mod tests {
                     result_metric_count as u32,
                 );
                 fill_f32_metric_sentinel(&mut result, f32::MAX);
-                PrecisionComputeBackend::execute_fp32(
-                    &mut backend,
-                    &handle,
-                    &protocol,
-                    result.raw_mut(),
-                )
-                .unwrap();
+                execute_owned_precision_fp32(&mut backend, &handle, &protocol, &mut result)
+                    .unwrap();
                 snapshot_f32(&result)
             }
             PrecisionProfile::Mixed | PrecisionProfile::Fp64 => {
@@ -2114,13 +2136,7 @@ mod tests {
                     result_metric_count as u32,
                 );
                 fill_f64_metric_sentinel(&mut result, f64::MAX);
-                PrecisionComputeBackend::execute_f64(
-                    &mut backend,
-                    &handle,
-                    &protocol,
-                    result.raw_mut(),
-                )
-                .unwrap();
+                execute_owned_precision_f64(&mut backend, &handle, &protocol, &mut result).unwrap();
                 snapshot_f64(&result)
             }
         };
@@ -2270,13 +2286,8 @@ mod tests {
             reserved: [0; 8],
         };
         let mut fp32_result = result::OwnedResultTable::new(1, 1, 2);
-        PrecisionComputeBackend::execute_fp32(
-            &mut backend,
-            &fp32_handle,
-            &fp32_protocol,
-            fp32_result.raw_mut(),
-        )
-        .unwrap();
+        execute_owned_precision_fp32(&mut backend, &fp32_handle, &fp32_protocol, &mut fp32_result)
+            .unwrap();
         assert_eq!(fp32_result.raw().row_count, 1);
         assert_eq!(fp32_result.metric_values()[0], 1.0);
 
@@ -2296,11 +2307,11 @@ mod tests {
             reserved: [0; 8],
         };
         let mut mixed_result = result::OwnedResultTableF64::new(1, 1, 2);
-        PrecisionComputeBackend::execute_f64(
+        execute_owned_precision_f64(
             &mut backend,
             &mixed_handle,
             &mixed_protocol,
-            mixed_result.raw_mut(),
+            &mut mixed_result,
         )
         .unwrap();
         assert_eq!(mixed_result.raw().row_count, 1);
@@ -2328,13 +2339,8 @@ mod tests {
             reserved: [0; 8],
         };
         let mut fp64_result = result::OwnedResultTableF64::new(1, 1, 2);
-        PrecisionComputeBackend::execute_f64(
-            &mut backend,
-            &fp64_handle,
-            &fp64_protocol,
-            fp64_result.raw_mut(),
-        )
-        .unwrap();
+        execute_owned_precision_f64(&mut backend, &fp64_handle, &fp64_protocol, &mut fp64_result)
+            .unwrap();
         assert_eq!(fp64_result.raw().row_count, 1);
         assert!((fp64_result.metric_values()[0] - 1.0).abs() < 1.0e-12);
         assert_eq!(fp64_result.candidate_ids()[0], 0);
@@ -2342,7 +2348,7 @@ mod tests {
 
     #[test]
     fn cpu_backend_executes_continuous_result_table() {
-        use gafime_orchestrator::{execute_plan, CompiledPlan};
+        use gafime_orchestrator::CompiledPlan;
         use gafime_types::{GAFIME_FAMILY_CONTINUOUS, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2};
 
         let matrix = CpuMatrix::from_row_major(
@@ -2366,7 +2372,7 @@ mod tests {
         fill_f32_metric_sentinel(&mut table, f32::MAX);
         let mut backend = CpuBackend;
 
-        let stats = execute_plan(&mut backend, &handle, &plan, table.raw_mut()).unwrap();
+        let stats = execute_owned_plan(&mut backend, &handle, &plan, &mut table).unwrap();
 
         assert_eq!(stats.rows_written, 3);
         assert_eq!(table.raw().row_count, 3);
@@ -2383,7 +2389,6 @@ mod tests {
 
     #[test]
     fn cpu_backend_executes_every_adaptive_fixed_mi_template() {
-        use gafime_orchestrator::execute_plan;
         use gafime_orchestrator::plan::combos::{
             build_continuous_plan, ContinuousPlanRequest, MI_TEMPLATE_BIN_LEVELS,
         };
@@ -2416,7 +2421,7 @@ mod tests {
             .with_flags(GAFIME_LAUNCH_FLAG_MI_APPROX);
             let mut table = result::OwnedResultTable::new(1, 1, 1);
 
-            execute_plan(&mut backend, &matrix.handle(), &plan, table.raw_mut()).unwrap();
+            execute_owned_plan(&mut backend, &matrix.handle(), &plan, &mut table).unwrap();
 
             let expected = kernels::mutual_info_fixed(&feature, &target, bins);
             assert_eq!(table.metric_values()[0], expected, "bins={bins}");
@@ -2425,7 +2430,7 @@ mod tests {
 
     #[test]
     fn cpu_backend_honors_rank_top_k() {
-        use gafime_orchestrator::{execute_plan, CompiledPlan};
+        use gafime_orchestrator::CompiledPlan;
         use gafime_types::{
             GafimeRankSpec, GAFIME_FAMILY_CONTINUOUS, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
         };
@@ -2459,7 +2464,7 @@ mod tests {
         fill_f32_metric_sentinel(&mut table, f32::MAX);
         let mut backend = CpuBackend;
 
-        let stats = execute_plan(&mut backend, &matrix.handle(), &plan, table.raw_mut()).unwrap();
+        let stats = execute_owned_plan(&mut backend, &matrix.handle(), &plan, &mut table).unwrap();
 
         assert_eq!(stats.rows_written, 2);
         assert_eq!(table.raw().row_count, 2);
@@ -2473,7 +2478,7 @@ mod tests {
 
     #[test]
     fn cpu_backend_ranks_arity_two_scores_like_materialized_reference() {
-        use gafime_orchestrator::{execute_plan, CompiledPlan};
+        use gafime_orchestrator::CompiledPlan;
         use gafime_types::{
             GafimeRankSpec, GAFIME_FAMILY_CONTINUOUS, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
         };
@@ -2560,7 +2565,7 @@ mod tests {
         let mut table = result::OwnedResultTable::new(3, 2, 2);
         let mut backend = CpuBackend;
 
-        let stats = execute_plan(&mut backend, &matrix.handle(), &plan, table.raw_mut()).unwrap();
+        let stats = execute_owned_plan(&mut backend, &matrix.handle(), &plan, &mut table).unwrap();
 
         assert_eq!(stats.rows_written, 3);
         assert_eq!(
@@ -2581,7 +2586,6 @@ mod tests {
 
     #[test]
     fn cpu_backend_executes_mixed_arity_continuous_plan() {
-        use gafime_orchestrator::execute_plan;
         use gafime_orchestrator::plan::combos::{build_continuous_plan, ContinuousPlanRequest};
         use gafime_types::{GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2};
 
@@ -2608,7 +2612,7 @@ mod tests {
         let mut table = result::OwnedResultTable::new(planned_rows, 2, 2);
         let mut backend = CpuBackend;
 
-        let stats = execute_plan(&mut backend, &matrix.handle(), &plan, table.raw_mut()).unwrap();
+        let stats = execute_owned_plan(&mut backend, &matrix.handle(), &plan, &mut table).unwrap();
 
         assert_eq!(stats.rows_written, 6);
         assert_eq!(table.raw().row_count, 6);

@@ -19,6 +19,38 @@ VERSION = "1.0.0b2"
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def _workflow_run_scripts(workflow: str) -> list[str]:
+    """Return inline and block run scripts without parsing action inputs as shell."""
+
+    lines = workflow.splitlines()
+    scripts: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.lstrip()
+        if not stripped.startswith("run:"):
+            index += 1
+            continue
+        indent = len(line) - len(stripped)
+        value = stripped.removeprefix("run:").strip()
+        if value not in {"|", "|-", ">", ">-"}:
+            scripts.append(value)
+            index += 1
+            continue
+        body: list[str] = []
+        index += 1
+        while index < len(lines):
+            body_line = lines[index]
+            if body_line.strip():
+                body_indent = len(body_line) - len(body_line.lstrip())
+                if body_indent <= indent:
+                    break
+            body.append(body_line)
+            index += 1
+        scripts.append("\n".join(body))
+    return scripts
+
+
 @pytest.fixture(autouse=True)
 def clear_payload_environment(monkeypatch):
     names = (
@@ -657,6 +689,7 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
         "retag_wheel",
     ):
         assert forbidden not in publish
+
     preflight = publish.split("\n  publication_preflight:\n", 1)[1].split(
         "\n  publish_pypi_core:\n", 1
     )[0]
@@ -703,6 +736,28 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     assert "CIBW_TEST_COMMAND:" in windows_arm_builder
     assert "python .github/scripts/stage_metal_payload.py" in build
     assert "gafime_metal-*.whl" not in build + publish
+
+
+def test_publish_workflow_keeps_adversarial_dispatch_values_out_of_shell_source():
+    publish = (ROOT / ".github" / "workflows" / "publish_release.yml").read_text(
+        encoding="utf-8"
+    )
+    run_scripts = _workflow_run_scripts(publish)
+
+    assert run_scripts
+    for expression in (
+        "${{ inputs.build_run_id }}",
+        "${{ inputs.release_tag }}",
+    ):
+        assert not any(expression in script for script in run_scripts)
+    assert publish.count("BUILD_RUN_ID: ${{ inputs.build_run_id }}") >= 1
+    assert publish.count("RELEASE_TAG: ${{ inputs.release_tag }}") >= 1
+    assert publish.count('--run-id "$BUILD_RUN_ID"') == 5
+    assert publish.count('--github-ref "refs/tags/$RELEASE_TAG"') == 2
+    assert 'tag_ref="refs/tags/$RELEASE_TAG"' in publish
+    assert 'git check-ref-format "$tag_ref"' in publish
+    assert 'git rev-parse --verify "${tag_ref}^{commit}"' in publish
+    assert '[[ ! "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]]' in publish
 
 
 def test_metal_staging_uses_lipo_input_before_verify_command():

@@ -428,11 +428,15 @@ pub(crate) fn execute_compact_decision_path_state(
             PyBoundaryError::InvalidInput("decision-path result capacity overflows".to_string())
         })?;
     let mut combined = OwnedResultTable::new(result_capacity, 1, metric_count);
-    let base_execution = state.base_prepared.execute(
-        &mut *state.backend.borrow_mut(),
-        state.matrix.handle(),
-        combined.raw_mut(),
-    )?;
+    // SAFETY: `combined` owns all output buffers and is uniquely borrowed;
+    // `base_prepared` owns the live immutable descriptor graph for this call.
+    let base_execution = unsafe {
+        state.base_prepared.execute(
+            &mut *state.backend.borrow_mut(),
+            state.matrix.handle(),
+            combined.raw_mut(),
+        )
+    }?;
     if base_execution.rows_written != u64::from(state.base_candidate_cols)
         || combined.row_count() != state.base_candidate_cols as usize
     {
@@ -448,15 +452,20 @@ pub(crate) fn execute_compact_decision_path_state(
             path_count as u64,
             |raw| -> Result<bool, PyBoundaryError> {
                 let expected_window = *raw;
+                // SAFETY: `with_raw_rows_mut` created a checked, uniquely
+                // borrowed output window over `combined`. The state-owned term
+                // and offset slices remain immutable for this synchronous call.
                 let scored = compact_score_abi_result(
-                    state.backend.borrow_mut().decision_path_score_with_policy(
-                        state.matrix.handle(),
-                        &state.terms,
-                        &state.path_offsets,
-                        &config.metric_ids,
-                        raw,
-                        state.policy,
-                    ),
+                    unsafe {
+                        state.backend.borrow_mut().decision_path_score_with_policy(
+                            state.matrix.handle(),
+                            &state.terms,
+                            &state.path_offsets,
+                            &config.metric_ids,
+                            raw,
+                            state.policy,
+                        )
+                    },
                     state.policy,
                 )?;
                 if !scored {

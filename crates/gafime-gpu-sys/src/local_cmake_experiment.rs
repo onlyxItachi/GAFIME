@@ -329,7 +329,15 @@ impl GpuBackend {
         Ok(Some(membership))
     }
 
-    pub fn decision_path_score(
+    /// Score decision paths into a caller-provided raw ABI result table.
+    ///
+    /// # Safety
+    ///
+    /// Every non-null pointer in `result` must reference uniquely borrowed,
+    /// writable storage covering the declared capacity and strides for this
+    /// synchronous call. The matrix handle must identify a live allocation
+    /// owned by this backend.
+    pub unsafe fn decision_path_score(
         &mut self,
         matrix: &MatrixHandle,
         terms: &[GafimeDecisionPathTerm],
@@ -337,17 +345,30 @@ impl GpuBackend {
         metric_ids: &[u32],
         result: &mut GafimeResultTable,
     ) -> Result<bool, GpuSysError> {
-        self.decision_path_score_with_policy(
-            matrix,
-            terms,
-            path_offsets,
-            metric_ids,
-            result,
-            DecisionPathRtPolicy::AllowSmFallback,
-        )
+        // SAFETY: this convenience entry point forwards the caller's complete
+        // raw-result contract unchanged to the policy-aware implementation.
+        unsafe {
+            self.decision_path_score_with_policy(
+                matrix,
+                terms,
+                path_offsets,
+                metric_ids,
+                result,
+                DecisionPathRtPolicy::AllowSmFallback,
+            )
+        }
     }
 
-    pub fn decision_path_score_with_policy(
+    /// Score decision paths into a caller-provided raw ABI result table under
+    /// the selected RT policy.
+    ///
+    /// # Safety
+    ///
+    /// Every non-null pointer in `result` must reference uniquely borrowed,
+    /// writable storage covering the declared capacity and strides for this
+    /// synchronous call. The matrix handle must identify a live allocation
+    /// owned by this backend.
+    pub unsafe fn decision_path_score_with_policy(
         &mut self,
         matrix: &MatrixHandle,
         terms: &[GafimeDecisionPathTerm],

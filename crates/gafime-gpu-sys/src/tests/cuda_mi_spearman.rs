@@ -29,7 +29,7 @@ fn cuda_mutual_info_metric_returns_finite_signal_when_library_is_available() {
         vec![GAFIME_METRIC_MUTUAL_INFO],
     );
     let mut result = TestResultTable::new(2, 1, 1);
-    execute_plan(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
+    execute_plan!(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
 
     assert_eq!(result.raw.row_count, 2);
     let values = result.metric_values();
@@ -74,7 +74,7 @@ fn cuda_fixed_mi_extreme_bin_mapping_matches_cpu_when_available() {
         vec![GAFIME_METRIC_MUTUAL_INFO],
     );
     let mut result = TestResultTable::new(2, 1, 1);
-    execute_plan(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
+    execute_plan!(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
 
     let expected_wide = gafime_cpu::kernels::mutual_info_fixed(&wide, &target, 8);
     let expected_subnormal = gafime_cpu::kernels::mutual_info_fixed(&subnormal, &target, 8);
@@ -144,7 +144,7 @@ fn cuda_spearman_matches_cpu_when_library_is_available() {
         CpuMatrix::from_row_major(rows, cols, features.clone(), target.clone()).unwrap();
     let mut cpu_backend = CpuBackend;
     let mut cpu_result = TestResultTable::new(3, 1, 1);
-    execute_plan(
+    execute_plan!(
         &mut cpu_backend,
         &cpu_matrix.handle(),
         &cpu_plan,
@@ -164,7 +164,7 @@ fn cuda_spearman_matches_cpu_when_library_is_available() {
         vec![GAFIME_METRIC_SPEARMAN],
     );
     let mut cuda_result = TestResultTable::new(3, 1, 1);
-    execute_plan(
+    execute_plan!(
         &mut cuda_backend,
         cuda_matrix.handle(),
         &cuda_plan,

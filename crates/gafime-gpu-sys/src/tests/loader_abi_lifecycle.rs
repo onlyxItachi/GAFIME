@@ -667,25 +667,35 @@ fn precision_allocation_preflight_requires_one_generic_operation_surface() {
             reserved: [0; 8],
         };
         assert_eq!(
-            gafime_orchestrator::PrecisionComputeBackend::execution_device_memory_peak_bytes_v2(
-                &mut backend,
-                matrix.handle(),
-                &protocol,
-            )
+            // SAFETY: `base` and `protocol` are live local descriptors with no
+            // non-empty raw spans; the synchronous test payload does not retain them.
+            unsafe {
+                gafime_orchestrator::PrecisionComputeBackend::execution_device_memory_peak_bytes_v2(
+                    &mut backend,
+                    matrix.handle(),
+                    &protocol,
+                )
+            }
             .unwrap(),
             Some(0)
         );
         match precision {
             PrecisionProfile::Fp32 => {
-                gafime_orchestrator::PrecisionComputeBackend::execute_fp32(
-                    &mut backend,
-                    matrix.handle(),
-                    &protocol,
-                    &mut GafimeResultTable::default(),
-                )
+                // SAFETY: the descriptors have no non-empty raw spans and the
+                // instrumented execute stub does not dereference output pointers.
+                unsafe {
+                    gafime_orchestrator::PrecisionComputeBackend::execute_fp32(
+                        &mut backend,
+                        matrix.handle(),
+                        &protocol,
+                        &mut GafimeResultTable::default(),
+                    )
+                }
                 .unwrap();
-                assert!(backend
-                    .permutation_pvalues_fp32_v2_with_budget(
+                // SAFETY: `protocol` is live and contains no non-empty raw spans;
+                // the selected input slices are live for the synchronous call.
+                assert!(unsafe {
+                    backend.permutation_pvalues_fp32_v2_with_budget(
                         matrix.handle(),
                         &protocol,
                         &[0],
@@ -693,19 +703,26 @@ fn precision_allocation_preflight_requires_one_generic_operation_surface() {
                         1,
                         Some(u64::MAX),
                     )
-                    .unwrap()
-                    .is_some());
+                }
+                .unwrap()
+                .is_some());
             }
             PrecisionProfile::Mixed | PrecisionProfile::Fp64 => {
-                gafime_orchestrator::PrecisionComputeBackend::execute_f64(
-                    &mut backend,
-                    matrix.handle(),
-                    &protocol,
-                    &mut GafimeResultTableF64::default(),
-                )
+                // SAFETY: the descriptors have no non-empty raw spans and the
+                // instrumented execute stub does not dereference output pointers.
+                unsafe {
+                    gafime_orchestrator::PrecisionComputeBackend::execute_f64(
+                        &mut backend,
+                        matrix.handle(),
+                        &protocol,
+                        &mut GafimeResultTableF64::default(),
+                    )
+                }
                 .unwrap();
-                assert!(backend
-                    .permutation_pvalues_f64_v2_with_budget(
+                // SAFETY: `protocol` is live and contains no non-empty raw spans;
+                // the selected input slices are live for the synchronous call.
+                assert!(unsafe {
+                    backend.permutation_pvalues_f64_v2_with_budget(
                         matrix.handle(),
                         &protocol,
                         &[0],
@@ -713,8 +730,9 @@ fn precision_allocation_preflight_requires_one_generic_operation_surface() {
                         1,
                         Some(u64::MAX),
                     )
-                    .unwrap()
-                    .is_some());
+                }
+                .unwrap()
+                .is_some());
             }
         }
     }
@@ -853,9 +871,14 @@ fn execution_memory_peak_remains_optional_and_calls_capable_payloads() {
     config.budget.max_comb_size = 1;
     let prepared = prepare_continuous_execution(&config, 4, 2).unwrap();
     assert_eq!(
-        legacy_backend
-            .execution_device_memory_peak_bytes(legacy_matrix.handle(), prepared.plan().protocol(),)
-            .unwrap(),
+        // SAFETY: `prepared` owns every protocol span for this synchronous query.
+        unsafe {
+            legacy_backend.execution_device_memory_peak_bytes(
+                legacy_matrix.handle(),
+                prepared.plan().protocol(),
+            )
+        }
+        .unwrap(),
         None
     );
 
@@ -864,12 +887,14 @@ fn execution_memory_peak_remains_optional_and_calls_capable_payloads() {
     let mut capable_backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
     let capable_matrix = capable_backend.alloc_matrix(4, 2).unwrap();
     assert_eq!(
-        capable_backend
-            .execution_device_memory_peak_bytes(
+        // SAFETY: `prepared` owns every protocol span for this synchronous query.
+        unsafe {
+            capable_backend.execution_device_memory_peak_bytes(
                 capable_matrix.handle(),
                 prepared.plan().protocol(),
             )
-            .unwrap(),
+        }
+        .unwrap(),
         Some(0x5A5A_A5A5)
     );
 }
@@ -897,9 +922,8 @@ fn permutation_pvalues_reject_peak_between_normal_and_significance_budget() {
     let matrix = backend.alloc_matrix(4, 2).unwrap();
     let budget = 12 * 1024 * 1024;
     assert_eq!(
-        backend
-            .execution_device_memory_peak_bytes(matrix.handle(), protocol)
-            .unwrap(),
+        // SAFETY: `prepared` owns every protocol span for this synchronous query.
+        unsafe { backend.execution_device_memory_peak_bytes(matrix.handle(), protocol) }.unwrap(),
         Some(TEST_NORMAL_EXECUTION_PEAK)
     );
     assert!(TEST_NORMAL_EXECUTION_PEAK < budget);
@@ -907,8 +931,10 @@ fn permutation_pvalues_reject_peak_between_normal_and_significance_budget() {
 
     TEST_PERMUTATION_PVALUE_CALLS.store(0, Ordering::SeqCst);
     TEST_PERMUTATION_PEAK_SELECTED_ROWS.store(0, Ordering::SeqCst);
-    let error = backend
-        .permutation_pvalues_with_budget(
+    // SAFETY: `prepared` owns the protocol and the selected-row slices remain
+    // initialized and live for this synchronous call.
+    let error = unsafe {
+        backend.permutation_pvalues_with_budget(
             matrix.handle(),
             protocol,
             &[0, 1],
@@ -916,7 +942,8 @@ fn permutation_pvalues_reject_peak_between_normal_and_significance_budget() {
             1,
             Some(budget),
         )
-        .unwrap_err();
+    }
+    .unwrap_err();
     assert!(matches!(
         error,
         GpuSysError::InvalidInput(
@@ -929,8 +956,10 @@ fn permutation_pvalues_reject_peak_between_normal_and_significance_budget() {
     );
     assert_eq!(TEST_PERMUTATION_PVALUE_CALLS.load(Ordering::SeqCst), 0);
 
-    let pvalues = backend
-        .permutation_pvalues_with_budget(
+    // SAFETY: `prepared` owns the protocol and the selected-row slices remain
+    // initialized and live for this synchronous call.
+    let pvalues = unsafe {
+        backend.permutation_pvalues_with_budget(
             matrix.handle(),
             protocol,
             &[0, 1],
@@ -938,8 +967,9 @@ fn permutation_pvalues_reject_peak_between_normal_and_significance_budget() {
             1,
             Some(TEST_PERMUTATION_EXECUTION_PEAK),
         )
-        .unwrap()
-        .unwrap();
+    }
+    .unwrap()
+    .unwrap();
     assert_eq!(pvalues, vec![0.5, 0.5]);
     assert_eq!(TEST_PERMUTATION_PVALUE_CALLS.load(Ordering::SeqCst), 1);
 
@@ -948,8 +978,10 @@ fn permutation_pvalues_reject_peak_between_normal_and_significance_budget() {
     let mut legacy_backend = GpuBackend::new(GAFIME_BACKEND_CUDA, legacy_functions).unwrap();
     let legacy_matrix = legacy_backend.alloc_matrix(4, 2).unwrap();
     assert_eq!(
-        legacy_backend
-            .permutation_pvalues_with_budget(
+        // SAFETY: `prepared` owns the protocol and the selected-row slices remain
+        // initialized and live for this synchronous capability probe.
+        unsafe {
+            legacy_backend.permutation_pvalues_with_budget(
                 legacy_matrix.handle(),
                 protocol,
                 &[0, 1],
@@ -957,7 +989,8 @@ fn permutation_pvalues_reject_peak_between_normal_and_significance_budget() {
                 1,
                 Some(budget),
             )
-            .unwrap(),
+        }
+        .unwrap(),
         None
     );
     assert_eq!(TEST_PERMUTATION_PVALUE_CALLS.load(Ordering::SeqCst), 1);
@@ -989,9 +1022,10 @@ fn descriptor_generation_is_sent_only_to_generation_capable_payloads() {
         let mut result = GafimeResultTable::default();
         TEST_EXECUTE_FLAGS.store(u32::MAX, Ordering::SeqCst);
         TEST_EXECUTE_DESCRIPTOR_GENERATION.store(u64::MAX, Ordering::SeqCst);
-        prepared
-            .execute(&mut backend, matrix.handle(), &mut result)
-            .unwrap();
+        // SAFETY: `prepared` owns the complete protocol graph. This test
+        // payload only records descriptor metadata and never dereferences the
+        // zero-capacity result descriptor.
+        unsafe { prepared.execute(&mut backend, matrix.handle(), &mut result) }.unwrap();
         (
             backend.supports_immutable_protocol(),
             backend.supports_descriptor_generation(),
@@ -1144,24 +1178,29 @@ fn legacy_operations_reject_precision_handles_before_ffi() {
         ..Default::default()
     };
     assert!(matches!(
-        backend
-            .execution_device_memory_peak_bytes(matrix.handle(), &protocol)
+        // SAFETY: `protocol` is live and has no non-empty raw spans. The handle
+        // generation check rejects the operation before entering payload FFI.
+        unsafe { backend.execution_device_memory_peak_bytes(matrix.handle(), &protocol) }
             .unwrap_err(),
         OrchestratorError::InvalidPlan("legacy GPU operation requires an ABI 1.0 matrix handle")
     ));
     assert!(matches!(
-        backend
-            .execute(
+        // SAFETY: the live protocol/result descriptors have no non-empty spans;
+        // the handle generation check rejects them before payload FFI.
+        unsafe {
+            backend.execute(
                 matrix.handle(),
                 &protocol,
                 &mut GafimeResultTable::default(),
             )
-            .unwrap_err(),
+        }
+        .unwrap_err(),
         OrchestratorError::InvalidPlan("legacy GPU operation requires an ABI 1.0 matrix handle")
     ));
     assert!(matches!(
-        backend
-            .permutation_pvalues(matrix.handle(), &protocol, &[0], &[0.0], 1)
+        // SAFETY: `protocol` is live with no non-empty spans and both selected-row
+        // slices remain live; the handle check rejects before payload FFI.
+        unsafe { backend.permutation_pvalues(matrix.handle(), &protocol, &[0], &[0.0], 1) }
             .unwrap_err(),
         GpuSysError::InvalidInput("legacy GPU operation requires an ABI 1.0 matrix handle")
     ));
@@ -1209,27 +1248,37 @@ fn precision_operations_reject_legacy_handles_before_ffi() {
         reserved: [0; 8],
     };
     assert!(matches!(
-        gafime_orchestrator::PrecisionComputeBackend::execution_device_memory_peak_bytes_v2(
-            &mut backend,
-            matrix.handle(),
-            &protocol,
-        )
+        // SAFETY: `base` and `protocol` are live with no non-empty raw spans. The
+        // handle generation check rejects before payload FFI.
+        unsafe {
+            gafime_orchestrator::PrecisionComputeBackend::execution_device_memory_peak_bytes_v2(
+                &mut backend,
+                matrix.handle(),
+                &protocol,
+            )
+        }
         .unwrap_err(),
         OrchestratorError::InvalidPlan("precision GPU operation requires an ABI 1.1 matrix handle")
     ));
     assert!(matches!(
-        gafime_orchestrator::PrecisionComputeBackend::execute_f64(
-            &mut backend,
-            matrix.handle(),
-            &protocol,
-            &mut GafimeResultTableF64::default(),
-        )
+        // SAFETY: the live protocol/result descriptors have no non-empty spans;
+        // the handle generation check rejects before payload FFI.
+        unsafe {
+            gafime_orchestrator::PrecisionComputeBackend::execute_f64(
+                &mut backend,
+                matrix.handle(),
+                &protocol,
+                &mut GafimeResultTableF64::default(),
+            )
+        }
         .unwrap_err(),
         OrchestratorError::InvalidPlan("precision GPU operation requires an ABI 1.1 matrix handle")
     ));
     assert!(matches!(
-        backend
-            .permutation_pvalues_f64_v2_with_budget(
+        // SAFETY: the live precision descriptor has no non-empty raw spans and
+        // both selected-row slices remain live; the handle check rejects first.
+        unsafe {
+            backend.permutation_pvalues_f64_v2_with_budget(
                 matrix.handle(),
                 &protocol,
                 &[0],
@@ -1237,7 +1286,8 @@ fn precision_operations_reject_legacy_handles_before_ffi() {
                 1,
                 None,
             )
-            .unwrap_err(),
+        }
+        .unwrap_err(),
         GpuSysError::InvalidInput("precision GPU operation requires an ABI 1.1 matrix handle")
     ));
     assert_eq!(TEST_PRECISION_ABI_SURFACE_CALLS.load(Ordering::SeqCst), 0);

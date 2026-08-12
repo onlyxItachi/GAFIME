@@ -30,7 +30,7 @@ fn cuda_graph_flag_replays_same_continuous_result_when_library_is_available() {
         normal_prepared.result_max_arity(),
         normal_prepared.result_metric_count(),
     );
-    execute_plan(
+    execute_plan!(
         &mut backend,
         matrix.handle(),
         normal_prepared.plan(),
@@ -43,7 +43,7 @@ fn cuda_graph_flag_replays_same_continuous_result_when_library_is_available() {
         normal_prepared.result_max_arity(),
         normal_prepared.result_metric_count(),
     );
-    let first_stats = execute_plan(
+    let first_stats = execute_plan!(
         &mut backend,
         matrix.handle(),
         &graph_plan,
@@ -61,7 +61,7 @@ fn cuda_graph_flag_replays_same_continuous_result_when_library_is_available() {
         normal_prepared.result_max_arity(),
         normal_prepared.result_metric_count(),
     );
-    let second_stats = execute_plan(
+    let second_stats = execute_plan!(
         &mut backend,
         matrix.handle(),
         &graph_plan,
@@ -137,7 +137,7 @@ fn cuda_graph_captures_whole_multi_arity_sweep_when_available() {
     let planned: u64 = graph_plan.chunks().iter().map(|c| c.combo_count).sum();
 
     let mut graph_result = TestResultTable::new(planned, 3, 2);
-    execute_plan(
+    execute_plan!(
         &mut backend,
         matrix.handle(),
         &graph_plan,
@@ -152,7 +152,7 @@ fn cuda_graph_captures_whole_multi_arity_sweep_when_available() {
 
     let normal_plan = request(0);
     let mut normal_result = TestResultTable::new(planned, 3, 2);
-    execute_plan(
+    execute_plan!(
         &mut backend,
         matrix.handle(),
         &normal_plan,
