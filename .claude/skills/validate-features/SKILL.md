@@ -12,12 +12,17 @@ python .claude/skills/validate-features/scripts/validate_features.py \
   --data data.parquet \
   --target target \
   --interactions '0,1;2,3' \
-  --operator multiply
+  --operator multiply \
+  --precision mixed
 ```
 
 The helper measures train/holdout Pearson correlation, a bootstrap interval, and
-a random-pair baseline. It validates only the supplied continuous pairs; it does
-not rerun GAFIME discovery and must not be described as nested model validation.
+a random-pair baseline. Its `HEURISTIC_PASS` / `HEURISTIC_INCONCLUSIVE` labels
+are descriptive checks, not proof that a feature is genuine or noise. It
+validates only the supplied continuous pairs; it does not rerun GAFIME discovery
+and must not be described as nested model validation.
+Its pointwise and reduction dtypes follow the selected public precision profile;
+this still remains a NumPy holdout diagnostic, not backend-parity evidence.
 Pair indices refer to the numeric, non-target `feature_names` list emitted in the
 result, not the original mixed-schema file column positions.
 
@@ -32,8 +37,8 @@ Generated-family rules:
   training fold, with no entity-boundary crossing;
 - decision paths depend on the target and must be rediscovered in each training
   fold;
-- decision-path bootstrap stability is supported, but permutation significance
-  is unavailable and positive `permutation_tests` fails closed.
+- decision-path bootstrap stability and permutation maxT are supported;
+  permutation validation must rediscover paths for every permuted target.
 
 Do not reuse removed v0.4 discrete-candidate helpers or thresholds. Prefer
 candidate IDs and family names when joining interactions, stability, and

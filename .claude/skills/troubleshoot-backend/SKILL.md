@@ -8,14 +8,19 @@ description: Diagnose GAFIME v1 Core, CUDA, ROCm, or Metal selection and payload
 Run:
 
 ```bash
-python .claude/skills/troubleshoot-backend/scripts/diagnose_backends.py
+python .claude/skills/troubleshoot-backend/scripts/diagnose_backends.py \
+  --precision mixed
 ```
 
 The JSON report probes `core`, `cuda`, `rocm`, `metal`, and `auto` through
 `backend_capabilities(..., probe=True)`. It records package versions, platform,
 whether explicit library overrides are present, selected backend, probe status,
-runtime device facts, graph support, significance placement, MI policy, and
-payload-discovery errors. It does not execute a scoring workload.
+runtime device facts, graph support, significance placement, MI policy,
+precision, version-alignment warnings, and payload-discovery errors. The Metal
+payload-health probe always uses its supported `fp32` profile; the requested
+profile remains visible separately. The script does not execute a scoring
+workload. It reports `release_status="not_yet_published"`, current source-tree
+guidance, and exact commands only under `when_published_install`.
 
 Interpret capability evidence literally:
 
@@ -25,15 +30,27 @@ Interpret capability evidence literally:
 
 Common fixes:
 
-- CUDA payload missing or damaged: `pip install --force-reinstall gafime gafime-cuda`.
+Beta.2 is not yet published. Before publication, repair and diagnose the
+repository development environment; do not present the commands below as
+currently available from PyPI. Once beta.2 is published, use these exact-version
+commands where applicable:
+
+- CUDA payload missing or damaged: reinstall Core and CUDA at one explicit
+  version:
+  `pip install --force-reinstall "gafime==1.0.0b2" "gafime-cuda==1.0.0b2"`.
 - CUDA runtime load failure: verify system `libcudart.so.13` on Linux or
-  `cudart64_13.dll` on Windows; the payload wheel does not vendor it.
+  driver-provided `nvcudart_hybrid64.dll` on Windows; the payload wheel does not
+  vendor it.
 - ROCm payload missing on Linux x86_64:
-  `pip install --force-reinstall gafime gafime-rocm`.
-- Metal payload missing on macOS arm64: reinstall `gafime`; the dylib and
-  metallib are bundled in the Core wheel.
-- Core/native boundary missing: reinstall `gafime` for the active Python and
-  architecture.
+  install the exact matching Core and ROCm versions. PyPI will provide the
+  buildable ROCm sdist; the matching GitHub Release will carry the prebuilt thin
+  raw-Linux wheel. Both require the compatible system ROCm runtime. The
+  when-published source command is
+  `pip install --force-reinstall "gafime==1.0.0b2" "gafime-rocm==1.0.0b2"`.
+- Metal payload missing on macOS arm64: reinstall `gafime==1.0.0b2`; the dylib
+  and metallib are bundled in the Core wheel.
+- Core/native boundary missing: reinstall `gafime==1.0.0b2` for the active
+  Python and architecture.
 - Version mismatch: install Core and vendor payload packages at the exact same
   release version.
 - Linux ROCm permission failure: verify `/dev/kfd` and render-node access.
@@ -41,9 +58,12 @@ Common fixes:
   override and remove or correct it.
 
 Explicit `cuda`, `rocm`, and `metal` requests never fall back. `backend="auto"`
-is the only ranked resolver. `backend="gpu"` is rejected as ambiguous.
+is the only ranked resolver. `backend="gpu"` is rejected as ambiguous. Metal
+supports only `precision="fp32"`; mixed/fp64 requests fail closed.
 
 Generated-family candidate creation remains in `gafime_cpu`; CUDA, ROCm, and
-Metal may score the expanded continuous matrix. Optional compact CUDA RT
-decision-path scoring is available only when the validated payload and device
-report it. Do not infer RT support from a GPU model name.
+Metal may score the expanded continuous matrix within their supported precision
+profiles. Standard beta.2 CUDA artifacts are always RT-free. Optional compact
+CUDA RT decision-path scoring is a local CMake experiment selected through an
+explicit validated library override only; it is never a distribution or release
+artifact. Do not infer RT support from a GPU model name.

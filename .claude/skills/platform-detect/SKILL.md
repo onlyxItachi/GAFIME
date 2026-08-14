@@ -8,21 +8,26 @@ description: Inspect platform and visible accelerator hints, then recommend a tr
 Run:
 
 ```bash
-python .claude/skills/platform-detect/scripts/platform_detect.py
+python .claude/skills/platform-detect/scripts/platform_detect.py --precision mixed
 ```
 
-The script reports OS, CPU architecture, visible NVIDIA/ROCm hints, installed
-GAFIME distribution versions, and the public `auto` capability probe when
-GAFIME is installed. Hardware hints guide installation only; the validated
+Beta.2 is not yet published. The script reports OS, CPU architecture, visible
+NVIDIA/ROCm hints, installed GAFIME distribution versions, and the public `auto`
+capability probe when GAFIME is installed. It reports
+`release_status="not_yet_published"`, directs current work to the repository
+development environment, and exposes the exact target command only as
+`when_published_install`. Hardware hints guide installation only; the validated
 capability result is the authority for runtime selection.
 
-Distribution policy:
+Target distribution policy once beta.2 is published:
 
 - Core: Linux x86_64/aarch64, Windows x86_64/arm64, macOS arm64.
 - CUDA payload: Linux and Windows x86_64 via `gafime` plus `gafime-cuda`;
-  requires the system CUDA runtime.
-- ROCm payload: Linux x86_64 via `gafime` plus `gafime-rocm`.
-- Metal: bundled in the macOS arm64 Core wheel.
+  requires the system CUDA 13 runtime.
+- ROCm payload: Linux x86_64 via `gafime` plus `gafime-rocm`; PyPI will provide
+  the buildable sdist, while the matching GitHub Release will carry the prebuilt
+  thin raw-Linux wheel. Both require the compatible system ROCm runtime.
+- Metal: bundled in the macOS arm64 Core wheel and supports `fp32` only.
 - Optional OptiX RT: local CMake build only, selected explicitly through
   `GAFIME_CUDA_V1_LIB`; it is never a distribution or release artifact.
 
@@ -33,6 +38,7 @@ from gafime import ComputeBudget, EngineConfig, GafimeEngine
 
 config = EngineConfig(
     backend="auto",
+    precision="mixed",
     metric_names=("pearson", "spearman", "mutual_info", "r2"),
     budget=ComputeBudget(max_comb_size=2, vram_budget_mb=6144),
 )
@@ -41,4 +47,6 @@ engine = GafimeEngine(config)
 
 Adjust `vram_budget_mb` from validated device capacity and the whole workload,
 not only the raw matrix size. Explicit backends are appropriate when failure is
-preferred to fallback. Do not recommend removed discrete-family options.
+preferred to fallback. With `precision="mixed"` or `precision="fp64"`, auto
+excludes Metal and may select Core; request `fp32` to make Metal eligible. Do not
+recommend removed discrete-family options.

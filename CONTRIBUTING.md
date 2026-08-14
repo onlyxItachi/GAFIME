@@ -26,24 +26,26 @@ uv venv .venv
 uv pip install --python .venv/bin/python -e ".[dev,sklearn]" --no-build-isolation
 ```
 
-Useful build controls:
+The root build produces Core only. GPU payload development builds are staged
+and installed explicitly after Core; there are no root-build skip or strictness
+switches for CUDA or ROCm.
 
-- `GAFIME_SKIP_CUDA=1`: skip CUDA build.
-- `GAFIME_SKIP_ROCM=1`: skip ROCm/HIP build.
-- `STRICT_CPU=1`: fail if the Rust/PyO3 CPU runtime cannot build.
-- `STRICT_CUDA=1`: fail if CUDA cannot build.
-- `STRICT_ROCM=1`: fail if ROCm/HIP cannot build.
-- `GAFIME_ROCM_ARCHS=<rocm-offload-target>[,<rocm-offload-target>...]`:
-  explicit HIP targets.
-
-Examples:
+CUDA payload:
 
 ```bash
-GAFIME_SKIP_CUDA=1 GAFIME_SKIP_ROCM=1 STRICT_CPU=1 \
-  uv pip install --python .venv/bin/python -e . --no-build-isolation
+python .github/scripts/stage_gpu_payload.py cuda payload-src/gafime-cuda
+uv pip install --python .venv/bin/python -e payload-src/gafime-cuda \
+  --no-build-isolation
+```
 
-GAFIME_SKIP_CUDA=1 GAFIME_ROCM_ARCHS=<rocm-offload-target> STRICT_CPU=1 \
-  uv pip install --python .venv/bin/python -e . --no-build-isolation
+ROCm/HIP payload with an explicit supported offload target:
+
+```bash
+python .github/scripts/stage_gpu_payload.py rocm payload-src/gafime-rocm \
+  --rocm-wheel-policy system
+GAFIME_ROCM_ARCHS=<rocm-offload-target> \
+  uv pip install --python .venv/bin/python -e payload-src/gafime-rocm \
+    --no-build-isolation
 ```
 
 ## Verification
@@ -52,8 +54,8 @@ Run focused checks before committing native changes:
 
 ```bash
 python -m gafime --check
-python -m pytest tests/test_v045_native_spine.py -q
-python -m pytest tests/test_rocm_native_backend.py -q
+python -m pytest tests/python/test_v1_public_truthfulness.py -q
+python -m pytest tests/python/test_v1_rocm.py -q
 ```
 
 ROCm and CUDA tests that require device access may skip in restricted
@@ -63,7 +65,9 @@ environments. Do not count sandbox-only device skips as hardware validation.
 
 Docker is for maintainers and contributors who need reproducible source-build
 environments. Docker images in this repository are not distribution images.
-Normal users should install GAFIME from PyPI wheels.
+Normal users should install the published artifacts documented in `README.md`;
+the prebuilt thin ROCm wheel comes from the matching GitHub Release rather than
+PyPI.
 
 CUDA development environment:
 
@@ -79,7 +83,7 @@ docker compose run --build gafime-core-smoke
 
 The CUDA developer image includes:
 
-- CUDA Toolkit 13.2 base image,
+- CUDA Toolkit 13.3 base image,
 - compiler toolchain,
 - Rust,
 - CMake/Ninja,
@@ -113,6 +117,19 @@ The Core smoke image skips CUDA and ROCm and verifies the Rust/PyO3 CPU path.
 
 Before merge, every PR must have a current-head AI Review Record submitted as a GitHub review, all configured required status checks reported for the final head after executing against GitHub's current PR merge commit for that head/base pair, and all review conversations resolved. A `COMMENTED` review is valid review evidence; an `APPROVED` review state is not required. The AI Review Record must state the model, role, exact reviewed commit SHA, verdict, and findings.
 
+Keep changes reviewable and semantically focused. Independent architecture,
+feature, and fix work should use separate focused or explicitly stacked PRs;
+mutually dependent documentation, validation, and implementation needed to
+make one change coherent may remain together. Validation is proportionate to
+the affected surfaces: execution changes need the relevant backend-local and
+end-to-end evidence, while documentation/governance-only changes do not require
+unrelated benchmark campaigns.
+
+Autonomous and AI-assisted contributions follow the same contracts, tests,
+evidence, review, provenance, safety, numerical, and release gates as every
+other contribution. They do not receive weaker gates or acquire an extra
+human-authorship or approving-review requirement.
+
 Use this record shape:
 
 ```markdown
@@ -130,9 +147,14 @@ Intermediate PR commits do not need to be green. Merge eligibility is based on t
 
 ## Release Safety
 
-Do not create tags, push release tags, enable release workflows, or publish to
-PyPI without maintainer approval.
+Do not create or push release tags, dispatch publication, or publish to PyPI
+without maintainer approval. Follow
+[`docs/releases/release-operations.md`](docs/releases/release-operations.md).
 
-The wheel workflow may be intentionally disabled during backend development.
-Check `.github/workflows/build_wheels.yml` before assuming tag pushes will
-publish artifacts.
+`.github/workflows/build_wheels.yml` validates and freezes an immutable bundle;
+it never publishes. After that exact source is reviewed and merged, a canonical
+tag may bind the same source commit. The manual-only
+`.github/workflows/publish_release.yml` verifies and publishes the byte-identical
+frozen bundle in Core-first order, runs public exact-version installation
+checks, and creates the GitHub Release last. Pushing a tag alone neither builds
+nor publishes a release.

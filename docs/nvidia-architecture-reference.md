@@ -1,5 +1,13 @@
 # NVIDIA GPU Architecture Reference for GAFIME
 
+> **Historical/future research note, not shipping architecture.** This July
+> 2025 snapshot preserves an exploratory hardware survey. Its tensor-core,
+> TF32, FP16, GEMM, and future-target suggestions are not implemented or
+> enabled by the current GAFIME v1 runtime and must not be treated as beta.2
+> capability or numerical policy. Current build targets are documented in
+> [`BUILD.md`](../BUILD.md); current arithmetic is governed by
+> [`precision-contract.md`](precision-contract.md).
+
 > **Research date:** July 2025
 > **Scope:** Turing (sm_75) → Blackwell Ultra — gencode flags, tensor cores, CUDA toolkit compatibility
 > **Context:** GAFIME compiles fused CUDA kernels (map-reduce, Pearson correlation, dot products)

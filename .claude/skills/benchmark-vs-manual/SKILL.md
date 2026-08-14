@@ -14,22 +14,33 @@ python .claude/skills/benchmark-vs-manual/scripts/compare_approaches.py \
   --manual-features '0,1;2,3' \
   --task classification \
   --k 10 \
-  --metric pearson
+  --metric pearson \
+  --precision mixed
 ```
 
 It compares baseline, manual, GAFIME, and combined feature sets under the same
 cross-validation splitter and model. `GafimeSelector` remains inside each
 pipeline, so candidate discovery uses only that fold's training rows.
+The output reports `release_status="not_yet_published"`. If the integration is
+missing, it keeps the exact beta.2 command under `when_published_install`; use
+the repository development environment until beta.2 is actually published.
 Feature indices refer to the reported numeric, non-target `feature_names` order;
 timestamp, identifier, and categorical columns are not silently cast to floats.
+This is a bounded sklearn integration helper: native GAFIME performs candidate
+discovery, while the compatibility transformer materializes only the selected
+columns at the Python/sklearn boundary. Do not present it as the scalable
+production data plane.
 
 Keep the claim narrow: this measures downstream predictive score for the given
 dataset, split, model, metric, operator, and seed. It is not a kernel benchmark,
 hardware throughput proof, or evidence that one feature-engineering method is
 universally better. Report fold values, mean, standard deviation, sample count,
-feature count, selected backend policy, and all preprocessing.
+feature count, selected backend capability probe, precision profile, seed, and
+all preprocessing. A capability probe is evidence about backend availability;
+it is not a kernel timing result.
 
 The helper evaluates continuous pair interactions only. Generated time-series
 and decision-path families need separate fold-local discovery and faithful
-materialization. Decision-path permutation significance is unavailable; do not
-invent p-values or reuse target-dependent paths across folds.
+materialization. Decision-path permutation maxT is supported only through
+per-permuted-target path rediscovery; do not reuse target-dependent paths across
+folds or permutations.

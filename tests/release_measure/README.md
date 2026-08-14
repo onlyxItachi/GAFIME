@@ -185,15 +185,19 @@ explicit combined timing buckets. Metal runtime/context initialization is the
 only current diagnostic-only phase because Metal exposes no separate public C
 runtime operation; CUDA and ROCm must provide the complete measured phase.
 
-The hosted Metal Beast workflow requires an explicit full
-`expected_candidate_sha`, verifies that the checkout and live PR #70 head match
-it before building, and checks the live head again around final evidence. Its
-canonical cold lane runs this same current tracked harness against the exact
-wheel-extracted baseline and candidate dylibs in four isolated A/B plus B/A
-cells. It uploads all raw samples and the hash-bound comparison manifest and
-fails unless `valid_for_canonical_cold_lifecycle_claims` is true. The typed
-historical ABI surface is accepted for the baseline only; the candidate must
-resolve the generic numeric-route surface.
+The hosted Metal Beast workflow was frozen for PR #70 qualification. It
+required an explicit full `expected_candidate_sha`, verified that the checkout
+and then-live PR #70 head matched it before building, and checked the live head
+again around final evidence. Its canonical cold lane ran this same tracked
+harness against the exact wheel-extracted baseline and candidate dylibs in four
+isolated A/B plus B/A cells. It uploaded all raw samples and the hash-bound
+comparison manifest and failed unless
+`valid_for_canonical_cold_lifecycle_claims` was true. The typed historical ABI
+surface was accepted for the baseline only; the candidate had to resolve the
+generic numeric-route surface. PR #70 is now merged, so that PR-specific
+workflow is retained as historical evidence rather than a reusable current
+release gate. Stable-runner and permanent comparative benchmark work continues
+under issue #71.
 
 The public cold envelope never invents sub-times for boundaries that the
 top-level compile/analyze API combines. Phase-by-phase cold claims come only

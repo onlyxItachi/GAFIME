@@ -12,7 +12,9 @@ from pathlib import Path
 
 
 def _strength(metric: str, value: float) -> str:
-    magnitude = abs(value) if metric in {"pearson", "spearman"} else value
+    if metric not in {"pearson", "spearman"}:
+        return "metric-specific; interpret against domain and held-out evidence"
+    magnitude = abs(value)
     if magnitude >= 0.9:
         return "very strong"
     if magnitude >= 0.7:
@@ -63,6 +65,7 @@ def explain_report(report: dict) -> dict:
 
     decision = report.get("decision") or {}
     backend = report.get("backend") or {}
+    config = report.get("config") or {}
     interactions = list(report.get("interactions", report.get("top_interactions", [])))
     stability_by_id = {
         _identity(item): item.get("metrics_std", {})
@@ -122,6 +125,13 @@ def explain_report(report: dict) -> dict:
             "configured_backend": report.get("configured_backend"),
             "selected_backend": backend.get("selected_backend", backend.get("name")),
             "execution_placement": backend.get("execution_placement"),
+            "requested_precision": backend.get(
+                "requested_precision", config.get("precision")
+            ),
+            "effective_precision": backend.get("effective_precision"),
+            "storage_dtype": backend.get("storage_dtype"),
+            "reduction_dtype": backend.get("reduction_dtype"),
+            "result_dtype": backend.get("result_dtype"),
             "interaction_count": len(interactions),
             "stability_count": len(report.get("stability", [])),
             "permutation_count": len(report.get("permutations", [])),
@@ -131,7 +141,7 @@ def explain_report(report: dict) -> dict:
         "interpretation_limits": [
             "Metric magnitude is domain-dependent and is not a model-quality guarantee.",
             "Missing p-values do not mean significance; the mode may be disabled or unsupported.",
-            "Decision-path permutation significance is unavailable in v1; bootstrap stability is supported.",
+            "Decision-path permutation maxT is supported only with path rediscovery for every permuted target; never reuse target-dependent paths.",
             "Bootstrap stability is conditional on an already-selected candidate using the same rows; it is not out-of-sample evidence and does not correct selection bias.",
             "Validate selected candidates in an untouched evaluation split or nested cross-validation.",
         ],

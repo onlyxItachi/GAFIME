@@ -18,7 +18,7 @@ except ImportError:
     HAS_POLARS = False
 
 
-def detect_time_structure(file_path: str) -> dict:
+def detect_time_structure(file_path: str, target_col: str | None = None) -> dict:
     """Detect temporal structure in a dataset."""
     path = Path(file_path)
     if not path.exists():
@@ -36,6 +36,8 @@ def detect_time_structure(file_path: str) -> dict:
         return {"error": f"Unsupported format: {path.suffix}"}
 
     n_rows, n_cols = df.shape
+    if target_col is not None and target_col not in df.columns:
+        return {"error": f"Target column not found: {target_col}"}
 
     # Detect time columns
     time_columns = []
@@ -176,7 +178,8 @@ def detect_time_structure(file_path: str) -> dict:
     # Estimate the exact v1 generated-family descriptor universe. Each valid lag
     # contributes lag/delta/velocity/acceleration and each window contributes
     # rolling mean/std/sum. Runtime row-validity guards can reduce this count.
-    target_hint = target_candidates[0]["name"] if target_candidates else None
+    inferred_target = target_candidates[0]["name"] if target_candidates else None
+    target_hint = target_col if target_col is not None else inferred_target
     numeric_cols = [
         name
         for name, dtype in df.schema.items()
@@ -196,6 +199,8 @@ def detect_time_structure(file_path: str) -> dict:
         "time_columns": time_columns,
         "group_candidates": group_candidates[:5],
         "target_candidates": target_candidates[:3],
+        "target_used_for_estimate": target_hint,
+        "target_source": "explicit" if target_col is not None else "heuristic",
         "detected_granularity": granularity,
         "recommended_lags": recommended_lags,
         "recommended_windows": recommended_windows,
@@ -230,9 +235,10 @@ def detect_time_structure(file_path: str) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="GAFIME Time-Series Structure Detector")
     parser.add_argument("file", help="Path to CSV or Parquet file")
+    parser.add_argument("--target", "-t", default=None, help="Known target column name")
     args = parser.parse_args()
 
-    report = detect_time_structure(args.file)
+    report = detect_time_structure(args.file, target_col=args.target)
     print(json.dumps(report, indent=2, default=str))
     return 0
 

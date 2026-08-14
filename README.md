@@ -17,17 +17,25 @@ Python loops or model-by-model trial code.
 
 ## Install
 
+Beta.2 is not yet published. The exact-version commands below are the intended
+public install surface once it is published; until then, use the source checkout
+instructions in [BUILD.md](BUILD.md).
+
 Core package:
 
 ```bash
-pip install gafime
+python -m pip install "gafime==1.0.0b2"
 ```
+
+Beta.2 is a prerelease, so its public install commands use the exact PEP 440
+version shown above; an unqualified `pip install gafime` continues to prefer
+the latest stable release.
 
 Optional Python integrations:
 
 ```bash
-pip install "gafime[sklearn]"
-pip install "gafime[bench]"
+python -m pip install "gafime[sklearn]==1.0.0b2"
+python -m pip install "gafime[bench]==1.0.0b2"
 ```
 
 Vendor GPU payloads are explicit in the v1 distribution design. Pip can select
@@ -35,8 +43,8 @@ wheels by Python, ABI, OS, and CPU architecture, but not by local GPU vendor.
 GPU payloads therefore use explicit same-version package selection:
 
 ```bash
-pip install gafime gafime-cuda
-pip install gafime gafime-rocm
+python -m pip install "gafime==1.0.0b2" "gafime-cuda==1.0.0b2"
+python -m pip install "gafime==1.0.0b2" "gafime-rocm==1.0.0b2"
 ```
 
 Core has no dependency on either payload; each payload requires the exact
@@ -69,10 +77,19 @@ Detailed install and backend policy:
 ```python
 from gafime import ComputeBudget, EngineConfig, GafimeEngine
 
+X = [
+    [float(i), float((i * 7) % 11), float((i % 5) - 2)]
+    for i in range(64)
+]
+y = [0.4 * row[0] * row[1] - 0.2 * row[2] for row in X]
+feature_names = ["trend", "cycle", "offset"]
+
 config = EngineConfig(
     backend="auto",
     precision="mixed",
     metric_names=("pearson", "r2"),
+    permutation_tests=0,
+    num_repeats=1,
     budget=ComputeBudget(max_comb_size=2),
 )
 
@@ -84,7 +101,7 @@ print(report.interactions[:5])
 `precision` is the single public arithmetic profile and is keyword-only.
 `"mixed"` is the default: fp32 ingest/storage and pointwise interaction work,
 with fp64 reductions, ranking, and public results. `"fp32"` keeps all four
-numeric domains in fp32 for maximum throughput. `"fp64"` preserves fp64 from
+numeric domains in fp32. `"fp64"` preserves fp64 from
 ingest through public results without an fp32 staging conversion.
 Core, CUDA, and ROCm support all three profiles
 in their existing packages.
@@ -163,7 +180,9 @@ It should not be used as a runtime data-flow path.
 ## Developer Docker Images
 
 Docker files in this repository are development environments, not distribution
-images. Normal users should install GAFIME from PyPI wheels.
+images. Normal users should install the published artifacts described above;
+the prebuilt thin ROCm wheel comes from the matching GitHub Release rather than
+PyPI.
 
 Available source-build containers:
 
@@ -197,6 +216,10 @@ machine-checked mapping and recovery rules.
 
 ## Project References
 
+- [docs/contract.md](docs/contract.md) (normative v1 architecture and ownership)
+- [docs/abi-evolution.md](docs/abi-evolution.md) (ABI 1.0/1.1 evolution and compatibility)
+- [SECURITY.md](SECURITY.md) and
+  [docs/security/threat-model.md](docs/security/threat-model.md)
 - [docs/releases/v1.0.0-beta.2.md](docs/releases/v1.0.0-beta.2.md)
 - [docs/releases/release-artifact-matrix.md](docs/releases/release-artifact-matrix.md)
 - [docs/releases/v1.0.0b1.md](docs/releases/v1.0.0b1.md) (aborted packaging checkpoint)

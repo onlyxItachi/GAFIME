@@ -21,12 +21,31 @@ except ImportError:
     HAS_POLARS = False
 
 
+def _resident_element_bytes(precision: str) -> int:
+    if precision not in {"fp32", "mixed", "fp64"}:
+        raise ValueError("precision must be one of: fp32, mixed, fp64")
+    return 8 if precision == "fp64" else 4
+
+
+def _recommended_batch_size(
+    n_rows: int, bytes_per_row: int, usable_vram_bytes: int
+) -> int:
+    if n_rows <= 0 or bytes_per_row <= 0 or usable_vram_bytes <= 0:
+        return 0
+    max_rows = usable_vram_bytes // bytes_per_row
+    if max_rows <= 0:
+        return 0
+    aligned = (max_rows // 1024) * 1024 if max_rows >= 1024 else max_rows
+    return min(n_rows, aligned)
+
+
 def profile_dataset(
     file_path: str,
     target_col: str = None,
     vram_gb: float = 6.0,
     max_arity: int = 2,
     max_combinations_per_arity: int = 5000,
+    precision: str = "mixed",
 ) -> dict:
     """Profile a dataset file and return analysis report."""
     path = Path(file_path)
@@ -101,7 +120,7 @@ def profile_dataset(
     n_features = len(feature_cols)
 
     # Memory estimates
-    bytes_per_element = 4  # float32
+    bytes_per_element = _resident_element_bytes(precision)
     raw_feature_bytes = n_rows * n_features * bytes_per_element
     raw_feature_mb = raw_feature_bytes / (1024 * 1024)
     target_bytes = n_rows * bytes_per_element
@@ -114,9 +133,9 @@ def profile_dataset(
     # Optimal batch size if streaming needed
     if not fits_resident_input and n_features > 0:
         bytes_per_row = n_features * bytes_per_element + bytes_per_element
-        max_rows = int(usable_vram_mb * 1024 * 1024 / bytes_per_row)
-        optimal_batch = (max_rows // 1024) * 1024  # GPU-friendly alignment
-        optimal_batch = max(1024, optimal_batch)
+        optimal_batch = _recommended_batch_size(
+            n_rows, bytes_per_row, int(usable_vram_mb * 1024 * 1024)
+        )
     else:
         optimal_batch = n_rows
 
@@ -159,7 +178,9 @@ def profile_dataset(
         "numeric_columns": len(numeric_cols),
         "feature_columns": n_features,
         "target": target_info,
+        "precision": precision,
         "memory": {
+            "resident_element_bytes": bytes_per_element,
             "raw_features_mb": round(raw_feature_mb, 2),
             "minimum_resident_input_mb": round(resident_input_mb, 2),
             "available_vram_mb": round(usable_vram_mb, 2),
@@ -196,6 +217,7 @@ def main():
     parser.add_argument("file", help="Path to CSV or Parquet file")
     parser.add_argument("--target", "-t", help="Target column name", default=None)
     parser.add_argument("--vram", "-v", type=float, default=6.0, help="Available VRAM in GB (default: 6.0)")
+    parser.add_argument("--precision", default="mixed", choices=["fp32", "mixed", "fp64"])
     parser.add_argument("--max-arity", type=int, default=2, choices=range(1, 6))
     parser.add_argument(
         "--max-combinations-per-arity",
@@ -211,6 +233,7 @@ def main():
         vram_gb=args.vram,
         max_arity=args.max_arity,
         max_combinations_per_arity=args.max_combinations_per_arity,
+        precision=args.precision,
     )
     print(json.dumps(report, indent=2))
     return 0

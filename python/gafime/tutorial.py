@@ -154,7 +154,8 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
         _md(
             "For model evaluation, place `GafimeSelector` inside a scikit-learn "
             "Pipeline so discovery is refit on every training fold. Install the "
-            'optional integration with `pip install "gafime[sklearn]"`.'
+            'optional integration once beta.2 is published with `python -m pip install '
+            '"gafime[sklearn]==1.0.0b2"`.'
         ),
     ]
     notebook = {

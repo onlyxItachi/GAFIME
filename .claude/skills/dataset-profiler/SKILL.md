@@ -11,14 +11,16 @@ Run:
 python .claude/skills/dataset-profiler/scripts/profile_dataset.py data.parquet \
   --target target \
   --vram 8 \
+  --precision mixed \
   --max-arity 3 \
   --max-combinations-per-arity 5000
 ```
 
-The JSON output includes numeric columns, nulls, constant columns, a conservative
-float32 input-buffer estimate, the combinatorial universe for each arity, the
-planned cap, and candidate-row evaluations. Arity is limited to the v1 range
-`1..5`.
+The JSON output includes numeric columns, nulls, constant columns, a
+precision-aware resident-input estimate, the combinatorial universe for each
+arity, the planned cap, and candidate-row evaluations. `fp32` and `mixed` use
+four-byte resident input; `fp64` uses eight-byte resident input. Arity is limited
+to the v1 range `1..5`.
 
 The resident-input estimate is not peak memory. It excludes backend workspaces,
 MI histograms, descriptor/result storage, significance replay, generated-family

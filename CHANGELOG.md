@@ -1,9 +1,9 @@
 # Changelog
 
-## v1.0.0-beta.2 (2026-08-14)
+## v1.0.0-beta.2 (unreleased)
 
-Public GAFIME v1 beta.2 release. Python and PyPI identify the same release as
-`1.0.0b2`.
+Prepared GAFIME v1 beta.2 release record. When published, Python and PyPI
+identify the same release as `1.0.0b2`.
 
 - Added public interaction-materialization overflow diagnostics across Core,
   CUDA, ROCm, and Metal without eagerly paying the diagnostics cost on every

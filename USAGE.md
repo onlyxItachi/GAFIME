@@ -15,8 +15,8 @@ config = EngineConfig(
         max_comb_size=2,                # Maximum interaction depth (1 = unary, 2 = pairs, 3 = trios)
         max_combinations_per_k=5000,    # Max combinations to search at each depth dimension
         top_features_for_higher_k=50,   # How many of the best unary features pass to the pairwise step
-        keep_in_vram=True,              # Keeps data pinned to GPU VRAM for the entire analysis
-        vram_budget_mb=6144             # Defines the maximum VRAM we allocate (e.g. 6GB on an RTX 4060)
+        keep_in_vram=True,              # Allows the selected backend's bounded resident cache
+        vram_budget_mb=6144             # GPU admission budget when a GPU backend is selected
     ),
     metric_names=("pearson", "spearman", "mutual_info", "r2"), # Metrics to evaluate interactions against
     num_repeats=3,                      # Selected-candidate bootstrap repeat count
@@ -223,7 +223,7 @@ selector.fit(X, y)
 * **`multiply`**: $X_1 \times X_2$ (Most common).
 * **`add`**: $X_1 + X_2$.
 * **`subtract`**: $X_1 - X_2$.
-* **`divide`**: $X_1 \div X_2$ (Protected against division by zero via epsilon addition).
+* **`divide`**: $X_1 \div X_2$ (Uses a guarded positive epsilon denominator when $|X_2|$ is too small).
 
 ## Using the Underlying Report
 
@@ -241,10 +241,10 @@ report = engine.analyze(X, y)
 
 print(f"Signal Detected: {report.decision.signal_detected}")
 
-# View the raw stability variance of the top interaction
+# View the conditional bootstrap metric standard deviation for the top interaction
 print(report.stability[0].metrics_std)
 
-# View the exact p-value against the random noise threshold!
+# View finite-permutation family-wise maxT p-values when requested and supported
 print(report.permutations[0].p_values)
 ```
 

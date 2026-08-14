@@ -62,8 +62,14 @@ Tracked project source, runtime, test, and documentation content must converge i
 - `python/gafime/`
 - `tests/`
 - `docs/`
+- `.claude/skills/` for tracked maintainer/agent guidance and bounded helper
+  scripts only
 
 Do not add new source/runtime/test/documentation homes outside those roots. All needed artifacts must be moved into the relevant allowed root before old locations are disconnected.
+
+Tracked skills must remain operational guidance and validation helpers. They
+must not become a runtime input, a backend implementation home, or a way to
+bypass the ownership, safety, numerical, PR, or release rules in this contract.
 
 `docs/` is the repo's historical and design record. Agents may read it and may add new documentation when the task requires it, but must not rewrite, delete, or collapse historical docs without explicit maintainer approval.
 
@@ -71,11 +77,23 @@ Do not add new source/runtime/test/documentation homes outside those roots. All 
 
 Required root metadata and bootstrap files may exist only when they are needed to build, package, discover, or govern the repo. They must not contain backend implementation logic, fallback behavior, source orchestration, or hidden runtime ownership.
 
-Ignored local agent memory, release scratch, editor state, and Claude/agent skill artifacts are outside this tracked-layout rule, but they must stay ignored and must not become required runtime inputs.
+Ignored local agent memory, release scratch, editor state, and generated
+agent/skill caches are outside this tracked-layout rule, but they must stay
+ignored and must not become required runtime inputs.
 
 ## PR And Main Gate
 
 Testing, review, and pushes for implementation work must happen on a feature branch and PR. Do not contribute implementation changes directly to `main`.
+
+Keep changes reviewable and semantically focused. Independent architecture,
+feature, and fix work belongs in separate focused or explicitly stacked PRs;
+mutually dependent documentation, validation, and implementation needed to
+make one change coherent may remain together.
+
+Autonomous and AI-assisted contributions are subject to the same contracts,
+tests, evidence, review, provenance, safety, numerical, and release gates as
+every other contribution. Agent authorship neither weakens those gates nor
+creates an additional human-authorship or approving-review requirement.
 
 `main` remains protected and accepts tracked changes only through a pull request. The required GitHub approving-review count is zero; independent human approval is not required. `@onlyxItachi` is the sole final merge authority.
 
@@ -324,7 +342,10 @@ Validation always starts from the top-level Python API to guarantee user-space s
 Each PR must validate:
 
 - numerical correctness: bit parity against the approved reference implementation whenever possible; otherwise, documented and approved numerical tolerance
-- performance: backend-local benchmarks, end-to-end Python API benchmarks, and performance reports for every changed critical path
+- performance: validation proportionate to every affected critical path,
+  including backend-local and end-to-end Python API evidence when execution
+  behavior changes; documentation/governance-only changes do not require
+  unrelated benchmark campaigns
 - ABI stability: public ABI compatibility, Rust/C boundary compatibility, and Python API compatibility
 - contract compatibility: ownership rules, safety rules, compiler-chain rules, and extension policy
 - documentation: implementation documentation, a reference to the design location, and at least one Markdown design document
