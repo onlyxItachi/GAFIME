@@ -1,9 +1,9 @@
 # Changelog
 
-## v1.0.0-beta.2 (2026-07-27)
+## v1.0.0-beta.2 (2026-08-14)
 
-Third public beta candidate of the GAFIME v1 native runtime. Python and PyPI
-identify the same release as `1.0.0b2`.
+Public GAFIME v1 beta.2 release. Python and PyPI identify the same release as
+`1.0.0b2`.
 
 - Added public interaction-materialization overflow diagnostics across Core,
   CUDA, ROCm, and Metal without eagerly paying the diagnostics cost on every
@@ -36,6 +36,17 @@ identify the same release as `1.0.0b2`.
   storage/pointwise with fp64 statistics/results), and end-to-end `fp64`.
   Core, CUDA, and ROCm carry all three profiles in their existing artifacts;
   embedded Apple Metal carries fp32 only and fails closed for mixed/fp64.
+- Preserved the frozen ABI 1.0 surface through shared modern internals and
+  established one canonical generic numeric-route ABI 1.1 surface, with an
+  additive synthetic ABI 1.2 compatibility fixture.
+- Made production Core scoring candidate-parallel through Rayon with
+  worker-local precision scratch, per-candidate SIMD/native arithmetic,
+  guarded scalar fallbacks, and deterministic result and ranking order.
+- Established the pre-RC security policy, private-reporting path, threat model,
+  and standard-scan baseline. Release-blocking findings were closed with
+  explicit unsafe raw-descriptor contracts, canonical tar/ZIP member
+  validation, CUDA/ROCm caller-device restoration, and strict workflow-input
+  handling.
 
 ## v1.0.0b1 (2026-07-26, aborted)
 
