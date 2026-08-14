@@ -1,12 +1,35 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import importlib.metadata as metadata
 import json
 import os
 import platform
 import shutil
 import subprocess
+
+
+RELEASE_STATUS = "not_yet_published"
+CURRENT_INSTALL_GUIDANCE = (
+    "GAFIME 1.0.0b2 is not yet published; use the repository development "
+    "environment until publication completes."
+)
+WHEN_PUBLISHED_CORE_INSTALL = 'pip install "gafime==1.0.0b2"'
+WHEN_PUBLISHED_CUDA_INSTALL = (
+    'pip install "gafime==1.0.0b2" "gafime-cuda==1.0.0b2"'
+)
+WHEN_PUBLISHED_ROCM_INSTALL = (
+    'pip install "gafime==1.0.0b2" "gafime-rocm==1.0.0b2"'
+)
+
+
+def _release_install_fields(command: str) -> dict[str, str]:
+    return {
+        "release_status": RELEASE_STATUS,
+        "current_install_guidance": CURRENT_INSTALL_GUIDANCE,
+        "when_published_install": command,
+    }
 
 
 def _dist_version(name: str) -> str | None:
@@ -54,7 +77,24 @@ def _amd_rocm_hint() -> list[str] | None:
     return None
 
 
+def _payload_version_warnings(payloads: dict[str, str | None]) -> list[str]:
+    core = payloads.get("gafime")
+    if core is None:
+        return []
+    return [
+        f"{name} {version} does not match gafime {core}; payloads require exact Core alignment."
+        for name, version in sorted(payloads.items())
+        if name != "gafime" and version is not None and version != core
+    ]
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Detect the supported GAFIME platform")
+    parser.add_argument(
+        "--precision", default="mixed", choices=["fp32", "mixed", "fp64"]
+    )
+    args = parser.parse_args()
+
     system = platform.system()
     machine = platform.machine()
     system_l = system.lower()
@@ -69,23 +109,26 @@ def main() -> int:
         "os": system,
         "machine": machine,
         "python": platform.python_version(),
+        "requested_precision": args.precision,
         "nvidia": nvidia,
         "amd_rocm": amd_rocm,
         "payload_distributions": payloads,
         "recommended_backend": "core",
-        "recommended_install": "pip install gafime",
+        **_release_install_fields(WHEN_PUBLISHED_CORE_INSTALL),
         "capability_probe": None,
         "notes": [
             "backend='auto' ranks validated GPU payloads above Rust Core.",
             "Explicit cuda, rocm, and metal requests never fall back to another backend.",
             "Family generation and scoring placement are separate capability facts.",
+            "Once published, beta.2 will provide dedicated wheels for CPython 3.10 through 3.14.",
         ],
     }
+    result["notes"].extend(_payload_version_warnings(payloads))
 
     try:
         from gafime import backend_capabilities
 
-        caps = backend_capabilities("auto", probe=True)
+        caps = backend_capabilities("auto", probe=True, precision=args.precision)
         result["capability_probe"] = caps.to_dict()
         if caps.selected_backend:
             result["recommended_backend"] = caps.selected_backend
@@ -93,12 +136,24 @@ def main() -> int:
         result["notes"].append(f"installed capability probe unavailable: {type(exc).__name__}: {exc}")
 
     if system_l == "darwin" and machine_l in {"arm64", "aarch64"}:
-        result["recommended_install"] = "pip install gafime"
-        result["notes"].append("Metal is bundled in the macOS arm64 Core wheel and is selected only after a successful runtime probe.")
+        result["when_published_install"] = WHEN_PUBLISHED_CORE_INSTALL
+        result["notes"].append(
+            "Metal is bundled in the macOS arm64 Core wheel, supports fp32 only, "
+            "and is selected only after a successful runtime probe."
+        )
+        if args.precision != "fp32":
+            result["notes"].append(
+                "The requested precision excludes Metal; auto may select Rust Core."
+            )
     elif nvidia and machine_l in {"x86_64", "amd64", "x64"}:
-        result["recommended_install"] = "pip install gafime gafime-cuda"
+        result["when_published_install"] = WHEN_PUBLISHED_CUDA_INSTALL
     elif amd_rocm and system_l == "linux" and machine_l in {"x86_64", "amd64", "x64"}:
-        result["recommended_install"] = "pip install gafime gafime-rocm"
+        result["when_published_install"] = WHEN_PUBLISHED_ROCM_INSTALL
+        result["notes"].append(
+            "Once published, PyPI will provide the buildable ROCm sdist; the matching "
+            "GitHub Release will carry the prebuilt thin raw-Linux wheel. Both use the "
+            "system ROCm runtime."
+        )
     elif amd_rocm and system_l == "windows":
         result["notes"].append("ROCm payload wheels are not distributed for Windows; use backend='core'.")
 

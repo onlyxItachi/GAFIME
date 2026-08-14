@@ -10,11 +10,59 @@ import tempfile
 from pathlib import Path
 
 
+RELEASE_STATUS = "not_yet_published"
+
+
 def _dist_version(name: str) -> str | None:
     try:
         return metadata.version(name)
     except metadata.PackageNotFoundError:
         return None
+
+
+def _validate_distribution_versions(
+    installed: dict[str, str | None], *, runtime_version: str | None = None
+) -> str:
+    """Require every installed vendor payload to match installed Core exactly."""
+
+    core_version = installed.get("gafime")
+    if core_version is None:
+        raise RuntimeError("the gafime Core distribution is not installed")
+    if runtime_version is not None and runtime_version != core_version:
+        raise RuntimeError(
+            "imported gafime/runtime metadata mismatch: "
+            f"runtime={runtime_version}, distribution={core_version}"
+        )
+    mismatches = {
+        name: version
+        for name, version in installed.items()
+        if name != "gafime" and version is not None and version != core_version
+    }
+    if mismatches:
+        detail = ", ".join(
+            f"{name}={version} (Core={core_version})"
+            for name, version in sorted(mismatches.items())
+        )
+        raise RuntimeError(f"payload/Core exact-version mismatch: {detail}")
+    return json.dumps(installed, sort_keys=True)
+
+
+def _validate_python_version(
+    version_info: tuple[int, ...], *, implementation: str = "CPython"
+) -> str:
+    """Require a CPython minor covered by the beta.2 release matrix."""
+
+    if implementation != "CPython":
+        raise RuntimeError(
+            f"GAFIME 1.0.0b2 supports CPython only; found {implementation}"
+        )
+    major_minor = tuple(version_info[:2])
+    if major_minor not in {(3, minor) for minor in range(10, 15)}:
+        raise RuntimeError(
+            "GAFIME 1.0.0b2 supports CPython 3.10 through 3.14; "
+            f"found {major_minor[0]}.{major_minor[1]}"
+        )
+    return f"{major_minor[0]}.{major_minor[1]} (release-tested 3.10-3.14)"
 
 
 def main() -> int:
@@ -29,11 +77,19 @@ def main() -> int:
             checks.append((name, status, f"{type(exc).__name__}: {exc}"))
 
     def python_version() -> str:
-        if sys.version_info < (3, 10):
-            raise RuntimeError("GAFIME requires Python 3.10 or newer")
-        return f"{platform.python_version()} (>= 3.10 required)"
+        _validate_python_version(
+            sys.version_info, implementation=platform.python_implementation()
+        )
+        return f"{platform.python_version()} (release-tested 3.10-3.14)"
 
     check("Python", python_version)
+    check(
+        "Release status",
+        lambda: (
+            f"release_status={RELEASE_STATUS}; use the repository development "
+            "environment until beta.2 is published"
+        ),
+    )
 
     def import_gafime() -> str:
         import gafime
@@ -43,21 +99,27 @@ def main() -> int:
     check("GAFIME", import_gafime)
 
     def distributions() -> str:
+        import gafime
+
         installed = {
             name: _dist_version(name)
             for name in ("gafime", "gafime-cuda", "gafime-rocm")
         }
-        return json.dumps(installed, sort_keys=True)
+        return _validate_distribution_versions(
+            installed, runtime_version=gafime.__version__
+        )
 
-    check("Distribution versions", distributions)
+    check("Exact distribution versions", distributions)
 
     def capability_snapshot() -> str:
         from gafime import backend_capabilities
 
-        caps = backend_capabilities("auto", probe=True)
+        caps = backend_capabilities("auto", probe=True, precision="mixed")
+        precision = caps.precision_contract.value
         return (
             f"status={caps.selection_status}, selected={caps.selected_backend}, "
-            f"boundary={caps.native_boundary.value}, version={caps.native_version.value}"
+            f"boundary={caps.native_boundary.value}, version={caps.native_version.value}, "
+            f"precision={json.dumps(precision, sort_keys=True)}"
         )
 
     check("Backend capability probe", capability_snapshot)
@@ -88,18 +150,29 @@ def main() -> int:
             for index in range(80)
         ]
         target = [row[0] * row[1] for row in features]
-        report = GafimeEngine(
-            EngineConfig(
-                backend="core",
-                metric_names=("pearson", "r2"),
-                budget=ComputeBudget(max_comb_size=2, max_combinations_per_k=8),
-                permutation_tests=0,
-                num_repeats=1,
-            )
-        ).analyze(features, target)
-        if report.backend is None or report.backend.selected_backend != "core":
-            raise AssertionError(f"unexpected Core report backend: {report.backend!r}")
-        return f"{len(report.interactions)} interactions"
+        summaries = []
+        for precision in ("fp32", "mixed", "fp64"):
+            report = GafimeEngine(
+                EngineConfig(
+                    backend="core",
+                    metric_names=("pearson", "r2"),
+                    budget=ComputeBudget(max_comb_size=2, max_combinations_per_k=8),
+                    permutation_tests=0,
+                    num_repeats=1,
+                    precision=precision,
+                )
+            ).analyze(features, target)
+            if report.backend is None or report.backend.selected_backend != "core":
+                raise AssertionError(
+                    f"unexpected Core report backend: {report.backend!r}"
+                )
+            if report.backend.effective_precision != precision:
+                raise AssertionError(
+                    "Core report precision mismatch: "
+                    f"requested={precision}, effective={report.backend.effective_precision}"
+                )
+            summaries.append(f"{precision}={len(report.interactions)}")
+        return "interactions: " + ", ".join(summaries)
 
     check("Rust Core analysis", core_engine)
 

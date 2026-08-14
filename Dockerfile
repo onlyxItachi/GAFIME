@@ -23,9 +23,7 @@ ARG CUDA_PAYLOAD_DIR=/tmp/gafime-cuda-payload
 
 ENV DEBIAN_FRONTEND=noninteractive \
     VIRTUAL_ENV=/opt/gafime-venv \
-    PATH="/opt/gafime-venv/bin:/root/.cargo/bin:${PATH}" \
-    GAFIME_SKIP_ROCM=1 \
-    STRICT_CPU=1
+    PATH="/opt/gafime-venv/bin:/root/.cargo/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \

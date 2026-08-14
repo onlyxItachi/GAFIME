@@ -11,6 +11,7 @@ Prefer live report properties:
 top = report.interactions.top_k(10, metric_name="pearson")
 print(report.configured_backend)
 print(report.backend.selected_backend, report.backend.execution_placement)
+print(report.backend.effective_precision, report.backend.result_dtype)
 print(report.decision)
 for item in top:
     print(item.candidate_id, item.family, item.expression, item.metrics)
@@ -38,8 +39,9 @@ Keep interpretation conservative:
   bias.
 - Permutation rows exist only when supported and requested; absence never means
   significant.
-- Decision-path permutation significance is unavailable in v1, while bootstrap
-  stability is supported.
+- Decision-path permutation maxT and bootstrap stability are supported.
+  Permutation evidence is valid only because paths are rediscovered separately
+  for every permuted target.
 - `signal_detected` applies configured strength, stability, and significance
   policy; it does not replace held-out model validation.
 

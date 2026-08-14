@@ -19,9 +19,12 @@ def generate_pipeline_script(
     k: int = 10,
     operator: str = "multiply",
     metric: str = "pearson",
+    precision: str = "mixed",
 ) -> str:
     """Generate a complete pipeline script."""
 
+    if precision not in {"fp32", "mixed", "fp64"}:
+        raise ValueError("precision must be one of: fp32, mixed, fp64")
     if task == "classification" and model == "ridge":
         raise ValueError("ridge is a regression model; use logistic for classification")
     if task == "regression" and model == "logistic":
@@ -72,6 +75,9 @@ def generate_pipeline_script(
     model_import = model_imports.get(model, model_imports[default_model])
     model_constructor = model_constructors.get(model, model_constructors[default_model])
 
+    # Pointwise/materialized input follows the public storage route.
+    numpy_dtype = "np.float64" if precision == "fp64" else "np.float32"
+
     # Data loading section
     if data_path:
         ext = Path(data_path).suffix
@@ -88,8 +94,8 @@ feature_cols = [
 ]
 if not feature_cols:
     raise ValueError("No numeric feature columns remain after excluding the target")
-X = df.select(feature_cols).to_numpy().astype(np.float32)
-y = df["{target}"].to_numpy().astype(np.float32)
+X = df.select(feature_cols).to_numpy().astype({numpy_dtype})
+y = df["{target}"].to_numpy().astype({numpy_dtype})
 feature_names = feature_cols
 print(f"Loaded {{X.shape[0]}} samples x {{X.shape[1]}} features from {data_path}")'''
         else:
@@ -105,17 +111,17 @@ feature_cols = [
 ]
 if not feature_cols:
     raise ValueError("No numeric feature columns remain after excluding the target")
-X = df.select(feature_cols).to_numpy().astype(np.float32)
-y = df["{target}"].to_numpy().astype(np.float32)
+X = df.select(feature_cols).to_numpy().astype({numpy_dtype})
+y = df["{target}"].to_numpy().astype({numpy_dtype})
 feature_names = feature_cols
 print(f"Loaded {{X.shape[0]}} samples x {{X.shape[1]}} features from {data_path}")'''
     else:
         data_load = f'''# Generate synthetic data (replace with your own data loading)
 n_samples, n_features = 5000, 20
-X = np.random.randn(n_samples, n_features).astype(np.float32)
+X = np.random.randn(n_samples, n_features).astype({numpy_dtype})
 # Plant a signal: target depends on interaction of features 0 and 1
-y = (0.7 * X[:, 0] * X[:, 1] + 0.3 * X[:, 2] + 0.1 * np.random.randn(n_samples)).astype(np.float32)
-{"y = (y > np.median(y)).astype(np.float32)  # Convert to binary for classification" if task == "classification" else ""}
+y = (0.7 * X[:, 0] * X[:, 1] + 0.3 * X[:, 2] + 0.1 * np.random.randn(n_samples)).astype({numpy_dtype})
+{"y = (y > np.median(y)).astype(" + numpy_dtype + ")  # Convert to binary for classification" if task == "classification" else ""}
 feature_names = [f"feature_{{i}}" for i in range(n_features)]
 print(f"Generated {{X.shape[0]}} samples x {{X.shape[1]}} features (synthetic)")'''
 
@@ -140,6 +146,7 @@ from sklearn.metrics import {
     else "r2_score, mean_squared_error"
 }
 {model_import}
+from gafime import backend_capabilities
 from gafime.sklearn import GafimeSelector
 
 # ============================================================================
@@ -162,6 +169,14 @@ print(f"Train: {{X_train.shape[0]}} samples, Test: {{X_test.shape[0]}} samples")
 # 3. GAFIME PIPELINE
 # ============================================================================
 
+capability = backend_capabilities("auto", probe=True, precision="{precision}")
+print(
+    "GAFIME capability probe: "
+    f"configured={{capability.configured_backend}}, "
+    f"selected={{capability.selected_backend}}, "
+    f"status={{capability.selection_status}}, precision={precision}"
+)
+
 # GafimeSelector discovers the top {k} most predictive feature interactions
 # during fit() and appends them as new columns during transform()
 pipeline = Pipeline([
@@ -170,6 +185,7 @@ pipeline = Pipeline([
         backend="auto",       # Platform-aware native backend selection
         metric="{metric}",
         operator="{operator}",
+        precision="{precision}",
     )),
     ("scaler", StandardScaler()),
     ("model", {model_constructor}),
@@ -249,6 +265,7 @@ def main():
         default="pearson",
         choices=["pearson", "spearman", "mutual_info", "r2"],
     )
+    parser.add_argument("--precision", default="mixed", choices=["fp32", "mixed", "fp64"])
     parser.add_argument("--output", "-o", default="gafime_pipeline.py", help="Output script path")
     args = parser.parse_args()
 
@@ -260,6 +277,7 @@ def main():
         k=args.k,
         operator=args.operator,
         metric=args.metric,
+        precision=args.precision,
     )
 
     output_path = Path(args.output)

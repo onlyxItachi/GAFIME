@@ -14,6 +14,29 @@ from pathlib import Path
 import numpy as np
 
 
+RELEASE_STATUS = "not_yet_published"
+WHEN_PUBLISHED_SKLEARN_INSTALL = "pip install 'gafime[sklearn]==1.0.0b2'"
+
+
+def _divide_values(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """Match ``GafimeSelector``'s guarded small-denominator materialization."""
+
+    epsilon = np.asarray(1e-8, dtype=left.dtype).item()
+    denominator = np.where(np.abs(right) > epsilon, right, epsilon)
+    return left / denominator
+
+
+def _missing_gafime_install_record() -> dict[str, str]:
+    return {
+        "error": (
+            "scikit-learn or gafime.sklearn is unavailable. GAFIME 1.0.0b2 "
+            "is not yet published; use the repository development environment."
+        ),
+        "release_status": RELEASE_STATUS,
+        "when_published_install": WHEN_PUBLISHED_SKLEARN_INSTALL,
+    }
+
+
 def run_comparison(
     X: np.ndarray,
     y: np.ndarray,
@@ -24,6 +47,7 @@ def run_comparison(
     n_folds: int = 5,
     feature_names: list = None,
     metric: str = "pearson",
+    precision: str = "mixed",
 ) -> dict:
     """Run three-way comparison: baseline, manual, GAFIME."""
 
@@ -43,8 +67,22 @@ def run_comparison(
         cv_factory = lambda: KFold(n_splits=n_folds, shuffle=True, random_state=42)
 
     results = {
+        "release_status": RELEASE_STATUS,
         "feature_names": list(feature_names) if feature_names is not None else None,
         "feature_index_contract": "indices refer to numeric non-target columns in feature_names order",
+        "run_contract": {
+            "sample_count": int(X.shape[0]),
+            "input_feature_count": int(X.shape[1]),
+            "fold_count": int(n_folds),
+            "task": task,
+            "model_scoring": scoring,
+            "interaction_metric": metric,
+            "operator": operator,
+            "precision": precision,
+            "backend_policy": "auto",
+            "seed": 42,
+            "preprocessing": "numeric non-target columns; float64 only for fp64, otherwise float32",
+        },
     }
 
     # Experiment 1: Baseline (original features only)
@@ -72,7 +110,7 @@ def run_comparison(
             elif operator == "subtract":
                 manual_features.append(X[:, i] - X[:, j])
             elif operator == "divide":
-                manual_features.append(X[:, i] / (X[:, j] + 1e-8))
+                manual_features.append(_divide_values(X[:, i], X[:, j]))
 
         X_manual = np.column_stack([X] + manual_features)
 
@@ -91,17 +129,31 @@ def run_comparison(
 
     # Experiment 3: GAFIME features
     try:
+        from gafime import backend_capabilities
         from gafime.sklearn import GafimeSelector
 
+        capability = backend_capabilities("auto", probe=True, precision=precision)
+        results["run_contract"]["backend_capability_probe"] = {
+            "configured_backend": capability.configured_backend,
+            "selected_backend": capability.selected_backend,
+            "selection_status": capability.selection_status,
+        }
+
         pipe_gafime = Pipeline([
-            ("gafime", GafimeSelector(k=k, backend="auto", metric=metric, operator=operator)),
+            ("gafime", GafimeSelector(k=k, backend="auto", metric=metric, operator=operator, precision=precision)),
             ("scaler", StandardScaler()),
             ("model", model_factory()),
         ])
         scores_gafime = cross_val_score(pipe_gafime, X, y, cv=cv_factory(), scoring=scoring)
 
         # Get the discovered interactions from a full fit
-        gafime_selector = GafimeSelector(k=k, backend="auto", metric=metric, operator=operator)
+        gafime_selector = GafimeSelector(
+            k=k,
+            backend="auto",
+            metric=metric,
+            operator=operator,
+            precision=precision,
+        )
         gafime_selector.fit(X, y)
 
         discovered = []
@@ -121,13 +173,13 @@ def run_comparison(
             "discovered_interactions": discovered,
         }
     except ImportError:
-        results["gafime"] = {"error": "scikit-learn or gafime.sklearn not available. Install with: pip install gafime[sklearn]"}
+        results["gafime"] = _missing_gafime_install_record()
 
     # Experiment 4: Combined (manual + GAFIME) if both available
     if "manual" in results and "gafime" in results and "error" not in results["gafime"]:
         try:
             pipe_combined = Pipeline([
-                ("gafime", GafimeSelector(k=k, backend="auto", metric=metric, operator=operator)),
+                ("gafime", GafimeSelector(k=k, backend="auto", metric=metric, operator=operator, precision=precision)),
                 ("scaler", StandardScaler()),
                 ("model", model_factory()),
             ])
@@ -175,6 +227,7 @@ def main():
         default="pearson",
         choices=["pearson", "spearman", "mutual_info", "r2"],
     )
+    parser.add_argument("--precision", default="mixed", choices=["fp32", "mixed", "fp64"])
     args = parser.parse_args()
 
     # Load data
@@ -201,8 +254,9 @@ def main():
         ]
         if not feature_cols:
             raise ValueError("No numeric feature columns remain after excluding the target")
-        X = df.select(feature_cols).to_numpy().astype(np.float32)
-        y = df[args.target].to_numpy().astype(np.float32)
+        dtype = np.float64 if args.precision == "fp64" else np.float32
+        X = df.select(feature_cols).to_numpy().astype(dtype)
+        y = df[args.target].to_numpy().astype(dtype)
         feature_names = feature_cols
     except ImportError:
         print(json.dumps({"error": "Polars is required. Install with: pip install polars"}))
@@ -225,6 +279,7 @@ def main():
         operator=args.operator,
         feature_names=feature_names,
         metric=args.metric,
+        precision=args.precision,
     )
     print(json.dumps(report, indent=2))
     return 0

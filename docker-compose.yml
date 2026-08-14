@@ -16,10 +16,6 @@ services:
         INSTALL_CUDA_PAYLOAD: "1"
         EXTRA_PIP_PACKAGES: ""
     gpus: all
-    environment:
-      GAFIME_SKIP_ROCM: "1"
-      STRICT_CPU: "1"
-      STRICT_CUDA: "1"
     volumes:
       - ./data:/workspace/GAFIME/data
       - ./output:/workspace/GAFIME/output
@@ -31,10 +27,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.smoketest
-    environment:
-      GAFIME_SKIP_CUDA: "1"
-      GAFIME_SKIP_ROCM: "1"
-      STRICT_CPU: "1"
     volumes:
       - ./data:/workspace/GAFIME/data
       - ./output:/workspace/GAFIME/output

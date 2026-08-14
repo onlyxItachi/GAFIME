@@ -8,25 +8,29 @@ description: Configure the GAFIME v1 row-ordered time-series generated family wi
 Inspect the file when available:
 
 ```bash
-python .claude/skills/time-series-setup/scripts/detect_time_structure.py data.parquet
+python .claude/skills/time-series-setup/scripts/detect_time_structure.py \
+  data.parquet --target target
 ```
 
 The detector identifies possible time/group columns and recommends row-unit lags
-and windows. GAFIME does not accept a time column or group column in
+and windows. Pass the known target explicitly so descriptor estimates do not
+count it as an input feature; target-name inference is only a hint. GAFIME does
+not accept a time column or group column in
 `EngineConfig`: it consumes the supplied row order. Sort rows before analysis,
 and run separate entity groups or otherwise partition them so lag and rolling
 windows never cross group boundaries.
 
 The v1 family generates lag, delta, velocity, acceleration, rolling mean,
 rolling standard deviation, and rolling sum columns in `gafime_cpu`. The
-selected Core/CUDA/ROCm/Metal backend then scores the expanded continuous
-matrix. Graph capture never includes the expansion step.
+selected Core/CUDA/ROCm backend, or Metal for `fp32` only, then scores the
+expanded continuous matrix. Graph capture never includes the expansion step.
 
 ```python
 from gafime import ComputeBudget, EngineConfig, GafimeEngine
 
 config = EngineConfig(
     backend="auto",
+    precision="mixed",
     metric_names=("pearson", "r2"),
     enable_time_series_functions=True,
     time_series_lags=(1, 2, 4, 8, 16),

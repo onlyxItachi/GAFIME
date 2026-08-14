@@ -30,10 +30,14 @@ runtime binaries rather than relying on hardware-dependent wheel selection.
 
 ## Install Commands
 
+Beta.2 is not yet published. The commands below are the intended public install
+surface once it is published. They use its exact PEP 440 version because an
+unqualified requirement continues to prefer the latest stable release.
+
 Core/native CPU install:
 
 ```bash
-pip install gafime
+python -m pip install "gafime==1.0.0b2"
 ```
 
 NVIDIA CUDA install target on Linux x86_64 or Windows AMD64 once the split
@@ -41,7 +45,7 @@ payload package is published and a compatible system CUDA 13 runtime is
 available:
 
 ```bash
-pip install gafime gafime-cuda
+python -m pip install "gafime==1.0.0b2" "gafime-cuda==1.0.0b2"
 ```
 
 The CUDA wheel contains only GAFIME binaries. It dynamically resolves
@@ -53,7 +57,7 @@ AMD ROCm/HIP source install on Linux x86_64 with a compatible ROCm 7.2.x
 development toolchain:
 
 ```bash
-pip install gafime gafime-rocm
+python -m pip install "gafime==1.0.0b2" "gafime-rocm==1.0.0b2"
 ```
 
 The prebuilt thin ROCm wheel is attached to the matching GitHub Release because
@@ -63,7 +67,7 @@ PyPI rejects its truthful raw Linux platform tag. It requires a system-visible
 Apple Silicon Metal:
 
 ```bash
-pip install gafime
+python -m pip install "gafime==1.0.0b2"
 ```
 
 The distribution target is:
@@ -178,7 +182,7 @@ The resolver should fail clearly for impossible requests:
 - GPU payload installed but no compatible hardware/runtime is visible: fix the
   driver/runtime installation or use `backend="core"`.
 
-`backend="gpu"` is deprecated because it is ambiguous across CUDA, ROCm, and
+`backend="gpu"` is rejected because it is ambiguous across CUDA, ROCm, and
 Metal. Use `backend="auto"` or a vendor-specific backend name.
 
 ## Diagnostics

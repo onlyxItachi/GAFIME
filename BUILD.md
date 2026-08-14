@@ -17,11 +17,12 @@ Distribution target for v1:
   `gafime/_metal/libgafime_metal_v1.dylib` and its paired
   `gafime/_metal/gafime_metal_v1.metallib`.
 
-Install Core and the selected payload as separate exact-version projects:
+Once beta.2 is published, install Core and the selected payload as separate
+exact-version projects:
 
 ```bash
-pip install gafime gafime-cuda
-pip install gafime gafime-rocm
+python -m pip install "gafime==1.0.0b2" "gafime-cuda==1.0.0b2"
+python -m pip install "gafime==1.0.0b2" "gafime-rocm==1.0.0b2"
 ```
 
 Core has no payload extras or payload dependencies. CUDA and ROCm payloads
@@ -31,6 +32,10 @@ the wheel carries no CUDA runtime library. ROCm is available only on Linux
 x86_64 and dynamically requires the system ROCm runtime; Windows ROCm is not a
 release target. Apple Silicon Metal is built from `src/metal` and bundled in the
 macOS arm64 Core wheel, not a fourth vendor package.
+
+Beta.2 is not yet published. Its eventual public install commands use the exact
+PEP 440 version so pip does not resolve the older stable series instead. Until
+publication, build the current v1 source as described below.
 
 Core and payload distributions build dedicated CPython wheels for each
 supported minor version. Python's Stable ABI and `abi3` are not used.
@@ -55,7 +60,7 @@ payload package policy.
 
 To emulate the CI pipeline locally, ensure you have:
 
-1. Python 3.10+
+1. CPython 3.10 through 3.14, matching the release wheel matrix
 2. Rust 1.89+ (the MSRV; official release builds use exact Rust 1.97.1)
 3. `maturin`
 4. CUDA Toolkit 13.3 when building the CUDA payload locally
@@ -162,8 +167,9 @@ We use a "Fat Bin" approach containing pre-compiled binaries (SASS) for all mode
 - **`sm_120`** (Blackwell consumer)
 - **`compute_120`** (PTX fallback for forward-compatible Blackwell-class drivers)
 
-This enables the CUDA payload package to work instantly on supported NVIDIA
-workstations and data-center accelerators without compilation delays at runtime.
+The listed SASS targets avoid runtime device-code compilation on those exact
+architectures. `compute_120` remains the PTX fallback for compatible newer
+drivers and devices.
 
 The distributed CUDA package stages and compiles `precision_kernels.cu` and
 `precision_launcher.cu` plus their non-RT headers, including
@@ -223,26 +229,26 @@ maintainer approval.
 
 ### v1 CI Wheel Build Notes
 
-The GitHub wheel workflow targets CUDA Toolkit 13.x for x86_64 Windows and
+The GitHub wheel workflow targets CUDA Toolkit 13.3 for x86_64 Windows and
 x86_64 Linux GPU payload builds. Linux manylinux x86_64 builds install the CUDA
 compiler/runtime needed by the payload package. ROCm payloads compile in the
 EL8-based `manylinux_2_28` image against the pinned ROCm 7.2.3 repository and
-are repaired in that same baseline. Windows x64 CUDA builds install the CUDA
-compiler components and overlay NVIDIA's SHA-256-pinned `cuda_cudart` archive
-for build and installed-wheel testing. Independent Linux CUDA validators also
-provision NVIDIA's SHA-256-pinned `cuda_cudart` archive under the temporary
-runner directory. Runtime libraries are explicitly excluded from repaired
-wheels and frozen artifacts; users still provide the compatible system CUDA 13
-runtime.
+retain their truthful, unrepaired `linux_x86_64` tag. Windows x64 CUDA builds
+install the CUDA compiler components and overlay NVIDIA's SHA-256-pinned
+`cuda_cudart` archive for build and installed-wheel testing. Independent Linux
+CUDA validators also provision NVIDIA's SHA-256-pinned `cuda_cudart` archive
+under the temporary runner directory. Runtime libraries are explicitly
+excluded from repaired wheels and frozen artifacts; users still provide the
+compatible system CUDA 13 runtime.
 
 ARM distribution wheels are built by separate jobs:
 
 - `ubuntu-24.04-arm` -> `manylinux_2_28_aarch64`
 - `windows-11-arm` -> `win_arm64`
 
-Those jobs set `GAFIME_SKIP_CUDA=1` and `STRICT_CPU=1`, build Rust
-orchestration plus the Rust CPU scalar/NEON path, and verify that no CUDA
-payload is present in the ARM wheel.
+Those jobs build only the Core distribution: Rust orchestration plus the Rust
+CPU scalar/NEON path. Installed-wheel and archive-composition gates verify that
+no CUDA or ROCm payload is present in an ARM wheel.
 
 `.github/workflows/build_wheels.yml` runs on pull requests, `main`, and manual
 dispatch. It builds, validates, and freezes one immutable release bundle but
@@ -258,10 +264,10 @@ identity, dependency direction, dedicated CPython tags, backend separation, and
 the frozen publication graph. Core platform dependencies may be repaired by the
 normal wheel toolchain; CUDA and ROCm vendor runtimes are never bundled.
 
-Setting `STRICT_CUDA=1` forces CI tests to instantly fail if an x86_64 GPU
-wheel is improperly built and missing its GPU acceleration runtime.
-`GAFIME_SKIP_CUDA=1` intentionally disables NVIDIA CUDA packaging for ARM
-distribution wheels. `STRICT_CPU=1` verifies the Rust/PyO3 CPU runtime path.
+Core and payload builds are separate jobs rather than environment-selected
+variants of one wheel. The payload archive gates fail if a declared x86_64 GPU
+wheel lacks its native payload, while Core and ARM archive gates reject vendor
+payload files. Installed-wheel smokes verify the Rust/PyO3 CPU runtime path.
 
 Payload artifact gates install the exact base and payload wheels outside the
 checkout, compare distribution versions, exercise automatic discovery, inspect

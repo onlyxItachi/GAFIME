@@ -236,10 +236,14 @@ identity/order contract.
 ## Distribution And Frozen-Bundle Contract
 
 Profiles do not create distributions or wheel families. The only standard
-distributions remain `gafime`, `gafime-cuda`, and `gafime-rocm`, producing 40
-wheels and 3 sdists. Every Core wheel carries Core `fp32`, `mixed`, and `fp64`.
-The five macOS arm64 Core wheels additionally embed Metal `fp32` only. Every
-CUDA and ROCm wheel carries all three specializations in one payload binary.
+distributions remain `gafime`, `gafime-cuda`, and `gafime-rocm`. Their
+dedicated-CPython/platform matrix and artifact totals are derived from
+[`release-artifacts.json`](../.github/release-artifacts.json); the generated
+human-readable view is
+[`releases/release-artifact-matrix.md`](releases/release-artifact-matrix.md).
+Every Core wheel carries Core `fp32`, `mixed`, and `fp64`. Each macOS arm64 Core
+wheel additionally embeds Metal `fp32` only. Every CUDA and ROCm wheel carries
+all three specializations in one payload binary.
 
 The system CUDA runtime, host-managed ROCm runtime, exact payload-to-Core
 dependency, ROCm GitHub-Release/PyPI-sdist policy, Core-first publication order,

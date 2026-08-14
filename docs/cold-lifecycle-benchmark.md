@@ -113,24 +113,29 @@ without that utility, the harness falls back to stable AMD DRM sysfs identity
 fields plus the running kernel and available `amdgpu` module identity; it does
 not treat a missing telemetry command as an unknown device.
 
-## Hosted Metal gate
+## Historical PR #70 hosted Metal gate
 
-The manually dispatched `Metal Beast Benchmark` requires the full current PR
-#70 head in `expected_candidate_sha`. It checks out that exact commit and reads
-the live PR head before any build. A second live-head check runs after the
-baseline/candidate builds, and a final check runs after evidence collection, so
-a moving PR cannot leave an artifact labeled as current-head evidence.
+The `Metal Beast Benchmark` workflow was frozen for PR #70 qualification. Its
+manual input required the full then-current PR #70 head in
+`expected_candidate_sha`; it checked out that exact commit and read the live PR
+head before any build. A second live-head check ran after the
+baseline/candidate builds, and a final check ran after evidence collection, so
+a moving PR could not leave an artifact labeled as current-head evidence.
 
-The workflow builds and installs the exact baseline and candidate wheels,
-extracts each wheel's Metal dylib, and invokes this one tracked current harness
-with the corresponding isolated interpreter. It collects block 0 in
+PR #70 is merged, so this retained PR-specific workflow is historical evidence,
+not a reusable current release gate. Stable-runner and permanent comparative
+benchmark work remains tracked by issue #71.
+
+The workflow built and installed the exact baseline and candidate wheels,
+extracted each wheel's Metal dylib, and invoked this one tracked harness with the
+corresponding isolated interpreter. It collected block 0 in
 `baseline,candidate` order and block 1 in reversed `candidate,baseline` order,
 with 30 fresh processes for Metal fp32 in every cell. The four raw artifacts,
 their SHA-256-bound comparison manifest, the validated comparison, and the
-pre/post live-head record are uploaded together. The hosted job fails unless
-`valid_for_canonical_cold_lifecycle_claims` is true. The baseline is explicitly
+pre/post live-head record were uploaded together. The hosted job failed unless
+`valid_for_canonical_cold_lifecycle_claims` is true. The baseline was explicitly
 required to report the historical `precision-typed-v1.1` surface, while the
-candidate is required to report `numeric-route-v2`.
+candidate was required to report `numeric-route-v2`.
 
 This canonical fp32 lifecycle uses one fixed typed ABI input route. The
 separate native Metal helper runs both `common-f64` and native-fp32 source
