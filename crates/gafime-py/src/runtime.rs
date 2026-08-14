@@ -175,6 +175,10 @@ pub(crate) struct RuntimeCacheCounters {
     pub(crate) candidate_table_hits: u64,
 }
 
+// Capability probing decides eligibility. The score only provides a stable
+// preference among already-compatible payloads; it is neither capability proof
+// nor a performance guarantee. The fixed tie-breaker keeps equal scores
+// deterministic.
 fn resolve_auto_backend(device_id: u32, precision: PrecisionProfile) -> u32 {
     let metal = if precision == PrecisionProfile::Fp32 {
         probe_gpu_candidate(GAFIME_BACKEND_METAL, device_id, precision)

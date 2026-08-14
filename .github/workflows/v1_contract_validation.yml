@@ -76,7 +76,7 @@ jobs:
           set -euo pipefail
           rustup default 1.97.1
           python -m pip install --upgrade pip
-          python -m pip install numpy scikit-learn polars pytest
+          python -m pip install nbformat numpy scikit-learn polars pytest
           python -m pip install --no-deps .
 
       - name: Verify contract policy files
@@ -171,7 +171,7 @@ jobs:
           rustup toolchain install 1.97.1 --profile minimal
           rustup default 1.97.1
           python -m pip install --upgrade pip
-          python -m pip install numpy scikit-learn polars pytest
+          python -m pip install nbformat numpy scikit-learn polars pytest
           python -m pip install --no-deps .
 
       - name: Validate installed Metal backend through top-level API

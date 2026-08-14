@@ -59,6 +59,13 @@ fn fixed_bin_indices_scalar_into(values: &[f32], min: f32, inv: f32, bins: u32, 
     }
 }
 
+/// Writes fixed-bin indices with AVX2 lane arithmetic.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX2, `values` and `out`
+/// have equal lengths, and `bins.saturating_sub(1)` fits in `i32`. The public
+/// entry point establishes those conditions before dispatch.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn fixed_bin_indices_avx2(values: &[f32], min: f32, inv: f32, bins: u32, out: &mut [u32]) {
@@ -84,6 +91,12 @@ unsafe fn fixed_bin_indices_avx2(values: &[f32], min: f32, inv: f32, bins: u32, 
     }
 }
 
+/// Converts eight scaled AVX2 lanes to clamped fixed-bin indices.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX2 and `max_bin` fits in
+/// `i32` so the integer clamp preserves the scalar mapping.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -180,6 +193,14 @@ fn fixed_bin_histogram2d_scalar(
     }
 }
 
+/// Builds marginal and joint fixed-bin histograms with AVX2 lane arithmetic.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX2, `x` and `y` have equal
+/// lengths, `bins` is nonzero with `bins - 1` fitting in `i32`, and the three
+/// histogram slices cover `bins`, `bins`, and `bins * bins` entries
+/// respectively. The public entry point validates those bounds before dispatch.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(

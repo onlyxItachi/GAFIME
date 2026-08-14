@@ -32,6 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "nbformat>=5.10",
     "pytest>=7.0",
     "pytest-cov",
 ]

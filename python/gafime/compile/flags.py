@@ -5,6 +5,15 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class CompileFlags:
+    """Options for constructing an explicit compiled artifact.
+
+    ``plan`` exposes the bounded v0.5 scenario-plan compatibility projection.
+    ``graph`` requires a selected CUDA or ROCm/HIP payload that proves graph
+    support and replay; Core and Metal reject it.  ``export`` enables Arrow C
+    Data Interface export of the compact result table.  All values must be
+    booleans.
+    """
+
     plan: bool = True
     graph: bool = False
     export: bool = False

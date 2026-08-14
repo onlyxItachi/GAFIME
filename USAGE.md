@@ -1,7 +1,15 @@
 # GAFIME Usage Guide
 
-Welcome to the advanced technical reference for GAFIME.
-This guide details how to control the `GafimeEngine` underneath the hood using `EngineConfig` and `ComputeBudget`.
+This is the concise operational guide to `GafimeEngine`, `EngineConfig`, and
+`ComputeBudget`. Start with [README.md](README.md) for installation and the fast
+path, use the [practice notebook](docs/notebooks/gafime_tutorial.ipynb) for a
+guided walkthrough, and use the
+[authoritative v1 API reference](docs/notebooks/gafime_v1_api_reference.ipynb)
+for every public parameter, lifecycle, integration, result field, and
+compatibility surface. Maintainer architecture remains normative in
+[docs/contract.md](docs/contract.md); the
+[historical full API notebook](docs/notebooks/gafime_full_api_reference_notebook.ipynb)
+is pre-v1 evidence rather than current guidance.
 
 ## The Engine Configuration
 
@@ -202,8 +210,12 @@ The `EngineConfig` accepts a `metric_names` tuple. You can use any combination:
 
 * **`pearson`**: Classical linear correlation. Great for continuous features vs continuous targets.
 * **`spearman`**: Rank correlation. Perfect when you suspect monotonic (but non-linear) relationships.
-* **`mutual_info`**: Mutual information. Useful for capturing non-linear dependency between a feature (or interaction) and the target.
-* **`r2`**: R-squared variance explanation for regression-style signal strength.
+* **`mutual_info`**: Non-negative dependency score. Core uses adaptive quantile
+  MI unless `mi_approximate=True`; GPU scoring uses fixed equal-width adaptive
+  templates under the backend's bin ceiling.
+* **`r2`**: Pearson correlation squared and clamped to `[0, 1]`. It is not a
+  fitted-regression coefficient of determination. Exact zero variance maps to
+  zero; arithmetic failure remains NaN instead of being clamped into a score.
 
 ## Arithmetic Operators
 

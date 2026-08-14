@@ -5,14 +5,26 @@ from pathlib import Path
 
 
 def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
-    """Generate a runnable practice notebook for the current v1 public API."""
+    """Write the compact current-v1 practice notebook and return its path.
+
+    ``output_path`` defaults to ``gafime_tutorial.ipynb`` in the caller's
+    current directory.  The parent directory must already exist; an existing
+    file at that exact path is deterministically overwritten.  The returned
+    string is the supplied path.  This generator produces the approachable
+    tutorial, not the authoritative long-form reference in
+    ``docs/notebooks/gafime_v1_api_reference.ipynb``.
+    """
 
     cells = [
         _md(
             "# GAFIME v1 Practice Notebook\n\n"
             "This notebook uses bounded deterministic data and the public API. "
             "It probes capabilities before running continuous, compiled, "
-            "time-series, decision-path, and selector examples."
+            "time-series, decision-path, and selector examples. For every public "
+            "parameter, lifecycle, result field, and compatibility surface, use "
+            "[the authoritative v1 API reference]"
+            "(https://github.com/onlyxItachi/GAFIME/blob/main/docs/notebooks/"
+            "gafime_v1_api_reference.ipynb)."
         ),
         _md("## 1. Version and Capability Probe"),
         _code(
@@ -154,7 +166,7 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
         _md(
             "For model evaluation, place `GafimeSelector` inside a scikit-learn "
             "Pipeline so discovery is refit on every training fold. Install the "
-            'optional integration once beta.2 is published with `python -m pip install '
+            "optional integration once beta.2 is published with `python -m pip install "
             '"gafime[sklearn]==1.0.0b2"`.'
         ),
     ]

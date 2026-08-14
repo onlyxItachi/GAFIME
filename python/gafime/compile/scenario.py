@@ -25,12 +25,16 @@ _METRIC_IDS = {"pearson": 1, "spearman": 2, "mutual_info": 3, "r2": 4}
 
 @dataclass(frozen=True)
 class ChunkRange:
+    """Compact compatibility description of a contiguous chunk-id range."""
+
     first_chunk_id: int
     chunk_count: int
     chunk_size: int
 
     @property
     def last_chunk_id(self) -> int:
+        """Return the inclusive final id, or ``first_chunk_id - 1`` if empty."""
+
         return (
             self.first_chunk_id + self.chunk_count - 1
             if self.chunk_count
@@ -40,6 +44,12 @@ class ChunkRange:
 
 @dataclass(frozen=True)
 class ContinuousArityDescriptor:
+    """Bounded v0.5 metadata for one planned continuous arity.
+
+    This descriptor never contains or drives candidate execution.  Rust owns
+    the authoritative native plan.
+    """
+
     arity: int
     feature_start: int
     feature_stop: int
@@ -51,11 +61,18 @@ class ContinuousArityDescriptor:
 
     @property
     def offset_end(self) -> int:
+        """Return the saturating exclusive end of this descriptor's row range."""
+
         return min(UINT64_MAX, self.offset + self.planned_count)
 
 
 @dataclass(frozen=True)
 class TimeSeriesDescriptor:
+    """Bounded v0.5 metadata for configured time-series generation.
+
+    It reports counts only; native generation and execution remain Rust-owned.
+    """
+
     feature_start: int
     feature_stop: int
     lag_count: int
@@ -68,11 +85,20 @@ class TimeSeriesDescriptor:
 
     @property
     def offset_end(self) -> int:
+        """Return the saturating exclusive end of this descriptor's row range."""
+
         return min(UINT64_MAX, self.offset + self.planned_count)
 
 
 @dataclass(frozen=True)
 class ScenarioPlan:
+    """Read-only compatibility projection of a native analysis scenario.
+
+    The object contains shape, count, metric-id, and warning metadata with at
+    most one descriptor per arity.  It is not passed to native execution and
+    must not be treated as an editable candidate plan.
+    """
+
     n_samples: int
     n_features: int
     feature_candidate_count: int
@@ -84,22 +110,32 @@ class ScenarioPlan:
 
     @property
     def rows(self) -> int:
+        """Compatibility alias for ``n_samples``."""
+
         return self.n_samples
 
     @property
     def cols(self) -> int:
+        """Compatibility alias for ``n_features``."""
+
         return self.n_features
 
     @property
     def max_arity(self) -> int:
+        """Return the greatest represented continuous arity, or zero."""
+
         return max((item.arity for item in self.continuous), default=0)
 
     @property
     def continuous_count(self) -> int:
+        """Return the sum of planned continuous descriptor counts."""
+
         return sum(item.planned_count for item in self.continuous)
 
     @property
     def planned_count(self) -> int:
+        """Return the saturating continuous plus time-series metadata count."""
+
         count = self.continuous_count
         if self.time_series is not None:
             count = min(UINT128_MAX, count + self.time_series.planned_count)
@@ -109,6 +145,8 @@ class ScenarioPlan:
     def empty(
         cls, n_samples: int, n_features: int, precision: str = "mixed"
     ) -> "ScenarioPlan":
+        """Create an empty normalized-precision compatibility projection."""
+
         from .._precision import normalize_precision
 
         return cls(
@@ -126,6 +164,13 @@ def build_scenario_plan(
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
 ) -> ScenarioPlan:
+    """Project matrix shape and configuration into bounded compatibility data.
+
+    This helper inspects only shape/count policy and never materializes
+    candidates or controls native execution.  ``chunk_size`` must be positive
+    for meaningful chunk metadata.
+    """
+
     shape = getattr(X, "shape", None)
     n_samples = int(getattr(X, "n_samples", shape[0] if shape else len(X)))
     n_features = int(
@@ -152,6 +197,13 @@ def build_scenario_plan_from_shape(
     flags: CompileFlags | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
 ) -> ScenarioPlan:
+    """Build the compatibility projection from explicit sample/feature counts.
+
+    ``CompileFlags(plan=False)`` returns an empty projection.  Candidate counts
+    saturate at the documented integer widths; the authoritative plan remains
+    native.
+    """
+
     compile_flags = flags or CompileFlags()
     if not compile_flags.plan:
         return ScenarioPlan.empty(n_samples, n_features, config.precision)

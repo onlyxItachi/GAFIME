@@ -178,6 +178,72 @@ def _validate_notebook() -> None:
         _require(token in code, f"practice notebook is missing v1 example: {token}")
 
 
+def _validate_v1_api_reference() -> None:
+    generator_path = ROOT / "docs" / "notebooks" / "generate_v1_api_reference.py"
+    notebook_path = ROOT / "docs" / "notebooks" / "gafime_v1_api_reference.ipynb"
+    coverage_path = ROOT / "docs" / "public-api-coverage.md"
+    for path, description in (
+        (generator_path, "v1 API reference generator"),
+        (notebook_path, "generated v1 API reference"),
+        (coverage_path, "public API coverage inventory"),
+    ):
+        _require(path.is_file(), f"missing {description}: {path.relative_to(ROOT)}")
+
+    generator = _load_module(generator_path, "gafime_v1_api_reference_generator")
+    _require(
+        notebook_path.read_text(encoding="utf-8") == generator.render_notebook(),
+        "tracked v1 API reference differs from its deterministic generator",
+    )
+    parity = subprocess.run(
+        [sys.executable, str(generator_path), "--check"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    _require(
+        parity.returncode == 0,
+        "v1 API reference generator check failed: "
+        f"{(parity.stderr or parity.stdout).strip()}",
+    )
+
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    reference = notebook.get("metadata", {}).get("gafime_reference", {})
+    _require(
+        reference.get("release_scope") == "GAFIME v1 public API",
+        "v1 API reference scope is stale",
+    )
+    _require(
+        reference.get("generator") == "docs/notebooks/generate_v1_api_reference.py",
+        "v1 API reference generator is undisclosed",
+    )
+    _require(
+        reference.get("coverage") == "docs/public-api-coverage.md",
+        "v1 API reference does not identify its coverage inventory",
+    )
+
+    coverage = coverage_path.read_text(encoding="utf-8")
+    _require(
+        "[v1 API reference](notebooks/gafime_v1_api_reference.ipynb)" in coverage,
+        "public API coverage inventory does not link the authoritative reference",
+    )
+
+    hierarchy = {
+        ROOT / "README.md": "docs/notebooks/gafime_v1_api_reference.ipynb",
+        ROOT / "USAGE.md": "docs/notebooks/gafime_v1_api_reference.ipynb",
+        ROOT / "python" / "gafime" / "tutorial.py": ("gafime_v1_api_reference.ipynb"),
+        ROOT / "docs" / "notebooks" / "gafime_tutorial.ipynb": (
+            "gafime_v1_api_reference.ipynb"
+        ),
+    }
+    for path, target in hierarchy.items():
+        _require(
+            target in path.read_text(encoding="utf-8"),
+            f"{path.relative_to(ROOT)} does not link the current v1 API reference",
+        )
+
+
 def _validate_pipeline_generator() -> None:
     path = (
         ROOT
@@ -557,6 +623,7 @@ def _validate_release_docs() -> None:
 def main() -> None:
     _validate_skills()
     _validate_notebook()
+    _validate_v1_api_reference()
     _validate_pipeline_generator()
     _validate_documented_cli_commands()
     _validate_release_docs()

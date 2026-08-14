@@ -63,6 +63,8 @@ class FamilyCapability:
 
     @property
     def supported(self) -> bool:
+        """Whether at least one declared native scoring placement exists."""
+
         return bool(self.scoring_placement) or any(
             (self.cpu_kernel, self.cuda_kernel, self.rocm_kernel, self.metal_kernel)
         )
@@ -136,10 +138,18 @@ _FAMILIES: tuple[FamilyCapability, ...] = (
 
 
 def available_families() -> tuple[FamilyCapability, ...]:
+    """Return immutable capability records for all current v1 families.
+
+    These records describe placement policy; they do not probe installed
+    payloads or guarantee that a requested device is currently available.
+    """
+
     return _FAMILIES
 
 
 def family_capability(name: str) -> FamilyCapability:
+    """Return the exact named family contract or raise ``V1UnsupportedError``."""
+
     for capability in _FAMILIES:
         if capability.name == name:
             return capability
@@ -147,6 +157,12 @@ def family_capability(name: str) -> FamilyCapability:
 
 
 def require_family_supported(name: str) -> FamilyCapability:
+    """Return a family only when its native scoring placement is supported.
+
+    Unknown families and families without a native scoring route raise
+    :class:`V1UnsupportedError`; no Python candidate-loop fallback is created.
+    """
+
     capability = family_capability(name)
     if not capability.supported:
         raise V1UnsupportedError(

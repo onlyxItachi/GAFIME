@@ -8,12 +8,27 @@ from .config import ComputeBudget, EngineConfig
 
 
 class GafimeSelector:
-    """Native-list interaction transformer.
+    """Discover native pair candidates and append chosen interaction columns.
 
     This wrapper keeps the familiar fit/transform shape while letting the v1
     native engine choose and rank interaction candidates through the public API.
     It returns Python lists so callers can adapt the result to sklearn or another
     ML stack without exposing backend-owned buffers.
+
+    ``k`` is the maximum number of pair interactions retained and callers must
+    pass a non-negative value.  Beta.2 does not yet reject a negative ``k`` at
+    construction; it reaches Python slice semantics and can retain an
+    unexpected prefix.  ``backend``, ``metric``, and keyword-only ``precision``
+    are passed to the native
+    discovery run.  ``operator`` controls only post-discovery materialization
+    and accepts ``multiply``, ``add``, ``subtract``, or ``divide``; division
+    uses a positive ``1e-8`` guard in the selected pointwise dtype.
+    ``n_jobs`` and ``verbose`` are retained constructor parameters for
+    historical/scikit-learn cloning compatibility but do not currently alter
+    native scheduling or logging.
+
+    Put the selector inside each training fold: fitting on the full dataset
+    before cross-validation leaks target-guided interaction discovery.
     """
 
     def __init__(
@@ -43,6 +58,15 @@ class GafimeSelector:
         self.precision = precision
 
     def fit(self, X: Iterable[Iterable[float]], y: Iterable[float]):
+        """Discover and retain up to ``k`` ranked pair interactions.
+
+        ``X`` must be a non-empty rectangular numeric matrix and ``y`` must
+        contain one value per row.  Backend/profile compatibility is validated
+        before input coercion; actual payload/device resolution occurs later in
+        native analysis and may still fail closed.  Fitting sets
+        ``top_interactions_`` and ``n_features_in_`` and returns ``self``.
+        """
+
         cfg = EngineConfig(
             metric_names=(self.metric,),
             backend=self.backend,
@@ -78,6 +102,13 @@ class GafimeSelector:
         return self
 
     def transform(self, X: Iterable[Iterable[float]]) -> List[List[float]]:
+        """Append fitted interaction columns and return Python rows.
+
+        :meth:`fit` must have run and every row must match ``n_features_in_``.
+        The original columns remain first; generated pair columns follow in
+        ``top_interactions_`` order.
+        """
+
         rows = [[float(value) for value in row] for row in X]
         if not hasattr(self, "top_interactions_"):
             raise RuntimeError("GafimeSelector must be fitted before transform.")
@@ -89,10 +120,16 @@ class GafimeSelector:
     def fit_transform(
         self, X: Iterable[Iterable[float]], y: Iterable[float]
     ) -> List[List[float]]:
+        """Fit on ``X, y`` and transform the same rows."""
+
         return self.fit(X, y).transform(X)
 
     def get_params(self, deep: bool = True) -> dict[str, object]:
-        """Return constructor parameters for scikit-learn cloning."""
+        """Return constructor parameters for scikit-learn cloning.
+
+        ``deep`` is accepted for estimator compatibility; the selector has no
+        nested estimator parameters of its own.
+        """
 
         del deep
         return {
@@ -106,7 +143,12 @@ class GafimeSelector:
         }
 
     def set_params(self, **params: object):
-        """Set constructor parameters using the scikit-learn estimator contract."""
+        """Set known constructor parameters and return ``self``.
+
+        Unknown names raise :class:`ValueError`.  Precision is validated at
+        assignment; backend/metric/operator validity is enforced by fit or
+        transform at the boundary where it becomes relevant.
+        """
 
         valid = self.get_params(deep=False)
         for name, value in params.items():

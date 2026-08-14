@@ -1,3 +1,14 @@
+"""Lazy compatibility proxy for published native helper surfaces.
+
+Ordinary analysis should use :class:`gafime.GafimeEngine`.  This module keeps
+v0.4.7 helper classes and advanced native-boundary functions importable without
+loading the extension merely by importing :mod:`gafime`.  Its dynamic
+``__all__`` reflects public names exported by the installed compatible native
+module, so availability may differ for an older third-party boundary.  The
+low-level ``analyze_*``/``compile_*`` functions accept native protocol-shaped
+inputs and are not an alternative Python-owned production data plane.
+"""
+
 from __future__ import annotations
 
 from importlib import import_module

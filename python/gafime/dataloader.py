@@ -79,11 +79,25 @@ def dataload(
 
     Parameters
     ----------
-    path: parquet / CSV / Arrow-IPC file.
-    target: name of the target column.
+    path: parquet, CSV/TSV/text, or Arrow-IPC/Feather file.
+    target: name of the single target column.
     features: feature column names (default: every column except the target).
     config: engine configuration (default: ``EngineConfig()``).
-    read_kwargs: forwarded to the Polars reader.
+    read_kwargs: forwarded to the matching Polars reader.
+
+    Returns
+    -------
+    DiagnosticReport
+        The same report produced by ``GafimeEngine(config).analyze``.
+
+    Notes
+    -----
+    The frame is cast to the selected resident dtype and validated before the
+    native boundary runs.  A one-batch Arrow shortcut is used only when it can
+    preserve the complete configuration; otherwise this function routes
+    through the normal configured backend.  Missing/duplicate columns,
+    unsupported suffixes, impossible precision/backend requests, and ordinary
+    engine input failures are rejected rather than silently changing policy.
     """
     from .v1_adapter import _validate_precision_config, analyze_arrow_with_v1_boundary
 

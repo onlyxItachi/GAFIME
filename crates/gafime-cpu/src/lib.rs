@@ -1,3 +1,10 @@
+//! Native CPU execution for Rust-planned candidate batches.
+//!
+//! Production scoring parallelizes independent candidates with Rayon, reuses
+//! worker-local scratch, and dispatches scalar or SIMD arithmetic inside each
+//! candidate. Workers fill disjoint owned buffers; serial ABI-table placement
+//! then preserves the plan's deterministic candidate order.
+
 pub mod arena;
 pub mod decision_path;
 pub mod diagnostics;

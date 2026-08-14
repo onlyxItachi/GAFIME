@@ -84,6 +84,13 @@ class BackendCapabilities:
     probe_details: Mapping[str, object]
 
     def to_dict(self) -> dict[str, object]:
+        """Return a recursively materialized dictionary snapshot.
+
+        The result contains ordinary Python values suitable for diagnostics or
+        serialization.  Capability provenance remains explicit in each
+        nested ``CapabilityValue`` representation.
+        """
+
         return asdict(self)
 
 
@@ -99,10 +106,20 @@ def backend_capabilities(
 ) -> BackendCapabilities:
     """Return truthful static and, when requested, runtime backend facts.
 
-    ``probe=False`` is side-effect free with respect to GPU payload loading.
-    ``probe=True`` follows the same payload loader used by the native resolver;
-    explicit backends never become another backend, while ``auto`` reports its
-    CPU fallback and every failed candidate explicitly.
+    ``probe=False`` is side-effect free with respect to GPU payload loading and
+    reports unobserved GPU fields as unknown.  ``probe=True`` follows the same
+    payload loader used by the native resolver and performs identity/device/
+    capability queries, but does not allocate an analysis matrix or score
+    candidates.  Explicit backends never become another backend, while
+    ``auto`` reports its Core fallback and every failed candidate explicitly.
+
+    ``backend`` accepts the public aliases documented by :class:`EngineConfig`;
+    ``device_id`` must be a non-negative integer; ``mi_bins`` must be at least
+    two; and ``precision`` accepts ``fp32``, ``mixed``, or ``fp64``.  A static
+    unsupported Metal precision is represented as a rejected capability when
+    unprobed and raises :class:`ValueError` when a runtime probe is requested.
+    Deprecated precision pairs follow the same compatibility rules as
+    :class:`EngineConfig`.
     """
 
     configured = _normalize_backend(backend)
