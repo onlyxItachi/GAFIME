@@ -14,8 +14,8 @@ from pathlib import Path
 import numpy as np
 
 
-RELEASE_STATUS = "not_yet_published"
-WHEN_PUBLISHED_SKLEARN_INSTALL = "pip install 'gafime[sklearn]==1.0.0b2'"
+RELEASE_STATUS = "see_docs_releases_status"
+PRERELEASE_SKLEARN_INSTALL = "pip install --pre 'gafime[sklearn]'"
 
 
 def _divide_values(left: np.ndarray, right: np.ndarray) -> np.ndarray:
@@ -29,11 +29,12 @@ def _divide_values(left: np.ndarray, right: np.ndarray) -> np.ndarray:
 def _missing_gafime_install_record() -> dict[str, str]:
     return {
         "error": (
-            "scikit-learn or gafime.sklearn is unavailable. GAFIME 1.0.0b2 "
-            "is not yet published; use the repository development environment."
+            "scikit-learn or gafime.sklearn is unavailable. See "
+            "docs/releases/STATUS.md and install the current published prerelease "
+            "or use the repository development environment."
         ),
         "release_status": RELEASE_STATUS,
-        "when_published_install": WHEN_PUBLISHED_SKLEARN_INSTALL,
+        "prerelease_install": PRERELEASE_SKLEARN_INSTALL,
     }
 
 
@@ -57,14 +58,25 @@ def run_comparison(
 
     if task == "classification":
         from sklearn.linear_model import LogisticRegression
-        model_factory = lambda: LogisticRegression(max_iter=1000, random_state=42)
+
+        def model_factory():
+            return LogisticRegression(max_iter=1000, random_state=42)
+
         scoring = "roc_auc"
-        cv_factory = lambda: StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+        def cv_factory():
+            return StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
     else:
         from sklearn.linear_model import Ridge
-        model_factory = lambda: Ridge(alpha=1.0)
+
+        def model_factory():
+            return Ridge(alpha=1.0)
+
         scoring = "r2"
-        cv_factory = lambda: KFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+        def cv_factory():
+            return KFold(n_splits=n_folds, shuffle=True, random_state=42)
 
     results = {
         "release_status": RELEASE_STATUS,
@@ -86,11 +98,15 @@ def run_comparison(
     }
 
     # Experiment 1: Baseline (original features only)
-    pipe_baseline = Pipeline([
-        ("scaler", StandardScaler()),
-        ("model", model_factory()),
-    ])
-    scores_baseline = cross_val_score(pipe_baseline, X, y, cv=cv_factory(), scoring=scoring)
+    pipe_baseline = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            ("model", model_factory()),
+        ]
+    )
+    scores_baseline = cross_val_score(
+        pipe_baseline, X, y, cv=cv_factory(), scoring=scoring
+    )
     results["baseline"] = {
         "mean": round(float(scores_baseline.mean()), 4),
         "std": round(float(scores_baseline.std()), 4),
@@ -114,11 +130,15 @@ def run_comparison(
 
         X_manual = np.column_stack([X] + manual_features)
 
-        pipe_manual = Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", model_factory()),
-        ])
-        scores_manual = cross_val_score(pipe_manual, X_manual, y, cv=cv_factory(), scoring=scoring)
+        pipe_manual = Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                ("model", model_factory()),
+            ]
+        )
+        scores_manual = cross_val_score(
+            pipe_manual, X_manual, y, cv=cv_factory(), scoring=scoring
+        )
         results["manual"] = {
             "mean": round(float(scores_manual.mean()), 4),
             "std": round(float(scores_manual.std()), 4),
@@ -139,12 +159,25 @@ def run_comparison(
             "selection_status": capability.selection_status,
         }
 
-        pipe_gafime = Pipeline([
-            ("gafime", GafimeSelector(k=k, backend="auto", metric=metric, operator=operator, precision=precision)),
-            ("scaler", StandardScaler()),
-            ("model", model_factory()),
-        ])
-        scores_gafime = cross_val_score(pipe_gafime, X, y, cv=cv_factory(), scoring=scoring)
+        pipe_gafime = Pipeline(
+            [
+                (
+                    "gafime",
+                    GafimeSelector(
+                        k=k,
+                        backend="auto",
+                        metric=metric,
+                        operator=operator,
+                        precision=precision,
+                    ),
+                ),
+                ("scaler", StandardScaler()),
+                ("model", model_factory()),
+            ]
+        )
+        scores_gafime = cross_val_score(
+            pipe_gafime, X, y, cv=cv_factory(), scoring=scoring
+        )
 
         # Get the discovered interactions from a full fit
         gafime_selector = GafimeSelector(
@@ -158,12 +191,22 @@ def run_comparison(
 
         discovered = []
         for feat_i, feat_j in gafime_selector.top_interactions_:
-            name_i = feature_names[feat_i] if feature_names and feat_i < len(feature_names) else f"f{feat_i}"
-            name_j = feature_names[feat_j] if feature_names and feat_j < len(feature_names) else f"f{feat_j}"
-            discovered.append({
-                "indices": [int(feat_i), int(feat_j)],
-                "names": [name_i, name_j],
-            })
+            name_i = (
+                feature_names[feat_i]
+                if feature_names and feat_i < len(feature_names)
+                else f"f{feat_i}"
+            )
+            name_j = (
+                feature_names[feat_j]
+                if feature_names and feat_j < len(feature_names)
+                else f"f{feat_j}"
+            )
+            discovered.append(
+                {
+                    "indices": [int(feat_i), int(feat_j)],
+                    "names": [name_i, name_j],
+                }
+            )
 
         results["gafime"] = {
             "mean": round(float(scores_gafime.mean()), 4),
@@ -178,13 +221,26 @@ def run_comparison(
     # Experiment 4: Combined (manual + GAFIME) if both available
     if "manual" in results and "gafime" in results and "error" not in results["gafime"]:
         try:
-            pipe_combined = Pipeline([
-                ("gafime", GafimeSelector(k=k, backend="auto", metric=metric, operator=operator, precision=precision)),
-                ("scaler", StandardScaler()),
-                ("model", model_factory()),
-            ])
+            pipe_combined = Pipeline(
+                [
+                    (
+                        "gafime",
+                        GafimeSelector(
+                            k=k,
+                            backend="auto",
+                            metric=metric,
+                            operator=operator,
+                            precision=precision,
+                        ),
+                    ),
+                    ("scaler", StandardScaler()),
+                    ("model", model_factory()),
+                ]
+            )
             X_combined_input = X_manual  # manual features already appended
-            scores_combined = cross_val_score(pipe_combined, X_combined_input, y, cv=cv_factory(), scoring=scoring)
+            scores_combined = cross_val_score(
+                pipe_combined, X_combined_input, y, cv=cv_factory(), scoring=scoring
+            )
             results["combined"] = {
                 "mean": round(float(scores_combined.mean()), 4),
                 "std": round(float(scores_combined.std()), 4),
@@ -217,17 +273,31 @@ def main():
     parser = argparse.ArgumentParser(description="GAFIME vs Manual Feature Comparison")
     parser.add_argument("--data", required=True, help="Path to CSV or Parquet file")
     parser.add_argument("--target", "-t", required=True, help="Target column name")
-    parser.add_argument("--manual-features", "-m", default=None,
-                        help="Semicolon-separated index pairs for manual features, e.g. '0,1;2,3'")
-    parser.add_argument("--task", default="classification", choices=["classification", "regression"])
-    parser.add_argument("--k", type=int, default=10, help="Number of GAFIME interactions")
-    parser.add_argument("--operator", default="multiply", choices=["multiply", "add", "subtract", "divide"])
+    parser.add_argument(
+        "--manual-features",
+        "-m",
+        default=None,
+        help="Semicolon-separated index pairs for manual features, e.g. '0,1;2,3'",
+    )
+    parser.add_argument(
+        "--task", default="classification", choices=["classification", "regression"]
+    )
+    parser.add_argument(
+        "--k", type=int, default=10, help="Number of GAFIME interactions"
+    )
+    parser.add_argument(
+        "--operator",
+        default="multiply",
+        choices=["multiply", "add", "subtract", "divide"],
+    )
     parser.add_argument(
         "--metric",
         default="pearson",
         choices=["pearson", "spearman", "mutual_info", "r2"],
     )
-    parser.add_argument("--precision", default="mixed", choices=["fp32", "mixed", "fp64"])
+    parser.add_argument(
+        "--precision", default="mixed", choices=["fp32", "mixed", "fp64"]
+    )
     args = parser.parse_args()
 
     # Load data
@@ -238,6 +308,7 @@ def main():
 
     try:
         import polars as pl
+
         if path.suffix == ".parquet":
             df = pl.read_parquet(path)
         else:
@@ -253,13 +324,19 @@ def main():
             if name != args.target and dtype.is_numeric()
         ]
         if not feature_cols:
-            raise ValueError("No numeric feature columns remain after excluding the target")
+            raise ValueError(
+                "No numeric feature columns remain after excluding the target"
+            )
         dtype = np.float64 if args.precision == "fp64" else np.float32
         X = df.select(feature_cols).to_numpy().astype(dtype)
         y = df[args.target].to_numpy().astype(dtype)
         feature_names = feature_cols
     except ImportError:
-        print(json.dumps({"error": "Polars is required. Install with: pip install polars"}))
+        print(
+            json.dumps(
+                {"error": "Polars is required. Install with: pip install polars"}
+            )
+        )
         return 1
 
     # Parse manual features
@@ -272,7 +349,8 @@ def main():
                 manual_pairs.append((int(parts[0]), int(parts[1])))
 
     report = run_comparison(
-        X, y,
+        X,
+        y,
         manual_feature_indices=manual_pairs,
         task=args.task,
         k=args.k,

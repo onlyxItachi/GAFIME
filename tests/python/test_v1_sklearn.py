@@ -36,6 +36,16 @@ def _interaction_dataset(n=120, seed=0):
     return X, y
 
 
+def test_selector_rejects_negative_k_at_construction_and_assignment():
+    with pytest.raises(ValueError, match="k must be non-negative"):
+        GafimeSelector(k=-1)
+
+    selector = GafimeSelector(k=1)
+    with pytest.raises(ValueError, match="k must be non-negative"):
+        selector.set_params(k=-1)
+    assert selector.k == 1
+
+
 def test_selector_discovers_top_pair_and_appends_interaction_column():
     X, y = _interaction_dataset()
     selector = GafimeSelector(k=1, metric="pearson", operator="multiply", n_jobs=1)

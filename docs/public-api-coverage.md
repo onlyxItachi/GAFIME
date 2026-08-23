@@ -35,8 +35,8 @@ Coverage classes:
 | `gafime.FamilySignificanceSupport` | result model | class and fields | family/significance sections | family smoke | family-specific significance truth |
 | `gafime.dataload` | integration | arguments, formats, return/failures | input section | Polars Arrow-IPC smoke | reads and analyzes one file through Polars |
 | `gafime.GafimeEngine` | primary | constructor, `analyze`, `compile` | execution sections | Core/compiled smokes | safe public execution boundary |
-| `gafime.GafimeSelector` | integration | constructor and estimator methods | sklearn section | sklearn smoke | `n_jobs`/`verbose` are stored compatibility parameters; negative `k` is unsupported but not yet rejected |
-| `gafime.GafimeStreamer` | integration | constructor and batch methods | input/streaming section | Polars CSV smoke | reader only; non-positive `batch_size` is unsupported but not yet rejected and cannot advance |
+| `gafime.GafimeSelector` | integration | constructor and estimator methods | sklearn section | sklearn smoke | `n_jobs`/`verbose` are stored compatibility parameters; negative `k` fails validation |
+| `gafime.GafimeStreamer` | integration | constructor and batch methods | input/streaming section | Polars CSV smoke | reader only; non-positive `batch_size` fails before reading |
 | `gafime.GafimeV1Error` | result model | exception purpose | fail-closed section | expected-error smoke | base explicit v1 runtime error |
 | `gafime.InteractionResult` | result model | class and every field | report table | Core report smoke | includes candidate/provenance/numeric diagnostics |
 | `gafime.NativeCompiledGafime` | primary | factory-only construction and every public method/property | compiled lifecycle section | compile/update/close smoke | factory-returned, thread-affine lifecycle; explicit close; no context manager |
@@ -161,18 +161,9 @@ types, experimental RT/OptiX code, and future Candidate IR/decorator/JIT ideas
 are not public Python API. Documentation helpers and skills consume the API
 above; they do not authorize additional runtime surfaces.
 
-## Known beta.2 input-validation defects
+## Input-validation coverage
 
-Two compatibility/integration inputs require caller validation in beta.2:
-
-- `GafimeSelector(k=...)` requires a non-negative value, but a negative value is
-  not rejected and follows Python negative-slice behavior.
-- `GafimeStreamer.stream(..., batch_size=...)` and `stream_with_target(...)`
-  require a positive value, but a non-positive value is not rejected and can
-  prevent iteration from advancing.
-- Compatibility helper `benchmark_streaming(..., n_batches=...)` requires a
-  positive value, but a non-positive value is not rejected and still reads one
-  batch.
-
-These are recorded runtime defects, not documentation-authorized semantics.
-They are deliberately not fixed by this documentation-only change.
+Focused regression tests require `GafimeSelector(k=...)` to reject negative
+values at construction and assignment. Streamer batch sizes and the bounded
+`benchmark_streaming(..., n_batches=...)` diagnostic reject non-positive values
+before reading input.

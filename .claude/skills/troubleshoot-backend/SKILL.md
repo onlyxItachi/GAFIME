@@ -19,8 +19,9 @@ runtime device facts, graph support, significance placement, MI policy,
 precision, version-alignment warnings, and payload-discovery errors. The Metal
 payload-health probe always uses its supported `fp32` profile; the requested
 profile remains visible separately. The script does not execute a scoring
-workload. It reports `release_status="not_yet_published"`, current source-tree
-guidance, and exact commands only under `when_published_install`.
+workload. It reports `release_status="see_docs_releases_status"`, routes
+mutable publication state to `docs/releases/STATUS.md`, and offers current
+prerelease commands under `prerelease_install`.
 
 Interpret capability evidence literally:
 
@@ -28,28 +29,23 @@ Interpret capability evidence literally:
 - `static` is checked-in Core policy;
 - `unknown` means no compatible runtime observation, not that hardware is absent.
 
-Common fixes:
-
-Beta.2 is not yet published. Before publication, repair and diagnose the
-repository development environment; do not present the commands below as
-currently available from PyPI. Once beta.2 is published, use these exact-version
-commands where applicable:
+Common fixes (pin the current exact PyPI version when reproducibility is
+required):
 
 - CUDA payload missing or damaged: reinstall Core and CUDA at one explicit
   version:
-  `pip install --force-reinstall "gafime==1.0.0b2" "gafime-cuda==1.0.0b2"`.
+  `pip install --pre --force-reinstall gafime gafime-cuda`.
 - CUDA runtime load failure: verify system `libcudart.so.13` on Linux or
   driver-provided `nvcudart_hybrid64.dll` on Windows; the payload wheel does not
   vendor it.
 - ROCm payload missing on Linux x86_64:
-  install the exact matching Core and ROCm versions. PyPI will provide the
+  install the exact matching Core and ROCm versions. PyPI provides the
   buildable ROCm sdist; the matching GitHub Release will carry the prebuilt thin
   raw-Linux wheel. Both require the compatible system ROCm runtime. The
-  when-published source command is
-  `pip install --force-reinstall "gafime==1.0.0b2" "gafime-rocm==1.0.0b2"`.
-- Metal payload missing on macOS arm64: reinstall `gafime==1.0.0b2`; the dylib
+  source command is `pip install --pre --force-reinstall gafime gafime-rocm`.
+- Metal payload missing on macOS arm64: reinstall `gafime`; the dylib
   and metallib are bundled in the Core wheel.
-- Core/native boundary missing: reinstall `gafime==1.0.0b2` for the active
+- Core/native boundary missing: reinstall `gafime` for the active
   Python and architecture.
 - Version mismatch: install Core and vendor payload packages at the exact same
   release version.
@@ -63,7 +59,7 @@ supports only `precision="fp32"`; mixed/fp64 requests fail closed.
 
 Generated-family candidate creation remains in `gafime_cpu`; CUDA, ROCm, and
 Metal may score the expanded continuous matrix within their supported precision
-profiles. Standard beta.2 CUDA artifacts are always RT-free. Optional compact
+profiles. Standard release CUDA artifacts are always RT-free. Optional compact
 CUDA RT decision-path scoring is a local CMake experiment selected through an
 explicit validated library override only; it is never a distribution or release
 artifact. Do not infer RT support from a GPU model name.

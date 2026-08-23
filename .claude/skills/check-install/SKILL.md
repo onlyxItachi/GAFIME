@@ -11,10 +11,10 @@ Run the repository health check from the GAFIME checkout:
 python .claude/skills/check-install/scripts/health_check.py
 ```
 
-Beta.2 is not yet published. The current helper reports
-`release_status="not_yet_published"`. Run it from the repository development
-environment until publication completes; exact beta.2 install commands below
-are prospective.
+The helper routes mutable publication state to `docs/releases/STATUS.md`,
+GitHub Releases, and PyPI. It validates either a published installation or the
+repository development environment without embedding a self-invalidating
+release-status claim.
 
 The script checks:
 
@@ -31,19 +31,20 @@ The script checks:
 - required Polars and optional scikit-learn imports.
 
 Treat `SKIP` for scikit-learn as expected unless the user needs
-`GafimeSelector`. Once beta.2 is published, install it with the exact command
-`pip install "gafime[sklearn]==1.0.0b2"`. Any `FAIL` is an installation or
+`GafimeSelector`. Install the current prerelease with
+`pip install --pre "gafime[sklearn]"`, or pin an exact published version. Any
+`FAIL` is an installation or
 packaging problem and makes the health check return nonzero.
 
-Once beta.2 is published, install Core and CUDA at the same exact version for
+Install Core and CUDA at the same exact version for
 visible NVIDIA hardware and provide a compatible system CUDA 13 runtime:
-`pip install "gafime==1.0.0b2" "gafime-cuda==1.0.0b2"`.
-For supported AMD hardware on Linux x86_64, the published target will install
-Core and ROCm at the same exact version. PyPI will provide the buildable ROCm
+`pip install --pre gafime gafime-cuda`.
+For supported AMD hardware on Linux x86_64, install Core and ROCm at the same
+exact version. PyPI provides the buildable ROCm
 sdist, which needs the matching ROCm/HIP development toolchain; the matching
 GitHub Release will carry the prebuilt thin raw-Linux wheel. Both require the
-compatible system ROCm runtime. Once published, use
-`pip install "gafime==1.0.0b2" "gafime-rocm==1.0.0b2"` for the PyPI source path.
+compatible system ROCm runtime. Use `pip install --pre gafime gafime-rocm` for
+the PyPI source path, or pin both projects to one exact published version.
 Metal is bundled in the macOS arm64 Core wheel and supports
 `precision="fp32"` only. Backend presence must still be confirmed by the runtime
 capability probe; hardware names and package presence alone are not proof.

@@ -107,13 +107,14 @@ class GafimeStreamer:
     ) -> Generator[List[List[float]], None, None]:
         """Yield feature-only Python row batches in source order.
 
-        An explicit ``batch_size`` must be a positive integer.  The beta.2
-        compatibility streamer does not yet reject a non-positive value; such
-        a value does not advance the reader, so callers must validate it.
+        An explicit ``batch_size`` must be positive. Invalid values fail before
+        the source row count is evaluated or a batch is read.
         """
 
         if batch_size is None:
             batch_size = self.estimate_optimal_batch_size(vram_budget_gb)
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
         reader = self._lazy_df.select(self._feature_cols)
         current_row = 0
         total = self.total_rows
@@ -130,15 +131,16 @@ class GafimeStreamer:
     ) -> Generator[tuple[List[List[float]], List[float]], None, None]:
         """Yield ``(features, target)`` row batches in source order.
 
-        ``y_col`` must have been supplied at construction time.  An explicit
-        ``batch_size`` must be positive; beta.2 does not yet reject a
-        non-positive value, which prevents the reader from advancing.
+        ``y_col`` must have been supplied at construction time. An explicit
+        ``batch_size`` must be positive and is validated before reading.
         """
 
         if self.y_col is None:
             raise ValueError("y_col must be specified for stream_with_target().")
         if batch_size is None:
             batch_size = self.estimate_optimal_batch_size(vram_budget_gb)
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
         reader = self._lazy_df.select(self._feature_cols + [self.y_col])
         current_row = 0
         total = self.total_rows
@@ -170,11 +172,12 @@ def benchmark_streaming(file_path, batch_size=None, n_batches=5):
     """Read at most ``n_batches`` and return simple batch/row counts.
 
     This compatibility helper measures iteration shape only; it does not run a
-    backend or make a performance claim.  ``n_batches`` must be positive.
-    Beta.2 does not yet reject a non-positive value and still reads one batch,
-    so callers must validate this diagnostic-only argument.
+    backend or make a performance claim. ``n_batches`` must be positive and is
+    validated before the input is opened.
     """
 
+    if n_batches <= 0:
+        raise ValueError("n_batches must be positive.")
     streamer = GafimeStreamer(file_path)
     count = 0
     rows = 0

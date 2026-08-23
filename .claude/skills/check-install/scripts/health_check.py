@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 
-RELEASE_STATUS = "not_yet_published"
+RELEASE_STATUS = "see_docs_releases_status"
 
 
 def _dist_version(name: str) -> str | None:
@@ -50,16 +50,14 @@ def _validate_distribution_versions(
 def _validate_python_version(
     version_info: tuple[int, ...], *, implementation: str = "CPython"
 ) -> str:
-    """Require a CPython minor covered by the beta.2 release matrix."""
+    """Require a CPython minor covered by the current v1 release matrix."""
 
     if implementation != "CPython":
-        raise RuntimeError(
-            f"GAFIME 1.0.0b2 supports CPython only; found {implementation}"
-        )
+        raise RuntimeError(f"GAFIME v1 supports CPython only; found {implementation}")
     major_minor = tuple(version_info[:2])
     if major_minor not in {(3, minor) for minor in range(10, 15)}:
         raise RuntimeError(
-            "GAFIME 1.0.0b2 supports CPython 3.10 through 3.14; "
+            "GAFIME v1 supports CPython 3.10 through 3.14; "
             f"found {major_minor[0]}.{major_minor[1]}"
         )
     return f"{major_minor[0]}.{major_minor[1]} (release-tested 3.10-3.14)"
@@ -86,8 +84,8 @@ def main() -> int:
     check(
         "Release status",
         lambda: (
-            f"release_status={RELEASE_STATUS}; use the repository development "
-            "environment until beta.2 is published"
+            f"release_status={RELEASE_STATUS}; consult docs/releases/STATUS.md, "
+            "GitHub Releases, and PyPI for mutable publication state"
         ),
     )
 

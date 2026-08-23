@@ -21,9 +21,10 @@ python .claude/skills/benchmark-vs-manual/scripts/compare_approaches.py \
 It compares baseline, manual, GAFIME, and combined feature sets under the same
 cross-validation splitter and model. `GafimeSelector` remains inside each
 pipeline, so candidate discovery uses only that fold's training rows.
-The output reports `release_status="not_yet_published"`. If the integration is
-missing, it keeps the exact beta.2 command under `when_published_install`; use
-the repository development environment until beta.2 is actually published.
+The output routes mutable publication state to `docs/releases/STATUS.md`. If
+the integration is missing, it keeps a `--pre` command under
+`prerelease_install`; use an exact version from PyPI when reproducibility is
+required or use the repository development environment.
 Feature indices refer to the reported numeric, non-target `feature_names` order;
 timestamp, identifier, and categorical columns are not silently cast to floats.
 This is a bounded sklearn integration helper: native GAFIME performs candidate

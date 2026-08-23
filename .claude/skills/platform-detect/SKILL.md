@@ -11,20 +11,20 @@ Run:
 python .claude/skills/platform-detect/scripts/platform_detect.py --precision mixed
 ```
 
-Beta.2 is not yet published. The script reports OS, CPU architecture, visible
+The script reports OS, CPU architecture, visible
 NVIDIA/ROCm hints, installed GAFIME distribution versions, and the public `auto`
 capability probe when GAFIME is installed. It reports
-`release_status="not_yet_published"`, directs current work to the repository
-development environment, and exposes the exact target command only as
-`when_published_install`. Hardware hints guide installation only; the validated
+`release_status="see_docs_releases_status"`, routes mutable publication state
+to `docs/releases/STATUS.md`, and exposes a `--pre` command under
+`prerelease_install`. Hardware hints guide installation only; the validated
 capability result is the authority for runtime selection.
 
-Target distribution policy once beta.2 is published:
+Current v1 distribution policy:
 
 - Core: Linux x86_64/aarch64, Windows x86_64/arm64, macOS arm64.
 - CUDA payload: Linux and Windows x86_64 via `gafime` plus `gafime-cuda`;
   requires the system CUDA 13 runtime.
-- ROCm payload: Linux x86_64 via `gafime` plus `gafime-rocm`; PyPI will provide
+- ROCm payload: Linux x86_64 via `gafime` plus `gafime-rocm`; PyPI provides
   the buildable sdist, while the matching GitHub Release will carry the prebuilt
   thin raw-Linux wheel. Both require the compatible system ROCm runtime.
 - Metal: bundled in the macOS arm64 Core wheel and supports `fp32` only.

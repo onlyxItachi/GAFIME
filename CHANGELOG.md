@@ -1,9 +1,20 @@
 # Changelog
 
-## v1.0.0-beta.2 (unreleased)
+## Unreleased
 
-Prepared GAFIME v1 beta.2 release record. When published, Python and PyPI
-identify the same release as `1.0.0b2`.
+- Reject negative `GafimeSelector.k`, non-positive streaming batch sizes, and
+  non-positive streaming benchmark counts before selection or input reads.
+- Reorganized the public README, documentation index, and release index around
+  reader intent, and made publication guidance route through mutable release
+  status instead of self-invalidating prose.
+- Refined project metadata and public repository discovery information for the
+  v1 release candidate train.
+
+## v1.0.0-beta.2 (unreleased checkpoint)
+
+Prepared GAFIME v1 beta.2 release record. The qualified source and frozen build
+were retained as an unreleased pre-RC checkpoint rather than rebuilt solely to
+replace publication-state wording.
 
 - Added public interaction-materialization overflow diagnostics across Core,
   CUDA, ROCm, and Metal without eagerly paying the diagnostics cost on every

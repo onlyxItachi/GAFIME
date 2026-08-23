@@ -9,15 +9,15 @@ import platform
 from pathlib import Path
 
 
-RELEASE_STATUS = "not_yet_published"
+RELEASE_STATUS = "see_docs_releases_status"
 CURRENT_INSTALL_GUIDANCE = (
-    "GAFIME 1.0.0b2 is not yet published; diagnose from the repository "
-    "development environment until publication completes."
+    "Consult docs/releases/STATUS.md, GitHub Releases, and PyPI for mutable "
+    "publication state."
 )
-WHEN_PUBLISHED_INSTALLS = {
-    "core": 'pip install "gafime==1.0.0b2"',
-    "cuda": 'pip install "gafime==1.0.0b2" "gafime-cuda==1.0.0b2"',
-    "rocm": 'pip install "gafime==1.0.0b2" "gafime-rocm==1.0.0b2"',
+PRERELEASE_INSTALLS = {
+    "core": "pip install --pre gafime",
+    "cuda": "pip install --pre gafime gafime-cuda",
+    "rocm": "pip install --pre gafime gafime-rocm",
 }
 
 
@@ -63,7 +63,7 @@ def main() -> int:
         "version": gafime.__version__,
         "release_status": RELEASE_STATUS,
         "current_install_guidance": CURRENT_INSTALL_GUIDANCE,
-        "when_published_install": WHEN_PUBLISHED_INSTALLS,
+        "prerelease_install": PRERELEASE_INSTALLS,
         "requested_precision": args.precision,
         "platform": {
             "system": platform.system(),
