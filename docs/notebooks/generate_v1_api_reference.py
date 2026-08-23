@@ -338,10 +338,10 @@ def _cells() -> list:
             # GAFIME v1 Public API Reference & Cookbook
 
             This is the authoritative long-form reference for the current GAFIME
-            v1 public Python surface. It describes the `1.0.0-beta.2` repository
-            source (`1.0.0b2` in Python metadata). Beta.2 remains unpublished while
-            this documentation is under review, so install commands are prospective
-            until the canonical release is published.
+            v1 public Python surface. It targets the current v1 source tree; mutable
+            publication state and exact install identities live in
+            [docs/releases/STATUS.md](../releases/STATUS.md), GitHub Releases, and
+            PyPI.
 
             The compact [practice notebook](gafime_tutorial.ipynb) is the guided
             introduction. The old
@@ -367,13 +367,13 @@ def _cells() -> list:
             ## 1. Installation and package topology
 
             GAFIME supports CPython 3.10–3.14 with dedicated interpreter-specific
-            wheels rather than `abi3`. Once beta.2 is published, install exact
-            matching versions:
+            wheels rather than `abi3`. Install the current published prerelease;
+            payload metadata enforces exact Core alignment:
 
             ```bash
-            python -m pip install "gafime==1.0.0b2"
-            python -m pip install "gafime==1.0.0b2" "gafime-cuda==1.0.0b2"
-            python -m pip install "gafime==1.0.0b2" "gafime-rocm==1.0.0b2"
+            python -m pip install --pre gafime
+            python -m pip install --pre gafime gafime-cuda
+            python -m pip install --pre gafime gafime-rocm
             ```
 
             An unqualified `pip install gafime` prefers the latest stable release;
@@ -391,7 +391,7 @@ def _cells() -> list:
 
             Core never depends on a GPU payload. Payload packages require the exact
             same Core version. RT/OptiX remains experimental and local-only: it is
-            not a beta.2 package or artifact.
+            not a release package or artifact.
             """
         ),
         _md(
@@ -436,7 +436,7 @@ def _cells() -> list:
             from gafime import ComputeBudget, EngineConfig, GafimeEngine
 
             print(gafime.__version__)
-            assert gafime.__version__ == "1.0.0b2"
+            assert gafime.__version__
             """,
             test="core",
         ),
@@ -920,7 +920,7 @@ def _cells() -> list:
             """
             Rust/Core discovers target-dependent threshold paths and owns scheduling.
             Generated membership columns may then use the selected continuous scorer.
-            Native CUDA RT/OptiX remains a local experiment and is not a public beta.2
+            Native CUDA RT/OptiX remains a local experiment and is not a public
             route or package.
 
             Decision-path permutation maxT must rediscover paths for every permuted
@@ -1080,10 +1080,8 @@ def _cells() -> list:
             too small. `n_jobs` and `verbose` are stored compatibility parameters;
             they do not schedule work or enable logging in the current selector.
 
-            `k` must be non-negative. Beta.2 does not yet reject a negative value;
-            it reaches Python negative-slice behavior and can retain an unexpected
-            prefix. Validate this argument in application configuration until that
-            runtime defect is resolved separately.
+            `k` must be non-negative and is validated at construction and through
+            `set_params()` before discovery or materialization.
 
             Put `GafimeSelector` inside a scikit-learn `Pipeline` so interaction
             discovery is refit independently in each training fold. Transform adds
@@ -1171,9 +1169,8 @@ def _cells() -> list:
             target. It does **not** execute `GafimeEngine`, and it does not support
             Arrow IPC. `target_cols` is the retained compatibility name for an
             explicit feature-column list; `y_col` identifies the target used by
-            `stream_with_target()`. An explicit `batch_size` must be positive.
-            Beta.2 does not yet reject a non-positive value, which prevents the
-            compatibility reader from advancing; validate it before iteration.
+            `stream_with_target()`. An explicit `batch_size` must be positive and is
+            validated before the reader evaluates the source row count.
             """
         ),
         _code(
@@ -1220,7 +1217,7 @@ def _cells() -> list:
                 capture_output=True,
                 text=True,
             )
-            assert "gafime 1.0.0b2" in version_check.stdout
+            assert f"gafime {gafime.__version__}" in version_check.stdout
             """,
             test="core",
         ),
@@ -1370,7 +1367,7 @@ def _cells() -> list:
             """
             ### scikit-learn
 
-            Install the `sklearn` extra after beta.2 is published, place
+            Install the current published prerelease `sklearn` extra, place
             `GafimeSelector` inside the pipeline, and let each fold run its own fit.
             See section 18 for the executable bounded example.
             """
@@ -1389,12 +1386,12 @@ def _cells() -> list:
             - Do not build a compiled artifact on one thread and use/close it on another.
             - Do not expect `GafimeStreamer` to execute analysis or read Arrow IPC.
             - Do not expect selector `n_jobs`/`verbose` to schedule/log current work.
-            - Do not pass negative selector `k`; beta.2 does not yet reject it.
-            - Do not pass a non-positive streamer `batch_size`; it cannot advance.
+            - Do not pass negative selector `k`; it fails validation.
+            - Do not pass a non-positive streamer `batch_size`; it fails validation.
             - Do not construct `NativeCompiledGafime` from raw handles; use `compile()`.
             - Do not use deprecated `DiagnosticReport.to_dict()` as a hot data path.
             - Do not treat `max_generated_features` as an active v1 limit.
-            - Do not treat RT/OptiX or future Candidate IR/frontends as shipped beta.2 APIs.
+            - Do not treat RT/OptiX or future Candidate IR/frontends as shipped APIs.
             """
         ),
         _md("## 25. Compatibility surfaces and complete API index"),
@@ -1440,8 +1437,7 @@ def _cells() -> list:
               `DecisionPathCandidate`.
             - `gafime.io`: `GafimeStreamer`, compatibility `create_streamer`, and
               bounded diagnostic helper `benchmark_streaming`. Its `n_batches`
-              argument must be positive; beta.2 does not yet reject a non-positive
-              value and reads one batch.
+              argument must be positive and is validated before the file is opened.
             - `gafime.compile`: callable compile module, flags, and compiled aliases;
               `gafime.compile.scenario` exposes bounded compatibility plan metadata;
               `gafime.compile.exports` exposes deprecated handle compatibility.

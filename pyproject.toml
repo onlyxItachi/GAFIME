@@ -5,13 +5,24 @@ build-backend = "maturin"
 [project]
 name = "gafime"
 version = "1.0.0b2"
-description = "GPU Accelerated Feature Interaction Mining Engine"
+description = "GPU-Accelerated Feature Interaction Mining Engine (GAFIME) with native Rust CPU/SIMD, CUDA, ROCm/HIP, and Metal execution"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
-    {name = "Hamza", email = "hamzausta2222@gmail.com"},
+    {name = "Hamza Usta", email = "hamzausta2222@gmail.com"},
+]
+keywords = [
+    "feature-engineering",
+    "feature-interactions",
+    "machine-learning",
+    "hpc",
+    "heterogeneous-computing",
+    "cuda",
+    "rocm",
+    "metal",
+    "simd",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -52,6 +63,10 @@ bench = [
 Homepage = "https://github.com/onlyxItachi/GAFIME"
 Repository = "https://github.com/onlyxItachi/GAFIME"
 Issues = "https://github.com/onlyxItachi/GAFIME/issues"
+Documentation = "https://github.com/onlyxItachi/GAFIME/blob/main/docs/README.md"
+Changelog = "https://github.com/onlyxItachi/GAFIME/blob/main/CHANGELOG.md"
+Security = "https://github.com/onlyxItachi/GAFIME/security/policy"
+Releases = "https://github.com/onlyxItachi/GAFIME/releases"
 
 [project.scripts]
 gafime = "gafime.cli:main"

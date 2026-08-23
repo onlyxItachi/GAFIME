@@ -238,6 +238,28 @@ def test_streamer_preserves_csv_batch_and_target_contract(tmp_path):
     ]
 
 
+def test_streamer_rejects_non_positive_batch_size_before_reading(tmp_path):
+    pytest.importorskip("polars")
+    path = tmp_path / "samples.csv"
+    path.write_text("a,target\n1,0\n", encoding="utf-8")
+    streamer = GafimeStreamer(path, y_col="target")
+
+    for batch_size in (0, -1):
+        with pytest.raises(ValueError, match="batch_size must be positive"):
+            next(streamer.stream(batch_size=batch_size))
+        with pytest.raises(ValueError, match="batch_size must be positive"):
+            next(streamer.stream_with_target(batch_size=batch_size))
+
+
+def test_benchmark_streaming_rejects_non_positive_count_before_opening(tmp_path):
+    from gafime.io import benchmark_streaming
+
+    missing = tmp_path / "not-opened.csv"
+    for n_batches in (0, -1):
+        with pytest.raises(ValueError, match="n_batches must be positive"):
+            benchmark_streaming(missing, n_batches=n_batches)
+
+
 def test_generate_tutorial_uses_current_public_api(tmp_path):
     path = tmp_path / "tutorial.ipynb"
 

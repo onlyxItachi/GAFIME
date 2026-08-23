@@ -327,25 +327,44 @@ def _validate_release_docs() -> None:
     _require(publish_workflow_path.is_file(), "missing frozen-bundle publisher")
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    docs_index = (ROOT / "docs" / "README.md").read_text(encoding="utf-8")
+    release_index = (ROOT / "docs" / "releases" / "README.md").read_text(
+        encoding="utf-8"
+    )
+    release_status = (ROOT / "docs" / "releases" / "STATUS.md").read_text(
+        encoding="utf-8"
+    )
     for link in (
-        release.release_note,
-        "docs/releases/release-operations.md",
-        "docs/releases/release-artifact-matrix.md",
+        "docs/README.md",
+        "docs/releases/STATUS.md",
+        "docs/releases/README.md",
         "docs/capabilities.md",
-        "docs/rocm-wheel-policy.md",
         "docs/eager-resident-compiled-execution.md",
         "docs/notebooks/gafime_tutorial.ipynb",
     ):
-        _require(link in readme, f"README does not expose {link}")
+        _require(link in readme, f"README does not route to {link}")
+    for link in (
+        "contract.md",
+        "abi-evolution.md",
+        "releases/release-operations.md",
+        "releases/release-artifact-matrix.md",
+        "security/threat-model.md",
+    ):
+        _require(link in docs_index, f"docs/README.md does not route to {link}")
     _require(
-        "gafime.generate_tutorial()" in readme,
-        "README does not expose the supported notebook generator",
+        Path(release.release_note).name in release_index,
+        "release index does not expose the current version record",
+    )
+    _require(
+        "mutable operational status, not an immutable historical release record"
+        in " ".join(release_status.split()),
+        "release STATUS does not disclose its mutable role",
     )
     for token in (
         'precision="mixed"',
-        "single public arithmetic profile",
-        "Core, CUDA, and ROCm support all three profiles",
-        "Metal supports only the genuine fp32 profile",
+        "Rust Core/SIMD",
+        "`fp32`, `mixed`, `fp64`",
+        "`fp32` only",
         "docs/precision-contract.md",
     ):
         _require(token in readme, f"README is missing precision guidance: {token}")
@@ -359,6 +378,7 @@ def _validate_release_docs() -> None:
         'backend="metal"',
     ):
         _require(token in usage, f"USAGE is missing precision guidance: {token}")
+    build_guide = (ROOT / "BUILD.md").read_text(encoding="utf-8")
     for token in (
         "Windows ARM64 uses an ARM64 Python 3.11",
         "workflow host while cibuildwheel",
@@ -366,8 +386,8 @@ def _validate_release_docs() -> None:
         "`pythonarm64` NuGet packages",
     ):
         _require(
-            token in readme,
-            f"README is missing full Windows ARM64 wheel coverage: {token}",
+            token in build_guide,
+            f"BUILD is missing full Windows ARM64 wheel coverage: {token}",
         )
 
     note_text = release_note.read_text(encoding="utf-8")

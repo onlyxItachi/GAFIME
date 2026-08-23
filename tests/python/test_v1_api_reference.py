@@ -330,6 +330,15 @@ def test_documentation_hierarchy_and_local_links_are_valid() -> None:
     markdown_sources = {
         ROOT / "README.md": (ROOT / "README.md").read_text(encoding="utf-8"),
         ROOT / "USAGE.md": (ROOT / "USAGE.md").read_text(encoding="utf-8"),
+        ROOT / "docs" / "README.md": (ROOT / "docs" / "README.md").read_text(
+            encoding="utf-8"
+        ),
+        ROOT / "docs" / "releases" / "README.md": (
+            ROOT / "docs" / "releases" / "README.md"
+        ).read_text(encoding="utf-8"),
+        ROOT / "docs" / "releases" / "STATUS.md": (
+            ROOT / "docs" / "releases" / "STATUS.md"
+        ).read_text(encoding="utf-8"),
         COVERAGE_PATH: COVERAGE_PATH.read_text(encoding="utf-8"),
     }
     notebook_markdown = "\n".join(
@@ -357,8 +366,8 @@ def test_reference_records_current_non_api_boundaries() -> None:
         "advanced compatibility/native boundary",
         "RT/OptiX remains experimental and local-only",
         "not a universal performance claim",
-        "does not yet reject a negative value",
-        "does not yet reject a non-positive value",
-        "and reads one batch",
+        "validated at construction and through `set_params()`",
+        "validated before the reader evaluates the source row count",
+        "validated before the file is opened",
     ):
         assert required in source

@@ -72,27 +72,29 @@ class CurrentTruthHelperTests(unittest.TestCase):
         self.assertIn("per-permuted-target path rediscovery", guidance)
         self.assertIn("nvcudart_hybrid64.dll", guidance)
 
-    def test_beta2_install_guidance_is_prospective_until_publication(self) -> None:
+    def test_install_guidance_routes_mutable_release_state(self) -> None:
         for module in (self.health, self.platform, self.troubleshooter, self.benchmark):
-            self.assertEqual(module.RELEASE_STATUS, "not_yet_published")
+            self.assertEqual(module.RELEASE_STATUS, "see_docs_releases_status")
 
         platform_fields = self.platform._release_install_fields(
-            self.platform.WHEN_PUBLISHED_CUDA_INSTALL
+            self.platform.PRERELEASE_CUDA_INSTALL
         )
-        self.assertEqual(platform_fields["release_status"], "not_yet_published")
-        self.assertIn("not yet published", platform_fields["current_install_guidance"])
+        self.assertEqual(platform_fields["release_status"], "see_docs_releases_status")
+        self.assertIn(
+            "docs/releases/STATUS.md", platform_fields["current_install_guidance"]
+        )
         self.assertEqual(
-            platform_fields["when_published_install"],
-            'pip install "gafime==1.0.0b2" "gafime-cuda==1.0.0b2"',
+            platform_fields["prerelease_install"],
+            "pip install --pre gafime gafime-cuda",
         )
         self.assertNotIn("recommended_install", platform_fields)
 
         missing = self.benchmark._missing_gafime_install_record()
-        self.assertIn("not yet published", missing["error"])
-        self.assertEqual(missing["release_status"], "not_yet_published")
+        self.assertIn("docs/releases/STATUS.md", missing["error"])
+        self.assertEqual(missing["release_status"], "see_docs_releases_status")
         self.assertEqual(
-            missing["when_published_install"],
-            "pip install 'gafime[sklearn]==1.0.0b2'",
+            missing["prerelease_install"],
+            "pip install --pre 'gafime[sklearn]'",
         )
 
         for relative in (
@@ -102,8 +104,8 @@ class CurrentTruthHelperTests(unittest.TestCase):
             "troubleshoot-backend/SKILL.md",
         ):
             guidance = (SKILLS / relative).read_text(encoding="utf-8").lower()
-            self.assertIn("not yet published", guidance)
-            self.assertIn("once beta.2 is published", guidance)
+            self.assertIn("docs/releases/status.md", guidance)
+            self.assertNotIn("not yet published", guidance)
 
     def test_payload_versions_must_match_core_exactly(self) -> None:
         installed = {

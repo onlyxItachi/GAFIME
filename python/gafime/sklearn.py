@@ -15,11 +15,9 @@ class GafimeSelector:
     It returns Python lists so callers can adapt the result to sklearn or another
     ML stack without exposing backend-owned buffers.
 
-    ``k`` is the maximum number of pair interactions retained and callers must
-    pass a non-negative value.  Beta.2 does not yet reject a negative ``k`` at
-    construction; it reaches Python slice semantics and can retain an
-    unexpected prefix.  ``backend``, ``metric``, and keyword-only ``precision``
-    are passed to the native
+    ``k`` is the maximum number of pair interactions retained and must be
+    non-negative. Invalid values fail before discovery or materialization.
+    ``backend``, ``metric``, and keyword-only ``precision`` are passed to the native
     discovery run.  ``operator`` controls only post-discovery materialization
     and accepts ``multiply``, ``add``, ``subtract``, or ``divide``; division
     uses a positive ``1e-8`` guard in the selected pointwise dtype.
@@ -42,7 +40,7 @@ class GafimeSelector:
         *,
         precision: str = "mixed",
     ) -> None:
-        self.k = int(k)
+        self.k = self._validate_k(k)
         self.backend = backend
         self.metric = metric
         self.operator = operator
@@ -145,9 +143,9 @@ class GafimeSelector:
     def set_params(self, **params: object):
         """Set known constructor parameters and return ``self``.
 
-        Unknown names raise :class:`ValueError`.  Precision is validated at
-        assignment; backend/metric/operator validity is enforced by fit or
-        transform at the boundary where it becomes relevant.
+        Unknown names raise :class:`ValueError`. Precision and ``k`` are
+        validated at assignment; backend/metric/operator validity is enforced
+        by fit or transform at the boundary where it becomes relevant.
         """
 
         valid = self.get_params(deep=False)
@@ -161,8 +159,17 @@ class GafimeSelector:
                 from ._precision import normalize_precision
 
                 normalize_precision(value)
+            if name == "k":
+                value = self._validate_k(value)
             setattr(self, name, value)
         return self
+
+    @staticmethod
+    def _validate_k(value: object) -> int:
+        k = int(value)
+        if k < 0:
+            raise ValueError("k must be non-negative.")
+        return k
 
     def _interaction_values(self, row: Sequence[float]) -> List[float]:
         values: List[float] = []

@@ -38,10 +38,10 @@ must remain fold-local. Decision-path permutation maxT is supported only by
 rediscovering paths for every permuted target; never reuse target-dependent
 paths across folds or permutations.
 
-Beta.2 is not yet published. Run this helper from the repository development
-environment and do not present its target package as currently available from
-PyPI. Once beta.2 is published, require the exact command
-`pip install "gafime[sklearn]==1.0.0b2"`. Before presenting a generated script,
+Consult `docs/releases/STATUS.md`, GitHub Releases, and PyPI for current
+publication state. Install the current prerelease with
+`pip install --pre "gafime[sklearn]"`, or use an exact published version when
+reproducibility is required. Before presenting a generated script,
 run `python -m py_compile` on it and confirm the selected third-party model is
 installed. Never describe `backend="auto"` as guaranteed GPU execution; report
 the selected backend from the fitted GAFIME report or capability probe. The

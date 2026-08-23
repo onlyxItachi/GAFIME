@@ -10,25 +10,21 @@ import shutil
 import subprocess
 
 
-RELEASE_STATUS = "not_yet_published"
+RELEASE_STATUS = "see_docs_releases_status"
 CURRENT_INSTALL_GUIDANCE = (
-    "GAFIME 1.0.0b2 is not yet published; use the repository development "
-    "environment until publication completes."
+    "Consult docs/releases/STATUS.md, GitHub Releases, and PyPI for mutable "
+    "publication state."
 )
-WHEN_PUBLISHED_CORE_INSTALL = 'pip install "gafime==1.0.0b2"'
-WHEN_PUBLISHED_CUDA_INSTALL = (
-    'pip install "gafime==1.0.0b2" "gafime-cuda==1.0.0b2"'
-)
-WHEN_PUBLISHED_ROCM_INSTALL = (
-    'pip install "gafime==1.0.0b2" "gafime-rocm==1.0.0b2"'
-)
+PRERELEASE_CORE_INSTALL = "pip install --pre gafime"
+PRERELEASE_CUDA_INSTALL = "pip install --pre gafime gafime-cuda"
+PRERELEASE_ROCM_INSTALL = "pip install --pre gafime gafime-rocm"
 
 
 def _release_install_fields(command: str) -> dict[str, str]:
     return {
         "release_status": RELEASE_STATUS,
         "current_install_guidance": CURRENT_INSTALL_GUIDANCE,
-        "when_published_install": command,
+        "prerelease_install": command,
     }
 
 
@@ -59,7 +55,9 @@ def _nvidia_smi() -> list[str] | None:
 
 def _amd_rocm_hint() -> list[str] | None:
     env_hints = [
-        name for name in ("ROCM_PATH", "HIP_PATH", "HIPSDK_PATH") if os.environ.get(name)
+        name
+        for name in ("ROCM_PATH", "HIP_PATH", "HIPSDK_PATH")
+        if os.environ.get(name)
     ]
     if env_hints:
         return [f"{name}=configured" for name in env_hints]
@@ -68,7 +66,11 @@ def _amd_rocm_hint() -> list[str] | None:
             output = subprocess.check_output(
                 ["rocm_agent_enumerator"], text=True, timeout=5
             )
-            rows = [line.strip() for line in output.splitlines() if line.strip().startswith("gfx")]
+            rows = [
+                line.strip()
+                for line in output.splitlines()
+                if line.strip().startswith("gfx")
+            ]
             return rows or ["rocm_agent_enumerator available"]
         except Exception:
             return ["rocm_agent_enumerator available"]
@@ -102,8 +104,7 @@ def main() -> int:
     nvidia = _nvidia_smi()
     amd_rocm = _amd_rocm_hint()
     payloads = {
-        name: _dist_version(name)
-        for name in ("gafime", "gafime-cuda", "gafime-rocm")
+        name: _dist_version(name) for name in ("gafime", "gafime-cuda", "gafime-rocm")
     }
     result: dict[str, object] = {
         "os": system,
@@ -114,13 +115,13 @@ def main() -> int:
         "amd_rocm": amd_rocm,
         "payload_distributions": payloads,
         "recommended_backend": "core",
-        **_release_install_fields(WHEN_PUBLISHED_CORE_INSTALL),
+        **_release_install_fields(PRERELEASE_CORE_INSTALL),
         "capability_probe": None,
         "notes": [
             "backend='auto' ranks validated GPU payloads above Rust Core.",
             "Explicit cuda, rocm, and metal requests never fall back to another backend.",
             "Family generation and scoring placement are separate capability facts.",
-            "Once published, beta.2 will provide dedicated wheels for CPython 3.10 through 3.14.",
+            "GAFIME v1 uses dedicated wheels for CPython 3.10 through 3.14.",
         ],
     }
     result["notes"].extend(_payload_version_warnings(payloads))
@@ -133,10 +134,12 @@ def main() -> int:
         if caps.selected_backend:
             result["recommended_backend"] = caps.selected_backend
     except Exception as exc:
-        result["notes"].append(f"installed capability probe unavailable: {type(exc).__name__}: {exc}")
+        result["notes"].append(
+            f"installed capability probe unavailable: {type(exc).__name__}: {exc}"
+        )
 
     if system_l == "darwin" and machine_l in {"arm64", "aarch64"}:
-        result["when_published_install"] = WHEN_PUBLISHED_CORE_INSTALL
+        result["prerelease_install"] = PRERELEASE_CORE_INSTALL
         result["notes"].append(
             "Metal is bundled in the macOS arm64 Core wheel, supports fp32 only, "
             "and is selected only after a successful runtime probe."
@@ -146,16 +149,18 @@ def main() -> int:
                 "The requested precision excludes Metal; auto may select Rust Core."
             )
     elif nvidia and machine_l in {"x86_64", "amd64", "x64"}:
-        result["when_published_install"] = WHEN_PUBLISHED_CUDA_INSTALL
+        result["prerelease_install"] = PRERELEASE_CUDA_INSTALL
     elif amd_rocm and system_l == "linux" and machine_l in {"x86_64", "amd64", "x64"}:
-        result["when_published_install"] = WHEN_PUBLISHED_ROCM_INSTALL
+        result["prerelease_install"] = PRERELEASE_ROCM_INSTALL
         result["notes"].append(
-            "Once published, PyPI will provide the buildable ROCm sdist; the matching "
+            "PyPI provides the buildable ROCm sdist; the matching "
             "GitHub Release will carry the prebuilt thin raw-Linux wheel. Both use the "
             "system ROCm runtime."
         )
     elif amd_rocm and system_l == "windows":
-        result["notes"].append("ROCm payload wheels are not distributed for Windows; use backend='core'.")
+        result["notes"].append(
+            "ROCm payload wheels are not distributed for Windows; use backend='core'."
+        )
 
     print(json.dumps(result, indent=2, default=str))
     return 0

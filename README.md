@@ -1,257 +1,118 @@
-# GAFIME
+# GAFIME — GPU-Accelerated Feature Interaction Mining Engine
 
-![PyPI version](https://img.shields.io/pypi/v/gafime)
-![Python Versions](https://img.shields.io/pypi/pyversions/gafime)
-![License](https://img.shields.io/github/license/onlyxItachi/GAFIME)
+[![Latest release](https://img.shields.io/github/v/release/onlyxItachi/GAFIME?include_prereleases&sort=semver)](https://github.com/onlyxItachi/GAFIME/releases)
+[![PyPI version](https://img.shields.io/pypi/v/gafime)](https://pypi.org/project/gafime/)
+[![Python versions](https://img.shields.io/pypi/pyversions/gafime)](https://pypi.org/project/gafime/)
+[![V1 Contract Validation](https://github.com/onlyxItachi/GAFIME/actions/workflows/v1_contract_validation.yml/badge.svg?branch=main)](https://github.com/onlyxItachi/GAFIME/actions/workflows/v1_contract_validation.yml)
+[![License](https://img.shields.io/github/license/onlyxItachi/GAFIME)](LICENSE)
 
-GPU-Accelerated Feature Interaction Mining Engine.
+Native feature-interaction discovery across Rust CPU/SIMD, CUDA, ROCm/HIP,
+and Metal.
 
-GAFIME is a native feature interaction mining engine for tabular and structured
-machine-learning workflows. Python exposes a thin public API; Rust owns
-validation, planning, scheduling, CPU kernels, and report handles; CUDA, Metal,
-and ROCm/HIP own their backend-local C ABI payloads.
+GAFIME searches continuous interactions, decision-path regions, and temporal
+transforms for tabular and structured machine-learning workflows. Python is
+the concise public declaration and reporting surface; Rust owns validation,
+planning, scheduling, lifecycle, and Core execution; each native GPU payload
+owns its device-local execution.
 
-The engine is built for workloads where interaction candidates, decision-path
-regions, and temporal transforms become too expensive to search with ordinary
-Python loops or model-by-model trial code.
+## Quick Start
 
-## Install
-
-Beta.2 is not yet published. The exact-version commands below are the intended
-public install surface once it is published; until then, use the source checkout
-instructions in [BUILD.md](BUILD.md).
-
-Core package:
+Install the current published prerelease of Core, optionally with a matching
+vendor payload:
 
 ```bash
-python -m pip install "gafime==1.0.0b2"
+python -m pip install --pre gafime
+python -m pip install --pre gafime gafime-cuda  # Linux/Windows x86_64 + CUDA
+python -m pip install --pre gafime gafime-rocm  # Linux x86_64 + system ROCm
 ```
 
-Beta.2 is a prerelease, so its public install commands use the exact PEP 440
-version shown above; an unqualified `pip install gafime` continues to prefer
-the latest stable release.
-
-Optional Python integrations:
-
-```bash
-python -m pip install "gafime[sklearn]==1.0.0b2"
-python -m pip install "gafime[bench]==1.0.0b2"
-```
-
-Vendor GPU payloads are explicit in the v1 distribution design. Pip can select
-wheels by Python, ABI, OS, and CPU architecture, but not by local GPU vendor.
-GPU payloads therefore use explicit same-version package selection:
-
-```bash
-python -m pip install "gafime==1.0.0b2" "gafime-cuda==1.0.0b2"
-python -m pip install "gafime==1.0.0b2" "gafime-rocm==1.0.0b2"
-```
-
-Core has no dependency on either payload; each payload requires the exact
-matching Core version. CUDA ships wheels on Linux/Windows x86_64. Apple Silicon
-users install plain
-`gafime`; its macOS arm64 core wheel directly contains the paired Metal dylib
-and metallib. There is no separate Metal project or extra. Other core wheels
-contain no vendor GPU payload. CUDA wheels carry only GAFIME binaries and
-require a compatible system CUDA 13 runtime. The standard ROCm wheel is thin,
-carries only GAFIME binaries, and requires system ROCm 7.2.x. Because its
-truthful `linux_x86_64` tag is not accepted by PyPI, that wheel is attached to
-the matching GitHub Release while PyPI carries the buildable ROCm source
-distribution.
-
-Each platform builds and tests a dedicated wheel for CPython 3.10 through 3.14.
-Python's Stable ABI is not used. Windows ARM64 uses an ARM64 Python 3.11
-workflow host while cibuildwheel provisions every target interpreter,
-including CPython 3.10, from the official `pythonarm64` NuGet packages.
-
-Detailed install and backend policy:
-
-- [docs/backend-selection.md](docs/backend-selection.md)
-- [docs/capabilities.md](docs/capabilities.md)
-- [docs/rocm-wheel-policy.md](docs/rocm-wheel-policy.md)
-- [docs/eager-resident-compiled-execution.md](docs/eager-resident-compiled-execution.md)
-- [BUILD.md](BUILD.md)
-
-## Basic Usage
+Core never depends on a GPU payload. Payload packages require the exact matching
+Core version. Apple Silicon Core wheels contain the Metal payload; there is no
+standalone Metal distribution. See the live [release status](docs/releases/STATUS.md)
+and [backend installation guide](docs/backend-selection.md) before choosing a
+hardware package.
 
 ```python
 from gafime import ComputeBudget, EngineConfig, GafimeEngine
 
-X = [
-    [float(i), float((i * 7) % 11), float((i % 5) - 2)]
-    for i in range(64)
-]
+X = [[float(i), float((i * 7) % 11), float((i % 5) - 2)] for i in range(64)]
 y = [0.4 * row[0] * row[1] - 0.2 * row[2] for row in X]
-feature_names = ["trend", "cycle", "offset"]
 
 config = EngineConfig(
     backend="auto",
     precision="mixed",
     metric_names=("pearson", "r2"),
+    budget=ComputeBudget(max_comb_size=2),
     permutation_tests=0,
     num_repeats=1,
-    budget=ComputeBudget(max_comb_size=2),
 )
-
-report = GafimeEngine(config).analyze(X, y, feature_names=feature_names)
+report = GafimeEngine(config).analyze(
+    X, y, feature_names=["trend", "cycle", "offset"]
+)
 print(report.backend)
-print(report.interactions[:5])
+print(report.interactions.top_k(5, metric_name="pearson"))
 ```
 
-`precision` is the single public arithmetic profile and is keyword-only.
-`"mixed"` is the default: fp32 ingest/storage and pointwise interaction work,
-with fp64 reductions, ranking, and public results. `"fp32"` keeps all four
-numeric domains in fp32. `"fp64"` preserves fp64 from
-ingest through public results without an fp32 staging conversion.
-Core, CUDA, and ROCm support all three profiles
-in their existing packages.
-Metal supports only the genuine fp32 profile; an explicit Metal mixed/fp64 request fails before
-payload discovery or allocation, while `backend="auto"` can select Core on an
-Apple system for those profiles. See
-[docs/precision-contract.md](docs/precision-contract.md) for the full contract.
+## What GAFIME Supports
 
-Generate the compact practice notebook:
+- Continuous unary and higher-order interaction candidates.
+- Native decision-path candidates with target-rediscovered permutation maxT.
+- Lag, delta, velocity, acceleration, and rolling time-series candidates.
+- Eager, resident, and explicit compiled lifecycles.
+- NumPy, Polars/Arrow, file-streaming, scikit-learn, and CLI integration.
 
-```python
-import gafime
+| Backend | Distribution | Precision profiles |
+|---|---|---|
+| Rust Core/SIMD | `gafime` | `fp32`, `mixed`, `fp64` |
+| CUDA | `gafime-cuda` | `fp32`, `mixed`, `fp64` |
+| ROCm/HIP | `gafime-rocm` | `fp32`, `mixed`, `fp64` |
+| Metal | embedded in macOS arm64 `gafime` | `fp32` only |
 
-gafime.generate_tutorial()
-```
+Explicit unsupported backend/profile requests fail closed. `backend="auto"`
+selects only from available, compatible native paths; explicit vendor requests
+never silently substitute Core. RT/OptiX remains experimental and local-only.
 
-The generated notebook and the tracked practice notebook share the same v1
-source. The comprehensive reference is maintained separately so the compact
-tutorial stays approachable. The repository also keeps a clearly labeled
-historical API notebook from earlier release work.
+## Documentation
 
-- [docs/notebooks/gafime_tutorial.ipynb](docs/notebooks/gafime_tutorial.ipynb) (current v1 practice notebook)
-- [docs/notebooks/gafime_v1_api_reference.ipynb](docs/notebooks/gafime_v1_api_reference.ipynb) (authoritative current v1 API reference and cookbook)
-- [docs/public-api-coverage.md](docs/public-api-coverage.md) (machine-checked public surface coverage)
-- [docs/notebooks/gafime_full_api_reference_notebook.ipynb](docs/notebooks/gafime_full_api_reference_notebook.ipynb) (historical reference)
+### Getting Started
 
-## Candidate Families
+- [Guided tutorial](docs/notebooks/gafime_tutorial.ipynb)
+- [Practical usage guide](USAGE.md)
 
-GAFIME supports:
+### API
 
-- continuous interaction candidates,
-- native decision-path candidates for threshold/region-like structure,
-- explicit time-series candidates: lag, delta, velocity, acceleration, rolling
-  mean, rolling std, and rolling sum,
-- scikit-learn transformer integration through `gafime.sklearn.GafimeSelector`,
-- native Arrow ingest through `gafime.dataload`.
+- [Authoritative v1 API reference and cookbook](docs/notebooks/gafime_v1_api_reference.ipynb)
+- [Machine-checked public API coverage](docs/public-api-coverage.md)
 
-The v0.4 discrete candidate family has been deprecated and removed from the
-current engine path. Use decision-path candidates for tree-like threshold and
-region structure.
+### Execution and Backends
 
-Decision-path permutation maxT and bootstrap stability are supported.
-Every permuted target triggers fresh path discovery before the complete
-expanded candidate family is rescored, so the reported null distribution never
-reuses target-derived paths from the observed run.
-Bootstrap `stability_std` is variability conditional on an already-selected
-candidate using the same rows; it is not out-of-sample evidence and does not
-correct selection bias. Validate selected candidates on untouched data.
+- [Backend selection and installation](docs/backend-selection.md)
+- [Capability reporting](docs/capabilities.md)
+- [Precision contract](docs/precision-contract.md)
+- [Eager, resident, and compiled execution](docs/eager-resident-compiled-execution.md)
 
-## Backend Policy
+### Architecture and Development
 
-`backend="auto"` ranks the available native execution paths:
+- [Documentation index](docs/README.md)
+- [Normative v1 architecture contract](docs/contract.md)
+- [Build guide](BUILD.md)
+- [Contribution guide](CONTRIBUTING.md)
 
-1. configured GPU payloads whose C ABI library loads and whose `device_id`
-   reports valid device info,
-2. the Rust CPU vector path ranked by detected ISA
-   (`AVX512 > AVX2 > SSE4.2/NEON`),
-3. the scalar Rust CPU path.
+### Security
 
-Explicit `backend="cuda"`, `backend="rocm"`, and `backend="metal"` never fall
-back to another backend. `auto` is the only mode that probes candidates and
-selects the best available execution path.
+- [Security policy and private reporting](SECURITY.md)
 
-`backend="gpu"` is rejected because it is ambiguous across CUDA, ROCm, and
-Metal. Use `auto`, `cuda`, `rocm`, `metal`, or `core`.
+## Releases
 
-## Native Reports
+- [Current release-train status](docs/releases/STATUS.md)
+- [Release index](docs/releases/README.md)
+- [Changelog](CHANGELOG.md)
 
-Reports are structured Python objects. Read properties such as:
+## License / Contact
 
-- `report.interactions`
-- `report.decision`
-- `report.backend`
-- `report.warnings`
+GAFIME is licensed under [Apache-2.0](LICENSE).
 
-`DiagnosticReport.to_dict()` remains only as a deprecated export convenience.
-It should not be used as a runtime data-flow path.
+Maintainer: Hamza Usta — <hamzausta2222@gmail.com>
 
-## Developer Docker Images
-
-Docker files in this repository are development environments, not distribution
-images. Normal users should install the published artifacts described above;
-the prebuilt thin ROCm wheel comes from the matching GitHub Release rather than
-PyPI.
-
-Available source-build containers:
-
-```bash
-docker compose run --build gafime-cuda-dev
-docker compose run --build gafime-core-smoke
-```
-
-The CUDA development image includes the CUDA toolkit, compiler toolchain, Rust,
-CMake, GAFIME development/benchmark/scikit-learn dependencies, and the locally
-staged `gafime-cuda` payload by default. Extra workstation packages can be
-added with the `EXTRA_PIP_PACKAGES` Docker build argument. The Core smoke image
-is a smaller CPU-native source-build check.
-
-Docker details:
-
-- [CONTRIBUTING.md](CONTRIBUTING.md)
-
-## Release Versioning
-
-GAFIME uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) for
-Cargo, Git tags, GitHub Releases, changelog headings, and new release-note
-filenames. Python metadata, artifacts, dependencies, and PyPI use
-[PEP 440](https://peps.python.org/pep-0440/). For this release,
-`v1.0.0-beta.2` and `1.0.0b2` identify the same source and artifact set.
-
-The release parser rejects unsupported or ambiguous mappings before
-publication. See the
-[release operations runbook](docs/releases/release-operations.md) for the
-machine-checked mapping and recovery rules.
-
-## Project References
-
-- [docs/contract.md](docs/contract.md) (normative v1 architecture and ownership)
-- [docs/abi-evolution.md](docs/abi-evolution.md) (ABI 1.0/1.1 evolution and compatibility)
-- [SECURITY.md](SECURITY.md) and
-  [docs/security/threat-model.md](docs/security/threat-model.md)
-- [docs/releases/v1.0.0-beta.2.md](docs/releases/v1.0.0-beta.2.md)
-- [docs/releases/release-artifact-matrix.md](docs/releases/release-artifact-matrix.md)
-- [docs/releases/v1.0.0b1.md](docs/releases/v1.0.0b1.md) (aborted packaging checkpoint)
-- [docs/releases/v1.0.0b0.md](docs/releases/v1.0.0b0.md) (previous beta)
-- [docs/releases/v1.0.0a0.md](docs/releases/v1.0.0a0.md) (previous alpha)
-- [docs/capabilities.md](docs/capabilities.md)
-- [docs/eager-resident-compiled-execution.md](docs/eager-resident-compiled-execution.md)
-- [docs/backend-selection.md](docs/backend-selection.md)
-- [docs/notebooks/gafime_v1_api_reference.ipynb](docs/notebooks/gafime_v1_api_reference.ipynb)
-- [docs/notebooks/gafime_tutorial.ipynb](docs/notebooks/gafime_tutorial.ipynb)
-- [docs/public-api-coverage.md](docs/public-api-coverage.md)
-- [USAGE.md](USAGE.md)
-- [docs/notebooks/gafime_full_api_reference_notebook.ipynb](docs/notebooks/gafime_full_api_reference_notebook.ipynb) (historical reference)
-- [CONTRIBUTING.md](CONTRIBUTING.md)
-
-Maintainer release operations are documented separately in
-[docs/releases/release-operations.md](docs/releases/release-operations.md).
-That runbook does not authorize publication; release tags and uploads require an
-explicit maintainer decision from a fully validated commit.
-
-Historical release records remain available under `docs/releases/`, including
-[v0.4.7](docs/releases/v0.4.7.md) and
-[v0.5.0-legacy](docs/releases/v0.5.0-legacy.md).
-
-## Contact
-
-Maintainer: Hamza Usta
-
-Email: <hamzausta2222@gmail.com>
-
-Security reports: follow [SECURITY.md](SECURITY.md) and do not disclose
-suspected vulnerabilities through public issues.
+Report suspected vulnerabilities privately through the process in
+[SECURITY.md](SECURITY.md), not through a public issue.
