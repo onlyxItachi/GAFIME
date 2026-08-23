@@ -34,7 +34,7 @@ def source_checks() -> dict[str, bool]:
             )
         )
         and "finite_dispatch_isa" in isa,
-        "centered_covariance_kept": "self.sxy / denom" in covariance
+        "centered_covariance_kept": "self.sxy / product.sqrt()" in covariance
         and "clamp(-1.0, 1.0)" in covariance,
         "finite_check_fused_into_sum_pass": "all_pairs_finite" not in covariance
         and "EARLY_NONFINITE_PROBE_ROWS: usize = 16" in covariance
