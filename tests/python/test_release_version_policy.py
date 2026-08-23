@@ -119,13 +119,13 @@ def test_unsupported_pep440_identifiers_fail_closed(value: str) -> None:
 def test_current_project_metadata_agrees_through_authoritative_parser() -> None:
     release = release_version.validate_project_versions(ROOT)
 
-    assert release.semver == "1.0.0-beta.2"
-    assert release.pep440 == "1.0.0b2"
-    assert release.tag == "v1.0.0-beta.2"
+    assert release.semver == "1.0.0-rc.1"
+    assert release.pep440 == "1.0.0rc1"
+    assert release.tag == "v1.0.0-rc.1"
     release_version.validate_github_ref(release, f"refs/tags/{release.tag}")
     release_version.validate_github_ref(release, "refs/heads/release-candidate")
     with pytest.raises(VersionPolicyError, match="canonical SemVer tag"):
-        release_version.validate_github_ref(release, "refs/tags/v1.0.0b2")
+        release_version.validate_github_ref(release, "refs/tags/v1.0.0rc1")
 
 
 @pytest.mark.parametrize(
@@ -156,7 +156,7 @@ def test_cli_exports_parsed_release_outputs(tmp_path: Path) -> None:
             "--project-root",
             str(ROOT),
             "--github-ref",
-            "refs/tags/v1.0.0-beta.2",
+            "refs/tags/v1.0.0-rc.1",
             "--github-output",
             str(output),
         ],
@@ -166,11 +166,11 @@ def test_cli_exports_parsed_release_outputs(tmp_path: Path) -> None:
     )
 
     assert json.loads(result.stdout) == {
-        "pep440": "1.0.0b2",
+        "pep440": "1.0.0rc1",
         "prerelease": "true",
-        "release_note": "docs/releases/v1.0.0-beta.2.md",
-        "semver": "1.0.0-beta.2",
-        "tag": "v1.0.0-beta.2",
+        "release_note": "docs/releases/v1.0.0-rc.1.md",
+        "semver": "1.0.0-rc.1",
+        "tag": "v1.0.0-rc.1",
     }
     assert dict(
         line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines()

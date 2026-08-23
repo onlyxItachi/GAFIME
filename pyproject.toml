@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "gafime"
-version = "1.0.0b2"
+version = "1.0.0rc1"
 description = "GPU-Accelerated Feature Interaction Mining Engine (GAFIME) with native Rust CPU/SIMD, CUDA, ROCm/HIP, and Metal execution"
 readme = "README.md"
 license = "Apache-2.0"

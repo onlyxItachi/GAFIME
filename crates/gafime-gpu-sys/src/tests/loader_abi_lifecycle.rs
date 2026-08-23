@@ -1126,6 +1126,9 @@ fn gpu_backend_rejects_mismatched_payload_identity() {
 
 #[test]
 fn owned_gpu_matrix_exposes_only_a_borrowed_handle_and_frees_once() {
+    let _guard = ABI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     OWNED_MATRIX_FREES.store(0, Ordering::SeqCst);
     let mut functions = complete_test_function_table();
     functions.matrix_free = Some(owned_matrix_free);

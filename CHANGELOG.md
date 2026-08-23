@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.0.0-rc.1
 
 - Reject negative `GafimeSelector.k`, non-positive streaming batch sizes, and
   non-positive streaming benchmark counts before selection or input reads.
@@ -9,6 +9,8 @@
   status instead of self-invalidating prose.
 - Refined project metadata and public repository discovery information for the
   v1 release candidate train.
+- Froze the repository/Cargo identity as `1.0.0-rc.1` and the Python/PyPI
+  identity as `1.0.0rc1` under the canonical `v1.0.0-rc.1` release policy.
 
 ## v1.0.0-beta.2 (unreleased checkpoint)
 

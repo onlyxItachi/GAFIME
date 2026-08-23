@@ -34,15 +34,15 @@ def test_package_module_preserves_the_legacy_cli_entrypoint():
     result = _cli("--version", module="gafime")
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "gafime 1.0.0b2"
+    assert result.stdout.strip() == "gafime 1.0.0rc1"
 
 
 def test_check_reports_core_package_native_version_and_static_capabilities():
     result = _cli("--check", "--backend", "core")
 
     assert result.returncode == 0, result.stderr
-    assert "GAFIME package: 1.0.0b2" in result.stdout
-    assert "native version: 1.0.0b2" in result.stdout
+    assert "GAFIME package: 1.0.0rc1" in result.stdout
+    assert "native version: 1.0.0rc1" in result.stdout
     assert "configured backend: core" in result.stdout
     assert "selected backend: core" in result.stdout
     assert "backend status: available" in result.stdout
