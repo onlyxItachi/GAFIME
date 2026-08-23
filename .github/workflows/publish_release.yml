@@ -48,6 +48,13 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install cross-format ABI inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes llvm
+          command -v llvm-nm
+          command -v llvm-readobj
+
       - name: Bind successful build run to canonical tag commit
         id: bind
         shell: bash

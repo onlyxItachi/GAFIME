@@ -2437,6 +2437,13 @@ def _assert_publish_workflow(workflow: str) -> None:
         "publisher must bind a successful build run and revalidate its frozen bundle",
     )
     _require(
+        "Install cross-format ABI inspection tools" in preflight
+        and "sudo apt-get install --yes llvm" in preflight
+        and "command -v llvm-nm" in preflight
+        and "command -v llvm-readobj" in preflight,
+        "publisher preflight must install the cross-format ABI inspection tools",
+    )
+    _require(
         "check_pypi_artifact_collisions.py" in preflight
         and "--allow-matching-existing" in preflight,
         "publisher must fail closed on PyPI collisions unless hashes match",
