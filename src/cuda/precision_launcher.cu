@@ -152,6 +152,9 @@ int cuda_status(cudaError_t status) {
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
+// CUDA's current-device selection belongs to the caller thread. Payload entry
+// points borrow it only for this scope; restoration on every return path keeps
+// GAFIME from leaking its matrix/device choice into the embedding application.
 class ScopedCudaDevice {
 public:
     explicit ScopedCudaDevice(uint32_t device_id) {

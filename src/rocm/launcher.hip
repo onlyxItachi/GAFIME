@@ -891,6 +891,9 @@ int hip_status(hipError_t status) {
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
+// HIP's current-device selection belongs to the caller thread. Payload entry
+// points borrow it only for this scope; restoration on every return path keeps
+// GAFIME from leaking its matrix/device choice into the embedding application.
 class ScopedHipDevice {
 public:
     explicit ScopedHipDevice(uint32_t device_id) {

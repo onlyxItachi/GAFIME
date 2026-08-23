@@ -110,7 +110,7 @@ payload discovery or allocation, while `backend="auto"` can select Core on an
 Apple system for those profiles. See
 [docs/precision-contract.md](docs/precision-contract.md) for the full contract.
 
-Generate the reference notebook:
+Generate the compact practice notebook:
 
 ```python
 import gafime
@@ -119,10 +119,13 @@ gafime.generate_tutorial()
 ```
 
 The generated notebook and the tracked practice notebook share the same v1
-source. The repository also keeps a clearly labeled historical API notebook
-from earlier release work.
+source. The comprehensive reference is maintained separately so the compact
+tutorial stays approachable. The repository also keeps a clearly labeled
+historical API notebook from earlier release work.
 
 - [docs/notebooks/gafime_tutorial.ipynb](docs/notebooks/gafime_tutorial.ipynb) (current v1 practice notebook)
+- [docs/notebooks/gafime_v1_api_reference.ipynb](docs/notebooks/gafime_v1_api_reference.ipynb) (authoritative current v1 API reference and cookbook)
+- [docs/public-api-coverage.md](docs/public-api-coverage.md) (machine-checked public surface coverage)
 - [docs/notebooks/gafime_full_api_reference_notebook.ipynb](docs/notebooks/gafime_full_api_reference_notebook.ipynb) (historical reference)
 
 ## Candidate Families
@@ -228,7 +231,9 @@ machine-checked mapping and recovery rules.
 - [docs/capabilities.md](docs/capabilities.md)
 - [docs/eager-resident-compiled-execution.md](docs/eager-resident-compiled-execution.md)
 - [docs/backend-selection.md](docs/backend-selection.md)
+- [docs/notebooks/gafime_v1_api_reference.ipynb](docs/notebooks/gafime_v1_api_reference.ipynb)
 - [docs/notebooks/gafime_tutorial.ipynb](docs/notebooks/gafime_tutorial.ipynb)
+- [docs/public-api-coverage.md](docs/public-api-coverage.md)
 - [USAGE.md](USAGE.md)
 - [docs/notebooks/gafime_full_api_reference_notebook.ipynb](docs/notebooks/gafime_full_api_reference_notebook.ipynb) (historical reference)
 - [CONTRIBUTING.md](CONTRIBUTING.md)

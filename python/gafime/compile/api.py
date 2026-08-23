@@ -16,4 +16,12 @@ def compile(
     config: EngineConfig | None = None,
     flags: CompileFlags | None = None,
 ) -> NativeCompiledGafime:
+    """Create a thread-affine native artifact from a validated matrix.
+
+    This submodule entry point is equivalent to :func:`gafime.compile`.
+    ``flags`` controls compatibility-plan metadata, backend graph replay, and
+    Arrow result export.  Unsupported graph/backend combinations fail closed;
+    the caller must close the returned artifact on its creation thread.
+    """
+
     return GafimeEngine(config).compile(X, y, feature_names=feature_names, flags=flags)

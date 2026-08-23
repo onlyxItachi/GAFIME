@@ -221,6 +221,12 @@ fn centered_moments_scalar_f64(
     out
 }
 
+/// Computes f64 Pearson moments with AVX-512F lanes.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX-512F. Input shape and
+/// vector-load bounds are validated before any raw pointer is dereferenced.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[inline(never)]
@@ -263,6 +269,11 @@ unsafe fn pearson_moments_avx512(x: &[f64], y: &[f64]) -> PearsonMomentsF64 {
     centered_moments_avx512(parts, sum_x / n as f64, sum_y / n as f64)
 }
 
+/// Checks two AVX-512F vectors for finite values.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX-512F.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[inline]
@@ -281,6 +292,13 @@ unsafe fn all_finite_avx512_pd(
     x_mask == u8::MAX && y_mask == u8::MAX
 }
 
+/// Accumulates centered f64 moments with AVX-512F lanes.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX-512F. The two prefixes
+/// must have equal lengths divisible by 8, and the tails must have equal
+/// lengths. `EqualVectorParts::new` establishes those bounds.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[inline(never)]
@@ -330,6 +348,12 @@ unsafe fn centered_moments_avx512(
     out
 }
 
+/// Computes f64 Pearson moments with AVX2 lanes.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX2. Input shape and
+/// vector-load bounds are validated before any raw pointer is dereferenced.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline(never)]
@@ -372,6 +396,11 @@ unsafe fn pearson_moments_avx2(x: &[f64], y: &[f64]) -> PearsonMomentsF64 {
     centered_moments_avx2(parts, sum_x / n as f64, sum_y / n as f64)
 }
 
+/// Checks two AVX2 vectors for finite values.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -391,6 +420,13 @@ unsafe fn all_finite_avx2_pd(x: std::arch::x86_64::__m256d, y: std::arch::x86_64
     _mm256_movemask_pd(x_mask) == 0b1111 && _mm256_movemask_pd(y_mask) == 0b1111
 }
 
+/// Accumulates centered f64 moments with AVX2 lanes.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX2. The two prefixes must
+/// have equal lengths divisible by 4, and the tails must have equal lengths.
+/// `EqualVectorParts::new` establishes those bounds.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline(never)]
@@ -440,6 +476,11 @@ unsafe fn centered_moments_avx2(
     out
 }
 
+/// Reduces four f64 AVX2 lanes.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -449,6 +490,12 @@ unsafe fn horizontal_sum_avx2_pd(values: std::arch::x86_64::__m256d) -> f64 {
     lanes.into_iter().sum()
 }
 
+/// Computes f64 Pearson moments with SSE4.2 lanes.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports SSE4.2. Input shape and
+/// vector-load bounds are validated before any raw pointer is dereferenced.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
 #[inline(never)]
@@ -491,6 +538,11 @@ unsafe fn pearson_moments_sse42(x: &[f64], y: &[f64]) -> PearsonMomentsF64 {
     centered_moments_sse42(parts, sum_x / n as f64, sum_y / n as f64)
 }
 
+/// Checks two SSE4.2 vectors for finite values.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports SSE4.2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
 #[inline]
@@ -504,6 +556,13 @@ unsafe fn all_finite_sse_pd(x: std::arch::x86_64::__m128d, y: std::arch::x86_64:
     _mm_movemask_pd(x_mask) == 0b11 && _mm_movemask_pd(y_mask) == 0b11
 }
 
+/// Accumulates centered f64 moments with SSE4.2 lanes.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports SSE4.2. The two prefixes
+/// must have equal lengths divisible by 2, and the tails must have equal
+/// lengths. `EqualVectorParts::new` establishes those bounds.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
 #[inline(never)]
@@ -553,6 +612,11 @@ unsafe fn centered_moments_sse42(
     out
 }
 
+/// Reduces two f64 SSE4.2 lanes.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports SSE4.2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
 #[inline]
@@ -562,6 +626,12 @@ unsafe fn horizontal_sum_sse_pd(values: std::arch::x86_64::__m128d) -> f64 {
     lanes.into_iter().sum()
 }
 
+/// Computes f64 Pearson moments with NEON lanes.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports NEON. Input shape and
+/// vector-load bounds are validated before any raw pointer is dereferenced.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline(never)]
@@ -604,6 +674,11 @@ unsafe fn pearson_moments_neon(x: &[f64], y: &[f64]) -> PearsonMomentsF64 {
     centered_moments_neon(parts, sum_x / n as f64, sum_y / n as f64)
 }
 
+/// Checks two NEON vectors for finite values.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports NEON.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
@@ -623,6 +698,13 @@ unsafe fn all_finite_neon_f64(
         && vgetq_lane_u64(y_mask, 1) == u64::MAX
 }
 
+/// Accumulates centered f64 moments with NEON lanes.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports NEON. The two prefixes must
+/// have equal lengths divisible by 2, and the tails must have equal lengths.
+/// `EqualVectorParts::new` establishes those bounds.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline(never)]

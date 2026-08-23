@@ -37,6 +37,10 @@ const MAX_COMPATIBILITY_PROTOCOL_DESCRIPTOR_WORDS: u64 =
     DEFAULT_UNRANKED_HOST_STORAGE_BUDGET_BYTES / core::mem::size_of::<u32>() as u64;
 static NEXT_DESCRIPTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+// This process-local token identifies one immutable descriptor set; it does not
+// publish or synchronize descriptor memory, whose lifetime is owned by the
+// prepared plan. Relaxed ordering is therefore sufficient. Zero is skipped
+// because ABI payloads interpret it as "not cacheable; upload every call".
 fn next_descriptor_generation() -> u64 {
     loop {
         let generation = NEXT_DESCRIPTOR_GENERATION.fetch_add(1, Ordering::Relaxed);

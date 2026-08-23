@@ -13,6 +13,15 @@ from ..config import EngineConfig
 
 @dataclass(frozen=True)
 class BackendInfo:
+    """Backend and numeric-domain facts for one completed analysis.
+
+    ``name`` is the native boundary identity, while ``selected_backend`` and
+    ``execution_placement`` describe where the request actually ran.
+    ``requested_precision`` and ``effective_precision`` are kept separate so a
+    report never implies an unobserved conversion.  Memory fields may be
+    ``None`` when the boundary cannot report device capacity.
+    """
+
     name: str
     device: str
     is_gpu: bool
@@ -51,6 +60,15 @@ class BackendInfo:
 
 @dataclass(frozen=True)
 class InteractionResult:
+    """One surfaced candidate and its metric values.
+
+    ``combo`` indexes ``DiagnosticReport.feature_names``; ``candidate_id`` is
+    the stable native identity and ``family`` distinguishes continuous,
+    time-series, and decision-path results.  Precision diagnostics separate
+    finite-input pointwise overflow from source non-finite values and are
+    meaningful only when ``precision_diagnostics_available`` is true.
+    """
+
     combo: Tuple[int, ...]
     feature_names: Tuple[str, ...]
     metrics: Dict[str, float]
@@ -66,6 +84,13 @@ class InteractionResult:
 
 @dataclass(frozen=True)
 class StabilityResult:
+    """Conditional bootstrap summary for one already-selected candidate.
+
+    ``metrics_mean`` and ``metrics_std`` describe resampling on the same rows
+    that selected the candidate.  They are not out-of-sample evidence and do
+    not correct selection bias.
+    """
+
     combo: Tuple[int, ...]
     metrics_mean: Dict[str, float]
     metrics_std: Dict[str, float]
@@ -77,6 +102,14 @@ class StabilityResult:
 
 @dataclass(frozen=True)
 class PermutationResult:
+    """Family-wise maxT p-values for one surfaced candidate.
+
+    Generated adaptive families rediscover their target-dependent candidates
+    for every permutation.  ``p_values`` therefore follows the configured
+    current-v1 significance contract rather than the historical candidate-wise
+    v0.x procedure.
+    """
+
     combo: Tuple[int, ...]
     p_values: Dict[str, float]
     family: str = "interaction"
@@ -87,12 +120,25 @@ class PermutationResult:
 
 @dataclass(frozen=True)
 class Decision:
+    """Threshold-based summary of whether the configured report found signal."""
+
     signal_detected: bool
     message: str
 
 
 @dataclass
 class DiagnosticReport:
+    """Structured result of one eager or compiled GAFIME analysis.
+
+    ``interactions``, ``stability``, and ``permutations`` are sequence-like and
+    support slicing; native interaction sequences additionally provide
+    ``ranked`` and ``top_k`` without first materializing every result.
+    ``config.backend`` is the configured request, whereas ``backend`` records
+    the selected placement and effective numeric domains.  Warnings disclose
+    bounded candidate caps or generated-family details without changing the
+    request silently.
+    """
+
     config: EngineConfig
     feature_names: List[str]
     interactions: SequenceABC[InteractionResult] = field(default_factory=list)
@@ -114,6 +160,13 @@ class DiagnosticReport:
         return self.config.backend
 
     def to_dict(self) -> Dict[str, object]:
+        """Materialize the full report into JSON-like Python values.
+
+        This deprecated convenience can copy every native result row and emits
+        :class:`DeprecationWarning`; prefer sequence access/ranking or compiled
+        Arrow export for non-trivial data flow.
+        """
+
         _warnings.warn(
             "DiagnosticReport.to_dict() materializes the native report for export.",
             DeprecationWarning,
@@ -133,7 +186,12 @@ class DiagnosticReport:
 
 
 class NativeReportBuilder:
-    """Python-backed compatibility facade for the v0.5 report builder API."""
+    """Python-backed compatibility facade for the v0.5 report builder API.
+
+    The builder is intended for compatibility tests and small custom adapters,
+    not native production scoring.  ``kind`` determines default ranking
+    semantics for the frozen sequence returned by :meth:`sequence`.
+    """
 
     def __init__(self, kind: str) -> None:
         self.kind = kind
@@ -141,13 +199,19 @@ class NativeReportBuilder:
 
     @property
     def is_native_backed(self) -> bool:
+        """Always ``False`` for this Python compatibility builder."""
+
         return False
 
     @property
     def native_handle(self) -> Any | None:
+        """Always ``None`` because this builder owns Python items only."""
+
         return None
 
     def append(self, item: Any) -> None:
+        """Append one result-like Python object to the builder."""
+
         self._items.append(item)
 
     def append_interaction(
@@ -161,6 +225,8 @@ class NativeReportBuilder:
         params: Dict[str, object] | None = None,
         candidate_id: str = "",
     ) -> None:
+        """Construct and append one :class:`InteractionResult`."""
+
         self.append(
             InteractionResult(
                 combo=combo,
@@ -174,6 +240,8 @@ class NativeReportBuilder:
         )
 
     def sequence(self) -> "_PythonResultSequence":
+        """Return a frozen Python-backed snapshot of current builder items."""
+
         return _PythonResultSequence(self.kind, list(self._items))
 
 
@@ -247,6 +315,15 @@ class _PythonResultSequence(SequenceABC):
 
 
 class NativeContinuousInteractions(SequenceABC):
+    """Lazy sequence view over a native compact interaction report.
+
+    Users normally obtain this object as ``DiagnosticReport.interactions``
+    rather than constructing it.  Indexing materializes only the requested
+    row, iteration uses native batches when available, and ranking remains in
+    the native result dtype.  ``generated_feature_start`` and
+    ``generated_family`` are an all-or-none advanced adapter contract.
+    """
+
     _ITER_BATCH_SIZE = 1024
 
     def __init__(
@@ -311,14 +388,20 @@ class NativeContinuousInteractions(SequenceABC):
 
     @property
     def is_native_backed(self) -> bool:
+        """Always ``True`` for this compact native view."""
+
         return True
 
     @property
     def native_handle(self) -> Any:
+        """Return the advanced native report handle backing this view."""
+
         return self._native_report
 
     @property
     def native_indices(self) -> Tuple[int, ...] | None:
+        """Return ranked/subset native indices, or ``None`` for the full view."""
+
         return self._indices
 
     def __len__(self) -> int:
@@ -446,6 +529,14 @@ class NativeContinuousInteractions(SequenceABC):
         descending: bool = True,
         limit: int | None = None,
     ) -> "NativeContinuousInteractions":
+        """Return a lazy deterministically ranked view.
+
+        ``metric_name=None`` uses the report's established primary metric.
+        Unknown metric names and negative limits raise :class:`ValueError`.
+        Non-finite scores sort behind finite scores; native candidate identity
+        supplies the deterministic tie order.
+        """
+
         if limit is not None and limit < 0:
             raise ValueError("limit must be >= 0.")
         requested_metric = None if metric_name is None else str(metric_name)
@@ -508,6 +599,8 @@ class NativeContinuousInteractions(SequenceABC):
         *,
         descending: bool = True,
     ) -> "NativeContinuousInteractions":
+        """Return at most ``k`` rows from :meth:`ranked`; ``k`` must be non-negative."""
+
         if k < 0:
             raise ValueError("k must be >= 0.")
         return self.ranked(metric_name=metric_name, descending=descending, limit=k)

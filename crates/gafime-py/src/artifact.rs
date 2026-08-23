@@ -120,6 +120,10 @@ pub(crate) fn execute_compiled_artifact(
         }
         Ok(report)
     });
+    // A GPU failure may be reported after native resident state was mutated or
+    // asynchronous work was queued. The payload cannot prove that its cached
+    // descriptors and graph state rolled back, so retire the artifact instead
+    // of allowing a later call to reuse potentially partial state.
     if result.is_err() && backend_is_gpu(artifact.backend_kind()) {
         artifact.state = None;
         #[cfg(feature = "local-cmake-experiment")]
@@ -210,6 +214,8 @@ impl PyCompiledContinuousArtifact {
             }
         };
         if let Err(error) = update_result {
+            // Native target replacement has no rollback contract. A failed GPU
+            // update therefore poisons the resident artifact for future reuse.
             if backend_is_gpu(backend_kind) {
                 self.state = None;
                 self.closed = true;
@@ -226,6 +232,9 @@ impl PyCompiledContinuousArtifact {
                 PrecisionTarget::F64(target) => significance_matrix.replace_target_f64(target),
             };
             if let Err(error) = replacement {
+                // The primary resident matrix has already accepted this target.
+                // If the significance matrix cannot advance to the same target
+                // revision, retire GPU state rather than expose a split identity.
                 if backend_is_gpu(backend_kind) {
                     self.state = None;
                     self.closed = true;
@@ -241,6 +250,8 @@ impl PyCompiledContinuousArtifact {
         ) {
             Ok(value) => value,
             Err(error) => {
+                // The target changed before plan preparation. Closing prevents
+                // the new target from being paired with the artifact's old plans.
                 self.state = None;
                 self.closed = true;
                 return Err(PyErr::from(error));

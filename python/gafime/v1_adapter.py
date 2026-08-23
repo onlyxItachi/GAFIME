@@ -235,6 +235,10 @@ def _analyze_continuous_with_resident_cache(
     cache_payload = payload
     if config.random_seed is None:
         cache_payload = {**payload, "random_seed": None}
+    # Resident feature storage is keyed by content plus the selected Python/native
+    # boundary, payload environment, and execution configuration; Python object
+    # identity would miss in-place mutations. The target digest is deliberately
+    # separate: target-only changes reuse the feature matrix through update_target.
     cache_key = (
         id(boundary),
         str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
@@ -988,6 +992,17 @@ def analyze_arrow_with_v1_boundary(
 
 @dataclass
 class NativeCompiledGafime:
+    """Caller-owned, thread-affine resident native analysis artifact.
+
+    Create artifacts with :func:`gafime.compile` or
+    :meth:`gafime.GafimeEngine.compile`; the dataclass constructor exposes
+    native adapter state for compatibility and is not a normal user entry
+    point.  The artifact owns its matrix, target, plan/session, and optional
+    graph/export state until :meth:`close`.  Analyze, target updates, export,
+    property access that touches native state, and close must all occur on the
+    creation thread.  There is no context-manager protocol; use ``try/finally``.
+    """
+
     config: EngineConfig
     feature_names: List[str]
     native_handle: object
@@ -1012,6 +1027,8 @@ class NativeCompiledGafime:
 
     @property
     def flags(self):
+        """Return the effective immutable :class:`gafime.CompileFlags` view."""
+
         from .compile.flags import CompileFlags
 
         return CompileFlags(
@@ -1022,11 +1039,19 @@ class NativeCompiledGafime:
 
     @property
     def backend(self) -> BackendInfo:
+        """Return selected placement and numeric facts, or fail if closed."""
+
         self._ensure_open()
         return _backend_info(self.native_handle, self.config)
 
     @property
     def scenario_plan(self) -> object | None:
+        """Return bounded compatibility plan metadata when ``plan=True``.
+
+        The projection does not drive native execution.  ``plan=False`` returns
+        ``None``; custom compatible boundaries may expose their own plan object.
+        """
+
         self._ensure_open()
         if not self.plan_enabled:
             return None
@@ -1060,25 +1085,35 @@ class NativeCompiledGafime:
         *,
         flags=None,
     ) -> "NativeCompiledGafime":
+        """Compatibility constructor forwarding to ``engine.compile(...)``."""
+
         return engine.compile(X, y, feature_names=feature_names, flags=flags)
 
     @property
     def graph_replayed(self) -> bool:
+        """Whether the most recent analysis proved requested graph replay."""
+
         self._ensure_open()
         return self._graph_replayed
 
     @property
     def continuous_metric_cache_hits(self) -> int:
+        """Return the native continuous metric-cache hit counter."""
+
         self._ensure_open()
         return int(getattr(self.native_handle, "continuous_metric_cache_hits", 0))
 
     @property
     def continuous_metric_cache_builds(self) -> int:
+        """Return the native continuous metric-cache build counter."""
+
         self._ensure_open()
         return int(getattr(self.native_handle, "continuous_metric_cache_builds", 0))
 
     @property
     def candidate_table_cache_hits(self) -> int:
+        """Return the native prepared candidate-table cache hit counter."""
+
         self._ensure_open()
         return int(getattr(self.native_handle, "candidate_table_cache_hits", 0))
 
@@ -1112,6 +1147,14 @@ class NativeCompiledGafime:
         )
 
     def analyze(self) -> DiagnosticReport:
+        """Execute the prepared analysis and return a new report.
+
+        The matrix stays resident.  ``random_seed=None`` requests a fresh
+        native stochastic stream on each call.  A requested graph must confirm
+        replay, and a native failure that closes the handle makes the wrapper
+        unusable rather than silently rebuilding or falling back.
+        """
+
         self._ensure_open()
         self._graph_replayed = False
         if self.config.random_seed is None:
@@ -1152,7 +1195,10 @@ class NativeCompiledGafime:
     def update_target(self, y: Iterable[float]) -> "NativeCompiledGafime":
         """Resident-session reuse: replace the target and re-use the resident
         matrix on the next analyze() — the features stay uploaded (on GPU) or held
-        (on CPU), so only y crosses the boundary. Returns self for chaining."""
+        (on CPU), so only y crosses the boundary. Decision-path artifacts
+        rediscover target-dependent paths and refresh their public identities.
+        Target length/range must match the compiled contract. Returns self for
+        chaining."""
         self._ensure_open()
         target = _coerce_target_storage(y, precision=self.config.precision)
         update_buffer = getattr(self.native_handle, "update_target_buffer", None)
@@ -1200,11 +1246,21 @@ class NativeCompiledGafime:
         return self._native_report.__arrow_c_array__(requested_schema)
 
     def export_arrow(self, requested_schema=None):
-        """Explicit alias for the Arrow C Data Interface export (see
-        ``__arrow_c_array__``)."""
+        """Export the compact result table through the Arrow C Data Interface.
+
+        Compilation must have used ``CompileFlags(export=True)``.  The first
+        call analyzes lazily if needed; Arrow release callbacks retain native
+        ownership.  This is result export, not zero-copy input ingest.
+        """
         return self.__arrow_c_array__(requested_schema)
 
     def close(self) -> None:
+        """Release resident native state on the artifact's creation thread.
+
+        Closing is idempotent.  Later native-state access raises
+        :class:`RuntimeError`; reports returned before close remain readable.
+        """
+
         self._ensure_owner_thread()
         self._close_native()
 

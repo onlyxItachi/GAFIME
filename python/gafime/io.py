@@ -10,7 +10,15 @@ except ImportError:  # pragma: no cover - package metadata requires Polars
 
 
 class GafimeStreamer:
-    """Stream numeric CSV or Parquet feature batches through Polars."""
+    """Stream numeric CSV or Parquet batches through Polars.
+
+    ``target_cols`` selects feature columns (the historical name is retained);
+    otherwise every column except ``y_col`` is used.  ``precision`` controls
+    the resident batch dtype: fp64 for ``fp64`` and fp32 for ``fp32``/``mixed``.
+    The streamer returns Python lists and does not itself execute GAFIME or
+    retain a backend session.  Missing files, unsupported suffixes, or missing
+    Polars fail immediately.
+    """
 
     DEFAULT_VRAM_GB = 6.0
     VRAM_HEADROOM = 0.20
@@ -56,6 +64,8 @@ class GafimeStreamer:
 
     @property
     def total_rows(self) -> int:
+        """Return the lazily computed total input row count."""
+
         if self._total_rows is None:
             self._total_rows = int(self._lazy_df.select(pl.len()).collect().item())
         return self._total_rows
@@ -66,6 +76,14 @@ class GafimeStreamer:
         include_output: bool = True,
         n_combos: int = 256,
     ) -> int:
+        """Estimate a row batch size from a simple memory budget model.
+
+        ``include_output`` adds ``n_combos`` result values per row in the
+        selected public-result width.  The estimate is a convenience heuristic,
+        not a device allocation guarantee, and is rounded to a minimum/multiple
+        of 1024 rows.
+        """
+
         usable_bytes = vram_budget_gb * (1024**3) * (1.0 - self.VRAM_HEADROOM)
         bytes_per_value = (
             self.BYTES_PER_FLOAT64
@@ -87,6 +105,13 @@ class GafimeStreamer:
         batch_size: Optional[int] = None,
         vram_budget_gb: float = DEFAULT_VRAM_GB,
     ) -> Generator[List[List[float]], None, None]:
+        """Yield feature-only Python row batches in source order.
+
+        An explicit ``batch_size`` must be a positive integer.  The beta.2
+        compatibility streamer does not yet reject a non-positive value; such
+        a value does not advance the reader, so callers must validate it.
+        """
+
         if batch_size is None:
             batch_size = self.estimate_optimal_batch_size(vram_budget_gb)
         reader = self._lazy_df.select(self._feature_cols)
@@ -103,6 +128,13 @@ class GafimeStreamer:
         batch_size: Optional[int] = None,
         vram_budget_gb: float = DEFAULT_VRAM_GB,
     ) -> Generator[tuple[List[List[float]], List[float]], None, None]:
+        """Yield ``(features, target)`` row batches in source order.
+
+        ``y_col`` must have been supplied at construction time.  An explicit
+        ``batch_size`` must be positive; beta.2 does not yet reject a
+        non-positive value, which prevents the reader from advancing.
+        """
+
         if self.y_col is None:
             raise ValueError("y_col must be specified for stream_with_target().")
         if batch_size is None:
@@ -129,10 +161,20 @@ class GafimeStreamer:
 
 
 def create_streamer(*args, **kwargs) -> GafimeStreamer:
+    """Compatibility factory forwarding all arguments to ``GafimeStreamer``."""
+
     return GafimeStreamer(*args, **kwargs)
 
 
 def benchmark_streaming(file_path, batch_size=None, n_batches=5):
+    """Read at most ``n_batches`` and return simple batch/row counts.
+
+    This compatibility helper measures iteration shape only; it does not run a
+    backend or make a performance claim.  ``n_batches`` must be positive.
+    Beta.2 does not yet reject a non-positive value and still reads one batch,
+    so callers must validate this diagnostic-only argument.
+    """
+
     streamer = GafimeStreamer(file_path)
     count = 0
     rows = 0

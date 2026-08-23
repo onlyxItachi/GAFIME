@@ -6,6 +6,14 @@ from gafime import __version__, backend_capabilities
 
 
 def main() -> int:
+    """Run the public ``gafime`` diagnostic CLI.
+
+    ``--version`` prints the package identity.  ``--check`` performs the same
+    capability probe as :func:`gafime.backend_capabilities` for the requested
+    backend, device, and precision and exits zero only when the selection is
+    available.  It never runs an analysis workload.
+    """
+
     parser = argparse.ArgumentParser(description="GAFIME v1 native runtime")
     parser.add_argument(
         "-V", "--version", action="version", version=f"gafime {__version__}"

@@ -8,7 +8,16 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 @dataclass(frozen=True)
 class DecisionPathCandidate:
-    """Portable description of the v0.5 decision-path candidate surface."""
+    """Portable v0.5 compatibility description of one decision path.
+
+    ``features``, ``thresholds``, and ``signs`` are parallel tuples.  A
+    negative sign means ``value <= threshold`` and a positive sign means
+    ``value > threshold``; an active path containing an otherwise-undecided NaN
+    evaluates to NaN.  ``support`` is a non-negative structural row count, not
+    a significance or confidence estimate.  Current engine execution reports
+    :class:`InteractionResult`; this object is for descriptor interchange and
+    helper evaluation, not a separate backend execution path.
+    """
 
     features: Tuple[int, ...]
     thresholds: Tuple[float, ...]
@@ -30,6 +39,8 @@ class DecisionPathCandidate:
 
     @property
     def combo(self) -> Tuple[int, ...]:
+        """Return sorted unique feature indices referenced by the path."""
+
         seen: List[int] = []
         for feature in self.features:
             feature_int = int(feature)
@@ -38,6 +49,8 @@ class DecisionPathCandidate:
         return tuple(sorted(seen))
 
     def params(self) -> Dict[str, object]:
+        """Return the portable descriptor mapping used in result metadata."""
+
         return {
             "kind": "decision_path",
             "features": self.features,
@@ -54,6 +67,13 @@ class DecisionPathCandidate:
 def describe_decision_path_candidate(
     candidate: DecisionPathCandidate, feature_names: Sequence[str]
 ) -> str:
+    """Render a candidate using caller-provided feature names.
+
+    Invalid feature indices raise :class:`IndexError` through the supplied name
+    sequence; malformed parallel descriptor tuples should be rejected before
+    rendering.
+    """
+
     parts: List[str] = []
     for feature, threshold, sign in zip(
         candidate.features, candidate.thresholds, candidate.signs
@@ -64,6 +84,12 @@ def describe_decision_path_candidate(
 
 
 def decision_path_candidate_from_record(record: object) -> DecisionPathCandidate:
+    """Convert a native-compatible path record into a portable candidate.
+
+    The record must expose candidate id, feature, threshold, sign, gain,
+    support, and round fields compatible with the v0.5 descriptor contract.
+    """
+
     native_id = int(getattr(record, "candidate_id"))
     return DecisionPathCandidate(
         features=tuple(int(value) for value in getattr(record, "features")),
@@ -78,6 +104,14 @@ def decision_path_candidate_from_record(record: object) -> DecisionPathCandidate
 
 
 def decision_path_candidate_from_result(result: object) -> DecisionPathCandidate:
+    """Decode one standalone decision-path ``InteractionResult``.
+
+    Results with explicit path ``params`` preserve that descriptor.  A current
+    params-free native membership result is accepted only when it contains
+    exactly one generated path feature.  Mixed interactions and non-decision-
+    path families raise :class:`ValueError` rather than fabricating a path.
+    """
+
     params = getattr(result, "params", {}) or {}
     if getattr(result, "family", "") != "decision_path":
         raise ValueError("InteractionResult is not a decision_path candidate.")
@@ -132,6 +166,13 @@ def decision_path_candidate_from_result(result: object) -> DecisionPathCandidate
 def evaluate_decision_path_candidate(
     X: object, candidate: DecisionPathCandidate
 ) -> List[float]:
+    """Evaluate a portable path on a row matrix for compatibility/debug use.
+
+    Returns ``1.0`` for matching rows, ``0.0`` for rejected rows, and NaN when
+    all finite predicates match but at least one predicate is undetermined due
+    to NaN.  This Python helper is not the scalable production data plane.
+    """
+
     _validate_candidate(candidate)
     n_samples = int(getattr(X, "n_samples", len(X) if hasattr(X, "__len__") else 0))
     out: List[float] = []
@@ -166,6 +207,13 @@ def score_decision_path_candidates(
     candidates: Iterable[DecisionPathCandidate],
     metric_suite: Any,
 ) -> Dict[DecisionPathCandidate, Dict[str, float]]:
+    """Score portable candidates with a caller-supplied compatibility suite.
+
+    ``metric_suite`` must expose ``score(feature, y)``.  This small Python helper
+    exists for descriptor compatibility and tests; normal analysis must use
+    :class:`gafime.GafimeEngine` so native ownership and backend policy apply.
+    """
+
     return {
         candidate: metric_suite.score(evaluate_decision_path_candidate(X, candidate), y)
         for candidate in candidates
@@ -175,6 +223,8 @@ def score_decision_path_candidates(
 def decision_path_feature_names(
     candidate: DecisionPathCandidate, feature_names: Sequence[str]
 ) -> Tuple[str, ...]:
+    """Map the candidate's sorted unique feature indices to names."""
+
     return tuple(feature_names[index] for index in candidate.combo)
 
 
