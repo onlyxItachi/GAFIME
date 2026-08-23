@@ -15,10 +15,17 @@ the concise public declaration and reporting surface; Rust owns validation,
 planning, scheduling, lifecycle, and Core execution; each native GPU payload
 owns its device-local execution.
 
-## Quick Start
+## Installation
 
-Install the current published prerelease of Core, optionally with a matching
-vendor payload:
+Stable releases:
+
+```bash
+python -m pip install gafime
+python -m pip install gafime gafime-cuda  # Linux/Windows x86_64 + CUDA
+python -m pip install gafime gafime-rocm  # Linux x86_64 + system ROCm
+```
+
+Beta and release-candidate versions:
 
 ```bash
 python -m pip install --pre gafime
@@ -26,11 +33,23 @@ python -m pip install --pre gafime gafime-cuda  # Linux/Windows x86_64 + CUDA
 python -m pip install --pre gafime gafime-rocm  # Linux x86_64 + system ROCm
 ```
 
-Core never depends on a GPU payload. Payload packages require the exact matching
-Core version. Apple Silicon Core wheels contain the Metal payload; there is no
-standalone Metal distribution. See the live [release status](docs/releases/STATUS.md)
-and [backend installation guide](docs/backend-selection.md) before choosing a
-hardware package.
+Ordinary `pip install` prefers a stable release; `--pre` permits beta and RC
+versions. For reproducible RC1 testing, pin Core and any vendor payload to the
+same exact version:
+
+```bash
+python -m pip install gafime==1.0.0rc1
+python -m pip install gafime==1.0.0rc1 gafime-cuda==1.0.0rc1
+python -m pip install gafime==1.0.0rc1 gafime-rocm==1.0.0rc1
+```
+
+Core never depends on a GPU payload, while CUDA and ROCm payload versions must
+match Core exactly. Apple Silicon users install plain `gafime`; Metal is
+embedded in the macOS arm64 Core wheel and has no standalone distribution. See
+the live [release status](docs/releases/STATUS.md) and
+[backend installation guide](docs/backend-selection.md) for platform details.
+
+## Quick Start
 
 ```python
 from gafime import ComputeBudget, EngineConfig, GafimeEngine
