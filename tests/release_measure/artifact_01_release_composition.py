@@ -2522,6 +2522,14 @@ def _assert_publish_workflow(workflow: str) -> None:
         and '"gafime-cuda==$PYPI_VERSION"' in public_matrix,
         "public installation must pin Core and CUDA to the same release identity",
     )
+    _require(
+        "Provision pinned CUDA runtime prerequisite (Linux)" in public_matrix
+        and "runner.os == 'Linux' && matrix.platform.cuda == true" in public_matrix
+        and "CUDA_CUDART_LINUX_SHA256" in public_matrix
+        and 'test -f "$runtime_root/lib/libcudart.so.13"' in public_matrix
+        and '>> "$GITHUB_ENV"' in public_matrix,
+        "public Linux CUDA verification must provision the pinned system runtime",
+    )
     public_windows_arm = _workflow_job_block(workflow, "verify_public_windows_arm_core")
     for version in RELEASE_MANIFEST.supported_python:
         identifier = f"cp{version.replace('.', '')}-win_arm64"

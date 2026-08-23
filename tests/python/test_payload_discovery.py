@@ -718,6 +718,23 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     assert "verify_public_core_and_cuda" in publish
     assert "verify_public_windows_arm_core" in publish
     assert "verify_public_rocm_install" in publish
+    public_core_cuda = publish.split("\n  verify_public_core_and_cuda:\n", 1)[1].split(
+        "\n  verify_public_windows_arm_core:\n", 1
+    )[0]
+    assert "Provision pinned CUDA runtime prerequisite (Linux)" in public_core_cuda
+    assert "runner.os == 'Linux' && matrix.platform.cuda == true" in public_core_cuda
+    assert "CUDA_CUDART_LINUX_SHA256" in public_core_cuda
+    assert 'test -f "$runtime_root/lib/libcudart.so.13"' in public_core_cuda
+    assert '>> "$GITHUB_ENV"' in public_core_cuda
+    for variable in (
+        "CUDA_CUDART_VERSION",
+        "CUDA_CUDART_LINUX_URL",
+        "CUDA_CUDART_LINUX_SHA256",
+    ):
+        pattern = rf"(?m)^  {variable}: '([^']+)'$"
+        assert re.search(pattern, publish).group(1) == re.search(pattern, build).group(
+            1
+        )
     assert "Publish GitHub Release after public installation" in publish
     windows_arm_builder = build.split("\n  build_arm_windows_wheels:\n", 1)[1].split(
         "\n  build_cuda_payload_wheels:\n", 1
