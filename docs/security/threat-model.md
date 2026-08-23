@@ -259,5 +259,6 @@ attacker as the process owner, payload author, driver, or compiler provider.
 - Hardening opportunities where current validation and reachability evidence
   do not establish a concrete security outcome.
 
-Repository: target_sha256_0056e572c45e617b4ab6dd01d284204c7537a218b20325bd1875a75cd519481d
-Version: df4ab197e33b761b4c7236ea2e1642d90fac1357
+Exact candidate binding: the canonical Codex Security scan record binds this
+version-controlled model to the reviewed source SHA. The human-readable model
+does not embed a self-referential repository hash.

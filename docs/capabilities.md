@@ -1,7 +1,7 @@
 # GAFIME v1 Capability Reporting
 
 This document describes the public capability contract for the
-`1.0.0-beta.2` repository release (`1.0.0b2` on Python/PyPI). It is a report
+`1.0.0-rc.1` repository release (`1.0.0rc1` on Python/PyPI). It is a report
 of implementation placement, not a promise that a payload or device is
 installed.
 

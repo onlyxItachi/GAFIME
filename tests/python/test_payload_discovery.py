@@ -15,7 +15,7 @@ from gafime import _payloads as payloads
 from gafime import v1_adapter
 
 
-VERSION = "1.0.0b2"
+VERSION = "1.0.0rc1"
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -181,7 +181,7 @@ def test_reads_installed_payload_policy_without_loading_library(tmp_path, monkey
     policy, detail = payloads.installed_payload_build_policy("rocm")
 
     assert policy == expected
-    assert "gafime-rocm 1.0.0b2" in detail
+    assert "gafime-rocm 1.0.0rc1" in detail
     assert payloads.ROCM_LIBRARY_ENV not in payloads.os.environ
     assert ("gafime_rocm" in sys.modules) is was_imported
 
@@ -546,7 +546,7 @@ def test_staged_rocm_policy_is_immutable_and_matches_system_manifest(
 
     assert actual == expected
     assert 'name = "gafime-rocm"' in pyproject
-    assert 'dependencies = ["gafime==1.0.0b2"]' in pyproject
+    assert 'dependencies = ["gafime==1.0.0rc1"]' in pyproject
     assert 'ROCM_WHEEL_POLICY = "system"' in setup_source
     assert "restage the payload instead" in setup_source
     assert not (
@@ -592,7 +592,7 @@ def test_staged_cuda_has_one_distribution_identity_and_no_rt_sources(tmp_path):
     }
 
     assert 'name = "gafime-cuda"' in pyproject
-    assert 'dependencies = ["gafime==1.0.0b2"]' in pyproject
+    assert 'dependencies = ["gafime==1.0.0rc1"]' in pyproject
     assert "abi3" not in setup_source
     assert '"-cudart",\n            "shared"' in setup_source
     assert '"-cudart",\n            "static"' not in setup_source

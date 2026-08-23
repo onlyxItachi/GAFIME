@@ -20,8 +20,7 @@ and [PyPI project](https://pypi.org/project/gafime/) for publication state.
 
 ### v1
 
-- `v1.0.0-rc.1` — current release train; its immutable note is added with the
-  final RC identity.
+- [`v1.0.0-rc.1`](v1.0.0-rc.1.md) — current release-candidate train.
 - [`1.0.0-beta.2`](v1.0.0-beta.2.md) — unreleased pre-RC checkpoint; its frozen
   artifacts were qualification evidence, not a public release.
 - [`v1.0.0b1`](v1.0.0b1.md) — aborted packaging checkpoint with stranded
