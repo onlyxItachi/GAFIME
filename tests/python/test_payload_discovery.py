@@ -693,6 +693,10 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     preflight = publish.split("\n  publication_preflight:\n", 1)[1].split(
         "\n  publish_pypi_core:\n", 1
     )[0]
+    assert "Install cross-format ABI inspection tools" in preflight
+    assert "sudo apt-get install --yes llvm" in preflight
+    assert "command -v llvm-nm" in preflight
+    assert "command -v llvm-readobj" in preflight
     core = publish.split("\n  publish_pypi_core:\n", 1)[1].split(
         "\n  publish_pypi_cuda:\n", 1
     )[0]
