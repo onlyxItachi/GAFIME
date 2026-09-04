@@ -15,9 +15,9 @@ CURRENT_INSTALL_GUIDANCE = (
     "publication state."
 )
 PRERELEASE_INSTALLS = {
-    "core": "pip install --pre gafime 'polars>=1.3,<2'",
-    "cuda": "pip install --pre gafime gafime-cuda 'polars>=1.3,<2'",
-    "rocm": "pip install --pre gafime gafime-rocm 'polars>=1.3,<2'",
+    "core": 'pip install --pre gafime "polars>=1.3,<2"',
+    "cuda": 'pip install --pre gafime gafime-cuda "polars>=1.3,<2"',
+    "rocm": 'pip install --pre gafime gafime-rocm "polars>=1.3,<2"',
 }
 
 

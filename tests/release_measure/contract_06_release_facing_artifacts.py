@@ -13,9 +13,14 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "tests" / "release_measure"))
+_RELEASE_MEASURE_PATH = str(ROOT / "tests" / "release_measure")
+sys.path.insert(0, _RELEASE_MEASURE_PATH)
+try:
+    from release_manifest import load_release_manifest, render_release_matrix  # noqa: E402
+finally:
+    sys.path.remove(_RELEASE_MEASURE_PATH)
+
 sys.path.insert(0, str(ROOT / ".github" / "scripts"))
-from release_manifest import load_release_manifest, render_release_matrix  # noqa: E402
 from release_version import validate_project_versions  # noqa: E402
 
 

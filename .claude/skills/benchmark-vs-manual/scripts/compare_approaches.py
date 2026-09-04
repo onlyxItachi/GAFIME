@@ -16,7 +16,7 @@ import numpy as np
 
 RELEASE_STATUS = "see_docs_releases_status"
 PRERELEASE_SKLEARN_INSTALL = (
-    "pip install --pre 'gafime[sklearn]' 'polars>=1.3,<2'"
+    'pip install --pre "gafime[sklearn]" "polars>=1.3,<2"'
 )
 
 
@@ -339,7 +339,7 @@ def main():
                 {
                     "error": (
                         "Polars is required. Install with: "
-                        "pip install 'polars>=1.3,<2'"
+                        'pip install "polars>=1.3,<2"'
                     )
                 }
             )
