@@ -48,8 +48,10 @@ packaging, or release contracts.
 
 Prefer durable fixes on `main` first, then selectively integrate the exact
 reviewed fix into the candidate branch. If an urgent candidate-only condition
-requires a release-first fix, it must have a corresponding forward-port pull
-request to `main`; release branches must not accumulate orphaned fixes.
+requires a release-first fix, that fix must be present on `main` no later than
+final admission. The admission merge normally supplies that forward-port, so a
+duplicate pre-admission PR is unnecessary. Release branches must not accumulate
+orphaned fixes.
 
 Never merge a divergent `main` wholesale into the release branch. Selectively
 integrate only the reviewed fixes required for the candidate so unrelated

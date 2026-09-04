@@ -139,7 +139,8 @@ physical evidence, zero required approving reviews, and maintainer merge
 authority apply. Durable fixes normally land on `main` first, then enter the
 release branch through a provenance-preserving backport on a temporary topic
 branch; use `git cherry-pick -x` when carrying the commit. An urgent
-release-first fix must be forward-ported to `main` before release admission.
+release-first fix must be present on `main` no later than final admission; the
+admission merge normally supplies that forward-port without a duplicate PR.
 Never merge a divergent `main` wholesale into the active release branch.
 
 `main` may continue through independently reviewed work; never merge it into an

@@ -165,8 +165,9 @@ and uses focused pull requests, normal merge commits, exact-head AI review,
 strict checks, resolved conversations, and the same maintainer authority as
 `main`. Durable fixes normally land on `main` first and are backported with
 provenance (prefer `git cherry-pick -x` on a temporary branch). An urgent
-release-first fix must be forward-ported before admission. Do not merge
-divergent `main` wholesale into a release branch.
+release-first fix must be present on `main` no later than final admission; the
+admission merge normally supplies that forward-port without a duplicate PR. Do
+not merge divergent `main` wholesale into a release branch.
 
 Once the candidate is settled, its exact release-branch tip is the build,
 freeze, tag, and publication source. Admit that unchanged tip to `main` before

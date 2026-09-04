@@ -101,6 +101,39 @@ def _validate_protected_branch_triggers(path: Path) -> None:
             f"trigger events {sorted(expected_events)}; found {sorted(events)}"
         )
 
+    pull_request_start = trigger_lines.index("  pull_request:")
+    pull_request_end = next(
+        (
+            index
+            for index in range(pull_request_start + 1, len(trigger_lines))
+            if trigger_lines[index].startswith("  ")
+            and not trigger_lines[index].startswith("   ")
+        ),
+        len(trigger_lines),
+    )
+    pull_request_lines = [
+        line
+        for line in trigger_lines[pull_request_start + 1 : pull_request_end]
+        if line
+    ]
+    if pull_request_lines:
+        if pull_request_lines[0] != "    branches:" or any(
+            not line.startswith("      - ") for line in pull_request_lines[1:]
+        ):
+            raise AssertionError(
+                f"{path.relative_to(ROOT)} pull_request trigger must be unfiltered "
+                "or declare protected branches"
+            )
+        pull_request_branches = tuple(
+            line.removeprefix("      - ").strip().strip("'\"")
+            for line in pull_request_lines[1:]
+        )
+        if pull_request_branches != ("main", "release/v*"):
+            raise AssertionError(
+                f"{path.relative_to(ROOT)} pull_request trigger must cover "
+                "main and release/v* in that order"
+            )
+
     push_start = trigger_lines.index("  push:")
     push_end = next(
         (
