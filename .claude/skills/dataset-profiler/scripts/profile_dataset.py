@@ -56,7 +56,7 @@ def profile_dataset(
     # Read the data
     if not HAS_POLARS:
         return {
-            "error": "Polars is required. Install with: pip install 'polars>=1.3,<2'"
+            "error": 'Polars is required. Install with: pip install "polars>=1.3,<2"'
         }
 
     if path.suffix == ".parquet":

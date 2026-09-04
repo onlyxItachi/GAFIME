@@ -15,9 +15,9 @@ CURRENT_INSTALL_GUIDANCE = (
     "Consult docs/releases/STATUS.md, GitHub Releases, and PyPI for mutable "
     "publication state."
 )
-PRERELEASE_CORE_INSTALL = "pip install --pre gafime 'polars>=1.3,<2'"
-PRERELEASE_CUDA_INSTALL = "pip install --pre gafime gafime-cuda 'polars>=1.3,<2'"
-PRERELEASE_ROCM_INSTALL = "pip install --pre gafime gafime-rocm 'polars>=1.3,<2'"
+PRERELEASE_CORE_INSTALL = 'pip install --pre gafime "polars>=1.3,<2"'
+PRERELEASE_CUDA_INSTALL = 'pip install --pre gafime gafime-cuda "polars>=1.3,<2"'
+PRERELEASE_ROCM_INSTALL = 'pip install --pre gafime gafime-rocm "polars>=1.3,<2"'
 
 
 def _release_install_fields(command: str) -> dict[str, str]:

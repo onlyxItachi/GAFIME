@@ -128,7 +128,7 @@ class CurrentTruthHelperTests(unittest.TestCase):
         )
         self.assertEqual(
             platform_fields["prerelease_install"],
-            "pip install --pre gafime gafime-cuda 'polars>=1.3,<2'",
+            'pip install --pre gafime gafime-cuda "polars>=1.3,<2"',
         )
         self.assertNotIn("recommended_install", platform_fields)
 
@@ -137,7 +137,7 @@ class CurrentTruthHelperTests(unittest.TestCase):
         self.assertEqual(missing["release_status"], "see_docs_releases_status")
         self.assertEqual(
             missing["prerelease_install"],
-            "pip install --pre 'gafime[sklearn]' 'polars>=1.3,<2'",
+            'pip install --pre "gafime[sklearn]" "polars>=1.3,<2"',
         )
 
         for relative in (
@@ -157,6 +157,14 @@ class CurrentTruthHelperTests(unittest.TestCase):
             if path.is_file() and path.suffix in {".md", ".py"}
         )
         self.assertNotIn("pip install polars", guidance_and_helpers)
+        self.assertNotRegex(
+            guidance_and_helpers,
+            r"pip install[^\n]*'[A-Za-z0-9_-]+(?:\[[^']+\])?'",
+        )
+        self.assertNotRegex(
+            guidance_and_helpers,
+            r"pip install[^\n]*'polars>=1\.3,<2'",
+        )
         self.assertNotIn("will carry the prebuilt thin raw-linux wheel", guidance_and_helpers.lower())
         self.assertIn("polars>=1.3,<2", guidance_and_helpers)
 

@@ -26,7 +26,7 @@ def detect_time_structure(file_path: str, target_col: str | None = None) -> dict
 
     if not HAS_POLARS:
         return {
-            "error": "Polars is required. Install with: pip install 'polars>=1.3,<2'"
+            "error": 'Polars is required. Install with: pip install "polars>=1.3,<2"'
         }
 
     # Load data
