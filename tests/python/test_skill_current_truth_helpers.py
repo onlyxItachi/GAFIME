@@ -12,14 +12,17 @@ ROOT = Path(__file__).resolve().parents[2]
 SKILLS = ROOT / ".claude" / "skills"
 
 
-def _load(relative: str, name: str):
-    path = SKILLS / relative
+def _load_path(path: Path, name: str):
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load(relative: str, name: str):
+    return _load_path(SKILLS / relative, name)
 
 
 class CurrentTruthHelperTests(unittest.TestCase):
@@ -55,6 +58,46 @@ class CurrentTruthHelperTests(unittest.TestCase):
         cls.validator = _load(
             "validate-features/scripts/validate_features.py", "skill_feature_validator"
         )
+        cls.skill_contract = _load_path(
+            ROOT
+            / "tests"
+            / "release_measure"
+            / "contract_06_release_facing_artifacts.py",
+            "skill_metadata_contract",
+        )
+
+    def test_skill_frontmatter_matches_controlled_audience_contract(self) -> None:
+        paths = sorted(SKILLS.glob("*/SKILL.md"))
+        self.assertEqual(
+            {path.parent.name for path in paths},
+            set(self.skill_contract.SKILL_AUDIENCES),
+        )
+        for path in paths:
+            frontmatter = self.skill_contract._parse_skill_frontmatter(path)
+            self.assertEqual(frontmatter["name"], path.parent.name)
+            self.assertTrue(frontmatter["description"])
+            self.assertEqual(
+                frontmatter["audience"],
+                self.skill_contract.SKILL_AUDIENCES[path.parent.name],
+            )
+
+    def test_skill_frontmatter_rejects_unknown_audience(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="gafime-skill-frontmatter-"
+        ) as temp_dir:
+            path = Path(temp_dir) / "SKILL.md"
+            path.write_text(
+                "---\n"
+                "name: example-skill\n"
+                "description: Exercise the controlled metadata parser.\n"
+                "metadata:\n"
+                "  audience: operator\n"
+                "---\n\n"
+                "# Example\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AssertionError, "invalid skill audience"):
+                self.skill_contract._parse_skill_frontmatter(path)
 
     def test_skill_guidance_has_no_known_current_truth_regressions(self) -> None:
         guidance = "\n".join(
@@ -85,7 +128,7 @@ class CurrentTruthHelperTests(unittest.TestCase):
         )
         self.assertEqual(
             platform_fields["prerelease_install"],
-            "pip install --pre gafime gafime-cuda",
+            "pip install --pre gafime gafime-cuda 'polars>=1.3,<2'",
         )
         self.assertNotIn("recommended_install", platform_fields)
 
@@ -94,7 +137,7 @@ class CurrentTruthHelperTests(unittest.TestCase):
         self.assertEqual(missing["release_status"], "see_docs_releases_status")
         self.assertEqual(
             missing["prerelease_install"],
-            "pip install --pre 'gafime[sklearn]'",
+            "pip install --pre 'gafime[sklearn]' 'polars>=1.3,<2'",
         )
 
         for relative in (
@@ -106,6 +149,16 @@ class CurrentTruthHelperTests(unittest.TestCase):
             guidance = (SKILLS / relative).read_text(encoding="utf-8").lower()
             self.assertIn("docs/releases/status.md", guidance)
             self.assertNotIn("not yet published", guidance)
+            self.assertNotIn("install the current prerelease", guidance)
+
+        guidance_and_helpers = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(SKILLS.rglob("*"))
+            if path.is_file() and path.suffix in {".md", ".py"}
+        )
+        self.assertNotIn("pip install polars", guidance_and_helpers)
+        self.assertNotIn("will carry the prebuilt thin raw-linux wheel", guidance_and_helpers.lower())
+        self.assertIn("polars>=1.3,<2", guidance_and_helpers)
 
     def test_payload_versions_must_match_core_exactly(self) -> None:
         installed = {

@@ -108,7 +108,9 @@ The Core smoke image skips CUDA and ROCm and verifies the Rust/PyO3 CPU path.
 - `src/cuda/`: CUDA kernels.
 - `src/metal/`: Apple Metal backend.
 - `src/rocm/`: ROCm/HIP kernels.
-- `.claude/skills/`: maintainer/agent helper skills.
+- `.claude/skills/`: optional maintainer/agent skills, classified and bound to
+  checkout or release truth as documented in
+  [`docs/agent-skills.md`](docs/agent-skills.md).
 - `docs/`: release notes, backend notes, validation logs, and reference docs.
 
 ## Pull Requests And AI Review
@@ -129,6 +131,13 @@ Autonomous and AI-assisted contributions follow the same contracts, tests,
 evidence, review, provenance, safety, numerical, and release gates as every
 other contribution. They do not receive weaker gates or acquire an extra
 human-authorship or approving-review requirement.
+
+Contributor skills may help an agent orient, change a backend or numerical
+path, assess performance evidence, or review a PR. They are doctrine and
+evidence guidance from the current checkout, not a substitute for engineering
+judgment or permission. Human, co-developed, and fully autonomous work uses the
+same merge standard; using a skill neither grants authority nor creates a new
+gate. See [`docs/agent-skills.md`](docs/agent-skills.md).
 
 Use this record shape:
 

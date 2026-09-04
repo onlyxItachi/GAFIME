@@ -1,6 +1,8 @@
 ---
 name: check-install
 description: Verify a GAFIME v1 installation, native boundary, backend capability reporting, optional payload distributions, starter notebook, and a small Core analysis.
+metadata:
+  audience: both
 ---
 
 # Installation Health Check
@@ -31,20 +33,21 @@ The script checks:
 - required Polars and optional scikit-learn imports.
 
 Treat `SKIP` for scikit-learn as expected unless the user needs
-`GafimeSelector`. Install the current prerelease with
-`pip install --pre "gafime[sklearn]"`, or pin an exact published version. Any
-`FAIL` is an installation or
-packaging problem and makes the health check return nonzero.
+`GafimeSelector`. Install a published prerelease with
+`pip install --pre "gafime[sklearn]" "polars>=1.3,<2"`, or pin an exact
+published version. Any `FAIL` is an installation or packaging problem and makes
+the health check return nonzero.
 
 Install Core and CUDA at the same exact version for
 visible NVIDIA hardware and provide a compatible system CUDA 13 runtime:
-`pip install --pre gafime gafime-cuda`.
+`pip install --pre gafime gafime-cuda "polars>=1.3,<2"`.
 For supported AMD hardware on Linux x86_64, install Core and ROCm at the same
 exact version. PyPI provides the buildable ROCm
 sdist, which needs the matching ROCm/HIP development toolchain; the matching
-GitHub Release will carry the prebuilt thin raw-Linux wheel. Both require the
-compatible system ROCm runtime. Use `pip install --pre gafime gafime-rocm` for
-the PyPI source path, or pin both projects to one exact published version.
+GitHub Release is the prebuilt thin raw-Linux wheel channel. Both require the
+compatible system ROCm runtime. Use
+`pip install --pre gafime gafime-rocm "polars>=1.3,<2"` for the PyPI source
+path, or pin both projects to one exact published version.
 Metal is bundled in the macOS arm64 Core wheel and supports
 `precision="fp32"` only. Backend presence must still be confirmed by the runtime
 capability probe; hardware names and package presence alone are not proof.

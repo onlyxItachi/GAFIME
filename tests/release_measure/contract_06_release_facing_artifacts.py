@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -12,23 +13,31 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests" / "release_measure"))
 sys.path.insert(0, str(ROOT / ".github" / "scripts"))
 from release_manifest import load_release_manifest, render_release_matrix  # noqa: E402
 from release_version import validate_project_versions  # noqa: E402
 
 
 RELEASE_MANIFEST = load_release_manifest(ROOT)
-SKILL_NAMES = {
-    "benchmark-vs-manual",
-    "build-pipeline",
-    "check-install",
-    "dataset-profiler",
-    "interpret-results",
-    "platform-detect",
-    "time-series-setup",
-    "troubleshoot-backend",
-    "validate-features",
+SKILL_AUDIENCES = {
+    "backend-change": "contributor",
+    "benchmark-vs-manual": "end-user",
+    "build-pipeline": "end-user",
+    "check-install": "both",
+    "dataset-profiler": "end-user",
+    "interpret-results": "end-user",
+    "numerical-change": "contributor",
+    "performance-change": "contributor",
+    "platform-detect": "both",
+    "repository-orientation": "contributor",
+    "review-pr": "contributor",
+    "time-series-setup": "end-user",
+    "troubleshoot-backend": "both",
+    "validate-features": "end-user",
 }
+SKILL_AUDIENCE_VALUES = {"end-user", "contributor", "both"}
+SKILL_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 REMOVED_GUIDANCE = {
     "enable_discrete_functions",
     "discrete_mode",
@@ -54,11 +63,102 @@ def _load_module(path: Path, name: str):
     return module
 
 
+def _parse_skill_frontmatter(path: Path) -> dict[str, str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    _require(lines and lines[0] == "---", f"{path} has no frontmatter opener")
+    try:
+        closing_index = lines.index("---", 1)
+    except ValueError as exc:
+        raise AssertionError(f"{path} has no frontmatter closer") from exc
+    _require(
+        closing_index + 1 < len(lines) and any(lines[closing_index + 1 :]),
+        f"{path} has no skill body",
+    )
+
+    top_level: dict[str, str] = {}
+    metadata: dict[str, str] = {}
+    parent: str | None = None
+    for line_number, line in enumerate(lines[1:closing_index], start=2):
+        _require(line.strip(), f"{path}:{line_number} has blank frontmatter")
+        if line.startswith("  "):
+            _require(
+                not line.startswith("   ") and parent == "metadata",
+                f"{path}:{line_number} has unsupported frontmatter nesting",
+            )
+            key, separator, value = line[2:].partition(":")
+            _require(
+                separator == ":" and key == "audience" and value.strip(),
+                f"{path}:{line_number} has unsupported metadata",
+            )
+            _require(key not in metadata, f"{path} repeats metadata.{key}")
+            metadata[key] = value.strip()
+            continue
+
+        _require(
+            not line[:1].isspace(),
+            f"{path}:{line_number} has unsupported frontmatter indentation",
+        )
+        key, separator, value = line.partition(":")
+        _require(
+            separator == ":" and key in {"name", "description", "metadata"},
+            f"{path}:{line_number} has unsupported frontmatter field",
+        )
+        _require(key not in top_level, f"{path} repeats frontmatter field {key}")
+        value = value.strip()
+        if key == "metadata":
+            _require(not value, f"{path} metadata must be a mapping")
+        else:
+            _require(value, f"{path} has empty frontmatter field {key}")
+        top_level[key] = value
+        parent = key
+
+    _require(
+        set(top_level) == {"name", "description", "metadata"},
+        f"{path} frontmatter must contain name, description, and metadata",
+    )
+    _require(
+        set(metadata) == {"audience"},
+        f"{path} metadata must contain only audience",
+    )
+    name = top_level["name"]
+    audience = metadata["audience"]
+    _require(
+        SKILL_NAME_RE.fullmatch(name) is not None,
+        f"{path} has invalid skill name {name!r}",
+    )
+    _require(
+        audience in SKILL_AUDIENCE_VALUES,
+        f"{path} has invalid skill audience {audience!r}",
+    )
+    return {
+        "name": name,
+        "description": top_level["description"],
+        "audience": audience,
+    }
+
+
 def _validate_skills() -> None:
     skill_root = ROOT / ".claude" / "skills"
-    actual = {path.parent.name for path in skill_root.glob("*/SKILL.md")}
-    missing = sorted(SKILL_NAMES - actual)
-    _require(not missing, f"required release-facing skills are missing: {missing}")
+    skill_paths = sorted(skill_root.glob("*/SKILL.md"))
+    actual = {path.parent.name for path in skill_paths}
+    expected = set(SKILL_AUDIENCES)
+    _require(
+        actual == expected,
+        "tracked skill set differs from the audience contract: "
+        f"missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)}",
+    )
+    for path in skill_paths:
+        frontmatter = _parse_skill_frontmatter(path)
+        folder_name = path.parent.name
+        _require(
+            frontmatter["name"] == folder_name,
+            f"{path} name {frontmatter['name']!r} does not match its folder",
+        )
+        _require(
+            frontmatter["audience"] == SKILL_AUDIENCES[folder_name],
+            f"{path} audience {frontmatter['audience']!r} does not match "
+            f"the expected {SKILL_AUDIENCES[folder_name]!r}",
+        )
     texts = []
     for path in sorted(skill_root.rglob("*")):
         if not path.is_file() or path.suffix not in {".md", ".py"}:
@@ -328,6 +428,7 @@ def _validate_release_docs() -> None:
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     docs_index = (ROOT / "docs" / "README.md").read_text(encoding="utf-8")
+    skill_policy = (ROOT / "docs" / "agent-skills.md").read_text(encoding="utf-8")
     release_index = (ROOT / "docs" / "releases" / "README.md").read_text(
         encoding="utf-8"
     )
@@ -339,6 +440,7 @@ def _validate_release_docs() -> None:
         "docs/releases/STATUS.md",
         "docs/releases/README.md",
         "docs/capabilities.md",
+        "docs/agent-skills.md",
         "docs/eager-resident-compiled-execution.md",
         "docs/notebooks/gafime_tutorial.ipynb",
     ):
@@ -346,11 +448,23 @@ def _validate_release_docs() -> None:
     for link in (
         "contract.md",
         "abi-evolution.md",
+        "agent-skills.md",
         "releases/release-operations.md",
         "releases/release-artifact-matrix.md",
         "security/threat-model.md",
     ):
         _require(link in docs_index, f"docs/README.md does not route to {link}")
+    for token in (
+        "`end-user`",
+        "`contributor`",
+        "`both`",
+        "matching canonical GitHub Release/tag",
+        "do not silently apply `main` guidance to an older release",
+    ):
+        _require(
+            token in " ".join(skill_policy.split()),
+            f"agent skill policy is missing: {token}",
+        )
     _require(
         Path(release.release_note).name in release_index,
         "release index does not expose the current version record",

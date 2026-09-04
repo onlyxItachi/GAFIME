@@ -1,6 +1,8 @@
 ---
 name: benchmark-vs-manual
 description: Compare v1 continuous pair interactions against baseline and manually authored features with leakage-safe cross-validation.
+metadata:
+  audience: end-user
 ---
 
 # Benchmark Against Manual Features

@@ -1,6 +1,8 @@
 ---
 name: validate-features
 description: Validate selected GAFIME v1 continuous pair interactions on untouched data without confusing discovery, stability, permutation maxT, and downstream model evidence.
+metadata:
+  audience: end-user
 ---
 
 # Validate Discovered Features

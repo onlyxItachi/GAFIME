@@ -1,6 +1,8 @@
 ---
 name: platform-detect
 description: Inspect platform and visible accelerator hints, then recommend a truthful GAFIME v1 installation and backend configuration.
+metadata:
+  audience: both
 ---
 
 # Platform Detection
@@ -25,8 +27,8 @@ Current v1 distribution policy:
 - CUDA payload: Linux and Windows x86_64 via `gafime` plus `gafime-cuda`;
   requires the system CUDA 13 runtime.
 - ROCm payload: Linux x86_64 via `gafime` plus `gafime-rocm`; PyPI provides
-  the buildable sdist, while the matching GitHub Release will carry the prebuilt
-  thin raw-Linux wheel. Both require the compatible system ROCm runtime.
+  the buildable sdist, while the matching GitHub Release is the prebuilt thin
+  raw-Linux wheel channel. Both require the compatible system ROCm runtime.
 - Metal: bundled in the macOS arm64 Core wheel and supports `fp32` only.
 - Optional OptiX RT: local CMake build only, selected explicitly through
   `GAFIME_CUDA_V1_LIB`; it is never a distribution or release artifact.

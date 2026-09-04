@@ -1,6 +1,8 @@
 ---
 name: dataset-profiler
 description: Profile a CSV or Parquet dataset for GAFIME v1 data quality, candidate scale, candidate-row work, and conservative resident-input memory.
+metadata:
+  audience: end-user
 ---
 
 # Dataset Profiler
