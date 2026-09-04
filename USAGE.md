@@ -204,6 +204,13 @@ the top-level package as in v0.4.7. `GafimeStreamer` preserves CSV/Parquet batch
 iteration through Polars, while `generate_tutorial(path)` writes a notebook
 using the current v1 API.
 
+GAFIME v1 deliberately supports `polars>=1.3,<2`. Polars 2 changes API and its
+migration has a real compatibility cost that is not an objective of GAFIME v1;
+the migration will be handled as dedicated v1.1 or v1.2 work under
+[issue #87](https://github.com/onlyxItachi/GAFIME/issues/87). This upper bound
+prevents Polars 2 prereleases or a future final release from silently changing
+the supported file-ingest and streaming behavior.
+
 ## Available Evaluation Metrics
 
 The `EngineConfig` accepts a `metric_names` tuple. You can use any combination:

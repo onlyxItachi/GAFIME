@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Constrain GAFIME v1 to `polars>=1.3,<2` so Polars 2 API and semantic changes
+  cannot enter file-ingest or streaming paths before the dedicated v1.1/v1.2
+  migration tracked by issue #87.
+
 ## v1.0.0-rc.1
 
 - Reject negative `GafimeSelector.k`, non-positive streaming batch sizes, and

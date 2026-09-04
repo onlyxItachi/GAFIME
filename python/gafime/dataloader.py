@@ -3,7 +3,9 @@
 ``gafime.dataload(path, target)`` reads a parquet/CSV/Arrow file with Polars,
 converts to the selected profile's resident dtype, and runs the engine. Polars is
 the *external* loader; GAFIME still owns all compute memory internally. The
-Polars import is lazy so importing this module never requires Polars.
+Polars import is lazy so importing this module never requires Polars. GAFIME v1
+supports Polars 1.x from 1.3 onward; Polars 2 migration is deferred to the
+dedicated v1.1/v1.2 compatibility work.
 
 The adapter uses the Arrow-native CPU shortcut only when that entrypoint can
 honor the complete ``EngineConfig``. Other configurations use the configured

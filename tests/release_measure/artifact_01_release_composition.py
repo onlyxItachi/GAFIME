@@ -53,6 +53,7 @@ ROCM_BUILD_PACKAGES = (
     "libstdc++-devel-8.5.0-28.el8_10.alma.1.x86_64",
 )
 CANONICAL_PRECISION_PROFILES = ("fp32", "mixed", "fp64")
+POLARS_V1_SPECIFIERS = frozenset({">=1.3", "<2"})
 REQUIRED_PRECISION_ABI_IDENTITIES = (
     b"gafime_gpu_numeric_routes_v2",
     b"gafime_gpu_matrix_alloc_v2",
@@ -266,6 +267,39 @@ def _project_version(root: Path) -> str:
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def _assert_polars_v1_requirement(requirements: Iterable[str], context: str) -> None:
+    """Require the one supported Polars dependency range, independent of order."""
+    matches: list[str] = []
+    for requirement in requirements:
+        core, marker_separator, _marker = requirement.partition(";")
+        core = core.strip()
+        match = re.fullmatch(
+            r"(?i)polars(?:\s*\(([^)]*)\)|\s*((?:[<>=!~].*)?))",
+            core,
+        )
+        if match is None:
+            continue
+        _require(
+            not marker_separator,
+            f"{context} Polars dependency must be unconditional",
+        )
+        matches.append(match.group(1) or match.group(2) or "")
+
+    _require(
+        len(matches) == 1,
+        f"{context} must declare exactly one Polars dependency",
+    )
+    actual = frozenset(
+        re.sub(r"\s+", "", specifier)
+        for specifier in matches[0].split(",")
+        if specifier.strip()
+    )
+    _require(
+        actual == POLARS_V1_SPECIFIERS,
+        f"{context} Polars dependency must be >=1.3,<2; found {sorted(actual)}",
+    )
 
 
 def _canonical_archive_member(
@@ -1062,11 +1096,12 @@ def _assert_common_metadata(artifact: Artifact, version: str) -> None:
         f"{artifact.path.name} metadata version {artifact.version!r} != {version!r}",
     )
     _assert_license(artifact)
+    raw_requirements = artifact.metadata.get_all("Requires-Dist", [])
     requirements = {
-        requirement.split(";", 1)[0].strip()
-        for requirement in artifact.metadata.get_all("Requires-Dist", [])
+        requirement.split(";", 1)[0].strip() for requirement in raw_requirements
     }
     if artifact.distribution == "gafime":
+        _assert_polars_v1_requirement(raw_requirements, artifact.path.name)
         payload_dependencies = sorted(
             requirement
             for requirement in requirements
@@ -2035,6 +2070,9 @@ def _assert_release_manifest_pyproject(
     project: dict[str, object], version: str
 ) -> None:
     project_metadata = project["project"]
+    _assert_polars_v1_requirement(
+        project_metadata["dependencies"], "pyproject.toml project dependencies"
+    )
     optional = project_metadata["optional-dependencies"]
     expected_python = set(RELEASE_MANIFEST.supported_python)
     actual_python = {
@@ -2611,6 +2649,12 @@ def _assert_source_tree(root: Path) -> None:
     pyproject_text = (root / "pyproject.toml").read_text(encoding="utf-8")
     pyproject = tomllib.loads(pyproject_text)
     _assert_release_manifest_pyproject(pyproject, _project_version(root))
+    requirements = [
+        line.strip()
+        for line in (root / "requirements.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    _assert_polars_v1_requirement(requirements, "requirements.txt")
     sdist_paths = {
         str(entry["path"])
         for entry in pyproject["tool"]["maturin"].get("include", [])
@@ -2771,6 +2815,23 @@ def _assert_source_tree(root: Path) -> None:
     build_workflow = (root / ".github" / "workflows" / "build_wheels.yml").read_text(
         encoding="utf-8"
     )
+    contract_workflow = (
+        root / ".github" / "workflows" / "v1_contract_validation.yml"
+    ).read_text(encoding="utf-8")
+    for workflow_name, workflow in (
+        ("build_wheels.yml", build_workflow),
+        ("v1_contract_validation.yml", contract_workflow),
+    ):
+        polars_install_lines = [
+            line
+            for line in workflow.splitlines()
+            if "python -m pip install" in line and "polars" in line.lower()
+        ]
+        _require(
+            polars_install_lines
+            and all('"polars>=1.3,<2"' in line for line in polars_install_lines),
+            f"{workflow_name} must constrain every direct Polars install to >=1.3,<2",
+        )
     publish_workflow = (
         root / ".github" / "workflows" / "publish_release.yml"
     ).read_text(encoding="utf-8")

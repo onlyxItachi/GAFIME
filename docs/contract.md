@@ -331,7 +331,7 @@ decision-path calls per payload and device so separate backend objects cannot
 race that legacy mutable state. Current payloads with the lifecycle symbol keep
 their native locking path and must not pay this compatibility mutex.
 
-Arrow C Data / Arrow C Stream is the v1 framework-integration protocol. Polars is the external tabular compatibility layer for ingest and manipulation; GAFIME owns compute memory after validation and exports compact result tables over Arrow. Legacy DLPack/native-buffer export must not be reintroduced as a fallback or compatibility shortcut without explicit maintainer approval.
+Arrow C Data / Arrow C Stream is the v1 framework-integration protocol. Polars is the external tabular compatibility layer for ingest and manipulation; GAFIME owns compute memory after validation and exports compact result tables over Arrow. GAFIME v1 deliberately supports `polars>=1.3,<2`. Polars 2 changes API and migration has a real compatibility cost that is not an objective of GAFIME v1; that migration belongs to the dedicated v1.1 or v1.2 work tracked by [issue #87](https://github.com/onlyxItachi/GAFIME/issues/87). Legacy DLPack/native-buffer export must not be reintroduced as a fallback or compatibility shortcut without explicit maintainer approval.
 
 Prepared continuous plans may set `GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL` only
 while Rust owns the descriptor buffers and guarantees that their contents stay

@@ -674,7 +674,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install nbformat numpy pyarrow polars scikit-learn pytest
+          python -m pip install nbformat numpy pyarrow "polars>=1.3,<2" scikit-learn pytest
           cd "$RUNNER_TEMP"
           GAFIME_TEST_INSTALLED_PACKAGE=1 python - <<'PY'
           import os
