@@ -185,9 +185,9 @@ without maintainer approval. Follow
 [`docs/releases/release-operations.md`](docs/releases/release-operations.md).
 
 `.github/workflows/build_wheels.yml` validates and freezes an immutable bundle;
-it never publishes. After that exact source is reviewed and merged, a canonical
-tag may bind the same source commit. The manual-only
-`.github/workflows/publish_release.yml` verifies and publishes the byte-identical
-frozen bundle in Core-first order, runs public exact-version installation
-checks, and creates the GitHub Release last. Pushing a tag alone neither builds
-nor publishes a release.
+it never publishes. After that exact source is reviewed, frozen, and admitted
+into `main`, a canonical tag may bind the same release-branch commit. The
+manual-only `.github/workflows/publish_release.yml` verifies and publishes the
+byte-identical frozen bundle in Core-first order, runs public exact-version
+installation checks, and creates the GitHub Release last. Pushing a tag alone
+neither builds nor publishes a release.
