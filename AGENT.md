@@ -189,9 +189,11 @@ candidate tip an ancestor of `main` without moving or rebuilding the candidate.
 The publisher accepts only a successful `push` or `workflow_dispatch` build
 whose head branch is exactly `release/<tag>`, whose SHA equals both the current
 release-branch tip and canonical tag, and whose candidate commit has already
-been admitted to `main`. After publication, retain the exact release branch as
-a locked read-only reference. See `docs/releases/release-branches.md` for the
-full branch lifecycle.
+been admitted to `main`. After accepting the frozen candidate and before final
+admission, tagging, or publication, install exact-ref update/deletion protection
+and retain that read-only lock after publication. A later source fix requires a
+deliberate unlock, reviewed PR, new exact-tip build, and restored lock. See
+`docs/releases/release-branches.md` for the full branch lifecycle.
 
 ## Release Behavior
 

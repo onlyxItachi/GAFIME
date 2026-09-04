@@ -206,6 +206,19 @@ Before tagging a release candidate:
 The later stable-release deep security qualification is separate from this
 pre-RC baseline.
 
+## Lock The Accepted Candidate
+
+After the frozen bundle, physical/backend evidence, security qualification, and
+other release-blocking evidence are accepted, but before final admission,
+tagging, or publication, apply an exact-ref ruleset to the candidate branch that
+blocks updates and deletion with no bypass. This closes the gap between the
+publisher's release-tip preflight and the retained provenance reference.
+
+If a source fix is still required, deliberately remove the exact-ref lock, land
+the fix through the normal reviewed release-branch PR path, rebuild and verify
+the complete new exact-tip bundle, then restore the lock. The earlier bundle is
+stale. Never unlock or move a tagged or published candidate.
+
 ## Normal Publication
 
 After the exact frozen release tip has passed final admission and is an
@@ -269,10 +282,10 @@ checking its static precision ABI/package surface. The pre-publication physical
 CUDA/ROCm record above remains authoritative; hosted public-install jobs do not
 replace it. The GitHub Release is created only after all public checks pass.
 
-After successful publication, apply exact-ref read-only protection to the
-release branch and retain it for provenance. Ensure every release-first fix is
-also present on `main`; use a reviewed forward-port pull request for any
-exception not already carried by the admission merge.
+After successful publication, retain the existing exact-ref read-only
+protection for provenance. Ensure every release-first fix is also present on
+`main`; use a reviewed forward-port pull request for any exception not already
+carried by the admission merge.
 
 The publisher may copy files into per-project upload directories only to select
 them. It verifies each selected file is byte-identical to the frozen source.

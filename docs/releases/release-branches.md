@@ -73,7 +73,13 @@ and Validate Wheels against that exact tip. An eligible frozen build must be a
 sources.
 
 Do not advance the release branch after freezing. Any required tracked change
-creates a new tip and invalidates the previous bundle.
+creates a new tip and invalidates the previous bundle. Once the frozen
+candidate and its release-blocking evidence are accepted, install an exact-ref
+ruleset that blocks updates and deletion with no bypass before final admission,
+tagging, or publication. If a source fix is later required, deliberately remove
+that exact lock, land the reviewed release-branch PR under the normal candidate
+rules, build and verify the new exact tip, then restore the lock. Never treat an
+unlocked or changed tip as the previously accepted candidate.
 
 ## Admit The Exact Tip To Main
 
@@ -119,9 +125,10 @@ exact release tip (now ancestor of main) -> tag same tip -> publish frozen bytes
 
 ## Retention
 
-After publication, install exact-ref protection that makes the release branch
-read-only and retain it as provenance. Do not reuse it for another version,
-resume development on it, move its history, or delete it as routine cleanup.
+Retain the pre-publication exact-ref lock after publication so the release
+branch remains a read-only provenance record. Do not reuse it for another
+version, resume development on it, move its history, or delete it as routine
+cleanup.
 
 The admission merge normally forward-ports every release-first fix by making
 the release tip an ancestor of `main`. If an exceptional release-only fix is

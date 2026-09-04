@@ -175,8 +175,11 @@ tagging by creating a temporary admission branch from current `main`, merging
 the release tip into it, and submitting that branch through an ordinary strict
 PR. Do not merge `main` into the release branch. Publication additionally
 requires the frozen build, tag, and current release tip to resolve to the same
-SHA. Retain the candidate branch under an exact-ref read-only lock after
-publication. The lifecycle and permitted change matrix are in
+SHA. After accepting the frozen candidate and before admission or tagging,
+install exact-ref update/deletion protection; retain that read-only lock after
+publication. A later source fix requires a deliberate unlock, reviewed PR, new
+exact-tip build, and restored lock. The lifecycle and permitted change matrix
+are in
 [`docs/releases/release-branches.md`](docs/releases/release-branches.md).
 
 ## Release Safety

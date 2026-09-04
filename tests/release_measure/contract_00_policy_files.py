@@ -172,6 +172,8 @@ def main() -> None:
     contributing = ROOT / "CONTRIBUTING.md"
     build_doc = ROOT / "BUILD.md"
     release_branches = ROOT / "docs" / "releases" / "release-branches.md"
+    release_operations = ROOT / "docs" / "releases" / "release-operations.md"
+    release_status = ROOT / "docs" / "releases" / "STATUS.md"
     workflow = ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
     release_workflow = ROOT / ".github" / "workflows" / "build_wheels.yml"
     native_workflow = ROOT / ".github" / "workflows" / "native_platform_validation.yml"
@@ -192,6 +194,8 @@ def main() -> None:
         contributing,
         build_doc,
         release_branches,
+        release_operations,
+        release_status,
         gitignore,
         workflow,
         release_workflow,
@@ -345,7 +349,8 @@ def main() -> None:
             "temporary branch based on current `main`",
             "making the candidate an ancestor",
             "build head branch to `release/<tag>`",
-            "read-only lock",
+            "before admission, tagging, or publication",
+            "exact-ref update/deletion protection",
         ),
         agent: (
             "release/v<canonical-semver>",
@@ -354,7 +359,8 @@ def main() -> None:
             "temporary admission branch cut from current `main`",
             "make the exact candidate tip an ancestor of `main`",
             "head branch is exactly `release/<tag>`",
-            "locked read-only reference",
+            "before final admission, tagging, or publication",
+            "exact-ref update/deletion protection",
         ),
         claude: (
             "release/v<canonical-semver>",
@@ -363,7 +369,8 @@ def main() -> None:
             "temporary admission branch cut from current `main`",
             "make the exact candidate tip an ancestor of `main`",
             "head branch is exactly `release/<tag>`",
-            "locked read-only reference",
+            "before final admission, tagging, or publication",
+            "exact-ref update/deletion protection",
         ),
         contributing: (
             "release/v<canonical-semver>",
@@ -371,7 +378,8 @@ def main() -> None:
             "exact release-branch tip is the build, freeze, tag, and publication source",
             "temporary admission branch from current `main`",
             "current release tip to resolve to the same SHA",
-            "exact-ref read-only lock",
+            "before admission or tagging",
+            "exact-ref update/deletion protection",
         ),
         build_doc: (
             "pull requests, pushes to `main` and protected `release/v*` candidate branches",
@@ -385,7 +393,17 @@ def main() -> None:
             "temporary admission branch from the current green `main`",
             "unchanged release tip is now an ancestor of `main`",
             "`head_branch` is exactly `release/$tag`",
-            "exact-ref protection",
+            "blocks updates and deletion with no bypass before final admission",
+        ),
+        release_operations: (
+            "## Lock The Accepted Candidate",
+            "before final admission, tagging, or publication",
+            "blocks updates and deletion with no bypass",
+            "earlier bundle is stale",
+        ),
+        release_status: (
+            "exact-ref update/deletion protection before admission, tagging, or publication",
+            "any source fix requires an explicit unlock and new exact build",
         ),
     }
     for path, phrases in release_branch_policy.items():

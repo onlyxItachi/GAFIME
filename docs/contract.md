@@ -576,8 +576,11 @@ admit that unchanged tip to `main` through a temporary branch based on current
 `main` and an ordinary strict PR, making the candidate an ancestor without
 moving it. Publication must mechanically bind the build head branch to
 `release/<tag>` and prove build SHA, current branch tip, canonical tag, and the
-admitted candidate commit are identical. After publication, retain the exact
-candidate ref under a read-only lock. The detailed lifecycle is in
+admitted candidate commit are identical. After accepting the frozen candidate
+and before admission, tagging, or publication, install exact-ref
+update/deletion protection and retain that read-only lock after publication. A
+later source fix requires a deliberate unlock, reviewed PR, new exact-tip
+build, and restored lock. The detailed lifecycle is in
 [`docs/releases/release-branches.md`](releases/release-branches.md).
 
 A release must never:

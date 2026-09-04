@@ -50,6 +50,9 @@ moment-in-time commit, workflow, or package-presence result.
   wholesale into the candidate branch.
 - Qualify and build/freeze the exact protected release-branch tip; `main` may
   continue independently while that bounded candidate stabilizes.
+- After the frozen candidate is accepted, install exact-ref update/deletion
+  protection before admission, tagging, or publication. Retain that lock after
+  publication; any source fix requires an explicit unlock and new exact build.
 - For final admission, cut a temporary branch from current green `main`, merge
   the unchanged settled release tip into it, and submit that integration branch
   to `main` for strict checks and current-head AI review. Never merge divergent
@@ -57,8 +60,7 @@ moment-in-time commit, workflow, or package-presence result.
 - After admission, verify the frozen release tip is an ancestor of `main`, then
   tag that same tip and publish only its byte-identical frozen bundle.
 - Require the publisher to match the push/workflow-dispatch build branch,
-  remote release tip, tag, and build SHA exactly; after publication retain the
-  exact release branch under read-only protection.
+  remote release tip, tag, and build SHA exactly.
 
 No RC2 tag, GitHub Release, or PyPI publication exists merely because branch
 preparation has begun. Stable qualification, the Deep Security Scan, and the
