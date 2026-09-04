@@ -54,6 +54,7 @@ ROCM_BUILD_PACKAGES = (
 )
 CANONICAL_PRECISION_PROFILES = ("fp32", "mixed", "fp64")
 POLARS_V1_SPECIFIERS = frozenset({">=1.3", "<2"})
+POLARS_V1_SHELL_REQUIREMENT = re.compile(r"""(["'])polars>=1\.3,<2\1""")
 REQUIRED_PRECISION_ABI_IDENTITIES = (
     b"gafime_gpu_numeric_routes_v2",
     b"gafime_gpu_matrix_alloc_v2",
@@ -2829,7 +2830,10 @@ def _assert_source_tree(root: Path) -> None:
         ]
         _require(
             polars_install_lines
-            and all('"polars>=1.3,<2"' in line for line in polars_install_lines),
+            and all(
+                POLARS_V1_SHELL_REQUIREMENT.search(line)
+                for line in polars_install_lines
+            ),
             f"{workflow_name} must constrain every direct Polars install to >=1.3,<2",
         )
     publish_workflow = (
