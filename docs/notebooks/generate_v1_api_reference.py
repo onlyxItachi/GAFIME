@@ -1133,6 +1133,11 @@ def _cells() -> list:
             to one Arrow record batch, and runs analysis. A raw Arrow table/stream is
             not a top-level `analyze()` input; use the shipped file-oriented
             `dataload()` boundary for Arrow IPC.
+
+            GAFIME v1 deliberately supports `polars>=1.3,<2`. Polars 2 changes API
+            and its migration cost is outside the v1 objective; dedicated v1.1 or
+            v1.2 work will handle that migration. The upper bound keeps file ingest
+            and streaming on the compatibility surface validated for v1.
             """
         ),
         _code(

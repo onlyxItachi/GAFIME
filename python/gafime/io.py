@@ -1,3 +1,9 @@
+"""Polars 1.x streaming helpers for GAFIME's public file-input boundary.
+
+GAFIME v1 validates this surface with ``polars>=1.3,<2``. Polars 2 migration
+is dedicated compatibility work rather than an implicit dependency upgrade.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path

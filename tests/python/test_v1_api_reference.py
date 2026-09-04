@@ -70,6 +70,7 @@ def test_v1_reference_is_deterministic_and_substantial() -> None:
         "top_level_symbols": len(generator.TOP_LEVEL_PUBLIC_API),
     }
     assert len({cell["id"] for cell in notebook["cells"]}) == len(notebook["cells"])
+    assert "`polars>=1.3,<2`" in _source_text(notebook)
 
 
 def test_v1_reference_code_cells_compile_and_selected_examples_execute() -> None:

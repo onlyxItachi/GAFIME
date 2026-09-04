@@ -1232,7 +1232,7 @@ class NativeCompiledGafime:
     def __arrow_c_array__(self, requested_schema=None):
         """Zero-copy Arrow C Data Interface export of the compact result table.
         Requires the artifact to have been compiled with CompileFlags(export=True).
-        Consumers such as Polars >= 1.3 and pyarrow read the (schema, array)
+        Consumers such as Polars 1.x (>= 1.3) and pyarrow read the (schema, array)
         capsule pair with no copy; arrow-rs owns the FFI release callbacks."""
         if not self.export:
             raise V1UnsupportedError(

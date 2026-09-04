@@ -434,7 +434,7 @@ impl PyContinuousReport {
         Ok(Some(out))
     }
 
-    /// Arrow PyCapsule Interface (Polars >= 1.3, pyarrow, etc. consume this
+    /// Arrow PyCapsule Interface (Polars 1.x >= 1.3, pyarrow, etc. consume this
     /// zero-copy). Returns the (schema, array) capsule pair; arrow-rs owns the
     /// FFI release callbacks, so there is no hand-rolled unsafe lifetime logic.
     #[pyo3(signature = (requested_schema=None))]

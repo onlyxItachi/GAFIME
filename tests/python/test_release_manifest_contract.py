@@ -123,6 +123,38 @@ def test_optional_dependency_drift_names_distribution_and_extra() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "bad_requirement",
+    ("polars>=1.3", "polars>=2", "polars>=1.2,<2"),
+)
+def test_polars_v1_dependency_drift_is_rejected(bad_requirement: str) -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    mutated = copy.deepcopy(project)
+    mutated["project"]["dependencies"] = [bad_requirement]
+
+    with pytest.raises(AssertionError, match=r"Polars dependency must be >=1.3,<2"):
+        artifact_gate._assert_release_manifest_pyproject(
+            mutated, project["project"]["version"]
+        )
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    ("polars>=1.3,<2", "polars (<2, >=1.3)"),
+)
+def test_polars_v1_dependency_accepts_metadata_specifier_order(
+    requirement: str,
+) -> None:
+    artifact_gate._assert_polars_v1_requirement([requirement], "test metadata")
+
+
+def test_polars_v1_dependency_rejects_environment_marker() -> None:
+    with pytest.raises(AssertionError, match=r"Polars dependency must be unconditional"):
+        artifact_gate._assert_polars_v1_requirement(
+            ["polars>=1.3,<2; python_version < '3.11'"], "test metadata"
+        )
+
+
 def test_release_tag_uses_semver_while_artifacts_use_pep440() -> None:
     release = validate_project_versions(ROOT)
 

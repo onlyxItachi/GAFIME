@@ -33,10 +33,10 @@ Coverage classes:
 | `gafime.EngineConfig` | primary | class and every field | complete parameter table | field/signature and Core smokes | precision/family controls are keyword-only |
 | `gafime.FamilyCapability` | result model | class, fields, properties | family/capability sections | family smoke | separates generation from scoring placement |
 | `gafime.FamilySignificanceSupport` | result model | class and fields | family/significance sections | family smoke | family-specific significance truth |
-| `gafime.dataload` | integration | arguments, formats, return/failures | input section | Polars Arrow-IPC smoke | reads and analyzes one file through Polars |
+| `gafime.dataload` | integration | arguments, formats, return/failures | input section | supported Polars 1.x Arrow-IPC smoke | reads and analyzes one file through Polars |
 | `gafime.GafimeEngine` | primary | constructor, `analyze`, `compile` | execution sections | Core/compiled smokes | safe public execution boundary |
 | `gafime.GafimeSelector` | integration | constructor and estimator methods | sklearn section | sklearn smoke | `n_jobs`/`verbose` are stored compatibility parameters; negative `k` fails validation |
-| `gafime.GafimeStreamer` | integration | constructor and batch methods | input/streaming section | Polars CSV smoke | reader only; non-positive `batch_size` fails before reading |
+| `gafime.GafimeStreamer` | integration | constructor and batch methods | input/streaming section | supported Polars 1.x CSV smoke | reader only; non-positive `batch_size` fails before reading |
 | `gafime.GafimeV1Error` | result model | exception purpose | fail-closed section | expected-error smoke | base explicit v1 runtime error |
 | `gafime.InteractionResult` | result model | class and every field | report table | Core report smoke | includes candidate/provenance/numeric diagnostics |
 | `gafime.NativeCompiledGafime` | primary | factory-only construction and every public method/property | compiled lifecycle section | compile/update/close smoke | factory-returned, thread-affine lifecycle; explicit close; no context manager |
