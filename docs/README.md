@@ -50,6 +50,7 @@ documents that own each subject.
 
 - [Current release-train status](releases/STATUS.md)
 - [Release index and history](releases/README.md)
+- [Candidate release-branch policy](releases/release-branches.md)
 - [Release operations runbook](releases/release-operations.md)
 - [Release artifact matrix](releases/release-artifact-matrix.md)
 - [Chronological changelog](../CHANGELOG.md)

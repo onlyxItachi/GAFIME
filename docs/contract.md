@@ -563,6 +563,34 @@ Before merge, every PR must have:
 
 A `COMMENTED` review is valid review evidence; an `APPROVED` review state is not required. The AI Review Record must state the model, role, exact reviewed commit SHA, verdict, and findings. The reviewed SHA must equal the current PR head. A later head commit invalidates the record and requires a new review. A base change invalidates the merge-commit CI evidence and requires the configured checks to run against the new merge commit. A merge-blocking verdict or unresolved blocking finding prevents merge.
 
+Candidate stabilization branches use `release/v<canonical-semver>` and are cut
+only from an exact green `main` commit. Branch creation changes no release
+identity and authorizes no tag or publication. Release-branch changes remain
+PR-only, merge-commit-only, protected by the same review/check/thread gates,
+and limited to bounded stabilization for the named candidate. Durable fixes
+normally land on `main` first and retain backport provenance; an urgent
+release-first fix must be carried into `main` through final admission. A
+divergent `main` must not be merged into the candidate branch. The exact settled
+release tip is the build, freeze, tag, and publication source. Before tagging,
+admit that unchanged tip to `main` through a temporary branch based on current
+`main` and an ordinary strict PR, making the candidate an ancestor without
+moving it. Publication must mechanically bind the build head branch to
+`release/<tag>` and prove build SHA, current branch tip, canonical tag, and the
+admitted candidate commit are identical. After accepting the frozen candidate
+and before admission, tagging, or publication, install exact-ref
+update/deletion protection and retain that read-only lock after publication. A
+later source fix requires a deliberate unlock, reviewed PR, new exact-tip
+build, and restored lock. The detailed lifecycle is in
+[`docs/releases/release-branches.md`](releases/release-branches.md).
+
+Canonical `v*` release tags are governed by two layered active rulesets: an
+authorized creation-only rule and a separate no-bypass update/deletion rule.
+The creation bypass never permits an existing tag to move or be deleted. After
+admission, create the canonical tag on the exact frozen tip, verify both rules
+apply, and only then dispatch publication from the tag ref. Publisher workflow
+identity, downstream checkouts, live tag/branch refs, build source, and
+job-local pre-upload rechecks must resolve to the same commit.
+
 A release must never:
 
 - introduce silent backend behavior changes

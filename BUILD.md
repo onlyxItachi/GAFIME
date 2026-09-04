@@ -253,12 +253,15 @@ Those jobs build only the Core distribution: Rust orchestration plus the Rust
 CPU scalar/NEON path. Installed-wheel and archive-composition gates verify that
 no CUDA or ROCm payload is present in an ARM wheel.
 
-`.github/workflows/build_wheels.yml` runs on pull requests, `main`, and manual
-dispatch. It builds, validates, and freezes one immutable release bundle but
-never publishes. `.github/workflows/publish_release.yml` is manual-only and
-binds an exact successful build run to an exact tag commit. It publishes Core
-first, then CUDA and ROCm, verifies public exact-version installs, and only then
-creates the GitHub Release.
+`.github/workflows/build_wheels.yml` runs on pull requests, pushes to `main` and
+protected `release/v*` candidate branches, and manual dispatch. It builds,
+validates, and freezes one immutable release bundle but never publishes. The
+candidate lifecycle and eligible frozen-build identity are defined in
+[`docs/releases/release-branches.md`](docs/releases/release-branches.md).
+`.github/workflows/publish_release.yml` is manual-only and binds an exact
+successful build run to an exact tag commit. It publishes Core first, then CUDA
+and ROCm, verifies public exact-version installs, and only then creates the
+GitHub Release.
 
 ### Strict Validation in CI
 

@@ -4,6 +4,32 @@ This runbook covers validation, publication, and recovery for the split GAFIME
 distribution. It does not authorize a tag, PyPI upload, or GitHub Release.
 Publication still requires explicit maintainer approval.
 
+## Candidate Release Branches
+
+Candidate stabilization follows the
+[release-branch policy](release-branches.md). A branch named
+`release/v<canonical-semver>` may be cut only from a green `main`; its creation
+does not change version identity, create a tag, authorize publication, or
+establish a release-eligible frozen candidate. The creation push may produce an
+immutable validation bundle, but only the later settled, version-correct,
+reviewed, and admitted release tip may supply the publishable bundle. Changes
+remain bounded, reviewed through pull requests with merge commits, and subject
+to current-head AI review and all required checks.
+
+Durable fixes land on `main` first when practical. An urgent release-first fix
+must be present on `main` no later than final admission; the admission merge
+normally supplies that forward-port. Divergent `main` must never be merged
+wholesale into the candidate branch. The exact protected release tip is the
+candidate source and may be built and frozen while `main` continues
+independently.
+
+Before tagging, cut a temporary branch from current `main`, merge the unchanged
+settled release tip into it, and submit that integration branch to `main` as
+the final admission pull request. Strict checks and current-head AI review run
+on that integration. Once merged, verify that the frozen release tip is an
+ancestor of `main`; the release tip—not the later integration commit—remains
+the exact build, tag, and publication source.
+
 ## Pinned Distribution Set
 
 The authoritative per-CPython, platform, publication, and artifact-count
@@ -82,13 +108,19 @@ Do not create PyPI projects or publishers for Metal, RT/OptiX, or bundled ROCm.
 ## Build And Freeze
 
 `.github/workflows/build_wheels.yml` builds and validates but cannot publish.
-Run it from the exact reviewed candidate:
+Run it from the exact reviewed and settled release-branch tip:
 
 ```bash
-gh workflow run build_wheels.yml --ref <candidate-ref>
+gh workflow run build_wheels.yml --ref release/v<canonical-semver>
 gh run watch <build-run-id> --exit-status
-gh run view <build-run-id> --json headSha,conclusion,jobs,url
+gh run view <build-run-id> --json event,headBranch,headSha,conclusion,jobs,url
 ```
+
+The release-eligible run must use event `push` or `workflow_dispatch`, report
+`head_branch == release/$tag`, and bind its authoritative source SHA to the
+unchanged remote branch tip. A pull-request synthetic merge run cannot be
+published. Build/freeze may precede final admission, but tagging and
+publication may not.
 
 The workflow must:
 
@@ -174,9 +206,23 @@ Before tagging a release candidate:
 The later stable-release deep security qualification is separate from this
 pre-RC baseline.
 
+## Lock The Accepted Candidate
+
+After the frozen bundle, physical/backend evidence, security qualification, and
+other release-blocking evidence are accepted, but before final admission,
+tagging, or publication, apply an exact-ref ruleset to the candidate branch that
+blocks updates and deletion with no bypass. This closes the gap between the
+publisher's release-tip preflight and the retained provenance reference.
+
+If a source fix is still required, deliberately remove the exact-ref lock, land
+the fix through the normal reviewed release-branch PR path, rebuild and verify
+the complete new exact-tip bundle, then restore the lock. The earlier bundle is
+stale. Never unlock or move a tagged or published candidate.
+
 ## Normal Publication
 
-After the reviewed commit is on `main` and the build run succeeds:
+After the exact frozen release tip has passed final admission and is an
+ancestor of `main`:
 
 1. Confirm the release note and version surfaces are final.
 2. Confirm all three Trusted Publisher entries name `publish_release.yml`, use
@@ -194,9 +240,18 @@ python .github/scripts/check_pypi_release_status.py \
   --reason-contains "matching gafime==1.0.0b1 Core was not published"
 ```
 
-4. Only after every preceding check passes, create `v<semver>` on the exact
-   build-run commit and push the tag.
-5. Dispatch the publisher with the exact build run and tag:
+4. Verify that the build run used event `push` or `workflow_dispatch`, its
+   `head_branch` is exactly `release/v<semver>`, and the remote branch tip still
+   equals the authoritative build SHA.
+5. Only after every preceding check passes, create `v<semver>` on that exact
+   release-branch/build commit and push the tag.
+6. Verify that two active `refs/tags/v*` rulesets cover the new tag: an
+   authorized creation-only rule and a separate update/deletion rule with an
+   empty bypass list. The creation bypass is scoped to its own ruleset and must
+   never appear on the immutability rule. Do not dispatch while the exact tag
+   remains movable.
+7. Dispatch the publisher from the exact tag ref with the exact build run and
+   tag:
 
 ```bash
 gh workflow run publish_release.yml --ref v<semver> \
@@ -207,11 +262,19 @@ gh workflow run publish_release.yml --ref v<semver> \
 
 The publisher verifies that:
 
+- the workflow dispatch ref is the canonical tag and its captured workflow SHA
+  equals the checked-out source and tag commit;
 - the build run used `build_wheels.yml` and concluded successfully;
-- the tag resolves to the build run's exact SHA and that SHA is on `main`;
+- the build event is `push` or `workflow_dispatch` and its `head_branch` is
+  exactly `release/$tag`;
+- the remote release-branch tip, tag, and build run resolve to the same exact
+  SHA, and that SHA is an ancestor of `main`;
 - the downloaded bundle's checksums and provenance are unchanged, including
   the authoritative source identity (the `--source-sha` verifier option is
   the compatibility alias for that identity);
+- every downstream checkout uses that bound source SHA rather than resolving
+  the tag again, and each irreversible upload lane rechecks the live tag and
+  release branch against the same SHA;
 - archive composition and SemVer/PEP 440 identity still pass;
 - no PyPI filename already exists.
 
@@ -229,6 +292,11 @@ wheel, and build/install the public ROCm sdist against pinned system ROCm while
 checking its static precision ABI/package surface. The pre-publication physical
 CUDA/ROCm record above remains authoritative; hosted public-install jobs do not
 replace it. The GitHub Release is created only after all public checks pass.
+
+After successful publication, retain the existing exact-ref read-only
+protection for provenance. Ensure every release-first fix is also present on
+`main`; use a reviewed forward-port pull request for any exception not already
+carried by the admission merge.
 
 The publisher may copy files into per-project upload directories only to select
 them. It verifies each selected file is byte-identical to the frozen source.

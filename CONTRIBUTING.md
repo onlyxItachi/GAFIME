@@ -154,6 +154,41 @@ The reviewed SHA must equal the current PR head. A later head commit invalidates
 
 Intermediate PR commits do not need to be green. Merge eligibility is based on the final reviewed head and required checks that execute against GitHub's current PR merge commit for that exact head/base pair. Workflows configured for `main` must then validate the resulting commit on `main`; a failure blocks release use and follow-on integration until it is corrected or reverted through another PR.
 
+## Release Branches
+
+Candidate stabilization uses protected branches named
+`release/v<canonical-semver>`. A branch is cut only from a green `main` commit;
+creating it is not a version bump, tag, build publication, or release.
+
+Release-branch work is limited to the named candidate's bounded stabilization
+and uses focused pull requests, normal merge commits, exact-head AI review,
+strict checks, resolved conversations, and the same maintainer authority as
+`main`. Durable fixes normally land on `main` first and are backported with
+provenance (prefer `git cherry-pick -x` on a temporary branch). An urgent
+release-first fix must be present on `main` no later than final admission; the
+admission merge normally supplies that forward-port without a duplicate PR. Do
+not merge divergent `main` wholesale into a release branch.
+
+Once the candidate is settled, its exact release-branch tip is the build,
+freeze, tag, and publication source. Admit that unchanged tip to `main` before
+tagging by creating a temporary admission branch from current `main`, merging
+the release tip into it, and submitting that branch through an ordinary strict
+PR. Do not merge `main` into the release branch. Publication additionally
+requires the frozen build, tag, and current release tip to resolve to the same
+SHA. After accepting the frozen candidate and before admission or tagging,
+install exact-ref update/deletion protection; retain that read-only lock after
+publication. A later source fix requires a deliberate unlock, reviewed PR, new
+exact-tip build, and restored lock. The lifecycle and permitted change matrix
+are in
+[`docs/releases/release-branches.md`](docs/releases/release-branches.md).
+
+Canonical `v*` release tags are covered by layered rulesets: an authorized
+creation-only rule and a separate no-bypass update/deletion rule. After
+admission, create the tag on the exact accepted tip, verify that both rules
+apply, and dispatch publication from the tag ref. The publisher pins downstream
+checkouts to the preflight source SHA and revalidates live tag/branch identity
+before every irreversible upload lane.
+
 ## Release Safety
 
 Do not create or push release tags, dispatch publication, or publish to PyPI
@@ -161,9 +196,9 @@ without maintainer approval. Follow
 [`docs/releases/release-operations.md`](docs/releases/release-operations.md).
 
 `.github/workflows/build_wheels.yml` validates and freezes an immutable bundle;
-it never publishes. After that exact source is reviewed and merged, a canonical
-tag may bind the same source commit. The manual-only
-`.github/workflows/publish_release.yml` verifies and publishes the byte-identical
-frozen bundle in Core-first order, runs public exact-version installation
-checks, and creates the GitHub Release last. Pushing a tag alone neither builds
-nor publishes a release.
+it never publishes. After that exact source is reviewed, frozen, and admitted
+into `main`, a canonical tag may bind the same release-branch commit. The
+manual-only `.github/workflows/publish_release.yml` verifies and publishes the
+byte-identical frozen bundle in Core-first order, runs public exact-version
+installation checks, and creates the GitHub Release last. Pushing a tag alone
+neither builds nor publishes a release.

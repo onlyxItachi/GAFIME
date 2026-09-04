@@ -2470,11 +2470,44 @@ def _assert_publish_workflow(workflow: str) -> None:
     preflight = _workflow_job_block(workflow, "publication_preflight")
     _require(
         ".github/workflows/build_wheels.yml" in preflight
+        and "ref: ${{ github.sha }}" in preflight
         and "run-id: ${{ inputs.build_run_id }}" in preflight
         and "release_bundle.py verify" in preflight
         and "--scope full-release" in preflight,
         "publisher must bind a successful build run and revalidate its frozen bundle",
     )
+    for token in (
+        "run_path=\"$(jq -r '.path'",
+        "run_conclusion=\"$(jq -r '.conclusion'",
+        "run_event=\"$(jq -r '.event // empty'",
+        "run_branch=\"$(jq -r '.head_branch // empty'",
+        "run_sha=\"$(jq -r '.head_sha'",
+        "DISPATCH_REF: ${{ github.ref }}",
+        "DISPATCH_SHA: ${{ github.sha }}",
+        '[ "$DISPATCH_REF" != "$tag_ref" ]',
+        "checked_out_sha=\"$(git rev-parse --verify 'HEAD^{commit}')\"",
+        '[ "$checked_out_sha" != "$DISPATCH_SHA" ]',
+        'git fetch --force origin "+$tag_ref:$tag_ref"',
+        '[ "$tag_sha" != "$DISPATCH_SHA" ]',
+        '[ "$run_path" != ".github/workflows/build_wheels.yml" ]',
+        '[ "$run_conclusion" != "success" ]',
+        'case "$run_event" in',
+        "push|workflow_dispatch)",
+        'release_branch="release/$RELEASE_TAG"',
+        'branch_ref="refs/heads/$release_branch"',
+        'git check-ref-format "$branch_ref"',
+        '[ "$run_branch" != "$release_branch" ]',
+        '[ "$tag_sha" != "$run_sha" ]',
+        '"refs/heads/$release_branch:refs/remotes/origin/$release_branch"',
+        'branch_sha="$(git rev-parse --verify',
+        '[ "$branch_sha" != "$tag_sha" ]',
+        'git merge-base --is-ancestor "$tag_sha" origin/main',
+    ):
+        _require(
+            token in preflight,
+            "publisher must bind the frozen build to the exact admitted "
+            f"release branch: missing {token!r}",
+        )
     _require(
         "Install cross-format ABI inspection tools" in preflight
         and "sudo apt-get install --yes llvm" in preflight
@@ -2517,6 +2550,16 @@ def _assert_publish_workflow(workflow: str) -> None:
             f"{name} publisher must verify then upload the frozen bytes",
         )
         _require(
+            "ref: ${{ needs.publication_preflight.outputs.source_sha }}" in job,
+            f"{name} publisher must execute the exact preflight-bound source",
+        )
+        ref_check = job.find("verify_release_ref_identity.py")
+        upload = job.find("pypa/gh-action-pypi-publish")
+        _require(
+            0 <= ref_check < upload,
+            f"{name} publisher must recheck live release refs immediately before upload",
+        )
+        _require(
             "skip-existing: ${{ inputs.allow_matching_existing_pypi_files }}" in job,
             f"{name} publisher may recover only through the hash-matched input",
         )
@@ -2535,6 +2578,10 @@ def _assert_publish_workflow(workflow: str) -> None:
         _require(
             "publish_pypi_cuda" in job and "publish_pypi_rocm" in job,
             f"{job_name} must run only after both payload publication lanes",
+        )
+        _require(
+            "ref: ${{ needs.publication_preflight.outputs.source_sha }}" in job,
+            f"{job_name} must execute the exact preflight-bound source",
         )
     public_matrix = _workflow_job_block(workflow, "verify_public_core_and_cuda")
     for version in RELEASE_MANIFEST.supported_python:
@@ -2614,6 +2661,15 @@ def _assert_publish_workflow(workflow: str) -> None:
         and "softprops/action-gh-release" in github_release
         and "files: dist/*" in github_release,
         "GitHub Release must publish the verified frozen bundle after public installs",
+    )
+    _require(
+        "ref: ${{ needs.publication_preflight.outputs.source_sha }}"
+        in github_release
+        and 0
+        <= github_release.find("verify_release_ref_identity.py")
+        < github_release.find("softprops/action-gh-release"),
+        "GitHub Release must use the bound source and recheck live release refs "
+        "immediately before publication",
     )
 
 

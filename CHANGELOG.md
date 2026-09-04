@@ -5,6 +5,9 @@
 - Constrain GAFIME v1 to `polars>=1.3,<2` so Polars 2 API and semantic changes
   cannot enter file-ingest or streaming paths before the dedicated v1.1/v1.2
   migration tracked by issue #87.
+- Establish protected `release/v<canonical-semver>` stabilization lanes while
+  binding publication to the exact admitted release-branch tip, frozen bundle,
+  and canonical tag rather than to independently advancing `main` contents.
 
 ## v1.0.0-rc.1
 

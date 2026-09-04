@@ -43,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Set up Python
@@ -65,15 +65,39 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
           RELEASE_TAG: ${{ inputs.release_tag }}
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           if [[ ! "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
             echo "Build run ID must be a positive decimal integer."
             exit 1
           fi
+          tag_ref="refs/tags/$RELEASE_TAG"
+          if ! git check-ref-format "$tag_ref"; then
+            echo "Release tag is not a canonical Git tag name."
+            exit 1
+          fi
+          if [ "$DISPATCH_REF" != "$tag_ref" ]; then
+            echo "Publisher was dispatched from $DISPATCH_REF, not $tag_ref."
+            exit 1
+          fi
+          checked_out_sha="$(git rev-parse --verify 'HEAD^{commit}')"
+          if [ "$checked_out_sha" != "$DISPATCH_SHA" ]; then
+            echo "Checked-out workflow source is $checked_out_sha, not dispatch SHA $DISPATCH_SHA."
+            exit 1
+          fi
+          git fetch --force origin "+$tag_ref:$tag_ref"
+          tag_sha="$(git rev-parse --verify "${tag_ref}^{commit}")"
+          if [ "$tag_sha" != "$DISPATCH_SHA" ]; then
+            echo "Tag $RELEASE_TAG resolves to $tag_sha but workflow dispatch used $DISPATCH_SHA."
+            exit 1
+          fi
           run_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID")"
           run_path="$(jq -r '.path' <<<"$run_json")"
           run_conclusion="$(jq -r '.conclusion' <<<"$run_json")"
+          run_event="$(jq -r '.event // empty' <<<"$run_json")"
+          run_branch="$(jq -r '.head_branch // empty' <<<"$run_json")"
           run_sha="$(jq -r '.head_sha' <<<"$run_json")"
           if [ "$run_path" != ".github/workflows/build_wheels.yml" ]; then
             echo "Run $BUILD_RUN_ID belongs to $run_path, not build_wheels.yml."
@@ -83,17 +107,35 @@ jobs:
             echo "Run $BUILD_RUN_ID conclusion is $run_conclusion, not success."
             exit 1
           fi
-          tag_ref="refs/tags/$RELEASE_TAG"
-          if ! git check-ref-format "$tag_ref"; then
-            echo "Release tag is not a canonical Git tag name."
+          case "$run_event" in
+            push|workflow_dispatch) ;;
+            *)
+              echo "Run $BUILD_RUN_ID used event $run_event, not push or workflow_dispatch."
+              exit 1
+              ;;
+          esac
+          release_branch="release/$RELEASE_TAG"
+          branch_ref="refs/heads/$release_branch"
+          if ! git check-ref-format "$branch_ref"; then
+            echo "Release branch derived from $RELEASE_TAG is not a valid Git branch name."
             exit 1
           fi
-          tag_sha="$(git rev-parse --verify "${tag_ref}^{commit}")"
+          if [ "$run_branch" != "$release_branch" ]; then
+            echo "Run $BUILD_RUN_ID used branch $run_branch, not $release_branch."
+            exit 1
+          fi
           if [ -z "$tag_sha" ] || [ "$tag_sha" != "$run_sha" ]; then
             echo "Tag $RELEASE_TAG resolves to $tag_sha but build run used $run_sha."
             exit 1
           fi
-          git fetch origin main
+          git fetch origin \
+            "refs/heads/$release_branch:refs/remotes/origin/$release_branch" \
+            "refs/heads/main:refs/remotes/origin/main"
+          branch_sha="$(git rev-parse --verify "refs/remotes/origin/${release_branch}^{commit}")"
+          if [ -z "$branch_sha" ] || [ "$branch_sha" != "$tag_sha" ]; then
+            echo "Release branch $release_branch resolves to $branch_sha but tag $RELEASE_TAG resolves to $tag_sha."
+            exit 1
+          fi
           if ! git merge-base --is-ancestor "$tag_sha" origin/main; then
             echo "Tag commit $tag_sha is not contained in origin/main."
             exit 1
@@ -168,7 +210,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ needs.publication_preflight.outputs.source_sha }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -194,6 +236,16 @@ jobs:
             cmp --silent "$artifact" "dist/$(basename "$artifact")"
           done
 
+      - name: Revalidate locked refs before Core publication
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.publication_preflight.outputs.tag }}
+          SOURCE_SHA: ${{ needs.publication_preflight.outputs.source_sha }}
+        run: >-
+          python .github/scripts/verify_release_ref_identity.py
+          --release-tag "$RELEASE_TAG"
+          --source-sha "$SOURCE_SHA"
+
       - name: Publish Core
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
@@ -216,7 +268,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ needs.publication_preflight.outputs.source_sha }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -242,6 +294,16 @@ jobs:
             cmp --silent "$artifact" "dist/$(basename "$artifact")"
           done
 
+      - name: Revalidate locked refs before CUDA publication
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.publication_preflight.outputs.tag }}
+          SOURCE_SHA: ${{ needs.publication_preflight.outputs.source_sha }}
+        run: >-
+          python .github/scripts/verify_release_ref_identity.py
+          --release-tag "$RELEASE_TAG"
+          --source-sha "$SOURCE_SHA"
+
       - name: Publish CUDA payloads
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
@@ -264,7 +326,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ needs.publication_preflight.outputs.source_sha }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -287,6 +349,16 @@ jobs:
           mkdir publish
           cp --preserve=mode,timestamps dist/gafime_rocm-*.tar.gz publish/
           cmp --silent publish/gafime_rocm-*.tar.gz dist/gafime_rocm-*.tar.gz
+
+      - name: Revalidate locked refs before ROCm publication
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.publication_preflight.outputs.tag }}
+          SOURCE_SHA: ${{ needs.publication_preflight.outputs.source_sha }}
+        run: >-
+          python .github/scripts/verify_release_ref_identity.py
+          --release-tag "$RELEASE_TAG"
+          --source-sha "$SOURCE_SHA"
 
       - name: Publish ROCm source payload
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
@@ -330,7 +402,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ needs.publication_preflight.outputs.source_sha }}
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -470,7 +542,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ needs.publication_preflight.outputs.source_sha }}
 
       - name: Set up ARM64 Python 3.11 workflow host
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -527,7 +599,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ needs.publication_preflight.outputs.source_sha }}
 
       - name: Build and install public ROCm sdist against pinned system ROCm
         shell: bash
@@ -599,7 +671,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ needs.publication_preflight.outputs.source_sha }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -617,6 +689,16 @@ jobs:
           --source-sha "${{ needs.publication_preflight.outputs.source_sha }}"
           --run-id "$BUILD_RUN_ID"
           --repository "$GITHUB_REPOSITORY"
+
+      - name: Revalidate locked refs before GitHub Release publication
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.publication_preflight.outputs.tag }}
+          SOURCE_SHA: ${{ needs.publication_preflight.outputs.source_sha }}
+        run: >-
+          python .github/scripts/verify_release_ref_identity.py
+          --release-tag "$RELEASE_TAG"
+          --source-sha "$SOURCE_SHA"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
