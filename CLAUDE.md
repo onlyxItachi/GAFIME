@@ -120,6 +120,42 @@ A `COMMENTED` review is valid review evidence; an `APPROVED` review state is not
 
 Do not merge, fast-forward, force-push, or otherwise land work on `main` while any of those checks are unsatisfied. Passing a narrow test subset is not enough when boundary policy, layout policy, or numerical parity remains unverified.
 
+## Release Branch Gate
+
+Candidate stabilization branches use `release/v<canonical-semver>` and may be
+cut only from an exact `main` commit whose required checks are green. Creating
+one is source-control coordination only: it does not change version identity,
+create a tag or GitHub Release, publish artifacts, or grant release authority.
+
+A release branch accepts only bounded correctness, security, dependency,
+toolchain, packaging, release-metadata, and documentation stabilization for its
+named candidate. New feature families, ABI expansion, speculative optimization,
+and unrelated architecture work remain on focused mainline PRs.
+
+Every tracked release-branch change uses a pull request and normal merge commit;
+do not squash, rebase, force-push, or push directly. The same current-head AI
+Review Record, strict required checks, resolved conversations, proportional
+physical evidence, zero required approving reviews, and maintainer merge
+authority apply. Durable fixes normally land on `main` first, then enter the
+release branch through a provenance-preserving backport on a temporary topic
+branch; use `git cherry-pick -x` when carrying the commit. An urgent
+release-first fix must be forward-ported to `main` before release admission.
+Never merge a divergent `main` wholesale into the active release branch.
+
+`main` may continue through independently reviewed work; never merge it into an
+active candidate merely to make the histories current. Once stabilization is
+settled, the exact release-branch tip is the candidate source. Build and freeze
+that tip, then admit its unchanged history to `main` through a temporary
+admission branch cut from current `main`. The admission PR must make the exact
+candidate tip an ancestor of `main` without moving or rebuilding the candidate.
+
+The publisher accepts only a successful `push` or `workflow_dispatch` build
+whose head branch is exactly `release/<tag>`, whose SHA equals both the current
+release-branch tip and canonical tag, and whose candidate commit has already
+been admitted to `main`. After publication, retain the exact release branch as
+a locked read-only reference. See `docs/releases/release-branches.md` for the
+full branch lifecycle.
+
 ## Release Behavior
 
 A release must never:

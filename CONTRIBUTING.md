@@ -154,6 +154,30 @@ The reviewed SHA must equal the current PR head. A later head commit invalidates
 
 Intermediate PR commits do not need to be green. Merge eligibility is based on the final reviewed head and required checks that execute against GitHub's current PR merge commit for that exact head/base pair. Workflows configured for `main` must then validate the resulting commit on `main`; a failure blocks release use and follow-on integration until it is corrected or reverted through another PR.
 
+## Release Branches
+
+Candidate stabilization uses protected branches named
+`release/v<canonical-semver>`. A branch is cut only from a green `main` commit;
+creating it is not a version bump, tag, build publication, or release.
+
+Release-branch work is limited to the named candidate's bounded stabilization
+and uses focused pull requests, normal merge commits, exact-head AI review,
+strict checks, resolved conversations, and the same maintainer authority as
+`main`. Durable fixes normally land on `main` first and are backported with
+provenance (prefer `git cherry-pick -x` on a temporary branch). An urgent
+release-first fix must be forward-ported before admission. Do not merge
+divergent `main` wholesale into a release branch.
+
+Once the candidate is settled, its exact release-branch tip is the build,
+freeze, tag, and publication source. Admit that unchanged tip to `main` before
+tagging by creating a temporary admission branch from current `main`, merging
+the release tip into it, and submitting that branch through an ordinary strict
+PR. Do not merge `main` into the release branch. Publication additionally
+requires the frozen build, tag, and current release tip to resolve to the same
+SHA. Retain the candidate branch under an exact-ref read-only lock after
+publication. The lifecycle and permitted change matrix are in
+[`docs/releases/release-branches.md`](docs/releases/release-branches.md).
+
 ## Release Safety
 
 Do not create or push release tags, dispatch publication, or publish to PyPI

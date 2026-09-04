@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - 'release/v*'
   workflow_dispatch:
     inputs:
       core_wheel_build_tag:

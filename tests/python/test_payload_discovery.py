@@ -778,6 +778,22 @@ def test_publish_workflow_keeps_adversarial_dispatch_values_out_of_shell_source(
     assert 'tag_ref="refs/tags/$RELEASE_TAG"' in publish
     assert 'git check-ref-format "$tag_ref"' in publish
     assert 'git rev-parse --verify "${tag_ref}^{commit}"' in publish
+    assert 'run_event="$(jq -r \'.event // empty\' <<<"$run_json")"' in publish
+    assert 'run_branch="$(jq -r \'.head_branch // empty\' <<<"$run_json")"' in publish
+    assert 'run_sha="$(jq -r \'.head_sha\' <<<"$run_json")"' in publish
+    assert '[ "$run_path" != ".github/workflows/build_wheels.yml" ]' in publish
+    assert '[ "$run_conclusion" != "success" ]' in publish
+    assert 'case "$run_event" in' in publish
+    assert "push|workflow_dispatch)" in publish
+    assert 'release_branch="release/$RELEASE_TAG"' in publish
+    assert 'branch_ref="refs/heads/$release_branch"' in publish
+    assert 'git check-ref-format "$branch_ref"' in publish
+    assert '[ "$run_branch" != "$release_branch" ]' in publish
+    assert '[ "$tag_sha" != "$run_sha" ]' in publish
+    assert '"refs/heads/$release_branch:refs/remotes/origin/$release_branch"' in publish
+    assert 'branch_sha="$(git rev-parse --verify' in publish
+    assert '[ "$branch_sha" != "$tag_sha" ]' in publish
+    assert 'git merge-base --is-ancestor "$tag_sha" origin/main' in publish
     assert '[[ ! "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]]' in publish
 
 

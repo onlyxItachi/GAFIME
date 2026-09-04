@@ -71,13 +71,76 @@ def normalized_agent_text(path: Path) -> str:
     return "\n".join(lines)
 
 
+def _validate_protected_branch_triggers(path: Path) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    try:
+        trigger_start = lines.index("on:")
+    except ValueError as exc:
+        raise AssertionError(
+            f"{path.relative_to(ROOT)} has no workflow triggers"
+        ) from exc
+
+    trigger_end = next(
+        (
+            index
+            for index in range(trigger_start + 1, len(lines))
+            if lines[index] and not lines[index][0].isspace()
+        ),
+        len(lines),
+    )
+    trigger_lines = lines[trigger_start + 1 : trigger_end]
+    events = {
+        line[2:-1]
+        for line in trigger_lines
+        if line.startswith("  ") and not line.startswith("   ") and line.endswith(":")
+    }
+    expected_events = {"pull_request", "push", "workflow_dispatch"}
+    if events != expected_events:
+        raise AssertionError(
+            f"{path.relative_to(ROOT)} must retain exactly the protected-branch "
+            f"trigger events {sorted(expected_events)}; found {sorted(events)}"
+        )
+
+    push_start = trigger_lines.index("  push:")
+    push_end = next(
+        (
+            index
+            for index in range(push_start + 1, len(trigger_lines))
+            if trigger_lines[index].startswith("  ")
+            and not trigger_lines[index].startswith("   ")
+        ),
+        len(trigger_lines),
+    )
+    push_lines = [line for line in trigger_lines[push_start + 1 : push_end] if line]
+    if not push_lines or push_lines[0] != "    branches:":
+        raise AssertionError(
+            f"{path.relative_to(ROOT)} push trigger must declare protected branches"
+        )
+    branch_lines = push_lines[1:]
+    if any(not line.startswith("      - ") for line in branch_lines):
+        raise AssertionError(
+            f"{path.relative_to(ROOT)} push trigger has unsupported branch policy"
+        )
+    branches = tuple(
+        line.removeprefix("      - ").strip().strip("'\"") for line in branch_lines
+    )
+    expected_branches = ("main", "release/v*")
+    if branches != expected_branches:
+        raise AssertionError(
+            f"{path.relative_to(ROOT)} push branches must be "
+            f"{expected_branches}; found {branches}"
+        )
+
+
 def main() -> None:
     contract = ROOT / "docs" / "contract.md"
     claude = ROOT / "CLAUDE.md"
     agent = ROOT / "AGENT.md"
     contributing = ROOT / "CONTRIBUTING.md"
+    release_branches = ROOT / "docs" / "releases" / "release-branches.md"
     workflow = ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
     release_workflow = ROOT / ".github" / "workflows" / "build_wheels.yml"
+    native_workflow = ROOT / ".github" / "workflows" / "native_platform_validation.yml"
     clippy_config = ROOT / "clippy.toml"
     cargo_manifest = ROOT / "Cargo.toml"
     rust_release_evidence = (
@@ -93,9 +156,11 @@ def main() -> None:
         claude,
         agent,
         contributing,
+        release_branches,
         gitignore,
         workflow,
         release_workflow,
+        native_workflow,
         clippy_config,
         cargo_manifest,
         rust_release_evidence,
@@ -237,6 +302,60 @@ def main() -> None:
             "CLAUDE.md and AGENT.md must mirror outside the explicit Codex-only section"
         )
 
+    release_branch_policy = {
+        contract: (
+            "release/v<canonical-semver>",
+            "exact green `main` commit",
+            "exact settled release tip is the build, freeze, tag, and publication source",
+            "temporary branch based on current `main`",
+            "making the candidate an ancestor",
+            "build head branch to `release/<tag>`",
+            "read-only lock",
+        ),
+        agent: (
+            "release/v<canonical-semver>",
+            "exact `main` commit whose required checks are green",
+            "exact release-branch tip is the candidate source",
+            "temporary admission branch cut from current `main`",
+            "make the exact candidate tip an ancestor of `main`",
+            "head branch is exactly `release/<tag>`",
+            "locked read-only reference",
+        ),
+        claude: (
+            "release/v<canonical-semver>",
+            "exact `main` commit whose required checks are green",
+            "exact release-branch tip is the candidate source",
+            "temporary admission branch cut from current `main`",
+            "make the exact candidate tip an ancestor of `main`",
+            "head branch is exactly `release/<tag>`",
+            "locked read-only reference",
+        ),
+        contributing: (
+            "release/v<canonical-semver>",
+            "green `main` commit",
+            "exact release-branch tip is the build, freeze, tag, and publication source",
+            "temporary admission branch from current `main`",
+            "current release tip to resolve to the same SHA",
+            "exact-ref read-only lock",
+        ),
+        release_branches: (
+            "release/v<canonical-semver>",
+            "green `main`",
+            "protected release-branch tip as the candidate source",
+            "temporary admission branch from the current green `main`",
+            "unchanged release tip is now an ancestor of `main`",
+            "`head_branch` is exactly `release/$tag`",
+            "exact-ref protection",
+        ),
+    }
+    for path, phrases in release_branch_policy.items():
+        policy_text = " ".join(path.read_text(encoding="utf-8").split())
+        for phrase in phrases:
+            if phrase not in policy_text:
+                raise AssertionError(
+                    f"{path.relative_to(ROOT)} missing release-branch policy: {phrase}"
+                )
+
     cargo_config = tomllib.loads(cargo_manifest.read_text(encoding="utf-8"))
     if cargo_config["workspace"]["package"].get("rust-version") != "1.89":
         raise AssertionError("Cargo.toml must declare the proven Rust 1.89 minimum")
@@ -256,6 +375,8 @@ def main() -> None:
 
     workflow_text = workflow.read_text(encoding="utf-8")
     release_workflow_text = release_workflow.read_text(encoding="utf-8")
+    for protected_workflow in (workflow, release_workflow, native_workflow):
+        _validate_protected_branch_triggers(protected_workflow)
     for toolchain in ("1.89.0", "1.97.1"):
         install = (
             f"rustup toolchain install {toolchain} --profile minimal "

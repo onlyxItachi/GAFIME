@@ -2474,6 +2474,31 @@ def _assert_publish_workflow(workflow: str) -> None:
         and "--scope full-release" in preflight,
         "publisher must bind a successful build run and revalidate its frozen bundle",
     )
+    for token in (
+        "run_path=\"$(jq -r '.path'",
+        "run_conclusion=\"$(jq -r '.conclusion'",
+        "run_event=\"$(jq -r '.event // empty'",
+        "run_branch=\"$(jq -r '.head_branch // empty'",
+        "run_sha=\"$(jq -r '.head_sha'",
+        '[ "$run_path" != ".github/workflows/build_wheels.yml" ]',
+        '[ "$run_conclusion" != "success" ]',
+        'case "$run_event" in',
+        "push|workflow_dispatch)",
+        'release_branch="release/$RELEASE_TAG"',
+        'branch_ref="refs/heads/$release_branch"',
+        'git check-ref-format "$branch_ref"',
+        '[ "$run_branch" != "$release_branch" ]',
+        '[ "$tag_sha" != "$run_sha" ]',
+        '"refs/heads/$release_branch:refs/remotes/origin/$release_branch"',
+        'branch_sha="$(git rev-parse --verify',
+        '[ "$branch_sha" != "$tag_sha" ]',
+        'git merge-base --is-ancestor "$tag_sha" origin/main',
+    ):
+        _require(
+            token in preflight,
+            "publisher must bind the frozen build to the exact admitted "
+            f"release branch: missing {token!r}",
+        )
     _require(
         "Install cross-format ABI inspection tools" in preflight
         and "sudo apt-get install --yes llvm" in preflight

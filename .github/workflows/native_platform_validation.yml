@@ -2,6 +2,10 @@ name: Native Platform Validation
 
 on:
   pull_request:
+  push:
+    branches:
+      - main
+      - 'release/v*'
   workflow_dispatch:
 
 permissions:
