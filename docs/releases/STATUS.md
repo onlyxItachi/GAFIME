@@ -44,9 +44,10 @@ moment-in-time commit, workflow, or package-presence result.
   the [candidate release-branch policy](release-branches.md).
 - Keep stabilization bounded. Use focused pull requests, merge commits,
   current-head AI review, strict required checks, and resolved review threads.
-- Land durable fixes on `main` first where practical; forward-port any urgent
-  release-first fix and never merge divergent `main` wholesale into the
-  candidate branch.
+- Land durable fixes on `main` first where practical. An urgent release-first
+  fix must be present on `main` no later than final admission; the admission
+  merge normally supplies that forward-port. Never merge divergent `main`
+  wholesale into the candidate branch.
 - Qualify and build/freeze the exact protected release-branch tip; `main` may
   continue independently while that bounded candidate stabilizes.
 - For final admission, cut a temporary branch from current green `main`, merge

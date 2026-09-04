@@ -9,14 +9,19 @@ Publication still requires explicit maintainer approval.
 Candidate stabilization follows the
 [release-branch policy](release-branches.md). A branch named
 `release/v<canonical-semver>` may be cut only from a green `main`; its creation
-does not change version identity, freeze artifacts, create a tag, or authorize
-publication. Changes remain bounded, reviewed through pull requests with merge
-commits, and subject to current-head AI review and all required checks.
+does not change version identity, create a tag, authorize publication, or
+establish a release-eligible frozen candidate. The creation push may produce an
+immutable validation bundle, but only the later settled, version-correct,
+reviewed, and admitted release tip may supply the publishable bundle. Changes
+remain bounded, reviewed through pull requests with merge commits, and subject
+to current-head AI review and all required checks.
 
 Durable fixes land on `main` first when practical. An urgent release-first fix
-requires a forward-port, and divergent `main` must never be merged wholesale
-into the candidate branch. The exact protected release tip is the candidate
-source and may be built and frozen while `main` continues independently.
+must be present on `main` no later than final admission; the admission merge
+normally supplies that forward-port. Divergent `main` must never be merged
+wholesale into the candidate branch. The exact protected release tip is the
+candidate source and may be built and frozen while `main` continues
+independently.
 
 Before tagging, cut a temporary branch from current `main`, merge the unchanged
 settled release tip into it, and submit that integration branch to `main` as

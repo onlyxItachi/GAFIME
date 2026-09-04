@@ -170,6 +170,7 @@ def main() -> None:
     claude = ROOT / "CLAUDE.md"
     agent = ROOT / "AGENT.md"
     contributing = ROOT / "CONTRIBUTING.md"
+    build_doc = ROOT / "BUILD.md"
     release_branches = ROOT / "docs" / "releases" / "release-branches.md"
     workflow = ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
     release_workflow = ROOT / ".github" / "workflows" / "build_wheels.yml"
@@ -189,6 +190,7 @@ def main() -> None:
         claude,
         agent,
         contributing,
+        build_doc,
         release_branches,
         gitignore,
         workflow,
@@ -370,6 +372,11 @@ def main() -> None:
             "temporary admission branch from current `main`",
             "current release tip to resolve to the same SHA",
             "exact-ref read-only lock",
+        ),
+        build_doc: (
+            "pull requests, pushes to `main` and protected `release/v*` candidate branches",
+            "manual dispatch",
+            "candidate lifecycle and eligible frozen-build identity",
         ),
         release_branches: (
             "release/v<canonical-semver>",

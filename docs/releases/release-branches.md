@@ -25,8 +25,13 @@ Creating the branch does **not**:
 
 - change Cargo, Python, or documentation version identity;
 - create or authorize a tag, PyPI publication, or GitHub Release;
-- freeze release artifacts; or
+- establish a settled, release-eligible frozen candidate; or
 - prove that the initial branch tip is ready to release.
+
+The creation push may run validation and produce an immutable validation
+bundle. That bundle is not publication authority: only the later settled,
+version-correct, reviewed, and admitted release tip can supply the eligible
+frozen release bundle.
 
 Version identity changes require their own focused, reviewed preparation.
 
