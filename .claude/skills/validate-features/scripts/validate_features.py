@@ -257,7 +257,6 @@ def main():
         X = df.select(feature_cols).to_numpy().astype(dtype)
         y = df[args.target].to_numpy().astype(dtype)
     except ImportError:
-        import csv
         # Fallback to numpy-only loading
         print(json.dumps({"error": "Polars is required for data loading"}))
         return 1

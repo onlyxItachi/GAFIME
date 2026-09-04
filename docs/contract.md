@@ -19,6 +19,12 @@ Do not create new source, runtime, test, or documentation homes outside those ro
 Tracked skills must remain operational guidance and validation helpers. They
 must not become a runtime input, a backend implementation home, or a way to
 bypass this contract.
+Every tracked skill declares one mechanically validated audience: `end-user`,
+`contributor`, or `both`. Contributor guidance resolves repository truth from
+the active checkout. Guidance used with an installed release must match that
+release's canonical tag/source; it must fail closed and disclose a mismatch
+instead of silently applying newer `main` guidance. The bootstrap and audience
+contract is documented in [`docs/agent-skills.md`](agent-skills.md).
 
 `docs/` is the historical and design record. It may be read and extended, but historical docs must not be rewritten, deleted, or collapsed without maintainer approval.
 

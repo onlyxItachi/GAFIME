@@ -70,6 +70,12 @@ Do not add new source/runtime/test/documentation homes outside those roots. All 
 Tracked skills must remain operational guidance and validation helpers. They
 must not become a runtime input, a backend implementation home, or a way to
 bypass the ownership, safety, numerical, PR, or release rules in this contract.
+Every skill declares an `end-user`, `contributor`, or `both` audience. Resolve
+contributor guidance from the active checkout and released-product guidance
+from the matching canonical release source; disclose and fail closed on a
+version mismatch rather than applying `main` guidance to an older install. See
+`docs/agent-skills.md` for discovery and version-binding policy. Skills remain
+optional and never expand task authority or weaken repository gates.
 
 `docs/` is the repo's historical and design record. Agents may read it and may add new documentation when the task requires it, but must not rewrite, delete, or collapse historical docs without explicit maintainer approval.
 

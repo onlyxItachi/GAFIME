@@ -15,9 +15,9 @@ CURRENT_INSTALL_GUIDANCE = (
     "Consult docs/releases/STATUS.md, GitHub Releases, and PyPI for mutable "
     "publication state."
 )
-PRERELEASE_CORE_INSTALL = "pip install --pre gafime"
-PRERELEASE_CUDA_INSTALL = "pip install --pre gafime gafime-cuda"
-PRERELEASE_ROCM_INSTALL = "pip install --pre gafime gafime-rocm"
+PRERELEASE_CORE_INSTALL = 'pip install --pre gafime "polars>=1.3,<2"'
+PRERELEASE_CUDA_INSTALL = 'pip install --pre gafime gafime-cuda "polars>=1.3,<2"'
+PRERELEASE_ROCM_INSTALL = 'pip install --pre gafime gafime-rocm "polars>=1.3,<2"'
 
 
 def _release_install_fields(command: str) -> dict[str, str]:
@@ -154,7 +154,7 @@ def main() -> int:
         result["prerelease_install"] = PRERELEASE_ROCM_INSTALL
         result["notes"].append(
             "PyPI provides the buildable ROCm sdist; the matching "
-            "GitHub Release will carry the prebuilt thin raw-Linux wheel. Both use the "
+            "GitHub Release is the prebuilt thin raw-Linux wheel channel. Both use the "
             "system ROCm runtime."
         )
     elif amd_rocm and system_l == "windows":

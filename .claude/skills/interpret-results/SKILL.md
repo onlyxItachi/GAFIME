@@ -1,6 +1,8 @@
 ---
 name: interpret-results
 description: Interpret a live GAFIME v1 DiagnosticReport or an explicit to_dict export while preserving backend, family, stability, and significance evidence boundaries.
+metadata:
+  audience: end-user
 ---
 
 # Interpret GAFIME Results

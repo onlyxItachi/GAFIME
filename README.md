@@ -114,6 +114,7 @@ never silently substitute Core. RT/OptiX remains experimental and local-only.
 
 - [Documentation index](docs/README.md)
 - [Normative v1 architecture contract](docs/contract.md)
+- [Agent skill audiences and bootstrap](docs/agent-skills.md)
 - [Build guide](BUILD.md)
 - [Contribution guide](CONTRIBUTING.md)
 

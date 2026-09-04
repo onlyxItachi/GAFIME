@@ -38,6 +38,7 @@ documents that own each subject.
 - [Source builds and toolchains](../BUILD.md)
 - [Contribution and review governance](../CONTRIBUTING.md)
 - [Agent repository contract](../AGENT.md)
+- [Agent skill audiences and bootstrap](agent-skills.md)
 
 ## Security
 

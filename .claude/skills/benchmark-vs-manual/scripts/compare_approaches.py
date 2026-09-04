@@ -15,7 +15,9 @@ import numpy as np
 
 
 RELEASE_STATUS = "see_docs_releases_status"
-PRERELEASE_SKLEARN_INSTALL = "pip install --pre 'gafime[sklearn]'"
+PRERELEASE_SKLEARN_INSTALL = (
+    'pip install --pre "gafime[sklearn]" "polars>=1.3,<2"'
+)
 
 
 def _divide_values(left: np.ndarray, right: np.ndarray) -> np.ndarray:
@@ -334,7 +336,12 @@ def main():
     except ImportError:
         print(
             json.dumps(
-                {"error": "Polars is required. Install with: pip install polars"}
+                {
+                    "error": (
+                        "Polars is required. Install with: "
+                        'pip install "polars>=1.3,<2"'
+                    )
+                }
             )
         )
         return 1

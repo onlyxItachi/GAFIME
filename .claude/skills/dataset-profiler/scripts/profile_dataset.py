@@ -12,8 +12,6 @@ import math
 import sys
 from pathlib import Path
 
-import numpy as np
-
 try:
     import polars as pl
     HAS_POLARS = True
@@ -57,7 +55,9 @@ def profile_dataset(
 
     # Read the data
     if not HAS_POLARS:
-        return {"error": "Polars is required. Install with: pip install polars"}
+        return {
+            "error": 'Polars is required. Install with: pip install "polars>=1.3,<2"'
+        }
 
     if path.suffix == ".parquet":
         df = pl.read_parquet(path)

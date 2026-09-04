@@ -1,6 +1,8 @@
 ---
 name: time-series-setup
 description: Configure the GAFIME v1 row-ordered time-series generated family with truthful ordering, grouping, candidate-cap, and scoring-placement constraints.
+metadata:
+  audience: end-user
 ---
 
 # Time-Series Setup
