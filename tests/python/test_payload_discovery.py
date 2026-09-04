@@ -715,6 +715,11 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     assert "gafime_rocm-*.tar.gz" in rocm
     assert "gafime_rocm-*.whl" not in rocm
     assert publish.count("release_bundle.py verify") >= 5
+    assert publish.count(
+        "ref: ${{ needs.publication_preflight.outputs.source_sha }}"
+    ) == 7
+    assert publish.count("verify_release_ref_identity.py") == 4
+    assert "ref: ${{ inputs.release_tag }}" not in publish
     assert "verify_public_core_and_cuda" in publish
     assert "verify_public_windows_arm_core" in publish
     assert "verify_public_rocm_install" in publish
@@ -777,6 +782,13 @@ def test_publish_workflow_keeps_adversarial_dispatch_values_out_of_shell_source(
     assert publish.count('--github-ref "refs/tags/$RELEASE_TAG"') == 2
     assert 'tag_ref="refs/tags/$RELEASE_TAG"' in publish
     assert 'git check-ref-format "$tag_ref"' in publish
+    assert "DISPATCH_REF: ${{ github.ref }}" in publish
+    assert "DISPATCH_SHA: ${{ github.sha }}" in publish
+    assert '[ "$DISPATCH_REF" != "$tag_ref" ]' in publish
+    assert "checked_out_sha=\"$(git rev-parse --verify 'HEAD^{commit}')\"" in publish
+    assert '[ "$checked_out_sha" != "$DISPATCH_SHA" ]' in publish
+    assert 'git fetch --force origin "+$tag_ref:$tag_ref"' in publish
+    assert '[ "$tag_sha" != "$DISPATCH_SHA" ]' in publish
     assert 'git rev-parse --verify "${tag_ref}^{commit}"' in publish
     assert 'run_event="$(jq -r \'.event // empty\' <<<"$run_json")"' in publish
     assert 'run_branch="$(jq -r \'.head_branch // empty\' <<<"$run_json")"' in publish
@@ -795,6 +807,11 @@ def test_publish_workflow_keeps_adversarial_dispatch_values_out_of_shell_source(
     assert '[ "$branch_sha" != "$tag_sha" ]' in publish
     assert 'git merge-base --is-ancestor "$tag_sha" origin/main' in publish
     assert '[[ ! "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]]' in publish
+    assert publish.count(
+        "ref: ${{ needs.publication_preflight.outputs.source_sha }}"
+    ) == 7
+    assert publish.count("verify_release_ref_identity.py") == 4
+    assert "ref: ${{ inputs.release_tag }}" not in publish
 
 
 def test_metal_staging_uses_lipo_input_before_verify_command():

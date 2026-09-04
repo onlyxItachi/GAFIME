@@ -182,6 +182,13 @@ exact-tip build, and restored lock. The lifecycle and permitted change matrix
 are in
 [`docs/releases/release-branches.md`](docs/releases/release-branches.md).
 
+Canonical `v*` release tags are covered by layered rulesets: an authorized
+creation-only rule and a separate no-bypass update/deletion rule. After
+admission, create the tag on the exact accepted tip, verify that both rules
+apply, and dispatch publication from the tag ref. The publisher pins downstream
+checkouts to the preflight source SHA and revalidates live tag/branch identity
+before every irreversible upload lane.
+
 ## Release Safety
 
 Do not create or push release tags, dispatch publication, or publish to PyPI

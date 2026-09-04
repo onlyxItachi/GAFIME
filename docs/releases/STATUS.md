@@ -58,9 +58,12 @@ moment-in-time commit, workflow, or package-presence result.
   to `main` for strict checks and current-head AI review. Never merge divergent
   `main` into the release branch.
 - After admission, verify the frozen release tip is an ancestor of `main`, then
-  tag that same tip and publish only its byte-identical frozen bundle.
+  tag that same tip. Before publication, verify that the authorized
+  creation-only rule and the separate no-bypass update/deletion rule both cover
+  the exact tag, then dispatch the publisher from that tag ref.
 - Require the publisher to match the push/workflow-dispatch build branch,
-  remote release tip, tag, and build SHA exactly.
+  remote release tip, tag, dispatch/workflow SHA, downstream checkouts, and
+  build SHA exactly, with job-local ref rechecks before irreversible uploads.
 
 No RC2 tag, GitHub Release, or PyPI publication exists merely because branch
 preparation has begun. Stable qualification, the Deep Security Scan, and the

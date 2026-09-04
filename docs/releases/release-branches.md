@@ -117,10 +117,20 @@ verify all of these identities:
   source SHA; and
 - that SHA is an ancestor of current `main`.
 
+Canonical `v*` tags are covered by two layered active rulesets. One restricts
+creation and gives only the authorized maintainer a creation bypass. The other
+has no bypass and blocks every update and deletion. Because bypasses are scoped
+to one ruleset, authorization to create a tag never authorizes moving or
+deleting it. Immediately after creating the canonical tag, verify that both
+rulesets apply before dispatching the publisher from the exact tag ref. The
+dispatch/workflow SHA and every downstream checkout are pinned to the preflight
+source SHA; each irreversible publication lane rechecks the live tag and
+release-branch commits immediately before upload.
+
 ```text
 green main -> release/v<canonical-semver> -> settle -> build/freeze exact tip
 current main -> temporary admission branch + exact release tip -> PR -> main
-exact release tip (now ancestor of main) -> tag same tip -> publish frozen bytes
+exact release tip (now ancestor of main) -> immutable tag -> publish frozen bytes
 ```
 
 ## Retention

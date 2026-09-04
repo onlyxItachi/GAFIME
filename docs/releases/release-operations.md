@@ -245,7 +245,13 @@ python .github/scripts/check_pypi_release_status.py \
    equals the authoritative build SHA.
 5. Only after every preceding check passes, create `v<semver>` on that exact
    release-branch/build commit and push the tag.
-6. Dispatch the publisher with the exact build run and tag:
+6. Verify that two active `refs/tags/v*` rulesets cover the new tag: an
+   authorized creation-only rule and a separate update/deletion rule with an
+   empty bypass list. The creation bypass is scoped to its own ruleset and must
+   never appear on the immutability rule. Do not dispatch while the exact tag
+   remains movable.
+7. Dispatch the publisher from the exact tag ref with the exact build run and
+   tag:
 
 ```bash
 gh workflow run publish_release.yml --ref v<semver> \
@@ -256,6 +262,8 @@ gh workflow run publish_release.yml --ref v<semver> \
 
 The publisher verifies that:
 
+- the workflow dispatch ref is the canonical tag and its captured workflow SHA
+  equals the checked-out source and tag commit;
 - the build run used `build_wheels.yml` and concluded successfully;
 - the build event is `push` or `workflow_dispatch` and its `head_branch` is
   exactly `release/$tag`;
@@ -264,6 +272,9 @@ The publisher verifies that:
 - the downloaded bundle's checksums and provenance are unchanged, including
   the authoritative source identity (the `--source-sha` verifier option is
   the compatibility alias for that identity);
+- every downstream checkout uses that bound source SHA rather than resolving
+  the tag again, and each irreversible upload lane rechecks the live tag and
+  release branch against the same SHA;
 - archive composition and SemVer/PEP 440 identity still pass;
 - no PyPI filename already exists.
 

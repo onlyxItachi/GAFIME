@@ -195,6 +195,14 @@ and retain that read-only lock after publication. A later source fix requires a
 deliberate unlock, reviewed PR, new exact-tip build, and restored lock. See
 `docs/releases/release-branches.md` for the full branch lifecycle.
 
+Canonical `v*` release tags use two layered active rulesets: an authorized
+creation-only rule and a separate no-bypass update/deletion rule. The creation
+bypass never grants permission to move or delete an existing tag. After
+admission, create the tag, verify both rules apply to it, and only then dispatch
+`publish_release.yml` from the exact tag ref. Its workflow SHA, downstream
+checkouts, live tag, release branch, build source, and job-local pre-upload
+rechecks must remain bound to one commit.
+
 ## Release Behavior
 
 A release must never:

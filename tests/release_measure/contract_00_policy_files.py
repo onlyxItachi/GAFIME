@@ -351,6 +351,8 @@ def main() -> None:
             "build head branch to `release/<tag>`",
             "before admission, tagging, or publication",
             "exact-ref update/deletion protection",
+            "separate no-bypass update/deletion rule",
+            "Publisher workflow identity, downstream checkouts",
         ),
         agent: (
             "release/v<canonical-semver>",
@@ -361,6 +363,8 @@ def main() -> None:
             "head branch is exactly `release/<tag>`",
             "before final admission, tagging, or publication",
             "exact-ref update/deletion protection",
+            "separate no-bypass update/deletion rule",
+            "dispatch `publish_release.yml` from the exact tag ref",
         ),
         claude: (
             "release/v<canonical-semver>",
@@ -371,6 +375,8 @@ def main() -> None:
             "head branch is exactly `release/<tag>`",
             "before final admission, tagging, or publication",
             "exact-ref update/deletion protection",
+            "separate no-bypass update/deletion rule",
+            "dispatch `publish_release.yml` from the exact tag ref",
         ),
         contributing: (
             "release/v<canonical-semver>",
@@ -380,6 +386,8 @@ def main() -> None:
             "current release tip to resolve to the same SHA",
             "before admission or tagging",
             "exact-ref update/deletion protection",
+            "separate no-bypass update/deletion rule",
+            "revalidates live tag/branch identity before every irreversible upload lane",
         ),
         build_doc: (
             "pull requests, pushes to `main` and protected `release/v*` candidate branches",
@@ -394,16 +402,23 @@ def main() -> None:
             "unchanged release tip is now an ancestor of `main`",
             "`head_branch` is exactly `release/$tag`",
             "blocks updates and deletion with no bypass before final admission",
+            "blocks every update and deletion",
+            "each irreversible publication lane rechecks the live tag",
         ),
         release_operations: (
             "## Lock The Accepted Candidate",
             "before final admission, tagging, or publication",
             "blocks updates and deletion with no bypass",
             "earlier bundle is stale",
+            "two active `refs/tags/v*` rulesets",
+            "workflow dispatch ref is the canonical tag",
+            "every downstream checkout uses that bound source SHA",
         ),
         release_status: (
             "exact-ref update/deletion protection before admission, tagging, or publication",
             "any source fix requires an explicit unlock and new exact build",
+            "separate no-bypass update/deletion rule",
+            "job-local ref rechecks before irreversible uploads",
         ),
     }
     for path, phrases in release_branch_policy.items():

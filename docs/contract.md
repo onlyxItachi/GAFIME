@@ -583,6 +583,14 @@ later source fix requires a deliberate unlock, reviewed PR, new exact-tip
 build, and restored lock. The detailed lifecycle is in
 [`docs/releases/release-branches.md`](releases/release-branches.md).
 
+Canonical `v*` release tags are governed by two layered active rulesets: an
+authorized creation-only rule and a separate no-bypass update/deletion rule.
+The creation bypass never permits an existing tag to move or be deleted. After
+admission, create the canonical tag on the exact frozen tip, verify both rules
+apply, and only then dispatch publication from the tag ref. Publisher workflow
+identity, downstream checkouts, live tag/branch refs, build source, and
+job-local pre-upload rechecks must resolve to the same commit.
+
 A release must never:
 
 - introduce silent backend behavior changes
