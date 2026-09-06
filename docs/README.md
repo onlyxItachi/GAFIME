@@ -33,6 +33,11 @@ documents that own each subject.
 - [GPU target-statistics cache](gpu-continuous-target-stats-cache.md)
 - [GPU Spearman target-rank cache](gpu-spearman-target-rank-cache.md)
 
+### Design Experiments (Not Shipping APIs)
+
+- [Issue #73 native evidence feasibility](issue-73-native-evidence-feasibility.md)
+  — a bounded post-v1 probe of candidate/evidence reuse and the #72 dependency.
+
 ## Build and Contribution
 
 - [Source builds and toolchains](../BUILD.md)
