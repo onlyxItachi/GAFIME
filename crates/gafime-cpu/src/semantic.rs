@@ -8,16 +8,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use gafime_orchestrator::semantic::{
-    CandidateRegistry, EvidenceDefinition, EvidenceValue, FeatureFrame, FeatureId, FeatureOp,
-    FrozenMeans, LabelSet, MaterializedColumns, NativeEvidenceExecutor, NeighborGraph,
-    NumericColumn, SemanticError, SemanticResult, UnavailableReason,
+    AssociationContext, AssociationStatistic, CandidateRegistry, EvidenceDefinition, EvidenceValue,
+    FeatureFrame, FeatureId, FeatureOp, FrozenMeans, LabelSet, MaterializedColumns,
+    NativeEvidenceExecutor, NeighborGraph, NumericColumn, SemanticError, SemanticResult,
+    UnavailableReason,
 };
 use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CPU};
 use rayon::prelude::*;
 
 use crate::kernels::precision::{
-    multiply_centered_into_f32, multiply_centered_into_f64, pearson_f32_checked,
-    pearson_f64_checked, pearson_mixed_checked,
+    fixed_corrected_nmi_f32_checked, fixed_corrected_nmi_f64_checked,
+    fixed_corrected_nmi_mixed_checked, multiply_centered_into_f32, multiply_centered_into_f64,
+    pearson_f32_checked, pearson_f64_checked, pearson_mixed_checked, spearman_f32_checked,
+    spearman_f64_checked, spearman_mixed_checked, FixedMiScratch, FixedNmiOutcome,
 };
 
 const MAX_NATIVE_BYTES: usize = 512 * 1024 * 1024;
@@ -114,7 +117,11 @@ impl NativeEvidenceExecutor for CoreEvidenceExecutor {
             if !needed.insert(id) {
                 continue;
             }
-            if let Some(value) = retained.and_then(|columns| columns.columns().get(&id)) {
+            if let Some(value) = retained
+                .map(|columns| columns.columns().map(|values| values.get(&id)))
+                .transpose()?
+                .flatten()
+            {
                 bank.insert(id, value.shared_clone());
                 continue;
             }
@@ -185,10 +192,16 @@ impl NativeEvidenceExecutor for CoreEvidenceExecutor {
         validate_budget(max_bytes)?;
         validate_bank_profile(values, candidates)?;
         let (evidence, calls) = match definition {
-            EvidenceDefinition::Redundancy { reference } => {
-                parallel_correlation(candidates, values, values, *reference, true)?
-            }
-            EvidenceDefinition::PairedConsistency { view } => {
+            EvidenceDefinition::Association {
+                statistic,
+                context: AssociationContext::Reference { reference },
+            } => parallel_association(
+                candidates, values, values, *reference, *statistic, true, max_bytes,
+            )?,
+            EvidenceDefinition::Association {
+                statistic,
+                context: AssociationContext::PairedView { view },
+            } => {
                 let paired = paired.ok_or(SemanticError::Invalid(
                     "paired evidence requires materialized view",
                 ))?;
@@ -201,21 +214,30 @@ impl NativeEvidenceExecutor for CoreEvidenceExecutor {
                     ));
                 }
                 validate_bank_profile(paired, candidates)?;
-                parallel_correlation_between(candidates, values, paired, false)?
+                parallel_association_between(
+                    candidates, values, paired, *statistic, false, max_bytes,
+                )?
             }
-            EvidenceDefinition::LabeledAssociation { labels: None } => (
+            EvidenceDefinition::Association {
+                context: AssociationContext::Labels { labels: None },
+                ..
+            } => (
                 vec![unavailable(UnavailableReason::MissingLabels, 0); candidates.len()],
                 0,
             ),
-            EvidenceDefinition::LabeledAssociation {
-                labels: Some(labels),
+            EvidenceDefinition::Association {
+                statistic,
+                context:
+                    AssociationContext::Labels {
+                        labels: Some(labels),
+                    },
             } => {
                 if labels.frame_id() != values.frame_id() || labels.profile() != values.profile() {
                     return Err(SemanticError::Invalid(
                         "label context or precision mismatch",
                     ));
                 }
-                labeled_association(candidates, values, labels, max_bytes)?
+                labeled_association(candidates, values, labels, *statistic, max_bytes)?
             }
             EvidenceDefinition::GraphEnergy { graph } => {
                 if graph.frame_id() != values.frame_id() || graph.profile() != values.profile() {
@@ -228,6 +250,77 @@ impl NativeEvidenceExecutor for CoreEvidenceExecutor {
         };
         self.evidence_kernel_calls = self.evidence_kernel_calls.saturating_add(calls);
         Ok(evidence)
+    }
+
+    fn retain(
+        &mut self,
+        registry: &CandidateRegistry,
+        frame: &FeatureFrame,
+        source: &MaterializedColumns,
+        prior: Option<&MaterializedColumns>,
+        selected: &[FeatureId],
+        max_live_bytes: usize,
+    ) -> SemanticResult<MaterializedColumns> {
+        if registry.schema() != frame.schema()
+            || registry.precision() != frame.profile()
+            || source.frame_id() != frame.id()
+            || source.profile() != frame.profile()
+            || source.backend_kind() != GAFIME_BACKEND_CPU
+            || prior.is_some_and(|values| {
+                values.frame_id() != frame.id()
+                    || values.profile() != frame.profile()
+                    || values.backend_kind() != GAFIME_BACKEND_CPU
+            })
+        {
+            return Err(SemanticError::Invalid(
+                "Core retained materialization context or backend mismatch",
+            ));
+        }
+        let source_columns = source.columns()?;
+        let prior_columns = match prior {
+            Some(values) => Some(values.columns()?),
+            None => None,
+        };
+        let mut merged = prior_columns.cloned().unwrap_or_default();
+        for &feature in selected {
+            registry.program(feature)?;
+            let values = source_columns.get(&feature).ok_or(SemanticError::Invalid(
+                "selected feature is absent from materialized source",
+            ))?;
+            merged.insert(feature, values.shared_clone());
+        }
+        let result = MaterializedColumns::from_columns(registry, frame, merged)?;
+        let live = source
+            .bytes()
+            .checked_add(prior.map_or(0, MaterializedColumns::bytes))
+            .ok_or(SemanticError::Invalid(
+                "Core retained materialization byte count overflow",
+            ))?;
+        if live > max_live_bytes || result.bytes() > max_live_bytes {
+            return Err(SemanticError::Invalid(
+                "Core retained materialization exceeds live byte budget",
+            ));
+        }
+        Ok(result)
+    }
+
+    fn download(
+        &mut self,
+        registry: &CandidateRegistry,
+        frame: &FeatureFrame,
+        source: &MaterializedColumns,
+        max_bytes: usize,
+    ) -> SemanticResult<MaterializedColumns> {
+        if source.frame_id() != frame.id()
+            || source.profile() != frame.profile()
+            || source.backend_kind() != GAFIME_BACKEND_CPU
+            || source.bytes() > max_bytes
+        {
+            return Err(SemanticError::Invalid(
+                "Core materialization download context or budget mismatch",
+            ));
+        }
+        MaterializedColumns::from_columns(registry, frame, source.columns()?.clone())
     }
 }
 
@@ -447,167 +540,402 @@ fn validate_bank_profile(
     Ok(())
 }
 
-fn parallel_correlation(
+#[derive(Clone, Copy)]
+enum AssociationRight<'a> {
+    Reference(&'a NumericColumn),
+    Paired(&'a MaterializedColumns),
+}
+
+impl<'a> AssociationRight<'a> {
+    fn column(self, candidate: FeatureId) -> SemanticResult<&'a NumericColumn> {
+        match self {
+            Self::Reference(values) => Ok(values),
+            Self::Paired(values) => values.get_typed(candidate),
+        }
+    }
+}
+
+fn parallel_association(
     candidates: &[FeatureId],
     values: &MaterializedColumns,
     reference_owner: &MaterializedColumns,
     reference: FeatureId,
+    statistic: AssociationStatistic,
     absolute: bool,
+    max_bytes: usize,
 ) -> SemanticResult<(Vec<EvidenceValue>, usize)> {
-    let reference_values = reference_owner.get_typed(reference)?;
-    let results: SemanticResult<Vec<_>> = candidates
-        .par_iter()
-        .map(|&candidate| {
-            correlation(
-                values.profile(),
-                values.get_typed(candidate)?,
-                reference_values,
-                absolute,
-            )
-        })
-        .collect();
-    Ok(split_evidence(results?))
+    parallel_association_with_right(
+        candidates,
+        values,
+        AssociationRight::Reference(reference_owner.get_typed(reference)?),
+        statistic,
+        absolute,
+        max_bytes,
+    )
 }
 
-fn parallel_correlation_between(
+fn parallel_association_between(
     candidates: &[FeatureId],
     values: &MaterializedColumns,
     paired: &MaterializedColumns,
+    statistic: AssociationStatistic,
     absolute: bool,
+    max_bytes: usize,
 ) -> SemanticResult<(Vec<EvidenceValue>, usize)> {
-    let results: SemanticResult<Vec<_>> = candidates
-        .par_iter()
-        .map(|&candidate| {
-            correlation(
-                values.profile(),
-                values.get_typed(candidate)?,
-                paired.get_typed(candidate)?,
-                absolute,
-            )
-        })
-        .collect();
+    parallel_association_with_right(
+        candidates,
+        values,
+        AssociationRight::Paired(paired),
+        statistic,
+        absolute,
+        max_bytes,
+    )
+}
+
+fn parallel_association_with_right(
+    candidates: &[FeatureId],
+    values: &MaterializedColumns,
+    right: AssociationRight<'_>,
+    statistic: AssociationStatistic,
+    absolute: bool,
+    max_bytes: usize,
+) -> SemanticResult<(Vec<EvidenceValue>, usize)> {
+    if candidates.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let workers = rayon::current_num_threads().min(candidates.len());
+    let rows = values.get_typed(candidates[0])?.len();
+    let scratch_bytes = association_scratch_bytes(statistic, values.profile(), rows, workers)?;
+    if scratch_bytes > max_bytes {
+        return Err(SemanticError::Invalid(
+            "association scratch exceeds execution budget",
+        ));
+    }
+    // `map_init` is per Rayon job. This indexed minimum bounds concurrent
+    // scratch instances by the worker-count reservation above.
+    let minimum_job_len = candidates.len().div_ceil(workers);
+    let results: SemanticResult<Vec<_>> = match values.profile() {
+        PrecisionProfile::Fp32 => candidates
+            .par_iter()
+            .with_min_len(minimum_job_len)
+            .map_init(FixedMiScratch::default, |scratch, &candidate| {
+                association_f32(
+                    values.get_typed(candidate)?.as_f32()?,
+                    right.column(candidate)?.as_f32()?,
+                    statistic,
+                    absolute,
+                    scratch,
+                )
+            })
+            .collect(),
+        PrecisionProfile::Mixed => candidates
+            .par_iter()
+            .with_min_len(minimum_job_len)
+            .map_init(FixedMiScratch::default, |scratch, &candidate| {
+                association_mixed(
+                    values.get_typed(candidate)?.as_f32()?,
+                    right.column(candidate)?.as_f32()?,
+                    statistic,
+                    absolute,
+                    scratch,
+                )
+            })
+            .collect(),
+        PrecisionProfile::Fp64 => candidates
+            .par_iter()
+            .with_min_len(minimum_job_len)
+            .map_init(FixedMiScratch::default, |scratch, &candidate| {
+                association_f64(
+                    values.get_typed(candidate)?.as_f64()?,
+                    right.column(candidate)?.as_f64()?,
+                    statistic,
+                    absolute,
+                    scratch,
+                )
+            })
+            .collect(),
+    };
     Ok(split_evidence(results?))
 }
 
-fn correlation(
-    profile: PrecisionProfile,
-    left: &NumericColumn,
-    right: &NumericColumn,
+fn association_f32(
+    left: &[f32],
+    right: &[f32],
+    statistic: AssociationStatistic,
     absolute: bool,
+    scratch: &mut FixedMiScratch,
 ) -> SemanticResult<(EvidenceValue, bool)> {
-    match profile {
-        PrecisionProfile::Fp32 => Ok(correlation_f32(left.as_f32()?, right.as_f32()?, absolute)),
-        PrecisionProfile::Mixed => Ok(correlation_mixed(left.as_f32()?, right.as_f32()?, absolute)),
-        PrecisionProfile::Fp64 => Ok(correlation_f64(left.as_f64()?, right.as_f64()?, absolute)),
-    }
-}
-
-fn correlation_f32(left: &[f32], right: &[f32], absolute: bool) -> (EvidenceValue, bool) {
     if left.len() != right.len() || left.len() < 2 {
-        return (
+        return Ok((
             unavailable(
                 UnavailableReason::InsufficientSupport,
                 left.len().min(right.len()),
             ),
             false,
-        );
+        ));
     }
     if left.iter().chain(right).any(|value| !value.is_finite()) {
-        return (
+        return Ok((
             unavailable(UnavailableReason::NonFiniteReduction, left.len()),
             false,
-        );
+        ));
     }
     if is_constant_f32(left) || is_constant_f32(right) {
-        return (
+        return Ok((
             unavailable(UnavailableReason::ConstantOperand, left.len()),
             false,
-        );
+        ));
     }
-    match pearson_f32_checked(left, right) {
-        Some(value) => (
-            EvidenceValue::measured_f32(if absolute { value.abs() } else { value }, left.len()),
-            true,
-        ),
-        None => (
-            unavailable(UnavailableReason::DegenerateReduction, left.len()),
-            true,
-        ),
-    }
+    let measured = |value: f32| {
+        EvidenceValue::measured_f32(if absolute { value.abs() } else { value }, left.len())
+    };
+    let result = match statistic {
+        AssociationStatistic::Pearson => pearson_f32_checked(left, right)
+            .map(|value| (measured(value), true))
+            .unwrap_or_else(|| {
+                (
+                    unavailable(UnavailableReason::DegenerateReduction, left.len()),
+                    true,
+                )
+            }),
+        AssociationStatistic::Spearman => spearman_f32_checked(left, right)
+            .map(|value| (measured(value), true))
+            .unwrap_or_else(|| {
+                (
+                    unavailable(UnavailableReason::DegenerateReduction, left.len()),
+                    true,
+                )
+            }),
+        AssociationStatistic::FixedCorrectedNmi { bins } => {
+            if left.len() < fixed_nmi_support(bins) {
+                (
+                    unavailable(UnavailableReason::InsufficientSupport, left.len()),
+                    false,
+                )
+            } else {
+                match fixed_corrected_nmi_f32_checked(left, right, bins, scratch) {
+                    FixedNmiOutcome::Measured(value) => {
+                        (EvidenceValue::measured_f32(value, left.len()), true)
+                    }
+                    FixedNmiOutcome::Degenerate => (
+                        unavailable(UnavailableReason::DegenerateReduction, left.len()),
+                        true,
+                    ),
+                    FixedNmiOutcome::NonFinite => (
+                        unavailable(UnavailableReason::NonFiniteReduction, left.len()),
+                        true,
+                    ),
+                }
+            }
+        }
+    };
+    Ok(result)
 }
 
-fn correlation_mixed(left: &[f32], right: &[f32], absolute: bool) -> (EvidenceValue, bool) {
+fn association_mixed(
+    left: &[f32],
+    right: &[f32],
+    statistic: AssociationStatistic,
+    absolute: bool,
+    scratch: &mut FixedMiScratch,
+) -> SemanticResult<(EvidenceValue, bool)> {
     if left.len() != right.len() || left.len() < 2 {
-        return (
+        return Ok((
             unavailable(
                 UnavailableReason::InsufficientSupport,
                 left.len().min(right.len()),
             ),
             false,
-        );
+        ));
     }
     if left.iter().chain(right).any(|value| !value.is_finite()) {
-        return (
+        return Ok((
             unavailable(UnavailableReason::NonFiniteReduction, left.len()),
             false,
-        );
+        ));
     }
     if is_constant_f32(left) || is_constant_f32(right) {
-        return (
+        return Ok((
             unavailable(UnavailableReason::ConstantOperand, left.len()),
             false,
-        );
+        ));
     }
-    match pearson_mixed_checked(left, right) {
-        Some(value) => (
-            EvidenceValue::measured(if absolute { value.abs() } else { value }, left.len()),
-            true,
-        ),
-        None => (
-            unavailable(UnavailableReason::DegenerateReduction, left.len()),
-            true,
-        ),
-    }
+    let measured = |value: f64| {
+        EvidenceValue::measured(if absolute { value.abs() } else { value }, left.len())
+    };
+    let result = match statistic {
+        AssociationStatistic::Pearson => pearson_mixed_checked(left, right)
+            .map(|value| (measured(value), true))
+            .unwrap_or_else(|| {
+                (
+                    unavailable(UnavailableReason::DegenerateReduction, left.len()),
+                    true,
+                )
+            }),
+        AssociationStatistic::Spearman => spearman_mixed_checked(left, right)
+            .map(|value| (measured(value), true))
+            .unwrap_or_else(|| {
+                (
+                    unavailable(UnavailableReason::DegenerateReduction, left.len()),
+                    true,
+                )
+            }),
+        AssociationStatistic::FixedCorrectedNmi { bins } => {
+            if left.len() < fixed_nmi_support(bins) {
+                (
+                    unavailable(UnavailableReason::InsufficientSupport, left.len()),
+                    false,
+                )
+            } else {
+                match fixed_corrected_nmi_mixed_checked(left, right, bins, scratch) {
+                    FixedNmiOutcome::Measured(value) => {
+                        (EvidenceValue::measured(value, left.len()), true)
+                    }
+                    FixedNmiOutcome::Degenerate => (
+                        unavailable(UnavailableReason::DegenerateReduction, left.len()),
+                        true,
+                    ),
+                    FixedNmiOutcome::NonFinite => (
+                        unavailable(UnavailableReason::NonFiniteReduction, left.len()),
+                        true,
+                    ),
+                }
+            }
+        }
+    };
+    Ok(result)
 }
 
-fn correlation_f64(left: &[f64], right: &[f64], absolute: bool) -> (EvidenceValue, bool) {
+fn association_f64(
+    left: &[f64],
+    right: &[f64],
+    statistic: AssociationStatistic,
+    absolute: bool,
+    scratch: &mut FixedMiScratch,
+) -> SemanticResult<(EvidenceValue, bool)> {
     if left.len() != right.len() || left.len() < 2 {
-        return (
+        return Ok((
             unavailable(
                 UnavailableReason::InsufficientSupport,
                 left.len().min(right.len()),
             ),
             false,
-        );
+        ));
     }
     if left.iter().chain(right).any(|value| !value.is_finite()) {
-        return (
+        return Ok((
             unavailable(UnavailableReason::NonFiniteReduction, left.len()),
             false,
-        );
+        ));
     }
     if is_constant_f64(left) || is_constant_f64(right) {
-        return (
+        return Ok((
             unavailable(UnavailableReason::ConstantOperand, left.len()),
             false,
-        );
+        ));
     }
-    match pearson_f64_checked(left, right) {
-        Some(value) => (
-            EvidenceValue::measured(if absolute { value.abs() } else { value }, left.len()),
-            true,
-        ),
-        None => (
-            unavailable(UnavailableReason::DegenerateReduction, left.len()),
-            true,
-        ),
-    }
+    let measured = |value: f64| {
+        EvidenceValue::measured(if absolute { value.abs() } else { value }, left.len())
+    };
+    let result = match statistic {
+        AssociationStatistic::Pearson => pearson_f64_checked(left, right)
+            .map(|value| (measured(value), true))
+            .unwrap_or_else(|| {
+                (
+                    unavailable(UnavailableReason::DegenerateReduction, left.len()),
+                    true,
+                )
+            }),
+        AssociationStatistic::Spearman => spearman_f64_checked(left, right)
+            .map(|value| (measured(value), true))
+            .unwrap_or_else(|| {
+                (
+                    unavailable(UnavailableReason::DegenerateReduction, left.len()),
+                    true,
+                )
+            }),
+        AssociationStatistic::FixedCorrectedNmi { bins } => {
+            if left.len() < fixed_nmi_support(bins) {
+                (
+                    unavailable(UnavailableReason::InsufficientSupport, left.len()),
+                    false,
+                )
+            } else {
+                match fixed_corrected_nmi_f64_checked(left, right, bins, scratch) {
+                    FixedNmiOutcome::Measured(value) => {
+                        (EvidenceValue::measured(value, left.len()), true)
+                    }
+                    FixedNmiOutcome::Degenerate => (
+                        unavailable(UnavailableReason::DegenerateReduction, left.len()),
+                        true,
+                    ),
+                    FixedNmiOutcome::NonFinite => (
+                        unavailable(UnavailableReason::NonFiniteReduction, left.len()),
+                        true,
+                    ),
+                }
+            }
+        }
+    };
+    Ok(result)
+}
+
+fn fixed_nmi_support(bins: u32) -> usize {
+    usize::try_from(bins)
+        .ok()
+        .and_then(|bins| bins.checked_mul(bins))
+        .and_then(|joint| joint.checked_mul(8))
+        .unwrap_or(usize::MAX)
+}
+
+fn association_scratch_bytes(
+    statistic: AssociationStatistic,
+    profile: PrecisionProfile,
+    rows: usize,
+    workers: usize,
+) -> SemanticResult<usize> {
+    let per_worker = match statistic {
+        AssociationStatistic::Pearson => 0,
+        // Two rank-position vectors plus two typed rank vectors are a
+        // conservative reservation for the existing checked rank primitive.
+        AssociationStatistic::Spearman => {
+            let rank_value_bytes = match profile {
+                PrecisionProfile::Fp32 => std::mem::size_of::<f32>(),
+                PrecisionProfile::Mixed | PrecisionProfile::Fp64 => std::mem::size_of::<f64>(),
+            };
+            rows.checked_mul(2 * std::mem::size_of::<u64>() + 2 * rank_value_bytes)
+                .ok_or(SemanticError::Invalid(
+                    "association scratch exceeds host address space",
+                ))?
+        }
+        AssociationStatistic::FixedCorrectedNmi { bins } => {
+            let bins = usize::try_from(bins)
+                .map_err(|_| SemanticError::Invalid("fixed NMI bins exceed host address space"))?;
+            let histogram_cells = bins
+                .checked_mul(bins)
+                .and_then(|joint| joint.checked_add(bins.checked_mul(2)?))
+                .ok_or(SemanticError::Invalid(
+                    "fixed NMI histogram exceeds host address space",
+                ))?;
+            histogram_cells
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or(SemanticError::Invalid(
+                    "fixed NMI histogram exceeds host address space",
+                ))?
+        }
+    };
+    workers
+        .checked_mul(per_worker)
+        .ok_or(SemanticError::Invalid(
+            "association scratch exceeds host address space",
+        ))
 }
 
 fn labeled_association(
     candidates: &[FeatureId],
     values: &MaterializedColumns,
     labels: &LabelSet,
+    statistic: AssociationStatistic,
     max_bytes: usize,
 ) -> SemanticResult<(Vec<EvidenceValue>, usize)> {
     if labels.values_typed().len() != labels.rows().len()
@@ -629,30 +957,38 @@ fn labeled_association(
     if candidates.is_empty() {
         return Ok((Vec::new(), 0));
     }
-    let workers = rayon::current_num_threads();
-    let scratch_bytes = checked_bytes(
+    let workers = rayon::current_num_threads().min(candidates.len());
+    let gather_bytes = checked_bytes(
         workers,
         labels.rows().len(),
         element_bytes(values.profile()),
     )?;
+    let association_bytes =
+        association_scratch_bytes(statistic, values.profile(), labels.rows().len(), workers)?;
+    let scratch_bytes =
+        gather_bytes
+            .checked_add(association_bytes)
+            .ok_or(SemanticError::Invalid(
+                "label association scratch exceeds host address space",
+            ))?;
     if scratch_bytes > max_bytes {
         return Err(SemanticError::Invalid(
-            "label gather scratch exceeds execution budget",
+            "label association scratch exceeds execution budget",
         ));
     }
 
     // Rayon initializes map_init once per job rather than per worker. The
-    // indexed minimum keeps its number of jobs within this worker-count budget.
+    // indexed minimum keeps concurrent scratch within the reservation above.
     let minimum_job_len = candidates.len().div_ceil(workers);
     match values.profile() {
         PrecisionProfile::Fp32 => {
-            labeled_association_f32(candidates, values, labels, minimum_job_len)
+            labeled_association_f32(candidates, values, labels, statistic, minimum_job_len)
         }
         PrecisionProfile::Mixed => {
-            labeled_association_mixed(candidates, values, labels, minimum_job_len)
+            labeled_association_mixed(candidates, values, labels, statistic, minimum_job_len)
         }
         PrecisionProfile::Fp64 => {
-            labeled_association_f64(candidates, values, labels, minimum_job_len)
+            labeled_association_f64(candidates, values, labels, statistic, minimum_job_len)
         }
     }
 }
@@ -661,6 +997,7 @@ fn labeled_association_f32(
     candidates: &[FeatureId],
     values: &MaterializedColumns,
     labels: &LabelSet,
+    statistic: AssociationStatistic,
     minimum_job_len: usize,
 ) -> SemanticResult<(Vec<EvidenceValue>, usize)> {
     let label_rows = labels.rows();
@@ -670,8 +1007,8 @@ fn labeled_association_f32(
         .par_iter()
         .with_min_len(minimum_job_len)
         .map_init(
-            || Vec::<f32>::with_capacity(rows),
-            |scratch, &candidate| {
+            || (Vec::<f32>::with_capacity(rows), FixedMiScratch::default()),
+            |(scratch, fixed_mi), &candidate| {
                 scratch.clear();
                 let candidate = values.get_typed(candidate)?.as_f32()?;
                 for &row in label_rows {
@@ -681,7 +1018,7 @@ fn labeled_association_f32(
                             .ok_or(SemanticError::Invalid("label row out of bounds"))?,
                     );
                 }
-                Ok(correlation_f32(scratch, label_values, true))
+                association_f32(scratch, label_values, statistic, true, fixed_mi)
             },
         )
         .collect();
@@ -692,6 +1029,7 @@ fn labeled_association_mixed(
     candidates: &[FeatureId],
     values: &MaterializedColumns,
     labels: &LabelSet,
+    statistic: AssociationStatistic,
     minimum_job_len: usize,
 ) -> SemanticResult<(Vec<EvidenceValue>, usize)> {
     let label_rows = labels.rows();
@@ -701,8 +1039,8 @@ fn labeled_association_mixed(
         .par_iter()
         .with_min_len(minimum_job_len)
         .map_init(
-            || Vec::<f32>::with_capacity(rows),
-            |scratch, &candidate| {
+            || (Vec::<f32>::with_capacity(rows), FixedMiScratch::default()),
+            |(scratch, fixed_mi), &candidate| {
                 scratch.clear();
                 let candidate = values.get_typed(candidate)?.as_f32()?;
                 for &row in label_rows {
@@ -712,7 +1050,7 @@ fn labeled_association_mixed(
                             .ok_or(SemanticError::Invalid("label row out of bounds"))?,
                     );
                 }
-                Ok(correlation_mixed(scratch, label_values, true))
+                association_mixed(scratch, label_values, statistic, true, fixed_mi)
             },
         )
         .collect();
@@ -723,6 +1061,7 @@ fn labeled_association_f64(
     candidates: &[FeatureId],
     values: &MaterializedColumns,
     labels: &LabelSet,
+    statistic: AssociationStatistic,
     minimum_job_len: usize,
 ) -> SemanticResult<(Vec<EvidenceValue>, usize)> {
     let label_rows = labels.rows();
@@ -732,8 +1071,8 @@ fn labeled_association_f64(
         .par_iter()
         .with_min_len(minimum_job_len)
         .map_init(
-            || Vec::<f64>::with_capacity(rows),
-            |scratch, &candidate| {
+            || (Vec::<f64>::with_capacity(rows), FixedMiScratch::default()),
+            |(scratch, fixed_mi), &candidate| {
                 scratch.clear();
                 let candidate = values.get_typed(candidate)?.as_f64()?;
                 for &row in label_rows {
@@ -743,7 +1082,7 @@ fn labeled_association_f64(
                             .ok_or(SemanticError::Invalid("label row out of bounds"))?,
                     );
                 }
-                Ok(correlation_f64(scratch, label_values, true))
+                association_f64(scratch, label_values, statistic, true, fixed_mi)
             },
         )
         .collect();

@@ -5,14 +5,39 @@ use gafime_cpu::{
     semantic::CoreEvidenceExecutor,
 };
 use gafime_orchestrator::semantic::{
-    CandidateRegistry, Direction, EvaluationRole, EvidenceChannel, EvidenceConstraint,
-    EvidenceDefinition, EvidenceTable, EvidenceValue, FeatureFrame, FeatureId, GraphEdge, LabelSet,
-    MissingEvidence, NeighborGraph, NumericColumn, ProgramLimits, SelectionPolicy, SemanticSession,
-    UnavailableReason,
+    AssociationContext, AssociationStatistic, CandidateRegistry, Direction, EvaluationRole,
+    EvidenceChannel, EvidenceConstraint, EvidenceDefinition, EvidenceTable, EvidenceValue,
+    FeatureFrame, FeatureId, GraphEdge, LabelSet, MissingEvidence, NeighborGraph, NumericColumn,
+    ProgramLimits, SelectionPolicy, SemanticSession, UnavailableReason,
 };
 use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CPU};
 
 const BUDGET: usize = 1 << 20;
+
+fn pearson_reference(reference: FeatureId) -> EvidenceDefinition {
+    EvidenceDefinition::Association {
+        statistic: AssociationStatistic::Pearson,
+        context: AssociationContext::Reference { reference },
+    }
+}
+
+fn pearson_paired(view: Arc<FeatureFrame>) -> EvidenceDefinition {
+    EvidenceDefinition::Association {
+        statistic: AssociationStatistic::Pearson,
+        context: AssociationContext::PairedView { view },
+    }
+}
+
+fn pearson_labels(labels: Option<Arc<LabelSet>>) -> EvidenceDefinition {
+    EvidenceDefinition::Association {
+        statistic: AssociationStatistic::Pearson,
+        context: AssociationContext::Labels { labels },
+    }
+}
+
+fn association(statistic: AssociationStatistic, context: AssociationContext) -> EvidenceDefinition {
+    EvidenceDefinition::Association { statistic, context }
+}
 
 fn frame(
     profile: PrecisionProfile,
@@ -137,11 +162,8 @@ fn rebinding_a_spec_keeps_its_policy_identity_and_old_table() {
     );
     let mut semantic = session(&discovery);
     let source = semantic.begin_round(&[]).unwrap().source(0).unwrap();
-    let unbound = EvidenceChannel::new(
-        "optional ground truth".into(),
-        EvidenceDefinition::LabeledAssociation { labels: None },
-    )
-    .unwrap();
+    let unbound =
+        EvidenceChannel::new("optional ground truth".into(), pearson_labels(None)).unwrap();
     let policy = selection(
         &unbound,
         Direction::Maximize,
@@ -174,11 +196,7 @@ fn rebinding_a_spec_keeps_its_policy_identity_and_old_table() {
         )
         .unwrap(),
     );
-    let rebound = unbound
-        .rebind(EvidenceDefinition::LabeledAssociation {
-            labels: Some(labels),
-        })
-        .unwrap();
+    let rebound = unbound.rebind(pearson_labels(Some(labels))).unwrap();
     assert_eq!(rebound.id(), unbound.id());
     assert_eq!(rebound.spec().id(), policy.primary);
     assert_eq!(
@@ -212,9 +230,7 @@ fn rebinding_a_spec_keeps_its_policy_identity_and_old_table() {
             ..
         }
     ));
-    assert!(unbound
-        .rebind(EvidenceDefinition::Redundancy { reference: source })
-        .is_err());
+    assert!(unbound.rebind(pearson_reference(source)).is_err());
 }
 
 #[test]
@@ -247,23 +263,12 @@ fn selection_separates_channel_bounds_from_optional_missingness() {
         )
         .unwrap(),
     );
-    let redundancy = EvidenceChannel::new(
-        "anchor redundancy".into(),
-        EvidenceDefinition::Redundancy { reference: anchor },
-    )
-    .unwrap();
-    let association = EvidenceChannel::new(
-        "label association".into(),
-        EvidenceDefinition::LabeledAssociation {
-            labels: Some(labels),
-        },
-    )
-    .unwrap();
-    let optional = EvidenceChannel::new(
-        "not collected labels".into(),
-        EvidenceDefinition::LabeledAssociation { labels: None },
-    )
-    .unwrap();
+    let redundancy =
+        EvidenceChannel::new("anchor redundancy".into(), pearson_reference(anchor)).unwrap();
+    let association =
+        EvidenceChannel::new("label association".into(), pearson_labels(Some(labels))).unwrap();
+    let optional =
+        EvidenceChannel::new("not collected labels".into(), pearson_labels(None)).unwrap();
     let channels = vec![redundancy.clone(), association.clone(), optional.clone()];
     let mut core = CoreEvidenceExecutor::default();
     let table = semantic
@@ -412,11 +417,9 @@ fn native_pearson_and_graph_follow_each_profile_lane_and_selection_precision() {
             let round = semantic.begin_round(&[]).unwrap();
             (round.source(0).unwrap(), round.source(1).unwrap())
         };
-        let pearson = EvidenceChannel::new(
-            "direct native pearson".into(),
-            EvidenceDefinition::Redundancy { reference: anchor },
-        )
-        .unwrap();
+        let pearson =
+            EvidenceChannel::new("direct native pearson".into(), pearson_reference(anchor))
+                .unwrap();
         let energy = EvidenceChannel::new(
             "ordered graph energy".into(),
             EvidenceDefinition::GraphEnergy { graph },
@@ -541,6 +544,140 @@ fn native_pearson_and_graph_follow_each_profile_lane_and_selection_precision() {
 }
 
 #[test]
+fn canonical_rank_and_fixed_nmi_associations_preserve_context_and_key_identity() {
+    let ascending = (0..32).map(f64::from).collect::<Vec<_>>();
+    let descending = ascending.iter().rev().copied().collect::<Vec<_>>();
+
+    for profile in [
+        PrecisionProfile::Fp32,
+        PrecisionProfile::Mixed,
+        PrecisionProfile::Fp64,
+    ] {
+        let input = frame(
+            profile,
+            &["candidate", "reference"],
+            vec![ascending.clone(), descending.clone()],
+            EvaluationRole::Discovery,
+            "rank and fixed-NMI discovery rows",
+        );
+        let paired = frame(
+            profile,
+            &["candidate", "reference"],
+            vec![descending.clone(), ascending.clone()],
+            EvaluationRole::Discovery,
+            "rank and fixed-NMI aligned view",
+        );
+        let labels = match profile {
+            PrecisionProfile::Fp32 | PrecisionProfile::Mixed => Arc::new(
+                LabelSet::new(
+                    &input,
+                    descending
+                        .iter()
+                        .enumerate()
+                        .map(|(row, value)| (row, *value as f32))
+                        .collect(),
+                    "rank labels".into(),
+                )
+                .unwrap(),
+            ),
+            PrecisionProfile::Fp64 => Arc::new(
+                LabelSet::new_f64(
+                    &input,
+                    descending.iter().copied().enumerate().collect(),
+                    "rank labels".into(),
+                )
+                .unwrap(),
+            ),
+        };
+        let mut semantic = session(&input);
+        let (candidate, reference) = {
+            let round = semantic.begin_round(&[]).unwrap();
+            (round.source(0).unwrap(), round.source(1).unwrap())
+        };
+        let rank_reference = EvidenceChannel::new(
+            "absolute rank reference".into(),
+            association(
+                AssociationStatistic::Spearman,
+                AssociationContext::Reference { reference },
+            ),
+        )
+        .unwrap();
+        let rank_paired = EvidenceChannel::new(
+            "signed rank paired view".into(),
+            association(
+                AssociationStatistic::Spearman,
+                AssociationContext::PairedView {
+                    view: Arc::clone(&paired),
+                },
+            ),
+        )
+        .unwrap();
+        let rank_labels = EvidenceChannel::new(
+            "absolute rank labels".into(),
+            association(
+                AssociationStatistic::Spearman,
+                AssociationContext::Labels {
+                    labels: Some(labels),
+                },
+            ),
+        )
+        .unwrap();
+        let fixed_nmi = EvidenceChannel::new(
+            "fixed two-bin NMI".into(),
+            association(
+                AssociationStatistic::FixedCorrectedNmi { bins: 2 },
+                AssociationContext::Reference { reference },
+            ),
+        )
+        .unwrap();
+        let table = semantic
+            .evaluate(
+                &mut CoreEvidenceExecutor::default(),
+                Arc::clone(&input),
+                &[candidate],
+                &[
+                    rank_reference.clone(),
+                    rank_paired.clone(),
+                    rank_labels.clone(),
+                    fixed_nmi.clone(),
+                ],
+            )
+            .unwrap();
+        assert!(
+            measured(&table, candidate, &rank_reference) > 0.999_999,
+            "{profile:?} reference correlations are absolute"
+        );
+        assert!(
+            measured(&table, candidate, &rank_paired) < -0.999_999,
+            "{profile:?} paired correlations retain their sign"
+        );
+        assert!(
+            measured(&table, candidate, &rank_labels) > 0.999_999,
+            "{profile:?} labeled correlations are absolute"
+        );
+        assert!(
+            measured(&table, candidate, &fixed_nmi) > 0.9,
+            "{profile:?} fixed corrected NMI measures the declared two-bin dependence"
+        );
+        assert!(fixed_nmi
+            .rebind(association(
+                AssociationStatistic::FixedCorrectedNmi { bins: 4 },
+                AssociationContext::Reference { reference },
+            ))
+            .is_err());
+    }
+
+    assert!(EvidenceChannel::new(
+        "unsupported NMI bins".into(),
+        association(
+            AssociationStatistic::FixedCorrectedNmi { bins: 3 },
+            AssociationContext::Labels { labels: None },
+        ),
+    )
+    .is_err());
+}
+
+#[test]
 fn constant_insufficient_and_nonfinite_evidence_remain_explicitly_unavailable() {
     let input = frame(
         PrecisionProfile::Mixed,
@@ -580,23 +717,15 @@ fn constant_insufficient_and_nonfinite_evidence_remain_explicitly_unavailable() 
         let round = semantic.begin_round(&[]).unwrap();
         (round.source(0).unwrap(), round.source(1).unwrap())
     };
-    let redundancy = EvidenceChannel::new(
-        "constant redundancy".into(),
-        EvidenceDefinition::Redundancy { reference: varying },
-    )
-    .unwrap();
+    let redundancy =
+        EvidenceChannel::new("constant redundancy".into(), pearson_reference(varying)).unwrap();
     let energy = EvidenceChannel::new(
         "constant graph energy".into(),
         EvidenceDefinition::GraphEnergy { graph },
     )
     .unwrap();
-    let association = EvidenceChannel::new(
-        "one label association".into(),
-        EvidenceDefinition::LabeledAssociation {
-            labels: Some(labels),
-        },
-    )
-    .unwrap();
+    let association =
+        EvidenceChannel::new("one label association".into(), pearson_labels(Some(labels))).unwrap();
     let channels = vec![redundancy.clone(), energy.clone(), association.clone()];
     let table = semantic
         .evaluate(
@@ -654,11 +783,8 @@ fn rounds_must_be_declared_and_context_mismatch_fails_before_native_work() {
     );
     let mut semantic = session(&input);
     let source = semantic.registry().unwrap().source(0).unwrap();
-    let predeclared = EvidenceChannel::new(
-        "pre-round reference".into(),
-        EvidenceDefinition::Redundancy { reference: source },
-    )
-    .unwrap();
+    let predeclared =
+        EvidenceChannel::new("pre-round reference".into(), pearson_reference(source)).unwrap();
     let mut core = CoreEvidenceExecutor::default();
     assert!(semantic
         .evaluate(
@@ -673,13 +799,8 @@ fn rounds_must_be_declared_and_context_mismatch_fails_before_native_work() {
         let mut round = semantic.begin_round(&[]).unwrap();
         round.softsign(source).unwrap()
     };
-    let self_reference = EvidenceChannel::new(
-        "declared reference".into(),
-        EvidenceDefinition::Redundancy {
-            reference: declared,
-        },
-    )
-    .unwrap();
+    let self_reference =
+        EvidenceChannel::new("declared reference".into(), pearson_reference(declared)).unwrap();
     let table = semantic
         .evaluate(
             &mut core,
@@ -716,9 +837,7 @@ fn rounds_must_be_declared_and_context_mismatch_fails_before_native_work() {
         Arc::new(LabelSet::new(&stale, vec![(0, 0.0), (1, 1.0)], "stale labels".into()).unwrap());
     let stale_channel = EvidenceChannel::new(
         "stale label binding".into(),
-        EvidenceDefinition::LabeledAssociation {
-            labels: Some(stale_labels),
-        },
+        pearson_labels(Some(stale_labels)),
     )
     .unwrap();
     assert!(semantic
@@ -771,7 +890,7 @@ fn rounds_must_be_declared_and_context_mismatch_fails_before_native_work() {
     );
     let paired = EvidenceChannel::new(
         "role mismatched paired evidence".into(),
-        EvidenceDefinition::PairedConsistency { view: holdout },
+        pearson_paired(holdout),
     )
     .unwrap();
     assert!(semantic

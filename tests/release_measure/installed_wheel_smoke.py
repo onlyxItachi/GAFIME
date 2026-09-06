@@ -10,8 +10,9 @@ import importlib.machinery
 import importlib.metadata
 import inspect
 import math
-from pathlib import Path
 import sys
+from array import array
+from pathlib import Path
 
 
 REQUIRED_BOUNDARY_SYMBOLS = (
@@ -21,6 +22,20 @@ REQUIRED_BOUNDARY_SYMBOLS = (
     "analyze_continuous",
     "analyze_continuous_cpu",
     "compile_continuous",
+)
+SEMANTIC_PUBLIC_EXPORTS = (
+    "AcceptedSet",
+    "Candidate",
+    "CandidateSet",
+    "Constraint",
+    "Evidence",
+    "EvidenceReport",
+    "FeatureTable",
+    "Graph",
+    "Labels",
+    "SelectionPolicy",
+    "Snapshot",
+    "TabularSession",
 )
 
 
@@ -391,6 +406,129 @@ def _assert_fp64_ingest_never_rounds_through_fp32(gafime: object) -> None:
         )
 
 
+def _f32_matrix(rows: list[tuple[float, ...]]) -> tuple[array, memoryview]:
+    """Build a 2-D stdlib buffer without introducing NumPy into wheel smoke."""
+
+    if not rows or not rows[0] or any(len(row) != len(rows[0]) for row in rows):
+        raise AssertionError("semantic wheel-smoke fixture must be rectangular")
+    storage = array("f", (value for row in rows for value in row))
+    matrix = memoryview(storage).cast("B").cast("f", shape=(len(rows), len(rows[0])))
+    return storage, matrix
+
+
+def _assert_semantic_lifecycle(gafime: object, source_root: Path) -> None:
+    if "semantic" in getattr(gafime, "__all__", ()):
+        raise AssertionError("semantic must remain outside legacy wildcard exports")
+    if "semantic" not in dir(gafime):
+        raise AssertionError(
+            "semantic must remain discoverable as an explicit namespace"
+        )
+    semantic = importlib.import_module("gafime.semantic")
+    _assert_installed(semantic, source_root, "gafime.semantic")
+    if tuple(getattr(semantic, "__all__", ())) != SEMANTIC_PUBLIC_EXPORTS:
+        raise AssertionError("installed semantic module changed its public inventory")
+    missing = [name for name in SEMANTIC_PUBLIC_EXPORTS if not hasattr(semantic, name)]
+    if missing:
+        raise AssertionError(f"installed semantic module is missing exports: {missing}")
+
+    storage, matrix = _f32_matrix([(0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 4.0)])
+    session = semantic.TabularSession(
+        matrix,
+        feature_names=["left", "right"],
+        row_keys=[101, 102, 103, 104],
+        row_domain="installed-wheel-smoke",
+        provenance="installed-wheel-smoke-input",
+    )
+    feature_table = None
+    try:
+        if session.configured_backend != "auto" or session.selected_backend != "core":
+            raise AssertionError(
+                "semantic session did not distinguish configured auto from selected Core"
+            )
+        if session.precision != "mixed":
+            raise AssertionError("semantic default precision is not mixed")
+        capabilities = session.capabilities
+        if (
+            capabilities["configured_device_id"] != 0
+            or capabilities["selected_device_id"] is not None
+        ):
+            raise AssertionError(
+                "semantic Core selection did not report requested versus selected device"
+            )
+        snapshot = session.frame
+        if (
+            snapshot.feature_names != ["left", "right"]
+            or snapshot.row_keys != [101, 102, 103, 104]
+            or snapshot.row_domain != "installed-wheel-smoke"
+            or snapshot.role != "discovery"
+        ):
+            raise AssertionError("semantic snapshot lost installed input identity")
+        storage[0] = 99.0
+        if session.frame.feature_names != ["left", "right"]:
+            raise AssertionError("semantic snapshot no longer exposes stable schema")
+        if session.begin_round() != 1:
+            raise AssertionError("semantic session did not begin its first round")
+        left = session.source("left")
+        labels = snapshot.labels(
+            row_keys=[101, 102, 103, 104],
+            values=[0.0, 1.0, 2.0, 3.0],
+            provenance="installed-wheel-smoke-labels",
+        )
+        channel = semantic.Evidence.labels("outcome", labels)
+        report = session.evaluate([left], [channel])
+        value = report.value(left, channel)
+        if (
+            value["state"] != "measured"
+            or value["support"] != 4
+            or value["reason"] is not None
+            or value["value"] is None
+            or abs(value["value"] - 1.0) > 1.0e-12
+        ):
+            raise AssertionError(
+                "semantic installed-wheel lifecycle did not preserve copied input"
+            )
+        accepted = session.select(
+            report,
+            semantic.SelectionPolicy(channel, direction="maximize", limit=1),
+        )
+        if len(accepted) != 1:
+            raise AssertionError(
+                "semantic installed-wheel selection rejected a valid row"
+            )
+        inference_storage, inference = _f32_matrix([(9.0, 19.0)])
+        snapshot_inference = session.snapshot(
+            inference,
+            feature_names=["left", "right"],
+            row_keys=[9001],
+            row_domain="installed-wheel-inference",
+            provenance="installed-wheel-inference",
+        )
+        feature_table = session.transform(accepted, snapshot_inference)
+        if (
+            feature_table.row_keys != [9001]
+            or feature_table.rows != 1
+            or feature_table.precision != "mixed"
+            or len(feature_table.__arrow_c_array__()) != 2
+        ):
+            raise AssertionError(
+                "semantic installed-wheel transform lost inference identity"
+            )
+        _ = inference_storage
+    finally:
+        session.close()
+        session.close()
+
+    if feature_table is None or len(feature_table.__arrow_c_array__()) != 2:
+        raise AssertionError("semantic Arrow output did not outlive its closed session")
+
+    try:
+        _ = session.frame
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("closed semantic session still exposes a live snapshot")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -422,6 +560,7 @@ def main() -> None:
         _assert_cpu_backend(gafime, precision)
         _assert_significance_identity(gafime, precision)
     _assert_fp64_ingest_never_rounds_through_fp32(gafime)
+    _assert_semantic_lifecycle(gafime, source_root)
     print(
         f"INSTALLED WHEEL: PASS version={installed_version} "
         f"package={package_path} boundary={boundary_path} backend=v1-rust-cpu"

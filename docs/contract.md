@@ -14,6 +14,18 @@ independent of its scores. Unsupported backend/profile/evidence requests fail
 closed. This bounded internal slice supports explicit Core fp32/mixed/fp64, with no change to
 the existing supervised backend/profile contract or release-branch scope.
 
+The additive [tabular product milestone](v1.1-tabular-semantic-product.md)
+builds a public declaration surface over the same canonical semantic owner.
+`gafime.semantic` must contain no Python data-plane computation or selection
+policy. Rust owns immutable input snapshots, row/context validation, candidate
+meaning, evidence definitions, explicit multi-channel policy and accepted
+program lifecycle. Native arithmetic lowerings may differ in implementation,
+never in ownership of meaning. Operation-specific capability validation must
+precede dispatch; existing supervised support is not proof of semantic
+operation support. Existing public supervised behavior and frozen native ABIs
+remain compatible. This development scope does not promote new capabilities
+into the isolated v1.0 release branch or activate future-domain/compiler work.
+
 ## Repository Layout
 
 Tracked project source, runtime, test, and documentation content must converge into:

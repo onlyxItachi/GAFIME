@@ -106,7 +106,8 @@ impl FeatureFrame {
             || schema.len() != columns.len()
             || schema.iter().any(String::is_empty)
             || schema.iter().collect::<BTreeSet<_>>().len() != schema.len()
-            || row_keys.len() < 2
+            || row_keys.is_empty()
+            || (role != EvaluationRole::Inference && row_keys.len() < 2)
             || row_domain.is_empty()
             || provenance.is_empty()
             || row_keys.iter().collect::<BTreeSet<_>>().len() != row_keys.len()

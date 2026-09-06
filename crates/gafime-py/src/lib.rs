@@ -10,6 +10,7 @@ mod generated;
 mod legacy_helpers;
 mod py_api;
 mod runtime;
+mod semantic;
 
 use pyo3::prelude::*;
 
@@ -39,6 +40,7 @@ pub use continuous::{
 
 #[pymodule]
 fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    semantic::register(m)?;
     m.add("__version__", public_package_version())?;
     m.add("BOUNDARY_NAME", BOUNDARY_NAME)?;
     m.add_class::<PyCompiledContinuousArtifact>()?;

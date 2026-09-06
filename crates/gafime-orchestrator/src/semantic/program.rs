@@ -211,6 +211,12 @@ pub struct CandidateRegistry {
     by_operation: BTreeMap<FeatureOp, FeatureId>,
 }
 
+/// Internal mutation boundary used by bounded bulk declaration. A failed batch
+/// never exposes newly allocated identities and may therefore safely reclaim
+/// its appended program slots without cloning/forking registry authority.
+#[derive(Clone, Copy)]
+pub(crate) struct RegistryCheckpoint(usize);
+
 struct DerivedProgramMetadata {
     source_dependencies: Vec<u32>,
     logical_arity: usize,
@@ -387,6 +393,21 @@ impl CandidateRegistry {
         self.programs
             .get(slot)
             .ok_or(SemanticError::Invalid("feature id slot is out of bounds"))
+    }
+
+    pub(crate) fn mutation_checkpoint(&self) -> RegistryCheckpoint {
+        RegistryCheckpoint(self.programs.len())
+    }
+
+    pub(crate) fn rollback_mutations(&mut self, checkpoint: RegistryCheckpoint) {
+        debug_assert!(checkpoint.0 <= self.programs.len());
+        while self.programs.len() > checkpoint.0 {
+            let program = self
+                .programs
+                .pop()
+                .expect("program length was checked before rollback");
+            self.by_operation.remove(program.op());
+        }
     }
 
     fn add_derived(

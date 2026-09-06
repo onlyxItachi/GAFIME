@@ -55,6 +55,95 @@ TOP_LEVEL_PUBLIC_API = (
     "subfunctions",
 )
 
+SEMANTIC_PUBLIC_API = (
+    "AcceptedSet",
+    "Candidate",
+    "CandidateSet",
+    "Constraint",
+    "Evidence",
+    "EvidenceReport",
+    "FeatureTable",
+    "Graph",
+    "Labels",
+    "SelectionPolicy",
+    "Snapshot",
+    "TabularSession",
+)
+
+SEMANTIC_METHOD_COVERAGE = {
+    "TabularSession": (
+        "frame",
+        "configured_backend",
+        "selected_backend",
+        "precision",
+        "retained_bytes",
+        "capabilities",
+        "diagnostics",
+        "snapshot",
+        "begin_round",
+        "source",
+        "describe",
+        "propose",
+        "absolute_difference",
+        "softsign",
+        "centered_product",
+        "evaluate",
+        "select",
+        "transform",
+        "clear_materializations",
+        "close",
+        "__enter__",
+        "__exit__",
+    ),
+    "CandidateSet": ("__len__", "__getitem__"),
+    "AcceptedSet": ("__len__", "__getitem__"),
+    "Candidate": (),
+    "Constraint": (),
+    "SelectionPolicy": (),
+    "Snapshot": (
+        "rows",
+        "feature_names",
+        "row_keys",
+        "row_domain",
+        "provenance",
+        "precision",
+        "role",
+        "labels",
+        "graph",
+    ),
+    "Labels": ("support", "provenance"),
+    "Graph": ("edges", "provenance"),
+    "Evidence": (
+        "reference",
+        "paired",
+        "labels",
+        "graph",
+        "rebind_reference",
+        "rebind_paired",
+        "rebind_labels",
+        "rebind_graph",
+        "name",
+        "semantics",
+        "bins",
+    ),
+    "EvidenceReport": (
+        "backend",
+        "precision",
+        "provenance",
+        "candidates",
+        "context",
+        "value",
+        "__arrow_c_array__",
+    ),
+    "FeatureTable": (
+        "feature_names",
+        "row_keys",
+        "precision",
+        "rows",
+        "__arrow_c_array__",
+    ),
+}
+
 DOCUMENTED_DATACLASS_FIELDS = {
     "ComputeBudget": (
         "max_comb_size",
@@ -1431,6 +1520,182 @@ def _cells() -> list:
         ),
         _md(
             """
+            ### `gafime.semantic`: bounded tabular lifecycle
+
+            `gafime.semantic` is an additive, Core-only development namespace for
+            an explicit candidate/evidence/selection lifecycle. It is separate from
+            `GafimeEngine.analyze()` and `compile()`: it does not inherit legacy
+            metrics, candidate-family, significance, ranking, or budget defaults.
+            `EngineConfig` contributes only `backend`, `device_id`, and `precision`;
+            a non-default unrelated field is rejected rather than silently changing
+            semantic behavior. Backend intent is normalized once: `cpu`, `rust`,
+            and `v1-rust-cpu` select Core, while `hip` normalizes to ROCm. Today
+            `core` and `auto` execute on Core; CUDA, ROCm,
+            Metal and asynchronous scheduling are not semantic product capabilities.
+            No Python feature-computation loop is admitted.
+
+            `TabularSession.capabilities` is an operation-specific static record:
+            it preserves the configured `device_id` as `configured_device_id` and
+            reports `selected_device_id=None` for Core, then lists the supported
+            program/evidence vocabulary and explains why Core, rather than a legacy
+            supervised GPU route, was selected. It is not a GPU probe or
+            physical-execution record. `diagnostics` reports
+            completed native materialization/evidence counters and retained bytes;
+            it is neither an elapsed-time claim nor a modeled cache/RSS account.
+            `describe(candidate)` exposes bounded program metadata and opaque
+            operand handles for inspection, not a serializable candidate IR or
+            native launch descriptor.
+
+            The module exports `TabularSession`, `Snapshot`, `Candidate`,
+            `CandidateSet`, `AcceptedSet`, `Evidence`, `Constraint`,
+            `SelectionPolicy`, `EvidenceReport`, `Labels`, `Graph`, and
+            `FeatureTable`. All are module-scoped. `gafime.semantic` is an explicit
+            namespace (`from gafime import semantic` or `import gafime.semantic`),
+            intentionally omitted from legacy `gafime.__all__` wildcard imports so
+            source-only compatibility imports do not require the native extension.
+            Candidate collections and accepted collections are bounded, indexable
+            opaque handles rather than serializable program IDs or output-column
+            identities.
+
+            A session copies an exact-profile 2-D typed buffer or one Arrow record
+            batch into a Rust-owned snapshot. It requires explicit feature names,
+            ordered unique row keys, a row domain, and provenance. The caller's
+            later mutation does not modify that snapshot. Label and graph
+            provenance are caller assertions, not proof that a split is leakage-free
+            or that a graph is statistically appropriate.
+
+            Begin a round before declaration. `source()`, `softsign()`,
+            `absolute_difference()`, and `centered_product()` make manual bounded
+            declarations; `propose(("source", "softsign", "absolute_difference"),
+            atoms=None, limit=...)` applies only that closed proposal vocabulary in
+            declared operator order and canonical atom order. Collection arguments
+            (operators, atoms, candidates, channels, operands, means, row keys,
+            labels, and graph edges) are bounded indexed sequences; numeric frames
+            are exact-profile typed 2-D buffers or one Arrow record batch. This
+            boundary does not execute arbitrary generator callbacks. Centered-product
+            means are explicit frozen constants, never fit from later inference rows.
+            Passing one `AcceptedSet`, or a bounded indexed sequence of
+            `AcceptedSet` values, to a later `begin_round()` is the only way to
+            authorize those accepted atoms there. The union preserves each native
+            acceptance record; raw `Candidate` handles do not acquire reuse
+            authority merely by being placed in a Python collection.
+
+            `Evidence.reference()`, `paired()`, `labels()`, and `graph()` ask
+            distinct contextual questions. Reference/labels association is absolute;
+            paired-view association retains sign; fixed NMI requires an exact
+            supported `bins` value; graph evidence is the uncentered weighted
+            edge-energy ratio. `Evidence.rebind_reference()`, `rebind_paired()`,
+            `rebind_labels()`, and `rebind_graph()` preserve the measurement kind
+            and estimator rather than converting one kind into another. A channel
+            is not a universal quality score or an implicit target. Evidence
+            evaluation is allowed only on discovery or holdout snapshots; inference
+            snapshots are transform-only and reject evidence before native work.
+
+            `SelectionPolicy` has one named maximize/minimize primary plus
+            inclusive `Constraint` bounds in the individual channel units. Missing
+            evidence is explicit (`reject`/`error`, with `ignore` only for an
+            optional constraint); the policy is not a weighted score or Pareto
+            optimizer. `EvidenceReport.value(candidate, channel)` returns
+            `state`, `value`, `support`, and `reason`. `EvidenceReport.context`
+            retains the original row/channel declarations, but it is not proof of
+            split independence, label provenance, graph validity, or leakage
+            safety. Report and feature-table
+            `__arrow_c_array__()` directly expose Arrow C Data rather than a Python
+            row loop. `FeatureTable` retains row keys and profile-native values;
+            its buffers remain valid after the session closes.
+
+            Calls are synchronous and thread-affine. `close()` is terminal and
+            idempotent. Cross-session/stale handles, incompatible snapshot contexts,
+            and selection from a prior round fail closed. See the full
+            [tabular semantic product contract](../v1.1-tabular-semantic-product.md)
+            for the bounded support boundary.
+            """
+        ),
+        _code(
+            """
+            from array import array
+            from gafime import semantic
+
+            semantic_storage = array(
+                "f", [0.0, 10.0, 1.0, 11.0, 2.0, 12.0, 3.0, 13.0]
+            )
+            semantic_matrix = memoryview(semantic_storage).cast("B").cast(
+                "f", shape=(4, 2)
+            )
+            semantic_keys = [101, 102, 103, 104]
+            semantic_session = semantic.TabularSession(
+                semantic_matrix,
+                feature_names=["left", "right"],
+                row_keys=semantic_keys,
+                row_domain="reference-demo",
+                provenance="reference-demo-input",
+            )
+            try:
+                assert semantic_session.configured_backend == "auto"
+                assert semantic_session.selected_backend == "core"
+                assert semantic_session.precision == "mixed"
+                semantic_capabilities = semantic_session.capabilities
+                assert semantic_capabilities["selected_backend"] == "core"
+                assert semantic_capabilities["configured_device_id"] == 0
+                assert semantic_capabilities["selected_device_id"] is None
+                assert "centered_product" in semantic_capabilities["programs"]
+                assert semantic_session.begin_round() == 1
+
+                semantic_left = semantic_session.source("left")
+                assert semantic_session.describe(semantic_left)["operation"] == "source"
+                semantic_proposed = semantic_session.propose(
+                    ("source", "softsign", "absolute_difference"), limit=8
+                )
+                assert 1 <= len(semantic_proposed) <= 8
+
+                semantic_labels = semantic_session.frame.labels(
+                    row_keys=semantic_keys,
+                    values=[0.0, 1.0, 2.0, 3.0],
+                    provenance="reference-demo-labels",
+                )
+                semantic_channel = semantic.Evidence.labels(
+                    "outcome", semantic_labels, statistic="pearson"
+                )
+                semantic_report = semantic_session.evaluate(
+                    [semantic_left], [semantic_channel]
+                )
+                assert semantic_report.context["role"] == "discovery"
+                semantic_value = semantic_report.value(semantic_left, semantic_channel)
+                assert semantic_value["state"] == "measured"
+                assert semantic_value["support"] == 4
+                assert semantic_session.diagnostics["evidence_kernel_calls"] >= 1
+                semantic_accepted = semantic_session.select(
+                    semantic_report,
+                    semantic.SelectionPolicy(
+                        semantic_channel, direction="maximize", limit=1
+                    ),
+                )
+                assert len(semantic_accepted) == 1
+
+                inference_storage = array("f", [9.0, 19.0])
+                inference_matrix = memoryview(inference_storage).cast("B").cast(
+                    "f", shape=(1, 2)
+                )
+                inference = semantic_session.snapshot(
+                    inference_matrix,
+                    feature_names=["left", "right"],
+                    row_keys=[9001],
+                    row_domain="inference-demo",
+                    provenance="reference-demo-inference",
+                )
+                semantic_features = semantic_session.transform(
+                    semantic_accepted, inference
+                )
+                assert semantic_features.row_keys == [9001]
+                assert semantic_features.rows == 1
+                assert len(semantic_features.__arrow_c_array__()) == 2
+            finally:
+                semantic_session.close()
+            """,
+            test="semantic",
+        ),
+        _md(
+            """
             Additional explicit module surfaces:
 
             - `gafime.reporting`: `BackendInfo`, `Decision`, `DiagnosticReport`,
@@ -1446,6 +1711,10 @@ def _cells() -> list:
             - `gafime.compile`: callable compile module, flags, and compiled aliases;
               `gafime.compile.scenario` exposes bounded compatibility plan metadata;
               `gafime.compile.exports` exposes deprecated handle compatibility.
+            - `gafime.semantic`: Rust-owned `TabularSession` lifecycle plus opaque
+              candidates/accepted values, contextual evidence, explicit selection,
+              and Arrow-output result objects. It is additive and Core-only today;
+              it is not a generic candidate IR, Python data plane, or GPU route.
             - `gafime.subfunctions`: the advanced native compatibility proxy. Prefer
               the top-level safe engine/capability APIs for new application code.
 
@@ -1461,7 +1730,23 @@ def _cells() -> list:
             `estimate_optimal_batch_size()`, `stream()`, and `stream_with_target()`;
             `DecisionPathCandidate.combo` and `params()`; and
             `FamilyCapability.supported`, `scoring_backends`, and
-            `generation_backend`.
+            `generation_backend`. Semantic public methods/properties are
+            `TabularSession.frame`, `configured_backend`, `selected_backend`,
+            `precision`, `retained_bytes`, `capabilities`, `diagnostics`,
+            `snapshot()`, `begin_round()`, `source()`, `describe()`, `propose()`,
+            `absolute_difference()`, `softsign()`,
+            `centered_product()`, `evaluate()`, `select()`, `transform()`,
+            `clear_materializations()`, `close()`, `__enter__()`, and `__exit__()`;
+            `Snapshot.rows`, `feature_names`, `row_keys`, `row_domain`,
+            `provenance`, `precision`, `role`, `labels()`, and `graph()`;
+            `Evidence.reference()`, `paired()`, `labels()`, `graph()`, all four
+            `rebind_*()` forms, `name`, `semantics`, and `bins`; collection
+            `__len__()`/`__getitem__()`; `EvidenceReport.backend`, `precision`,
+            `provenance`, `candidates`, `context`, `value()`, and
+            `__arrow_c_array__()`; and
+            `FeatureTable.feature_names`, `row_keys`, `precision`, `rows`, and
+            `__arrow_c_array__()`. `Labels.support`/`provenance` and
+            `Graph.edges`/`provenance` are contextual result metadata.
 
             CLI entry points are `gafime` and `python -m gafime`. No future
             Candidate IR/decorator/JIT surface is part of the current API.

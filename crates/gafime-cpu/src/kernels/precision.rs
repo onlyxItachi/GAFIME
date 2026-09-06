@@ -35,8 +35,10 @@ pub struct PrecisionScoreScratch {
     fixed_mi: FixedMiScratch,
 }
 
+/// Worker-local fixed-histogram storage for semantic fixed-NMI evaluation.
+/// Legacy scoring also owns this scratch through `PrecisionScoreScratch`.
 #[derive(Debug, Default)]
-struct FixedMiScratch {
+pub(crate) struct FixedMiScratch {
     finite_f32_x: Vec<f32>,
     finite_f32_y: Vec<f32>,
     finite_f64_x: Vec<f64>,
@@ -44,6 +46,15 @@ struct FixedMiScratch {
     hist_x: Vec<u32>,
     hist_y: Vec<u32>,
     joint: Vec<u32>,
+}
+
+/// Definedness-aware result for the semantic fixed corrected-NMI path. Public
+/// legacy helpers retain their historical numeric-zero behavior instead.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FixedNmiOutcome<T> {
+    Measured(T),
+    Degenerate,
+    NonFinite,
 }
 
 impl PrecisionScoreScratch {
@@ -621,6 +632,57 @@ pub fn spearman_f64(x: &[f64], y: &[f64]) -> f64 {
     pearson_f64(&x_ranks, &y_ranks)
 }
 
+/// Definedness-aware Spearman for already-validated finite fp32 inputs. It
+/// retains exact average-tie ranks and the checked fp32 Pearson finalizer; the
+/// public legacy helper above intentionally keeps its historical zero result.
+pub(crate) fn spearman_f32_checked(x: &[f32], y: &[f32]) -> Option<f32> {
+    if x.len() != y.len() || x.is_empty() {
+        return None;
+    }
+    let x_ranks = rank_positions_twice(x)
+        .into_iter()
+        .map(|position| position as f32 * 0.5)
+        .collect::<Vec<_>>();
+    let y_ranks = rank_positions_twice(y)
+        .into_iter()
+        .map(|position| position as f32 * 0.5)
+        .collect::<Vec<_>>();
+    pearson_f32_checked(&x_ranks, &y_ranks)
+}
+
+/// Definedness-aware Spearman for mixed inputs. Ranking and covariance stay in
+/// binary64 after the profile's binary32 input materialization.
+pub(crate) fn spearman_mixed_checked(x: &[f32], y: &[f32]) -> Option<f64> {
+    if x.len() != y.len() || x.is_empty() {
+        return None;
+    }
+    let x_ranks = rank_positions_twice(x)
+        .into_iter()
+        .map(|position| position as f64 * 0.5)
+        .collect::<Vec<_>>();
+    let y_ranks = rank_positions_twice(y)
+        .into_iter()
+        .map(|position| position as f64 * 0.5)
+        .collect::<Vec<_>>();
+    pearson_f64_checked(&x_ranks, &y_ranks)
+}
+
+/// Definedness-aware Spearman for already-validated finite fp64 inputs.
+pub(crate) fn spearman_f64_checked(x: &[f64], y: &[f64]) -> Option<f64> {
+    if x.len() != y.len() || x.is_empty() {
+        return None;
+    }
+    let x_ranks = rank_positions_twice(x)
+        .into_iter()
+        .map(|position| position as f64 * 0.5)
+        .collect::<Vec<_>>();
+    let y_ranks = rank_positions_twice(y)
+        .into_iter()
+        .map(|position| position as f64 * 0.5)
+        .collect::<Vec<_>>();
+    pearson_f64_checked(&x_ranks, &y_ranks)
+}
+
 pub fn mutual_info_f32(x: &[f32], y: &[f32], max_bins: u32) -> f32 {
     let (x_values, y_values) = finite_pairs_f32(x, y);
     if x_values.len() <= 1 || constant_f32(&x_values) || constant_f32(&y_values) {
@@ -812,6 +874,172 @@ fn mutual_info_fixed_f64_with_scratch(
         joint[x_bin * bins + y_bin] += 1;
     }
     corrected_mi_f64_with_marginals(joint, hist_x, hist_y, true)
+}
+
+/// Semantic fixed-NMI path for finite fp32 input. It keeps the existing
+/// equal-width SIMD histogram and corrected-NMI reduction, but exposes
+/// undefined/nonfinite states instead of collapsing them into legacy zero.
+pub(crate) fn fixed_corrected_nmi_f32_checked(
+    x: &[f32],
+    y: &[f32],
+    bins: u32,
+    scratch: &mut FixedMiScratch,
+) -> FixedNmiOutcome<f32> {
+    if x.len() != y.len() || x.is_empty() || !fixed_nmi_bins_supported(bins) {
+        return FixedNmiOutcome::Degenerate;
+    }
+    if x.iter().chain(y).any(|value| !value.is_finite()) {
+        return FixedNmiOutcome::NonFinite;
+    }
+    let (min_x, max_x) = min_max_f32(x);
+    let (min_y, max_y) = min_max_f32(y);
+    let span_x = max_x - min_x;
+    let span_y = max_y - min_y;
+    if !span_x.is_finite() || !span_y.is_finite() {
+        return FixedNmiOutcome::NonFinite;
+    }
+    if span_x <= 0.0 || span_y <= 0.0 {
+        return FixedNmiOutcome::Degenerate;
+    }
+    let bins_usize = bins as usize;
+    let inv_x = bins as f32 / span_x;
+    let inv_y = bins as f32 / span_y;
+    if !inv_x.is_finite() || !inv_y.is_finite() {
+        return FixedNmiOutcome::NonFinite;
+    }
+    let FixedMiScratch {
+        hist_x,
+        hist_y,
+        joint,
+        ..
+    } = scratch;
+    resize_fixed_histograms(hist_x, hist_y, joint, bins_usize);
+    crate::simd::fixed_bin_histogram2d(
+        x, y, min_x, inv_x, min_y, inv_y, bins, hist_x, hist_y, joint,
+    );
+    fixed_nmi_outcome_f32(hist_x, hist_y, joint)
+}
+
+/// Semantic fixed-NMI path for mixed inputs. Binning remains fp32 and only the
+/// probability/logarithm reduction widens to fp64.
+pub(crate) fn fixed_corrected_nmi_mixed_checked(
+    x: &[f32],
+    y: &[f32],
+    bins: u32,
+    scratch: &mut FixedMiScratch,
+) -> FixedNmiOutcome<f64> {
+    if x.len() != y.len() || x.is_empty() || !fixed_nmi_bins_supported(bins) {
+        return FixedNmiOutcome::Degenerate;
+    }
+    if x.iter().chain(y).any(|value| !value.is_finite()) {
+        return FixedNmiOutcome::NonFinite;
+    }
+    let (min_x, max_x) = min_max_f32(x);
+    let (min_y, max_y) = min_max_f32(y);
+    let span_x = max_x - min_x;
+    let span_y = max_y - min_y;
+    if !span_x.is_finite() || !span_y.is_finite() {
+        return FixedNmiOutcome::NonFinite;
+    }
+    if span_x <= 0.0 || span_y <= 0.0 {
+        return FixedNmiOutcome::Degenerate;
+    }
+    let bins_usize = bins as usize;
+    let inv_x = bins as f32 / span_x;
+    let inv_y = bins as f32 / span_y;
+    if !inv_x.is_finite() || !inv_y.is_finite() {
+        return FixedNmiOutcome::NonFinite;
+    }
+    let FixedMiScratch {
+        hist_x,
+        hist_y,
+        joint,
+        ..
+    } = scratch;
+    resize_fixed_histograms(hist_x, hist_y, joint, bins_usize);
+    crate::simd::fixed_bin_histogram2d(
+        x, y, min_x, inv_x, min_y, inv_y, bins, hist_x, hist_y, joint,
+    );
+    fixed_nmi_outcome_f64(hist_x, hist_y, joint)
+}
+
+/// Semantic fixed-NMI path for finite fp64 input without an fp32 intermediary.
+pub(crate) fn fixed_corrected_nmi_f64_checked(
+    x: &[f64],
+    y: &[f64],
+    bins: u32,
+    scratch: &mut FixedMiScratch,
+) -> FixedNmiOutcome<f64> {
+    if x.len() != y.len() || x.is_empty() || !fixed_nmi_bins_supported(bins) {
+        return FixedNmiOutcome::Degenerate;
+    }
+    if x.iter().chain(y).any(|value| !value.is_finite()) {
+        return FixedNmiOutcome::NonFinite;
+    }
+    let (min_x, max_x) = min_max_f64(x);
+    let (min_y, max_y) = min_max_f64(y);
+    let span_x = max_x - min_x;
+    let span_y = max_y - min_y;
+    if !span_x.is_finite() || !span_y.is_finite() {
+        return FixedNmiOutcome::NonFinite;
+    }
+    if span_x <= 0.0 || span_y <= 0.0 {
+        return FixedNmiOutcome::Degenerate;
+    }
+    let bins_usize = bins as usize;
+    let inv_x = bins as f64 / span_x;
+    let inv_y = bins as f64 / span_y;
+    if !inv_x.is_finite() || !inv_y.is_finite() {
+        return FixedNmiOutcome::NonFinite;
+    }
+    let FixedMiScratch {
+        hist_x,
+        hist_y,
+        joint,
+        ..
+    } = scratch;
+    resize_fixed_histograms(hist_x, hist_y, joint, bins_usize);
+    clear_fixed_histograms(hist_x, hist_y, joint);
+    for (&x_value, &y_value) in x.iter().zip(y) {
+        let x_bin = fixed_bin_f64((x_value - min_x) * inv_x, bins_usize) as usize;
+        let y_bin = fixed_bin_f64((y_value - min_y) * inv_y, bins_usize) as usize;
+        hist_x[x_bin] += 1;
+        hist_y[y_bin] += 1;
+        joint[x_bin * bins_usize + y_bin] += 1;
+    }
+    fixed_nmi_outcome_f64(hist_x, hist_y, joint)
+}
+
+fn fixed_nmi_bins_supported(bins: u32) -> bool {
+    MI_TEMPLATE_BIN_LEVELS.contains(&bins)
+}
+
+fn fixed_nmi_outcome_f32(hist_x: &[u32], hist_y: &[u32], joint: &[u32]) -> FixedNmiOutcome<f32> {
+    if active_bins(hist_x) < 2 || active_bins(hist_y) < 2 {
+        return FixedNmiOutcome::Degenerate;
+    }
+    let value = corrected_mi_f32_with_marginals(joint, hist_x, hist_y, true);
+    if value.is_finite() {
+        FixedNmiOutcome::Measured(value)
+    } else {
+        FixedNmiOutcome::NonFinite
+    }
+}
+
+fn fixed_nmi_outcome_f64(hist_x: &[u32], hist_y: &[u32], joint: &[u32]) -> FixedNmiOutcome<f64> {
+    if active_bins(hist_x) < 2 || active_bins(hist_y) < 2 {
+        return FixedNmiOutcome::Degenerate;
+    }
+    let value = corrected_mi_f64_with_marginals(joint, hist_x, hist_y, true);
+    if value.is_finite() {
+        FixedNmiOutcome::Measured(value)
+    } else {
+        FixedNmiOutcome::NonFinite
+    }
+}
+
+fn active_bins(histogram: &[u32]) -> usize {
+    histogram.iter().filter(|&&count| count != 0).count()
 }
 
 fn resize_fixed_histograms(

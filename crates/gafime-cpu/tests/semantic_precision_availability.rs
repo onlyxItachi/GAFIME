@@ -8,9 +8,9 @@ use gafime_cpu::{
     semantic::CoreEvidenceExecutor,
 };
 use gafime_orchestrator::semantic::{
-    CandidateRegistry, EvaluationRole, EvidenceChannel, EvidenceDefinition, EvidenceValue,
-    FeatureFrame, GraphEdge, NeighborGraph, NumericColumn, ProgramLimits, SemanticSession,
-    UnavailableReason,
+    AssociationContext, AssociationStatistic, CandidateRegistry, EvaluationRole, EvidenceChannel,
+    EvidenceDefinition, EvidenceValue, FeatureFrame, GraphEdge, NeighborGraph, NumericColumn,
+    ProgramLimits, SemanticSession, UnavailableReason,
 };
 use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CPU};
 
@@ -36,7 +36,10 @@ fn evaluate_redundancy(profile: PrecisionProfile, columns: Vec<NumericColumn>) -
     };
     let channel = EvidenceChannel::new(
         "tiny finite redundancy".into(),
-        EvidenceDefinition::Redundancy { reference: anchor },
+        EvidenceDefinition::Association {
+            statistic: AssociationStatistic::Pearson,
+            context: AssociationContext::Reference { reference: anchor },
+        },
     )
     .unwrap();
     let table = session

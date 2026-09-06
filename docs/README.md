@@ -34,6 +34,8 @@ documents that own each subject.
 - [GPU Spearman target-rank cache](gpu-spearman-target-rank-cache.md)
 - [v1.1 semantic evidence spine](v1.1-semantic-evidence-spine.md) — internal
   candidate/evidence semantics and staged migration boundary.
+- [v1.1 tabular semantic product](v1.1-tabular-semantic-product.md) — the
+  bounded public `gafime.semantic` lifecycle and its explicit support limits.
 
 ## Build and Contribution
 
