@@ -9,12 +9,10 @@ use gafime_cpu::{
 };
 use gafime_gpu_sys::{GpuBackend, OwnedGpuMatrix};
 use gafime_orchestrator::config::EngineConfig;
+use gafime_orchestrator::semantic::supervised::SupervisedStrengths as PrecisionUnaryStrengths;
 use gafime_orchestrator::{
     continuous_staged_device_footprint_bytes,
-    plan::combos::{
-        legacy_higher_feature_order, legacy_higher_feature_order_f64, legacy_unary_feature_order,
-        DEFAULT_UNRANKED_HOST_STORAGE_BUDGET_BYTES,
-    },
+    plan::combos::{legacy_unary_feature_order, DEFAULT_UNRANKED_HOST_STORAGE_BUDGET_BYTES},
     prepare_continuous_execution_for_feature_orders, OrchestratorError,
     PreparedContinuousExecution,
 };
@@ -957,70 +955,6 @@ pub(crate) fn prepare_screened_continuous_execution(
     })
 }
 
-pub(crate) enum PrecisionUnaryStrengths {
-    F32(Vec<(u32, f32)>),
-    F64(Vec<(u32, f64)>),
-}
-
-impl PrecisionUnaryStrengths {
-    pub(crate) fn sort_by_feature(&mut self) {
-        match self {
-            Self::F32(values) => values.sort_by_key(|(feature, _)| *feature),
-            Self::F64(values) => values.sort_by_key(|(feature, _)| *feature),
-        }
-    }
-
-    fn higher_feature_order(
-        &self,
-        candidate_cols: u32,
-        max_combinations_per_k: u64,
-        top_features_for_higher_k: u32,
-        planning_seed_words: &[u32],
-    ) -> Vec<u32> {
-        match self {
-            Self::F32(values) => legacy_higher_feature_order(
-                candidate_cols,
-                max_combinations_per_k,
-                top_features_for_higher_k,
-                planning_seed_words,
-                values,
-            ),
-            Self::F64(values) => legacy_higher_feature_order_f64(
-                candidate_cols,
-                max_combinations_per_k,
-                top_features_for_higher_k,
-                planning_seed_words,
-                values,
-            ),
-        }
-    }
-
-    pub(crate) fn into_ranked_features(mut self, top_k: u32) -> Vec<u32> {
-        match &mut self {
-            Self::F32(values) => {
-                values.sort_by(|left, right| {
-                    right
-                        .1
-                        .partial_cmp(&left.1)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                values.truncate(top_k as usize);
-                values.iter().map(|(feature, _)| *feature).collect()
-            }
-            Self::F64(values) => {
-                values.sort_by(|left, right| {
-                    right
-                        .1
-                        .partial_cmp(&left.1)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                values.truncate(top_k as usize);
-                values.iter().map(|(feature, _)| *feature).collect()
-            }
-        }
-    }
-}
-
 pub(crate) fn unary_strengths_from_table(
     table: &impl ResultTableView,
     unary_features: &[u32],
@@ -1033,52 +967,13 @@ pub(crate) fn unary_strengths_from_table(
     }
     match table.metric_values() {
         crate::common::MetricValuesRef::F32(values) => {
-            let mut strengths = Vec::with_capacity(unary_features.len());
-            for (row, &feature) in unary_features.iter().enumerate() {
-                let base = row * metric_ids.len();
-                let row_values = values.get(base..base + metric_ids.len()).ok_or_else(|| {
-                    PyBoundaryError::InvalidInput(
-                        "unary screening metric row is missing".to_string(),
-                    )
-                })?;
-                let mut strength = None::<f32>;
-                for (&metric_id, &value) in metric_ids.iter().zip(row_values) {
-                    let candidate =
-                        if matches!(metric_id, GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN) {
-                            value.abs()
-                        } else {
-                            value
-                        };
-                    strength = Some(strength.map_or(candidate, |current| current.max(candidate)));
-                }
-                strengths.push((feature, strength.unwrap_or(0.0)));
-            }
-            Ok(PrecisionUnaryStrengths::F32(strengths))
+            PrecisionUnaryStrengths::from_f32(values, unary_features, metric_ids)
         }
         crate::common::MetricValuesRef::F64(values) => {
-            let mut strengths = Vec::with_capacity(unary_features.len());
-            for (row, &feature) in unary_features.iter().enumerate() {
-                let base = row * metric_ids.len();
-                let row_values = values.get(base..base + metric_ids.len()).ok_or_else(|| {
-                    PyBoundaryError::InvalidInput(
-                        "unary screening metric row is missing".to_string(),
-                    )
-                })?;
-                let mut strength = None::<f64>;
-                for (&metric_id, &value) in metric_ids.iter().zip(row_values) {
-                    let candidate =
-                        if matches!(metric_id, GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN) {
-                            value.abs()
-                        } else {
-                            value
-                        };
-                    strength = Some(strength.map_or(candidate, |current| current.max(candidate)));
-                }
-                strengths.push((feature, strength.unwrap_or(0.0)));
-            }
-            Ok(PrecisionUnaryStrengths::F64(strengths))
+            PrecisionUnaryStrengths::from_f64(values, unary_features, metric_ids)
         }
     }
+    .map_err(|error| PyBoundaryError::InvalidInput(error.to_string()))
 }
 
 pub(crate) fn execute_continuous_state(

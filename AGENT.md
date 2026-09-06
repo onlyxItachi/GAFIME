@@ -158,6 +158,13 @@ Do not merge, fast-forward, force-push, or otherwise land work on `main` while a
 
 ## Release Branch Gate
 
+Mainline v1.1 semantic development follows
+`docs/v1.1-semantic-evidence-spine.md`: Rust owns candidate/dependency/evidence/
+selection identity, while native engines own arithmetic. The bounded internal
+Core/mixed slice does not add a frozen Python/native ABI or authorize promotion
+into a v1.0 stabilization branch. Never reinterpret supervised target/metric
+slots as a generic evidence protocol or claim unsupported GPU evidence support.
+
 Candidate stabilization branches use `release/v<canonical-semver>` and may be
 cut only from an exact `main` commit whose required checks are green. Creating
 one is source-control coordination only: it does not change version identity,
