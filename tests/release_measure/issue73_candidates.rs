@@ -193,7 +193,10 @@ pub(crate) struct CandidateBank {
     pub(crate) values_row_major: Vec<f32>,
     pub(crate) candidate_major_bytes: usize,
     pub(crate) row_major_bytes: usize,
-    /// f32 payload only: candidate-major outputs + row-major bank + worker scratch upper bound.
+    /// Conservative logical numeric payload: candidate-major outputs, row-major bank,
+    /// worker scratch, f64 mixed-reduction sums, and f32 mixed means. It explicitly
+    /// excludes the borrowed input, allocator/Vec metadata and slack, catalog metadata,
+    /// and all Core/CUDA/backend copies.
     pub(crate) conservative_peak_value_bytes: usize,
 }
 
@@ -223,6 +226,23 @@ fn checked_f32_bytes(
         return Err(CandidateError::Bytes { what, bytes });
     }
     Ok(bytes)
+}
+
+fn checked_materialization_peak_bytes(
+    bank_bytes: usize,
+    columns: usize,
+) -> Result<usize, CandidateError> {
+    let f64_sums = columns
+        .checked_mul(size_of::<f64>())
+        .ok_or(CandidateError::SizeOverflow)?;
+    let f32_means = columns
+        .checked_mul(size_of::<f32>())
+        .ok_or(CandidateError::SizeOverflow)?;
+    bank_bytes
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(f64_sums))
+        .and_then(|bytes| bytes.checked_add(f32_means))
+        .ok_or(CandidateError::SizeOverflow)
 }
 
 fn validate_matrix(matrix: NativeMatrixRef<'_>) -> Result<(), CandidateError> {
@@ -316,9 +336,10 @@ pub(crate) fn materialize_row_major(
         values_row_major,
         candidate_major_bytes: bank_bytes,
         row_major_bytes: bank_bytes,
-        conservative_peak_value_bytes: bank_bytes
-            .checked_mul(3)
-            .ok_or(CandidateError::SizeOverflow)?,
+        conservative_peak_value_bytes: checked_materialization_peak_bytes(
+            bank_bytes,
+            input.columns,
+        )?,
     })
 }
 
@@ -778,7 +799,27 @@ mod tests {
         };
         assert_eq!(overflowed_slice.row(1), None);
         assert_eq!(centered_oracle(&values, 2), [-1.0, -1.0]);
-        assert_eq!(bank.conservative_peak_value_bytes, bank.row_major_bytes * 3);
+        assert_eq!(
+            bank.conservative_peak_value_bytes,
+            bank.row_major_bytes * 3
+                + 2 * (std::mem::size_of::<f64>() + std::mem::size_of::<f32>())
+        );
+    }
+
+    #[test]
+    fn wide_input_peak_includes_mixed_mean_temporaries() {
+        let columns = 4_096;
+        let mut values = vec![0.0; 2 * columns];
+        values[0] = 1.0;
+        values[columns] = 2.0;
+        let input = NativeMatrixRef::new(2, columns, &values).unwrap();
+        let catalog =
+            CandidateCatalog::new(columns, vec![CandidateOp::Identity { column: 0 }]).unwrap();
+        let bank = materialize_row_major(&input, &catalog).unwrap();
+        let expected = bank.row_major_bytes * 3
+            + columns * (std::mem::size_of::<f64>() + std::mem::size_of::<f32>());
+        assert_eq!(bank.conservative_peak_value_bytes, expected);
+        assert!(bank.conservative_peak_value_bytes > bank.row_major_bytes * 3);
     }
 
     #[test]

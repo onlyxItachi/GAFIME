@@ -31,6 +31,12 @@ GROUPS = {
     ],
     "local_evidence_runner": ["tests/release_measure/run_issue73_quality_cuda.py"],
     "cuda_quality_design": ["docs/issue-73-cuda-quality-experiment.md"],
+    "retained_diagnostic_data_not_implementation": [
+        "docs/evidence/issue73-core-cuda-2026-09-06.json",
+        "docs/evidence/issue73-ncu-absdiff-2026-09-06.csv",
+        "docs/evidence/issue73-ncu-product-2026-09-06.csv",
+        "docs/evidence/issue73-ncu-product_direct-2026-09-06.csv",
+    ],
 }
 ALLOWED = {path for paths in GROUPS.values() for path in paths} | {"docs/README.md"}
 

@@ -202,7 +202,10 @@ fn bench(backend: &str, args: &[String]) -> Result<(), String> {
         .chunks_exact(columns)
         .map(|row| row[0])
         .collect();
-    let mut cold_start = Instant::now();
+    // Inputs/catalog/anchor already exist. This is preparation plus the first
+    // execution, not process-cold end-to-end latency. The direct control also
+    // follows oracle-only bank materialization, which can warm allocator/cache.
+    let mut preparation_start = Instant::now();
     let start = Instant::now();
     let bank = materialize_row_major(&input, &catalog).map_err(failure)?;
     let materialize_ns = start.elapsed().as_nanos();
@@ -212,7 +215,7 @@ fn bench(backend: &str, args: &[String]) -> Result<(), String> {
         return Err("direct product control requires a complete all-pairs catalog".into());
     }
     if direct {
-        cold_start = Instant::now();
+        preparation_start = Instant::now();
     }
     let mut scorer = if direct {
         Issue73UnaryScorer::prepare_existing_centered_products(
@@ -229,7 +232,7 @@ fn bench(backend: &str, args: &[String]) -> Result<(), String> {
     let setup_ns = start.elapsed().as_nanos();
     let actual = scorer.execute_resident()?;
     verify_backend(&scorer, backend)?;
-    let cold_end_to_end_ns = cold_start.elapsed().as_nanos();
+    let preparation_and_first_execute_ns = preparation_start.elapsed().as_nanos();
     let expected = oracle(&bank, &anchor);
     let max_error = parity(&actual, &expected)?;
     for _ in 0..warmups {
@@ -269,7 +272,8 @@ fn bench(backend: &str, args: &[String]) -> Result<(), String> {
               \"source_columns\":{columns},\"rayon_workers\":{},\
               \"materialize_ns_single_observation\":{materialize_ns},\
               \"setup_ns_single_observation\":{setup_ns},\
-              \"cold_end_to_end_ns_single_observation\":{cold_end_to_end_ns},\
+              \"preparation_and_first_execute_ns_single_observation\":{preparation_and_first_execute_ns},\
+              \"prior_oracle_bank_materialization_excluded\":{direct},\
               \"execution_materialized_bank_bytes\":{},\"oracle_bank_bytes\":{},\
               \"materialization_peak_value_bytes\":{},\
               \"warmups\":{warmups},\"loops_per_sample\":{loops},\

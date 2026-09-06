@@ -159,7 +159,7 @@ def main():
     # worker count is emitted by every native cell. No affinity/clock changes.
     env.pop("RAYON_NUM_THREADS", None)
     report = {
-        "schema": "gafime.issue73.quality-cuda-reuse.v1",
+        "schema": "gafime.issue73.quality-cuda-reuse.v2",
         "source": source_identity(),
         "payload": payload,
         "preflight": snapshot(),
@@ -218,6 +218,19 @@ def main():
                     f"{index + 1}/{len(cells)} {backend} {kind} {rows}x{count}",
                     flush=True,
                 )
+        # A successful numerical run is not evidence for a source tree or binary
+        # that changed during collection. Preserve the partial report on failure.
+        report["source_after"] = source_identity()
+        if report["source_after"] != report["source"]:
+            raise RuntimeError("source identity changed during evidence collection")
+        if identity(args.cuda_lib) != payload:
+            raise RuntimeError(
+                "CUDA payload identity changed during evidence collection"
+            )
+        if identity(output / "native-probe") != report["build"]["binary"]:
+            raise RuntimeError(
+                "native harness identity changed during evidence collection"
+            )
         report["completed"] = True
     except Exception as error:
         report["completed"] = False
