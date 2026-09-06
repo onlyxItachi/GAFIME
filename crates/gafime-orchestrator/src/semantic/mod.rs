@@ -7,19 +7,30 @@
 
 mod context;
 mod evidence;
+mod numeric;
+mod ordering;
 pub mod program;
 mod selection;
 mod session;
 pub mod supervised;
 
-pub use context::{EvaluationRole, FeatureFrame, GraphEdge, LabelSet, NeighborGraph};
-pub use evidence::{
-    EvidenceChannel, EvidenceDefinition, EvidenceId, EvidenceRecord, EvidenceTable, EvidenceValue,
-    UnavailableReason,
+pub use context::{
+    EvaluationRole, FeatureFrame, GraphEdge, GraphEndpoints, LabelSet, NeighborGraph,
 };
-pub use program::{CandidateRegistry, FeatureId, FeatureOp, FeatureProgram, ProgramLimits};
-pub use selection::{Direction, EvidenceConstraint, MissingEvidence, SelectionPolicy};
-pub use session::{AcceptedFeature, MaterializedColumns, NativeEvidenceExecutor, SemanticSession};
+pub use evidence::{
+    EvidenceChannel, EvidenceDefinition, EvidenceId, EvidenceRecord, EvidenceSpec, EvidenceTable,
+    EvidenceValue, UnavailableReason,
+};
+pub use numeric::NumericColumn;
+pub use ordering::Direction;
+pub use program::{
+    CandidateRegistry, FeatureId, FeatureOp, FeatureProgram, FrozenMeans, ProgramLimits,
+};
+pub use selection::{EvidenceConstraint, MissingEvidence, SelectionPolicy};
+pub use session::{
+    AcceptedFeature, DiscoveryRound, MaterializedColumns, NativeEvidenceExecutor, SemanticSession,
+    SessionLimits,
+};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

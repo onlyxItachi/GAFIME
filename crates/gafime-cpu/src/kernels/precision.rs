@@ -326,6 +326,26 @@ pub(crate) fn score_precision_signal_metrics_into<'a>(
     }
 }
 
+/// Apply one ordered f32 centering/multiply step to an existing interaction.
+///
+/// The caller controls initialization and operand order. This stays f32 even
+/// when the enclosing score route later uses mixed f64 reductions.
+pub(crate) fn multiply_centered_into_f32(out: &mut [f32], input: &[f32], mean: f32) {
+    for (product, &value) in out.iter_mut().zip(input) {
+        *product *= value - mean;
+    }
+}
+
+/// Apply one ordered f64 centering/multiply step to an existing interaction.
+///
+/// The caller controls initialization and operand order; no reassociation or
+/// narrowing occurs here.
+pub(crate) fn multiply_centered_into_f64(out: &mut [f64], input: &[f64], mean: f64) {
+    for (product, &value) in out.iter_mut().zip(input) {
+        *product *= value - mean;
+    }
+}
+
 fn build_interaction_f32(
     matrix: &CpuPrecisionMatrix,
     combo: &[u32],
@@ -345,9 +365,7 @@ fn build_interaction_f32(
                 .ok_or(OrchestratorError::InvalidPlan(
                     "f32 interaction requested from non-f32 CPU matrix",
                 ))?;
-        for (product, &value) in out.iter_mut().zip(column) {
-            *product *= value - mean;
-        }
+        multiply_centered_into_f32(out, column, mean);
     }
     Ok(())
 }
@@ -371,9 +389,7 @@ fn build_interaction_f64(
                 .ok_or(OrchestratorError::InvalidPlan(
                     "f64 interaction requested from non-f64 CPU matrix",
                 ))?;
-        for (product, &value) in out.iter_mut().zip(column) {
-            *product *= value - mean;
-        }
+        multiply_centered_into_f64(out, column, mean);
     }
     Ok(())
 }

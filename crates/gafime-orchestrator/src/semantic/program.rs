@@ -99,12 +99,49 @@ impl ProgramLimits {
     }
 }
 
+/// Exact frozen centering constants bound to one candidate profile.
+///
+/// The raw IEEE bit pattern participates in candidate identity. In particular,
+/// signed zero and adjacent f64 values must not be collapsed by a registry.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum FrozenMeans {
+    F32(Vec<u32>),
+    F64(Vec<u64>),
+}
+
+impl FrozenMeans {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::F32(bits) => bits.len(),
+            Self::F64(bits) => bits.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_f32_bits(&self) -> SemanticResult<&[u32]> {
+        match self {
+            Self::F32(bits) => Ok(bits),
+            Self::F64(_) => Err(SemanticError::Invalid("frozen means are not f32 bits")),
+        }
+    }
+
+    pub fn as_f64_bits(&self) -> SemanticResult<&[u64]> {
+        match self {
+            Self::F32(_) => Err(SemanticError::Invalid("frozen means are not f64 bits")),
+            Self::F64(bits) => Ok(bits),
+        }
+    }
+}
+
 /// A target-free, precision-bound candidate operation.
 ///
 /// `CenteredProduct` preserves operand order because sequential multiplication
 /// in the pointwise dtype is not generally associative.  Frozen means are
-/// caller-declared constants stored as exact f32 bits rather than recomputed
-/// from a later frame. This layer neither fits nor estimates them and makes no
+/// caller-declared constants stored as exact profile-bound bits rather than
+/// recomputed from a later frame. This layer neither fits nor estimates them and makes no
 /// declaration about their split or origin; that provenance is outside the
 /// mathematical identity and belongs to the evaluation/acceptance context.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -114,7 +151,7 @@ pub enum FeatureOp {
     Softsign(FeatureId),
     CenteredProduct {
         operands: Vec<FeatureId>,
-        mean_bits: Vec<u32>,
+        mean_bits: FrozenMeans,
     },
 }
 
@@ -181,17 +218,12 @@ struct DerivedProgramMetadata {
 }
 
 impl CandidateRegistry {
-    /// Create a mixed-precision registry for one named source schema.
+    /// Create a profile-bound registry for one named source schema.
     pub fn new(
         source_names: Vec<String>,
         precision: PrecisionProfile,
         limits: ProgramLimits,
     ) -> SemanticResult<Self> {
-        if precision != PrecisionProfile::Mixed {
-            return Err(SemanticError::Unsupported(
-                "semantic candidate registry currently supports only mixed precision",
-            ));
-        }
         if source_names.is_empty() {
             return Err(SemanticError::Invalid(
                 "semantic source schema must not be empty",
@@ -291,33 +323,51 @@ impl CandidateRegistry {
         self.add_derived(FeatureOp::Softsign(input), &[input])
     }
 
-    /// Add or resolve an ordered centered product with explicitly frozen means.
+    /// Add or resolve an ordered f32-storage centered product.
     pub fn centered_product(
         &mut self,
         operands: Vec<FeatureId>,
         frozen_means: Vec<f32>,
     ) -> SemanticResult<FeatureId> {
-        if operands.len() < 2 {
+        if self.precision == PrecisionProfile::Fp64 {
             return Err(SemanticError::Invalid(
-                "centered product requires at least two operands",
+                "f32 frozen means do not match an fp64 candidate registry",
             ));
         }
-        self.validate_derived_inputs(&operands)?;
-        if operands.len() != frozen_means.len() {
-            return Err(SemanticError::Invalid(
-                "centered product operands and frozen means must have equal lengths",
-            ));
-        }
+        let metadata = self.centered_product_metadata(&operands, frozen_means.len())?;
         if frozen_means.iter().any(|mean| !mean.is_finite()) {
             return Err(SemanticError::Invalid(
                 "centered product frozen means must be finite",
             ));
         }
-        let metadata = self.derived_metadata_from_valid_inputs(&operands)?;
-        let mean_bits = frozen_means
-            .into_iter()
-            .map(f32::to_bits)
-            .collect::<Vec<_>>();
+        let mean_bits = FrozenMeans::F32(frozen_means.into_iter().map(f32::to_bits).collect());
+        self.insert_derived(
+            FeatureOp::CenteredProduct {
+                operands,
+                mean_bits,
+            },
+            metadata,
+        )
+    }
+
+    /// Add or resolve an ordered f64-storage centered product.
+    pub fn centered_product_f64(
+        &mut self,
+        operands: Vec<FeatureId>,
+        frozen_means: Vec<f64>,
+    ) -> SemanticResult<FeatureId> {
+        if self.precision != PrecisionProfile::Fp64 {
+            return Err(SemanticError::Invalid(
+                "f64 frozen means require an fp64 candidate registry",
+            ));
+        }
+        let metadata = self.centered_product_metadata(&operands, frozen_means.len())?;
+        if frozen_means.iter().any(|mean| !mean.is_finite()) {
+            return Err(SemanticError::Invalid(
+                "centered product frozen means must be finite",
+            ));
+        }
+        let mean_bits = FrozenMeans::F64(frozen_means.into_iter().map(f64::to_bits).collect());
         self.insert_derived(
             FeatureOp::CenteredProduct {
                 operands,
@@ -346,6 +396,25 @@ impl CandidateRegistry {
     ) -> SemanticResult<FeatureId> {
         let metadata = self.derived_metadata(inputs)?;
         self.insert_derived(operation, metadata)
+    }
+
+    fn centered_product_metadata(
+        &self,
+        operands: &[FeatureId],
+        mean_len: usize,
+    ) -> SemanticResult<DerivedProgramMetadata> {
+        if operands.len() < 2 {
+            return Err(SemanticError::Invalid(
+                "centered product requires at least two operands",
+            ));
+        }
+        self.validate_derived_inputs(operands)?;
+        if operands.len() != mean_len {
+            return Err(SemanticError::Invalid(
+                "centered product operands and frozen means must have equal lengths",
+            ));
+        }
+        self.derived_metadata_from_valid_inputs(operands)
     }
 
     fn validate_derived_inputs(&self, inputs: &[FeatureId]) -> SemanticResult<()> {
@@ -449,9 +518,12 @@ fn allocate_registry_token() -> SemanticResult<u64> {
 }
 
 fn validate_source_names(source_names: &[String]) -> SemanticResult<()> {
-    if source_names.iter().any(|name| name.is_empty()) {
+    if source_names
+        .iter()
+        .any(|name| name.is_empty() || name.len() > 256)
+    {
         return Err(SemanticError::Invalid(
-            "semantic source names must not be empty",
+            "semantic source names must be nonempty and at most 256 bytes",
         ));
     }
     let mut names = BTreeSet::new();
@@ -468,27 +540,43 @@ mod tests {
     use super::*;
 
     fn registry_with(limits: ProgramLimits) -> CandidateRegistry {
+        registry_with_profile(PrecisionProfile::Mixed, limits)
+    }
+
+    fn registry_with_profile(
+        precision: PrecisionProfile,
+        limits: ProgramLimits,
+    ) -> CandidateRegistry {
         CandidateRegistry::new(
             vec!["a".into(), "b".into(), "c".into(), "d".into()],
-            PrecisionProfile::Mixed,
+            precision,
             limits,
         )
         .unwrap()
     }
 
     #[test]
-    fn only_mixed_precision_has_a_semantic_registry() {
-        for precision in [PrecisionProfile::Fp32, PrecisionProfile::Fp64] {
-            assert!(matches!(
-                CandidateRegistry::new(vec!["a".into()], precision, ProgramLimits::default()),
-                Err(SemanticError::Unsupported(_))
-            ));
+    fn all_profiles_have_a_profile_bound_semantic_registry() {
+        for precision in [
+            PrecisionProfile::Fp32,
+            PrecisionProfile::Mixed,
+            PrecisionProfile::Fp64,
+        ] {
+            let registry =
+                CandidateRegistry::new(vec!["a".into()], precision, ProgramLimits::default())
+                    .unwrap();
+            assert_eq!(registry.precision(), precision);
         }
     }
 
     #[test]
     fn source_schema_and_source_bounds_fail_closed() {
-        for source_names in [vec![], vec![String::new()], vec!["a".into(), "a".into()]] {
+        for source_names in [
+            vec![],
+            vec![String::new()],
+            vec!["a".into(), "a".into()],
+            vec!["a".repeat(257)],
+        ] {
             assert!(matches!(
                 CandidateRegistry::new(
                     source_names,
@@ -609,7 +697,7 @@ mod tests {
         };
         assert_eq!(operands.as_slice(), &[a, b]);
         assert_eq!(
-            mean_bits.as_slice(),
+            mean_bits.as_f32_bits().unwrap(),
             &[(-0.0f32).to_bits(), 1.25f32.to_bits()]
         );
         assert!(matches!(
@@ -640,6 +728,37 @@ mod tests {
             registry.centered_product(vec![a, b, c], vec![f32::NAN, f32::NAN, f32::NAN]),
             Err(SemanticError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn f64_frozen_means_preserve_bits_and_reject_f32_profile_crossing() {
+        let mut fp64 = registry_with_profile(PrecisionProfile::Fp64, ProgramLimits::default());
+        let a = fp64.source(0).unwrap();
+        let b = fp64.source(1).unwrap();
+        let one = 1.0f64;
+        let next = f64::from_bits(one.to_bits() + 1);
+        let first = fp64
+            .centered_product_f64(vec![a, b], vec![one, -0.0])
+            .unwrap();
+        let distinct = fp64
+            .centered_product_f64(vec![a, b], vec![next, -0.0])
+            .unwrap();
+        assert_ne!(first, distinct);
+        let FeatureOp::CenteredProduct { mean_bits, .. } = fp64.program(first).unwrap().op() else {
+            panic!("expected centered product");
+        };
+        assert_eq!(
+            mean_bits.as_f64_bits().unwrap(),
+            &[one.to_bits(), (-0.0f64).to_bits()]
+        );
+        assert!(fp64.centered_product(vec![a, b], vec![0.0, 0.0]).is_err());
+
+        let mut mixed = registry_with(ProgramLimits::default());
+        let a = mixed.source(0).unwrap();
+        let b = mixed.source(1).unwrap();
+        assert!(mixed
+            .centered_product_f64(vec![a, b], vec![0.0, 0.0])
+            .is_err());
     }
 
     #[test]

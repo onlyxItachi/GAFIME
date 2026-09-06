@@ -156,7 +156,7 @@ fn core_session_evaluates_all_channels_accepts_and_reuses_programs_on_new_rows()
 
     let mut semantic = session(&schema);
     let (difference, reference) = {
-        let registry = semantic.registry_mut().unwrap();
+        let mut registry = semantic.begin_round(&[]).unwrap();
         let a = registry.source(0).unwrap();
         let b = registry.source(1).unwrap();
         let reference = registry.source(2).unwrap();
@@ -269,6 +269,7 @@ fn core_session_evaluates_all_channels_accepts_and_reuses_programs_on_new_rows()
             channel: redundancy.id(),
             minimum: None,
             maximum: Some(0.01),
+            missing: None,
         }],
         missing: MissingEvidence::RejectCandidate,
         limit: 1,
@@ -290,7 +291,7 @@ fn core_session_evaluates_all_channels_accepts_and_reuses_programs_on_new_rows()
     // An accepted program stays registry-owned and can be the frozen input of
     // a new program.  Its source arity remains transitive through abs-diff.
     let child = semantic
-        .registry_mut()
+        .begin_round(&accepted)
         .unwrap()
         .softsign(difference)
         .unwrap();
@@ -376,7 +377,7 @@ fn selection_thresholds_missingness_and_ties_are_explicit_and_deterministic() {
     );
     let mut semantic = session(&schema);
     let (a, b, reference) = {
-        let registry = semantic.registry_mut().unwrap();
+        let registry = semantic.begin_round(&[]).unwrap();
         (
             registry.source(0).unwrap(),
             registry.source(1).unwrap(),
@@ -430,6 +431,7 @@ fn selection_thresholds_missingness_and_ties_are_explicit_and_deterministic() {
             channel: strength.id(),
             minimum: None,
             maximum: Some(0.99),
+            missing: None,
         }],
         missing: MissingEvidence::RejectCandidate,
         limit: 2,
@@ -446,6 +448,7 @@ fn selection_thresholds_missingness_and_ties_are_explicit_and_deterministic() {
             channel: absent.id(),
             minimum: None,
             maximum: None,
+            missing: None,
         }],
         missing: MissingEvidence::RejectCandidate,
         limit: 2,
@@ -480,7 +483,7 @@ fn changed_labels_only_change_labeled_evidence_for_the_same_program_and_frame() 
     );
     let mut semantic = session(&schema);
     let (difference, reference) = {
-        let registry = semantic.registry_mut().unwrap();
+        let mut registry = semantic.begin_round(&[]).unwrap();
         let a = registry.source(0).unwrap();
         let b = registry.source(1).unwrap();
         let reference = registry.source(2).unwrap();
@@ -603,7 +606,7 @@ fn frozen_centered_product_uses_declared_means_on_new_inference_rows() {
     );
     let mut semantic = session(&schema);
     let (product, reference) = {
-        let registry = semantic.registry_mut().unwrap();
+        let mut registry = semantic.begin_round(&[]).unwrap();
         let a = registry.source(0).unwrap();
         let b = registry.source(1).unwrap();
         (
@@ -658,7 +661,7 @@ fn core_budget_rejects_before_materialization_accounting_changes() {
     );
     let mut semantic = session_with_budget(&schema, 1);
     let (candidate, reference) = {
-        let registry = semantic.registry_mut().unwrap();
+        let registry = semantic.begin_round(&[]).unwrap();
         (registry.source(0).unwrap(), registry.source(1).unwrap())
     };
     let channel = EvidenceChannel::new(
@@ -705,7 +708,7 @@ fn core_evidence_records_are_bit_identical_with_one_or_four_rayon_workers() {
     );
     let mut semantic = session(&schema);
     let (difference, softsign, reference) = {
-        let registry = semantic.registry_mut().unwrap();
+        let mut registry = semantic.begin_round(&[]).unwrap();
         let a = registry.source(0).unwrap();
         let b = registry.source(1).unwrap();
         let reference = registry.source(2).unwrap();
@@ -903,7 +906,7 @@ fn backend_context_identity_and_closed_sessions_fail_closed() {
 
     let mut owner = session(&schema);
     let (owner_candidate, owner_reference) = {
-        let registry = owner.registry_mut().unwrap();
+        let registry = owner.begin_round(&[]).unwrap();
         (registry.source(0).unwrap(), registry.source(2).unwrap())
     };
     let channel = EvidenceChannel::new(
@@ -953,7 +956,7 @@ fn core_evidence_keeps_unavailability_and_uncentered_graph_translation_visible()
     );
     let mut semantic = session(&schema);
     let (constant, reference) = {
-        let registry = semantic.registry_mut().unwrap();
+        let registry = semantic.begin_round(&[]).unwrap();
         (registry.source(0).unwrap(), registry.source(1).unwrap())
     };
     let one_label = Arc::new(
@@ -1007,11 +1010,11 @@ fn core_evidence_keeps_unavailability_and_uncentered_graph_translation_visible()
     );
     let mut overflow_session = session(&schema);
     let (left, right) = {
-        let registry = overflow_session.registry_mut().unwrap();
+        let registry = overflow_session.begin_round(&[]).unwrap();
         (registry.source(0).unwrap(), registry.source(1).unwrap())
     };
     let product = overflow_session
-        .registry_mut()
+        .begin_round(&[])
         .unwrap()
         .centered_product(vec![left, right], vec![0.0, 0.0])
         .unwrap();
@@ -1110,6 +1113,7 @@ fn core_evidence_keeps_unavailability_and_uncentered_graph_translation_visible()
     // ten keeps the numerator 3 but changes the declared uncentered
     // denominator to 799, giving 3 / 799 rather than a translation-invariant
     // Laplacian-style score.
+    graph_session.begin_round(&[]).unwrap();
     let origin = graph_session
         .evaluate(
             &mut executor,

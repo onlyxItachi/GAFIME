@@ -9,9 +9,12 @@
 
 use gafime_types::{GAFIME_METRIC_PEARSON, GAFIME_METRIC_SPEARMAN};
 
-use crate::plan::combos::{legacy_higher_feature_order, legacy_higher_feature_order_f64};
+use crate::plan::legacy_rng::PythonRandom;
 
-use super::{SemanticError, SemanticResult};
+use super::{
+    ordering::{compare_f32, compare_f64, Direction},
+    SemanticError, SemanticResult,
+};
 
 /// Typed unary strengths used by supervised candidate planning.
 ///
@@ -119,21 +122,37 @@ impl SupervisedStrengths {
         top_features_for_higher_k: u32,
         planning_seed_words: &[u32],
     ) -> Vec<u32> {
+        let mut random = PythonRandom::from_seed_words(planning_seed_words);
+        // Legacy planning first shuffled a capped unary schedule.  Higher-order
+        // selection never used that schedule, but it must consume the exact
+        // same random stream before shuffling the retained shortlist.
+        if u64::from(candidate_cols) > max_combinations_per_k {
+            let mut consumed_unary_order = (0..candidate_cols).collect::<Vec<_>>();
+            random.shuffle(&mut consumed_unary_order);
+        }
         match self {
-            Self::F32(values) => legacy_higher_feature_order(
-                candidate_cols,
-                max_combinations_per_k,
-                top_features_for_higher_k,
-                planning_seed_words,
-                values,
-            ),
-            Self::F64(values) => legacy_higher_feature_order_f64(
-                candidate_cols,
-                max_combinations_per_k,
-                top_features_for_higher_k,
-                planning_seed_words,
-                values,
-            ),
+            Self::F32(values) => {
+                let mut ranked = values.clone();
+                ranked.sort_by(|left, right| compare_f32(left.1, right.1, Direction::Maximize));
+                ranked.truncate(top_features_for_higher_k as usize);
+                let mut selected = ranked
+                    .into_iter()
+                    .map(|(feature, _)| feature)
+                    .collect::<Vec<_>>();
+                random.shuffle(&mut selected);
+                selected
+            }
+            Self::F64(values) => {
+                let mut ranked = values.clone();
+                ranked.sort_by(|left, right| compare_f64(left.1, right.1, Direction::Maximize));
+                ranked.truncate(top_features_for_higher_k as usize);
+                let mut selected = ranked
+                    .into_iter()
+                    .map(|(feature, _)| feature)
+                    .collect::<Vec<_>>();
+                random.shuffle(&mut selected);
+                selected
+            }
         }
     }
 
@@ -142,22 +161,12 @@ impl SupervisedStrengths {
     pub fn into_ranked_features(mut self, top_k: u32) -> Vec<u32> {
         match &mut self {
             Self::F32(values) => {
-                values.sort_by(|left, right| {
-                    right
-                        .1
-                        .partial_cmp(&left.1)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                values.sort_by(|left, right| compare_f32(left.1, right.1, Direction::Maximize));
                 values.truncate(top_k as usize);
                 values.iter().map(|(feature, _)| *feature).collect()
             }
             Self::F64(values) => {
-                values.sort_by(|left, right| {
-                    right
-                        .1
-                        .partial_cmp(&left.1)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                values.sort_by(|left, right| compare_f64(left.1, right.1, Direction::Maximize));
                 values.truncate(top_k as usize);
                 values.iter().map(|(feature, _)| *feature).collect()
             }
@@ -244,6 +253,17 @@ mod tests {
         let ranked =
             SupervisedStrengths::F32(vec![(7, f32::NAN), (3, f32::NAN)]).into_ranked_features(2);
         assert_eq!(ranked, vec![7, 3]);
+
+        // Stable NaN comparisons retain the source prefix before the exact
+        // historical seeded shuffle is applied.
+        let higher = SupervisedStrengths::F32(vec![
+            (0, f32::NAN),
+            (1, f32::NAN),
+            (2, f32::NAN),
+            (3, f32::NAN),
+        ])
+        .higher_feature_order(4, 10, 3, &[7]);
+        assert_eq!(higher, vec![2, 0, 1]);
     }
 
     #[test]
@@ -282,5 +302,15 @@ mod tests {
 
         let strengths = SupervisedStrengths::F32(vec![(4, 0.5), (0, 0.1), (5, 0.6)]);
         assert_eq!(strengths.higher_feature_order(6, 3, 3, &[7]), vec![4, 0, 5]);
+    }
+
+    #[test]
+    fn preserves_producer_tie_order_until_the_caller_selects_core_order() {
+        let producer = SupervisedStrengths::F32(vec![(3, 1.0), (2, 1.0), (1, 1.0), (0, 1.0)]);
+        assert_eq!(producer.higher_feature_order(4, 10, 3, &[7]), vec![1, 3, 2]);
+
+        let mut core = producer;
+        core.sort_by_feature();
+        assert_eq!(core.higher_feature_order(4, 10, 3, &[7]), vec![2, 0, 1]);
     }
 }

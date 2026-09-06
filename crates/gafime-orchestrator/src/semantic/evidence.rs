@@ -60,13 +60,44 @@ impl EvidenceDefinition {
     }
 }
 
-/// Immutable channel identity includes its actual contextual operands. A new
-/// label set/view/graph requires a new channel; changing a display name cannot
-/// redirect an existing evidence record.
+/// Stable, process-local measurement specification. Policy names this identity,
+/// not a particular set of labels or rows. Binding new operands preserves the
+/// question being asked; it never changes an already recorded evaluation.
 #[derive(Clone, Debug)]
-pub struct EvidenceChannel {
+pub struct EvidenceSpec {
     id: EvidenceId,
     name: String,
+    semantics: &'static str,
+}
+
+impl EvidenceSpec {
+    pub fn id(&self) -> EvidenceId {
+        self.id
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn semantic_name(&self) -> &'static str {
+        self.semantics
+    }
+    pub fn bind(&self, definition: EvidenceDefinition) -> SemanticResult<EvidenceChannel> {
+        if self.semantics != definition.semantic_name() {
+            return Err(SemanticError::Invalid(
+                "evidence binding changes measurement semantics",
+            ));
+        }
+        Ok(EvidenceChannel {
+            spec: self.clone(),
+            definition,
+        })
+    }
+}
+
+/// An immutable binding of a specification to actual evaluation operands.
+/// Old tables and acceptances retain old bindings when a specification is rebound.
+#[derive(Clone, Debug)]
+pub struct EvidenceChannel {
+    spec: EvidenceSpec,
     definition: EvidenceDefinition,
 }
 
@@ -77,20 +108,55 @@ impl EvidenceChannel {
                 "evidence channel requires a bounded nonempty name",
             ));
         }
-        Ok(Self {
+        EvidenceSpec {
             id: EvidenceId(next_identity()?),
             name,
-            definition,
-        })
+            semantics: definition.semantic_name(),
+        }
+        .bind(definition)
     }
     pub fn id(&self) -> EvidenceId {
-        self.id
+        self.spec.id
     }
     pub fn name(&self) -> &str {
-        &self.name
+        &self.spec.name
     }
     pub fn definition(&self) -> &EvidenceDefinition {
         &self.definition
+    }
+    pub fn spec(&self) -> &EvidenceSpec {
+        &self.spec
+    }
+    pub fn rebind(&self, definition: EvidenceDefinition) -> SemanticResult<Self> {
+        self.spec.bind(definition)
+    }
+
+    // Within one evaluation, identical immutable operands can share native work
+    // even when users retain separate channel names for distinct policy roles.
+    pub(crate) fn same_work(&self, other: &Self) -> bool {
+        match (&self.definition, &other.definition) {
+            (
+                EvidenceDefinition::Redundancy { reference: a },
+                EvidenceDefinition::Redundancy { reference: b },
+            ) => a == b,
+            (
+                EvidenceDefinition::PairedConsistency { view: a },
+                EvidenceDefinition::PairedConsistency { view: b },
+            ) => Arc::ptr_eq(a, b),
+            (
+                EvidenceDefinition::GraphEnergy { graph: a },
+                EvidenceDefinition::GraphEnergy { graph: b },
+            ) => Arc::ptr_eq(a, b),
+            (
+                EvidenceDefinition::LabeledAssociation { labels: a },
+                EvidenceDefinition::LabeledAssociation { labels: b },
+            ) => match (a, b) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            },
+            _ => false,
+        }
     }
 }
 
@@ -115,6 +181,11 @@ pub enum EvidenceValue {
 }
 
 impl EvidenceValue {
+    /// Exact widening for storage only: fp32 arithmetic and selection thresholds
+    /// remain f32. This shared report container does not grant extra precision.
+    pub fn measured_f32(value: f32, support: usize) -> Self {
+        Self::measured(f64::from(value), support)
+    }
     pub fn measured(value: f64, support: usize) -> Self {
         if value.is_finite() {
             Self::Measured { value, support }
@@ -147,11 +218,12 @@ impl EvidenceRecord {
 }
 
 /// One immutable evaluation, retaining context/provenance and actual operands.
-/// Evidence is not cached across contexts. Numeric values are mixed-route Core
-/// evidence, not calibrated cross-paradigm utilities or significance claims.
+/// Evidence is not cached across contexts. Numeric values follow the frame's
+/// Core profile, not calibrated cross-paradigm utilities or significance claims.
 pub struct EvidenceTable {
     pub(crate) owner: u64,
     pub(crate) id: u64,
+    pub(crate) round: u64,
     pub(crate) frame: Arc<FeatureFrame>,
     pub(crate) candidates: Vec<FeatureId>,
     pub(crate) channels: Vec<EvidenceChannel>,
@@ -179,7 +251,11 @@ impl EvidenceTable {
         "core"
     }
     pub fn precision(&self) -> &'static str {
-        "mixed"
+        match self.frame.profile() {
+            gafime_types::PrecisionProfile::Fp32 => "fp32",
+            gafime_types::PrecisionProfile::Mixed => "mixed",
+            gafime_types::PrecisionProfile::Fp64 => "fp64",
+        }
     }
     pub fn value(
         &self,
@@ -193,7 +269,7 @@ impl EvidenceTable {
         let col = self
             .channels
             .iter()
-            .position(|c| c.id == channel)
+            .position(|c| c.id() == channel)
             .ok_or(SemanticError::ForeignIdentity)?;
         Ok(self.records[row * self.channels.len() + col].value)
     }

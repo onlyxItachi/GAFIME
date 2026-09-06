@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let mut session = SemanticSession::new(registry, GAFIME_BACKEND_CPU, 2 * 1024 * 1024)?;
     let (anchor, absolute_difference, softsign) = {
-        let registry = session.registry_mut()?;
+        let mut registry = session.begin_round(&[])?;
         let signal = registry.source(0)?;
         let anchor = registry.source(1)?;
         (
@@ -148,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         accepted[0].frame().provenance(),
     );
 
-    let child = session.registry_mut()?.softsign(parent)?;
+    let child = session.begin_round(&accepted)?.softsign(parent)?;
     let child_table = session.evaluate(
         &mut executor,
         Arc::clone(&discovery),

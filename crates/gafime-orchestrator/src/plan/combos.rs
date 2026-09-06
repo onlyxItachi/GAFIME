@@ -104,67 +104,6 @@ pub fn legacy_unary_feature_order(
     features
 }
 
-pub fn legacy_higher_feature_order(
-    n_features: u32,
-    max_combinations_per_arity: u64,
-    top_features_for_higher_arity: u32,
-    random_seed_words: &[u32],
-    unary_strengths: &[(u32, f32)],
-) -> Vec<u32> {
-    let mut random = PythonRandom::from_seed_words(random_seed_words);
-    if u64::from(n_features) > max_combinations_per_arity {
-        let mut consumed_unary_order = (0..n_features).collect::<Vec<_>>();
-        random.shuffle(&mut consumed_unary_order);
-    }
-
-    let mut ranked = unary_strengths.to_vec();
-    ranked.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    ranked.truncate(top_features_for_higher_arity as usize);
-    let mut selected = ranked
-        .into_iter()
-        .map(|(feature, _)| feature)
-        .collect::<Vec<_>>();
-    random.shuffle(&mut selected);
-    selected
-}
-
-/// Precision-aware form of [`legacy_higher_feature_order`] for mixed/fp64
-/// visible ranking scores. Structural feature identities and randomized
-/// scheduling remain unchanged; only the score lane is binary64.
-pub fn legacy_higher_feature_order_f64(
-    n_features: u32,
-    max_combinations_per_arity: u64,
-    top_features_for_higher_arity: u32,
-    random_seed_words: &[u32],
-    unary_strengths: &[(u32, f64)],
-) -> Vec<u32> {
-    let mut random = PythonRandom::from_seed_words(random_seed_words);
-    if u64::from(n_features) > max_combinations_per_arity {
-        let mut consumed_unary_order = (0..n_features).collect::<Vec<_>>();
-        random.shuffle(&mut consumed_unary_order);
-    }
-
-    let mut ranked = unary_strengths.to_vec();
-    ranked.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    ranked.truncate(top_features_for_higher_arity as usize);
-    let mut selected = ranked
-        .into_iter()
-        .map(|(feature, _)| feature)
-        .collect::<Vec<_>>();
-    random.shuffle(&mut selected);
-    selected
-}
-
 /// Resolve the configured adaptive MI ceiling to a supported template capacity.
 pub fn sanitize_mi_bins_for_backend(backend_kind: BackendKind, bins: u32) -> u32 {
     let backend_ceiling = if backend_kind == GAFIME_BACKEND_METAL {
@@ -444,6 +383,7 @@ fn generate_combinations_from_features_limited(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic::supervised::SupervisedStrengths;
     use gafime_types::{
         GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_ROCM, GAFIME_METRIC_PEARSON,
     };
@@ -457,8 +397,8 @@ mod tests {
 
     #[test]
     fn hundred_million_pairs_keep_feature_bounded_descriptor_metadata() {
-        let mut higher_features =
-            legacy_higher_feature_order(6, 3, 3, &[7], &[(4, 0.5), (0, 0.1), (5, 0.6)]);
+        let mut higher_features = SupervisedStrengths::F32(vec![(4, 0.5), (0, 0.1), (5, 0.6)])
+            .higher_feature_order(6, 3, 3, &[7]);
         higher_features.extend((0..20_000).filter(|feature| !matches!(feature, 0 | 4 | 5)));
         let plan = build_continuous_plan_for_feature_orders(
             ContinuousPlanRequest {
@@ -626,14 +566,15 @@ mod tests {
     }
 
     #[test]
-    fn legacy_feature_orders_match_v047_seeded_planning() {
+    fn unary_and_canonical_supervised_orders_match_v047_seeded_planning() {
         let unary = legacy_unary_feature_order(6, 3, &[7]);
         assert_eq!(unary, vec![4, 0, 5]);
-        let higher = legacy_higher_feature_order(6, 3, 3, &[7], &[(4, 0.5), (0, 0.1), (5, 0.6)]);
+        let higher = SupervisedStrengths::F32(vec![(4, 0.5), (0, 0.1), (5, 0.6)])
+            .higher_feature_order(6, 3, 3, &[7]);
         assert_eq!(higher, vec![4, 0, 5]);
 
-        let tied =
-            legacy_higher_feature_order(4, 10, 3, &[7], &[(0, 1.0), (1, 1.0), (2, 1.0), (3, 1.0)]);
+        let tied = SupervisedStrengths::F32(vec![(0, 1.0), (1, 1.0), (2, 1.0), (3, 1.0)])
+            .higher_feature_order(4, 10, 3, &[7]);
         assert_eq!(tied, vec![2, 0, 1]);
     }
 
@@ -643,7 +584,8 @@ mod tests {
         let higher = f64::from_bits(lower.to_bits() + 1);
         assert_eq!(lower as f32, higher as f32);
 
-        let selected = legacy_higher_feature_order_f64(2, 2, 1, &[7], &[(0, lower), (1, higher)]);
+        let selected = SupervisedStrengths::F64(vec![(0, lower), (1, higher)])
+            .higher_feature_order(2, 2, 1, &[7]);
         assert_eq!(selected, vec![1]);
     }
 
