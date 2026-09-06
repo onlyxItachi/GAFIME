@@ -47,12 +47,14 @@ Coverage classes:
 | `gafime.family_capability` | primary | lookup/failure semantics | family sections | family smoke | exact-name lookup |
 | `gafime.generate_tutorial` | integration | generator contract | documentation hierarchy | deterministic tutorial parity test | generates the compact practice notebook only |
 | `gafime.require_family_supported` | primary | lookup/failure semantics | family sections | family smoke | fail-closed family admission |
-| `gafime.semantic` | primary | bounded lifecycle and support boundary | semantic lifecycle/API index | semantic boundary and installed-wheel lifecycle smokes | additive Core-only development namespace; its handles are not copied to the top level |
+| `gafime.semantic` | explicit namespace | bounded lifecycle and support boundary | semantic lifecycle/API index | semantic boundary and installed-wheel lifecycle smokes | additive Core-only development namespace; explicit import only, deliberately omitted from legacy wildcard exports; its handles are not copied to the top level |
 | `gafime.subfunctions` | advanced compatibility | proxy and compatibility boundary | compatibility/API-index section | existing compatibility tests | prefer top-level safe APIs for new code |
 
 The table covers every name in `gafime.__all__` plus the public runtime version
-attribute. CI fails if either side changes without updating this record and the
-long-form generator.
+attribute and the explicit `gafime.semantic` namespace. `semantic` is
+deliberately omitted from legacy wildcard exports so a source-only
+`from gafime import *` never imports the native extension. CI fails if either
+side changes without updating this record and the long-form generator.
 
 ## Public Configuration Fields
 
@@ -192,7 +194,7 @@ unexplained import accident.
 | `gafime.compile` | `compile`, `CompileFlags`, `CompiledGafime`, `NativeCompiledGafime` | callable module and top-level aliases |
 | `gafime.compile.exports` | `ExportHandles`, `unsupported_export` | deprecated handle compatibility |
 | `gafime.compile.scenario` | `ChunkRange`, `ContinuousArityDescriptor`, `DEFAULT_CHUNK_SIZE`, `DEFAULT_UNKNOWN_POWER_USER_FEATURE_CAP`, `ScenarioPlan`, `TimeSeriesDescriptor`, `UINT32_MAX`, `UINT64_MAX`, `UINT128_MAX`, `build_scenario_plan`, `build_scenario_plan_from_shape` | bounded compatibility metadata; Rust plans remain authoritative |
-| `gafime.semantic` | `TabularSession`, `Snapshot`, `Candidate`, `CandidateSet`, `AcceptedSet`, `Evidence`, `Constraint`, `SelectionPolicy`, `EvidenceReport`, `Labels`, `Graph`, `FeatureTable` | additive Rust-owned tabular lifecycle; all handles remain module-scoped and opaque |
+| `gafime.semantic` | `TabularSession`, `Snapshot`, `Candidate`, `CandidateSet`, `AcceptedSet`, `Evidence`, `Constraint`, `SelectionPolicy`, `EvidenceReport`, `Labels`, `Graph`, `FeatureTable` | additive Rust-owned tabular lifecycle; explicit import only, omitted from legacy wildcard exports; all handles remain module-scoped and opaque |
 
 Compatibility record fields are also explicit: `ExportHandles` has
 `backend_name`, `feature_matrix_handle`, `result_table_handle`, and

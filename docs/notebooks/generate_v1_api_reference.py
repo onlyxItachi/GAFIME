@@ -52,7 +52,6 @@ TOP_LEVEL_PUBLIC_API = (
     "family_capability",
     "generate_tutorial",
     "require_family_supported",
-    "semantic",
     "subfunctions",
 )
 
@@ -415,7 +414,6 @@ def _top_level_index() -> str:
         "family_capability": "look up one family contract",
         "generate_tutorial": "generate the compact practice notebook",
         "require_family_supported": "fail-closed family lookup",
-        "semantic": "bounded Rust-owned tabular semantic lifecycle",
         "subfunctions": "advanced compatibility/native helper boundary",
     }
     rows.extend(f"| `gafime.{name}` | {roles[name]} |" for name in TOP_LEVEL_PUBLIC_API)
@@ -1551,10 +1549,13 @@ def _cells() -> list:
             The module exports `TabularSession`, `Snapshot`, `Candidate`,
             `CandidateSet`, `AcceptedSet`, `Evidence`, `Constraint`,
             `SelectionPolicy`, `EvidenceReport`, `Labels`, `Graph`, and
-            `FeatureTable`. All are module-scoped; `gafime.semantic` is the only
-            corresponding top-level package export. Candidate collections and
-            accepted collections are bounded, indexable opaque handles rather than
-            serializable program IDs or output-column identities.
+            `FeatureTable`. All are module-scoped. `gafime.semantic` is an explicit
+            namespace (`from gafime import semantic` or `import gafime.semantic`),
+            intentionally omitted from legacy `gafime.__all__` wildcard imports so
+            source-only compatibility imports do not require the native extension.
+            Candidate collections and accepted collections are bounded, indexable
+            opaque handles rather than serializable program IDs or output-column
+            identities.
 
             A session copies an exact-profile 2-D typed buffer or one Arrow record
             batch into a Rust-owned snapshot. It requires explicit feature names,

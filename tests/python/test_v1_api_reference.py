@@ -115,6 +115,8 @@ def test_semantic_reference_inventory_and_method_coverage_match_native_surface()
     semantic = importlib.import_module("gafime.semantic")
 
     assert gafime.semantic is semantic
+    assert "semantic" not in gafime.__all__
+    assert "semantic" in dir(gafime)
     assert tuple(semantic.__all__) == generator.SEMANTIC_PUBLIC_API
     assert set(semantic.__all__) == set(generator.SEMANTIC_PUBLIC_API)
 

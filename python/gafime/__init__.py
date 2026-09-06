@@ -70,5 +70,4 @@ __all__ = [
     "generate_tutorial",
     "require_family_supported",
     "subfunctions",
-    "semantic",
 ]

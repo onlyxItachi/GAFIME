@@ -417,6 +417,12 @@ def _f32_matrix(rows: list[tuple[float, ...]]) -> tuple[array, memoryview]:
 
 
 def _assert_semantic_lifecycle(gafime: object, source_root: Path) -> None:
+    if "semantic" in getattr(gafime, "__all__", ()):
+        raise AssertionError("semantic must remain outside legacy wildcard exports")
+    if "semantic" not in dir(gafime):
+        raise AssertionError(
+            "semantic must remain discoverable as an explicit namespace"
+        )
     semantic = importlib.import_module("gafime.semantic")
     _assert_installed(semantic, source_root, "gafime.semantic")
     if tuple(getattr(semantic, "__all__", ())) != SEMANTIC_PUBLIC_EXPORTS:

@@ -211,21 +211,25 @@ impl PyTabularSession {
     #[getter]
     fn configured_backend(&self) -> PyResult<&str> {
         self.check_thread()?;
+        self.session.registry().map_err(error)?;
         Ok(&self.configured_backend)
     }
     #[getter]
     fn selected_backend(&self) -> PyResult<&'static str> {
         self.check_thread()?;
+        self.session.registry().map_err(error)?;
         Ok("core")
     }
     #[getter]
     fn precision(&self) -> PyResult<&'static str> {
         self.check_thread()?;
+        self.session.registry().map_err(error)?;
         Ok(profile_name(self.profile))
     }
     #[getter]
     fn retained_bytes(&self) -> PyResult<usize> {
         self.check_thread()?;
+        self.session.registry().map_err(error)?;
         Ok(self.session.retained_bytes())
     }
 
@@ -315,6 +319,7 @@ impl PyTabularSession {
     #[pyo3(signature=(accepted=None))]
     fn begin_round(&mut self, accepted: Option<&Bound<'_, PyAny>>) -> PyResult<u64> {
         self.check_thread()?;
+        self.session.registry().map_err(error)?;
         let mut accepted_values = Vec::new();
         if let Some(value) = accepted {
             if let Ok(batch) = value.extract::<PyRef<'_, PyAcceptedSet>>() {
@@ -431,6 +436,7 @@ impl PyTabularSession {
         means: &Bound<'_, PyAny>,
     ) -> PyResult<PyCandidate> {
         self.check_thread()?;
+        self.session.registry().map_err(error)?;
         let ids = candidate_ids(operands)?;
         let means: Vec<f64> = input::bounded_items(means, ids.len(), "frozen means")?
             .map(|x| x?.extract())
@@ -459,6 +465,7 @@ impl PyTabularSession {
         limit: usize,
     ) -> PyResult<PyCandidateSet> {
         self.check_thread()?;
+        self.session.registry().map_err(error)?;
         let operators: Vec<String> = input::bounded_items(operators, 3, "proposal operators")?
             .map(|x| {
                 let x = x?;
@@ -502,6 +509,7 @@ impl PyTabularSession {
         frame: Option<PyRef<'_, PySnapshot>>,
     ) -> PyResult<PyEvidenceReport> {
         self.check_thread()?;
+        self.session.registry().map_err(error)?;
         let ids = candidate_ids(candidates)?;
         let channels: Vec<_> = input::bounded_items(channels, 32, "evidence channels")?
             .map(|c| Ok(c?.extract::<PyRef<'_, PyEvidence>>()?.channel.clone()))

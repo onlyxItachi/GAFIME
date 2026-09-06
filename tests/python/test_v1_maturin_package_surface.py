@@ -77,9 +77,13 @@ import gafime
 # The source-only compatibility path intentionally has only the fake legacy
 # boundary above.  `gafime.semantic` must therefore be discoverable without
 # eagerly importing its real PyO3 extension.
-assert "semantic" in gafime.__all__
+assert "semantic" not in gafime.__all__
 assert "semantic" in dir(gafime)
 assert "semantic" not in vars(gafime)
+legacy_star = {}
+exec("from gafime import *", legacy_star)
+assert "semantic" not in legacy_star
+assert legacy_star["GafimeEngine"] is gafime.GafimeEngine
 
 
 class FrameLike:

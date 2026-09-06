@@ -107,7 +107,8 @@ def _select_left(
 
 def test_semantic_namespace_is_module_scoped_and_handles_are_opaque() -> None:
     assert gafime.semantic is semantic
-    assert "semantic" in gafime.__all__
+    assert "semantic" not in gafime.__all__
+    assert "semantic" in dir(gafime)
     assert tuple(semantic.__all__) == SEMANTIC_PUBLIC_EXPORTS
     assert set(semantic.__all__) == set(SEMANTIC_PUBLIC_EXPORTS)
     assert not any(name in gafime.__all__ for name in SEMANTIC_PUBLIC_EXPORTS)
@@ -598,6 +599,39 @@ def test_single_row_inference_transform_preserves_arrow_output_after_close() -> 
         assert len(table.__arrow_c_array__()) == 2
         with pytest.raises(RuntimeError, match="closed"):
             _ = session.frame
+        for property_name in (
+            "configured_backend",
+            "selected_backend",
+            "precision",
+            "retained_bytes",
+        ):
+            with pytest.raises(RuntimeError, match="closed"):
+                getattr(session, property_name)
+
+        class ClosedSentinelSequence:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __len__(self) -> int:
+                self.calls += 1
+                raise AssertionError("closed session must not inspect sequence length")
+
+            def __getitem__(self, index: int):
+                self.calls += 1
+                raise AssertionError(
+                    f"closed session must not inspect sequence item {index}"
+                )
+
+        sentinel = ClosedSentinelSequence()
+        for call in (
+            lambda: session.begin_round(sentinel),
+            lambda: session.centered_product(sentinel, sentinel),
+            lambda: session.propose(sentinel),
+            lambda: session.evaluate(sentinel, sentinel),
+        ):
+            with pytest.raises(RuntimeError, match="closed"):
+                call()
+        assert sentinel.calls == 0
         _ = incompatible_storage
         _ = inference_storage
     finally:

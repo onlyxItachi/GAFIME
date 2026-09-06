@@ -787,6 +787,22 @@ def check_semantic_public_reexport_boundary() -> None:
     assert 'return sorted(set(globals()) | {"semantic"})' in package_source, (
         "semantic namespace must remain discoverable without importing its extension"
     )
+    package_tree = ast.parse(package_source, filename="python/gafime/__init__.py")
+    package_all = next(
+        (
+            node
+            for node in package_tree.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "__all__"
+        ),
+        None,
+    )
+    assert package_all is not None, "top-level package must retain an explicit __all__"
+    assert "semantic" not in ast.literal_eval(package_all.value), (
+        "semantic must remain outside source-compatible legacy wildcard exports"
+    )
     assert "from .semantic import" not in package_source, (
         "semantic handle classes must remain module-scoped rather than top-level"
     )
