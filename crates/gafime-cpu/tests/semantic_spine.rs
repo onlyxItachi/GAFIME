@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use gafime_cpu::semantic::CoreEvidenceExecutor;
 use gafime_orchestrator::semantic::{
-    CandidateRegistry, Direction, EvaluationRole, EvidenceChannel, EvidenceConstraint,
-    EvidenceDefinition, EvidenceId, EvidenceTable, EvidenceValue, FeatureFrame, FeatureId,
-    GraphEdge, LabelSet, MissingEvidence, NeighborGraph, ProgramLimits, SelectionPolicy,
-    SemanticError, SemanticSession, UnavailableReason,
+    AssociationContext, AssociationStatistic, CandidateRegistry, Direction, EvaluationRole,
+    EvidenceChannel, EvidenceConstraint, EvidenceDefinition, EvidenceId, EvidenceTable,
+    EvidenceValue, FeatureFrame, FeatureId, GraphEdge, LabelSet, MissingEvidence, NeighborGraph,
+    ProgramLimits, SelectionPolicy, SemanticError, SemanticSession, UnavailableReason,
 };
 use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA};
 
@@ -76,6 +76,27 @@ fn session_with_budget(schema: &[&str], budget: usize) -> SemanticSession {
     )
     .unwrap();
     SemanticSession::new(registry, GAFIME_BACKEND_CPU, budget).unwrap()
+}
+
+fn pearson_reference(reference: FeatureId) -> EvidenceDefinition {
+    EvidenceDefinition::Association {
+        statistic: AssociationStatistic::Pearson,
+        context: AssociationContext::Reference { reference },
+    }
+}
+
+fn pearson_paired(view: Arc<FeatureFrame>) -> EvidenceDefinition {
+    EvidenceDefinition::Association {
+        statistic: AssociationStatistic::Pearson,
+        context: AssociationContext::PairedView { view },
+    }
+}
+
+fn pearson_labels(labels: Option<Arc<LabelSet>>) -> EvidenceDefinition {
+    EvidenceDefinition::Association {
+        statistic: AssociationStatistic::Pearson,
+        context: AssociationContext::Labels { labels },
+    }
 }
 
 fn measured(value: EvidenceValue, expected: f64, support: usize) {
@@ -195,18 +216,10 @@ fn core_session_evaluates_all_channels_accepts_and_reuses_programs_on_new_rows()
         )
         .unwrap(),
     );
-    let redundancy = EvidenceChannel::new(
-        "redundancy".to_owned(),
-        EvidenceDefinition::Redundancy { reference },
-    )
-    .unwrap();
-    let paired_consistency = EvidenceChannel::new(
-        "paired".to_owned(),
-        EvidenceDefinition::PairedConsistency {
-            view: Arc::clone(&paired),
-        },
-    )
-    .unwrap();
+    let redundancy =
+        EvidenceChannel::new("redundancy".to_owned(), pearson_reference(reference)).unwrap();
+    let paired_consistency =
+        EvidenceChannel::new("paired".to_owned(), pearson_paired(Arc::clone(&paired))).unwrap();
     let graph_energy = EvidenceChannel::new(
         "graph".to_owned(),
         EvidenceDefinition::GraphEnergy {
@@ -216,16 +229,11 @@ fn core_session_evaluates_all_channels_accepts_and_reuses_programs_on_new_rows()
     .unwrap();
     let labeled = EvidenceChannel::new(
         "labels".to_owned(),
-        EvidenceDefinition::LabeledAssociation {
-            labels: Some(Arc::clone(&labels)),
-        },
+        pearson_labels(Some(Arc::clone(&labels))),
     )
     .unwrap();
-    let missing_labels = EvidenceChannel::new(
-        "missing-labels".to_owned(),
-        EvidenceDefinition::LabeledAssociation { labels: None },
-    )
-    .unwrap();
+    let missing_labels =
+        EvidenceChannel::new("missing-labels".to_owned(), pearson_labels(None)).unwrap();
     let channels = vec![
         redundancy.clone(),
         paired_consistency.clone(),
@@ -301,11 +309,8 @@ fn core_session_evaluates_all_channels_accepts_and_reuses_programs_on_new_rows()
     assert_eq!(child_program.source_arity(), 2);
     assert_eq!(child_program.depth(), 2);
 
-    let child_channel = EvidenceChannel::new(
-        "child-redundancy".to_owned(),
-        EvidenceDefinition::Redundancy { reference },
-    )
-    .unwrap();
+    let child_channel =
+        EvidenceChannel::new("child-redundancy".to_owned(), pearson_reference(reference)).unwrap();
     let nodes_before_child = executor.materialized_nodes();
     let reused_before_child = executor.reused_nodes();
     let child_table = semantic
@@ -384,16 +389,9 @@ fn selection_thresholds_missingness_and_ties_are_explicit_and_deterministic() {
             registry.source(2).unwrap(),
         )
     };
-    let strength = EvidenceChannel::new(
-        "strength".to_owned(),
-        EvidenceDefinition::Redundancy { reference },
-    )
-    .unwrap();
-    let absent = EvidenceChannel::new(
-        "optional-labels".to_owned(),
-        EvidenceDefinition::LabeledAssociation { labels: None },
-    )
-    .unwrap();
+    let strength =
+        EvidenceChannel::new("strength".to_owned(), pearson_reference(reference)).unwrap();
+    let absent = EvidenceChannel::new("optional-labels".to_owned(), pearson_labels(None)).unwrap();
     let mut executor = CoreEvidenceExecutor::default();
     // Input order must not choose a winner: evidence rows are canonicalized by
     // FeatureId before the deterministic tie break is applied.
@@ -491,7 +489,7 @@ fn changed_labels_only_change_labeled_evidence_for_the_same_program_and_frame() 
     };
     let redundancy = EvidenceChannel::new(
         "target-free-redundancy".to_owned(),
-        EvidenceDefinition::Redundancy { reference },
+        pearson_reference(reference),
     )
     .unwrap();
     let matching_labels = Arc::new(
@@ -513,16 +511,12 @@ fn changed_labels_only_change_labeled_evidence_for_the_same_program_and_frame() 
     assert_ne!(matching_labels.id(), different_labels.id());
     let first_labels = EvidenceChannel::new(
         "matching-label-evidence".to_owned(),
-        EvidenceDefinition::LabeledAssociation {
-            labels: Some(matching_labels),
-        },
+        pearson_labels(Some(matching_labels)),
     )
     .unwrap();
     let second_labels = EvidenceChannel::new(
         "different-label-evidence".to_owned(),
-        EvidenceDefinition::LabeledAssociation {
-            labels: Some(different_labels),
-        },
+        pearson_labels(Some(different_labels)),
     )
     .unwrap();
     assert_ne!(first_labels.id(), second_labels.id());
@@ -616,11 +610,8 @@ fn frozen_centered_product_uses_declared_means_on_new_inference_rows() {
             a,
         )
     };
-    let channel = EvidenceChannel::new(
-        "product-reference".to_owned(),
-        EvidenceDefinition::Redundancy { reference },
-    )
-    .unwrap();
+    let channel =
+        EvidenceChannel::new("product-reference".to_owned(), pearson_reference(reference)).unwrap();
     let mut executor = CoreEvidenceExecutor::default();
     let table = semantic
         .evaluate(
@@ -664,11 +655,8 @@ fn core_budget_rejects_before_materialization_accounting_changes() {
         let registry = semantic.begin_round(&[]).unwrap();
         (registry.source(0).unwrap(), registry.source(1).unwrap())
     };
-    let channel = EvidenceChannel::new(
-        "budget-reference".to_owned(),
-        EvidenceDefinition::Redundancy { reference },
-    )
-    .unwrap();
+    let channel =
+        EvidenceChannel::new("budget-reference".to_owned(), pearson_reference(reference)).unwrap();
     let mut executor = CoreEvidenceExecutor::default();
     assert!(matches!(
         semantic.evaluate(
@@ -761,30 +749,14 @@ fn core_evidence_records_are_bit_identical_with_one_or_four_rayon_workers() {
         .unwrap(),
     );
     let channels = vec![
-        EvidenceChannel::new(
-            "redundancy".to_owned(),
-            EvidenceDefinition::Redundancy { reference },
-        )
-        .unwrap(),
-        EvidenceChannel::new(
-            "paired".to_owned(),
-            EvidenceDefinition::PairedConsistency {
-                view: Arc::clone(&paired),
-            },
-        )
-        .unwrap(),
+        EvidenceChannel::new("redundancy".to_owned(), pearson_reference(reference)).unwrap(),
+        EvidenceChannel::new("paired".to_owned(), pearson_paired(Arc::clone(&paired))).unwrap(),
         EvidenceChannel::new(
             "graph".to_owned(),
             EvidenceDefinition::GraphEnergy { graph },
         )
         .unwrap(),
-        EvidenceChannel::new(
-            "labels".to_owned(),
-            EvidenceDefinition::LabeledAssociation {
-                labels: Some(labels),
-            },
-        )
-        .unwrap(),
+        EvidenceChannel::new("labels".to_owned(), pearson_labels(Some(labels))).unwrap(),
     ];
     let mut one_worker = CoreEvidenceExecutor::default();
     let one_pool = rayon::ThreadPoolBuilder::new()
@@ -860,13 +832,8 @@ fn backend_context_identity_and_closed_sessions_fail_closed() {
         ],
         "different-row-identity",
     );
-    let misaligned_channel = EvidenceChannel::new(
-        "misaligned".to_owned(),
-        EvidenceDefinition::PairedConsistency {
-            view: misaligned_rows,
-        },
-    )
-    .unwrap();
+    let misaligned_channel =
+        EvidenceChannel::new("misaligned".to_owned(), pearson_paired(misaligned_rows)).unwrap();
     assert!(matches!(
         semantic.evaluate(
             &mut executor,
@@ -889,9 +856,7 @@ fn backend_context_identity_and_closed_sessions_fail_closed() {
     );
     let schema_channel = EvidenceChannel::new(
         "schema-mismatch".to_owned(),
-        EvidenceDefinition::PairedConsistency {
-            view: schema_mismatch,
-        },
+        pearson_paired(schema_mismatch),
     )
     .unwrap();
     assert!(matches!(
@@ -911,9 +876,7 @@ fn backend_context_identity_and_closed_sessions_fail_closed() {
     };
     let channel = EvidenceChannel::new(
         "owner-strength".to_owned(),
-        EvidenceDefinition::Redundancy {
-            reference: owner_reference,
-        },
+        pearson_reference(owner_reference),
     )
     .unwrap();
     let table = owner
@@ -967,18 +930,10 @@ fn core_evidence_keeps_unavailability_and_uncentered_graph_translation_visible()
         )
         .unwrap(),
     );
-    let constant_channel = EvidenceChannel::new(
-        "constant".to_owned(),
-        EvidenceDefinition::Redundancy { reference },
-    )
-    .unwrap();
-    let insufficient_channel = EvidenceChannel::new(
-        "one-label".to_owned(),
-        EvidenceDefinition::LabeledAssociation {
-            labels: Some(one_label),
-        },
-    )
-    .unwrap();
+    let constant_channel =
+        EvidenceChannel::new("constant".to_owned(), pearson_reference(reference)).unwrap();
+    let insufficient_channel =
+        EvidenceChannel::new("one-label".to_owned(), pearson_labels(Some(one_label))).unwrap();
     let mut executor = CoreEvidenceExecutor::default();
     let table = semantic
         .evaluate(
@@ -1018,11 +973,8 @@ fn core_evidence_keeps_unavailability_and_uncentered_graph_translation_visible()
         .unwrap()
         .centered_product(vec![left, right], vec![0.0, 0.0])
         .unwrap();
-    let overflow_channel = EvidenceChannel::new(
-        "overflow".to_owned(),
-        EvidenceDefinition::Redundancy { reference: left },
-    )
-    .unwrap();
+    let overflow_channel =
+        EvidenceChannel::new("overflow".to_owned(), pearson_reference(left)).unwrap();
     assert!(matches!(
         overflow_session.evaluate(
             &mut executor,

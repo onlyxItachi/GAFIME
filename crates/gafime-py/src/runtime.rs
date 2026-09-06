@@ -330,7 +330,7 @@ fn cpu_isa_rank(isa: IsaLevel) -> i64 {
     }
 }
 
-fn normalize_runtime_backend(name: &str) -> Result<&'static str, PyBoundaryError> {
+pub(crate) fn normalize_runtime_backend(name: &str) -> Result<&'static str, PyBoundaryError> {
     match name {
         "auto" => Ok("auto"),
         "cpu" | "core" | "rust" | "v1-rust-cpu" => Ok("core"),

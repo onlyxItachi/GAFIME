@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use gafime_cpu::semantic::CoreEvidenceExecutor;
 use gafime_orchestrator::semantic::{
-    CandidateRegistry, Direction, EvaluationRole, EvidenceChannel, EvidenceDefinition,
-    FeatureFrame, GraphEdge, MissingEvidence, NeighborGraph, ProgramLimits, SelectionPolicy,
-    SemanticError, SemanticSession,
+    AssociationContext, AssociationStatistic, CandidateRegistry, Direction, EvaluationRole,
+    EvidenceChannel, EvidenceDefinition, FeatureFrame, GraphEdge, MissingEvidence, NeighborGraph,
+    ProgramLimits, SelectionPolicy, SemanticError, SemanticSession,
 };
 use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CPU};
 
@@ -86,8 +86,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let consistency = EvidenceChannel::new(
         "paired_view_consistency".into(),
-        EvidenceDefinition::PairedConsistency {
-            view: Arc::clone(&alternate),
+        EvidenceDefinition::Association {
+            statistic: AssociationStatistic::Pearson,
+            context: AssociationContext::PairedView {
+                view: Arc::clone(&alternate),
+            },
         },
     )?;
     let policy = SelectionPolicy {
@@ -106,7 +109,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &[
             EvidenceChannel::new(
                 "redundancy_against_anchor".into(),
-                EvidenceDefinition::Redundancy { reference: anchor },
+                EvidenceDefinition::Association {
+                    statistic: AssociationStatistic::Pearson,
+                    context: AssociationContext::Reference { reference: anchor },
+                },
             )?,
             consistency.clone(),
             EvidenceChannel::new(
@@ -115,7 +121,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?,
             EvidenceChannel::new(
                 "optional_labels_absent".into(),
-                EvidenceDefinition::LabeledAssociation { labels: None },
+                EvidenceDefinition::Association {
+                    statistic: AssociationStatistic::Pearson,
+                    context: AssociationContext::Labels { labels: None },
+                },
             )?,
         ],
     )?;

@@ -4,6 +4,27 @@ use gafime_cpu::semantic::CoreEvidenceExecutor;
 use gafime_orchestrator::semantic::*;
 use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CPU};
 
+fn pearson_reference(reference: FeatureId) -> EvidenceDefinition {
+    EvidenceDefinition::Association {
+        statistic: AssociationStatistic::Pearson,
+        context: AssociationContext::Reference { reference },
+    }
+}
+
+fn pearson_paired(view: Arc<FeatureFrame>) -> EvidenceDefinition {
+    EvidenceDefinition::Association {
+        statistic: AssociationStatistic::Pearson,
+        context: AssociationContext::PairedView { view },
+    }
+}
+
+fn pearson_labels(labels: Option<Arc<LabelSet>>) -> EvidenceDefinition {
+    EvidenceDefinition::Association {
+        statistic: AssociationStatistic::Pearson,
+        context: AssociationContext::Labels { labels },
+    }
+}
+
 #[test]
 fn independent_acceptance_rounds_retain_both_atoms_for_composition() {
     let frame = Arc::new(
@@ -36,11 +57,8 @@ fn independent_acceptance_rounds_retain_both_atoms_for_composition() {
     let mut core = CoreEvidenceExecutor::default();
     let mut atoms = Vec::new();
     for id in [first, second] {
-        let channel = EvidenceChannel::new(
-            "self association".into(),
-            EvidenceDefinition::Redundancy { reference: id },
-        )
-        .unwrap();
+        let channel =
+            EvidenceChannel::new("self association".into(), pearson_reference(id)).unwrap();
         let table = session
             .evaluate(
                 &mut core,
@@ -71,13 +89,8 @@ fn independent_acceptance_rounds_retain_both_atoms_for_composition() {
         .unwrap();
     let before = core.materialized_nodes();
     let reused = core.reused_nodes();
-    let channel = EvidenceChannel::new(
-        "combined association".into(),
-        EvidenceDefinition::Redundancy {
-            reference: combined,
-        },
-    )
-    .unwrap();
+    let channel =
+        EvidenceChannel::new("combined association".into(), pearson_reference(combined)).unwrap();
     session
         .evaluate(&mut core, frame, &[combined], &[channel])
         .unwrap();
@@ -149,24 +162,10 @@ fn channels(
         .unwrap(),
     );
     vec![
-        EvidenceChannel::new(
-            "redundancy".into(),
-            EvidenceDefinition::Redundancy { reference: anchor },
-        )
-        .unwrap(),
-        EvidenceChannel::new(
-            "consistency".into(),
-            EvidenceDefinition::PairedConsistency {
-                view: Arc::clone(view),
-            },
-        )
-        .unwrap(),
+        EvidenceChannel::new("redundancy".into(), pearson_reference(anchor)).unwrap(),
+        EvidenceChannel::new("consistency".into(), pearson_paired(Arc::clone(view))).unwrap(),
         EvidenceChannel::new("graph".into(), EvidenceDefinition::GraphEnergy { graph }).unwrap(),
-        EvidenceChannel::new(
-            "optional labels".into(),
-            EvidenceDefinition::LabeledAssociation { labels: None },
-        )
-        .unwrap(),
+        EvidenceChannel::new("optional labels".into(), pearson_labels(None)).unwrap(),
     ]
 }
 
@@ -395,11 +394,7 @@ fn stable_policy_rebinds_partial_labels_and_context_without_changing_program() {
                 .unwrap();
         let mut session = SemanticSession::new(registry, GAFIME_BACKEND_CPU, 1 << 20).unwrap();
         let candidate = session.begin_round(&[]).unwrap().source(0).unwrap();
-        let absent = EvidenceChannel::new(
-            "labeled".into(),
-            EvidenceDefinition::LabeledAssociation { labels: None },
-        )
-        .unwrap();
+        let absent = EvidenceChannel::new("labeled".into(), pearson_labels(None)).unwrap();
         let policy = SelectionPolicy {
             primary: absent.id(),
             direction: Direction::Maximize,
@@ -437,9 +432,7 @@ fn stable_policy_rebinds_partial_labels_and_context_without_changing_program() {
                 .unwrap()
             };
             let rebound = absent
-                .rebind(EvidenceDefinition::LabeledAssociation {
-                    labels: Some(Arc::new(labels)),
-                })
+                .rebind(pearson_labels(Some(Arc::new(labels))))
                 .unwrap();
             assert_eq!(absent.id(), rebound.id());
             let table = session
@@ -465,11 +458,7 @@ fn stable_policy_rebinds_partial_labels_and_context_without_changing_program() {
                 ..
             }
         ));
-        assert!(absent
-            .rebind(EvidenceDefinition::Redundancy {
-                reference: candidate
-            })
-            .is_err());
+        assert!(absent.rebind(pearson_reference(candidate)).is_err());
     }
 }
 
@@ -494,13 +483,7 @@ fn round_atom_admission_rejects_unaccepted_foreign_and_exhausted_state() {
             round.softsign(a).unwrap(),
         )
     };
-    let ch = EvidenceChannel::new(
-        "reference".into(),
-        EvidenceDefinition::Redundancy {
-            reference: accepted_id,
-        },
-    )
-    .unwrap();
+    let ch = EvidenceChannel::new("reference".into(), pearson_reference(accepted_id)).unwrap();
     let mut core = CoreEvidenceExecutor::default();
     let table = session
         .evaluate(
@@ -565,11 +548,7 @@ fn work_and_retention_admission_are_bounded_without_silent_eviction() {
     limits.max_work = 1;
     let mut session = SemanticSession::with_limits(registry, GAFIME_BACKEND_CPU, limits).unwrap();
     session.begin_round(&[]).unwrap();
-    let ch = EvidenceChannel::new(
-        "self".into(),
-        EvidenceDefinition::Redundancy { reference: ids[0] },
-    )
-    .unwrap();
+    let ch = EvidenceChannel::new("self".into(), pearson_reference(ids[0])).unwrap();
     let mut core = CoreEvidenceExecutor::default();
     assert!(session
         .evaluate(
@@ -591,11 +570,7 @@ fn work_and_retention_admission_are_bounded_without_silent_eviction() {
     limits.max_retained_bytes = 6 * 4;
     let mut session = SemanticSession::with_limits(registry, GAFIME_BACKEND_CPU, limits).unwrap();
     session.begin_round(&[]).unwrap();
-    let ch = EvidenceChannel::new(
-        "anchor".into(),
-        EvidenceDefinition::Redundancy { reference: ids[0] },
-    )
-    .unwrap();
+    let ch = EvidenceChannel::new("anchor".into(), pearson_reference(ids[0])).unwrap();
     let table = session
         .evaluate(
             &mut core,
@@ -648,11 +623,7 @@ fn accepted_atoms_do_not_hide_transitive_source_limits() {
         let c = round.source(2).unwrap();
         (a, b, c, round.abs_difference(a, b).unwrap())
     };
-    let channel = EvidenceChannel::new(
-        "reference".into(),
-        EvidenceDefinition::Redundancy { reference: a },
-    )
-    .unwrap();
+    let channel = EvidenceChannel::new("reference".into(), pearson_reference(a)).unwrap();
     let mut core = CoreEvidenceExecutor::default();
     let table = session
         .evaluate(&mut core, frame, &[feature], std::slice::from_ref(&channel))
@@ -699,11 +670,8 @@ fn repeated_discovery_rounds_stop_at_registry_budget_without_losing_accepted_inf
             .unwrap()
             .softsign(parent)
             .unwrap();
-        let channel = EvidenceChannel::new(
-            "self measurement".into(),
-            EvidenceDefinition::Redundancy { reference: child },
-        )
-        .unwrap();
+        let channel =
+            EvidenceChannel::new("self measurement".into(), pearson_reference(child)).unwrap();
         let table = session
             .evaluate(
                 &mut core,

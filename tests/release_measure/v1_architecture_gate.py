@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import os
 from pathlib import Path
@@ -50,6 +51,20 @@ FORBIDDEN_LOCAL_RUNTIME_GLOBS = (
     "python/gafime/_native*.so",
     "python/gafime/gafime_core*.so",
     "python/gafime/gafime_cpu*.so",
+)
+SEMANTIC_PUBLIC_EXPORTS = (
+    "AcceptedSet",
+    "Candidate",
+    "CandidateSet",
+    "Constraint",
+    "Evidence",
+    "EvidenceReport",
+    "FeatureTable",
+    "Graph",
+    "Labels",
+    "SelectionPolicy",
+    "Snapshot",
+    "TabularSession",
 )
 
 
@@ -671,6 +686,98 @@ def check_packaging() -> None:
     )
     for forbidden in FORBIDDEN_RUNTIME_STRINGS:
         assert forbidden not in package_text, forbidden
+
+
+def check_semantic_public_reexport_boundary() -> None:
+    """Keep ``gafime.semantic`` a declaration-only PyO3 re-export.
+
+    Existing v1 compatibility modules intentionally contain Python-side data
+    manipulation.  The semantic product is different: its public Python module
+    must never become a second data plane, candidate engine, or policy engine.
+    Inspect this one narrow shim rather than imposing a false repository-wide
+    ban on historical compatibility code.
+    """
+
+    path = ROOT / "python" / "gafime" / "semantic.py"
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+
+    imports = [node for node in tree.body if isinstance(node, ast.ImportFrom)]
+    assert len(imports) == 1, "semantic module must use one native re-export"
+    native_import = imports[0]
+    assert native_import.level == 1 and native_import.module == "gafime_py", (
+        "semantic module must re-export only the PyO3 boundary"
+    )
+    imported = tuple(alias.name for alias in native_import.names)
+    assert imported == SEMANTIC_PUBLIC_EXPORTS, (
+        "semantic native re-export inventory changed without a public-surface update"
+    )
+
+    assignments = [node for node in tree.body if isinstance(node, ast.Assign)]
+    assert len(assignments) == 1, "semantic module must expose one __all__ record"
+    assignment = assignments[0]
+    assert len(assignment.targets) == 1 and isinstance(assignment.targets[0], ast.Name)
+    assert assignment.targets[0].id == "__all__"
+    exported = ast.literal_eval(assignment.value)
+    assert tuple(exported) == SEMANTIC_PUBLIC_EXPORTS, (
+        "semantic __all__ differs from the native public re-export inventory"
+    )
+
+    allowed_top_level = (ast.Expr, ast.ImportFrom, ast.Assign)
+    unexpected = [
+        type(node).__name__
+        for node in tree.body
+        if not isinstance(node, allowed_top_level)
+    ]
+    assert not unexpected, (
+        "semantic module must remain a pure native declaration shim, found "
+        f"{unexpected}"
+    )
+    forbidden_nodes = (
+        ast.For,
+        ast.AsyncFor,
+        ast.While,
+        ast.ListComp,
+        ast.SetComp,
+        ast.DictComp,
+        ast.GeneratorExp,
+        ast.Lambda,
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+        ast.Call,
+    )
+    violations = [
+        type(node).__name__ for node in ast.walk(tree) if isinstance(node, forbidden_nodes)
+    ]
+    assert not violations, (
+        "semantic module may not contain Python execution/data-plane constructs: "
+        f"{violations}"
+    )
+    for forbidden in (
+        "v1_adapter",
+        "GafimeEngine",
+        "GafimeSelector",
+        "numpy",
+        "polars",
+        "pandas",
+        "iter_rows",
+        "tolist",
+        "to_numpy",
+    ):
+        assert forbidden not in source, (
+            f"semantic module contains a Python data-plane marker: {forbidden}"
+        )
+
+    package_source = (ROOT / "python" / "gafime" / "__init__.py").read_text(
+        encoding="utf-8"
+    )
+    assert "from . import semantic as semantic" in package_source, (
+        "top-level package must expose only the semantic module namespace"
+    )
+    assert "from .semantic import" not in package_source, (
+        "semantic handle classes must remain module-scoped rather than top-level"
+    )
 
 
 def check_compatibility_scenario_metadata() -> None:
@@ -3687,6 +3794,7 @@ def main() -> None:
 
     check_no_local_legacy_runtime_artifacts()
     check_packaging()
+    check_semantic_public_reexport_boundary()
     check_no_source_opt_in_or_fallback()
     check_native_kernel_structure()
     check_core_production_benchmark_architecture()

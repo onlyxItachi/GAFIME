@@ -1135,6 +1135,7 @@ def _assert_core_sdist(artifact: Artifact, root: Path) -> None:
         "Cargo.toml",
         "LICENSE",
         "README.md",
+        "python/gafime/semantic.py",
         "pyproject.toml",
     }
     missing = sorted(expected - artifact.members)
@@ -1725,6 +1726,10 @@ def _assert_core_wheel(artifact: Artifact) -> None:
     _require(
         artifact.kind == "wheel" and artifact.distribution == "gafime",
         f"expected core wheel, found {artifact.path.name}",
+    )
+    _require(
+        "gafime/semantic.py" in artifact.members,
+        f"{artifact.path.name} omits the public gafime.semantic module",
     )
     payload_packages = tuple(
         f"{package}/" for _, package, _ in PAYLOAD_IDENTITIES.values()

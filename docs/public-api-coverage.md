@@ -47,6 +47,7 @@ Coverage classes:
 | `gafime.family_capability` | primary | lookup/failure semantics | family sections | family smoke | exact-name lookup |
 | `gafime.generate_tutorial` | integration | generator contract | documentation hierarchy | deterministic tutorial parity test | generates the compact practice notebook only |
 | `gafime.require_family_supported` | primary | lookup/failure semantics | family sections | family smoke | fail-closed family admission |
+| `gafime.semantic` | primary | bounded lifecycle and support boundary | semantic lifecycle/API index | semantic boundary and installed-wheel lifecycle smokes | additive Core-only development namespace; its handles are not copied to the top level |
 | `gafime.subfunctions` | advanced compatibility | proxy and compatibility boundary | compatibility/API-index section | existing compatibility tests | prefer top-level safe APIs for new code |
 
 The table covers every name in `gafime.__all__` plus the public runtime version
@@ -114,6 +115,70 @@ Field coverage is exhaustive:
 - `DiagnosticReport`: `config`, `feature_names`, `interactions`, `stability`,
   `permutations`, `warnings`, `decision`, `backend`.
 
+## Tabular Semantic Lifecycle
+
+`gafime.semantic` is the one additive declaration namespace for the bounded
+tabular semantic product. It is intentionally a pure re-export of Rust-owned
+objects; it is not a second Python candidate engine or a convenience alias for
+the legacy supervised APIs. The detailed contract is
+[the tabular semantic product decision](v1.1-tabular-semantic-product.md).
+
+| Symbol | Classification | Supported purpose | Important boundary |
+|---|---|---|---|
+| `TabularSession` | primary | owns a bounded Core discovery/inference lifecycle | `capabilities` separates selected operation support from legacy backend availability; `diagnostics` reports completed native work, not timing; `close()` is terminal and idempotent |
+| `Snapshot` | result model | immutable Rust-owned frame identity | row keys/domain, profile, role, schema, and provenance are explicit; caller mutation after ingest does not alter it |
+| `Candidate`, `CandidateSet`, `AcceptedSet` | result model | opaque session-local program handles and bounded ordered collections | no integer constructor, serialization, cross-session reuse, or authority from output ordinals |
+| `Evidence` | primary declaration | named reference, paired-view, labels, or graph measurement | a named measurement is not a universal quality score or a fabricated target |
+| `Constraint`, `SelectionPolicy` | primary declaration | explicit primary ordering plus inclusive per-channel bounds | constraints are independent channels, not weighted/Pareto-like score synthesis |
+| `EvidenceReport` | result model | contextual values, immutable context metadata, availability reasons, support, and Arrow long-form export | `context` retains row/channel declarations without certifying leakage safety; use `value(candidate, channel)` or `__arrow_c_array__()`; no Python row materialization API is promised |
+| `Labels`, `Graph` | result model | row-key-bound optional label subset or caller-supplied graph | provenance/split text is caller-supplied context, not leakage or graph-quality proof |
+| `FeatureTable` | result model | Arrow-exportable accepted-program outputs with row keys | column ordinals/names are presentation only; Arrow buffers outlive a closed session |
+
+The semantic constructor uses `EngineConfig` only for `backend`, `device_id`,
+and `precision`; non-default legacy scoring, family, significance, or budget
+fields are rejected rather than silently becoming semantic policy. The current
+implementation admits `core` or `auto` and reports `core` as the selected
+backend. Native normalization maps `cpu`, `rust`, and `v1-rust-cpu` to `core`
+and `hip` to `rocm`; the latter remains unsupported by this semantic product.
+It does not claim a CUDA, ROCm, Metal, asynchronous, or Python data-plane
+semantic execution path.
+
+`TabularSession.capabilities` records the configured/selected backend, the
+requested `configured_device_id`, and `selected_device_id=None` for the current
+Core execution, along with the accepted program vocabulary, contextual evidence
+vocabulary, statistics, and why Core was selected. It is operation-specific
+static support information, not a GPU probe or physical-execution record.
+`TabularSession.diagnostics` contains
+cumulative completed materialization/evidence counters and retained bytes; it
+does not model cache performance, elapsed time, process RSS, or Arrow-output
+copies. `describe(candidate)` returns bounded operation/dependency metadata and
+opaque operand handles for inspection only; it does not make a candidate
+serializable or a public native descriptor.
+
+Collection arguments—including proposal operators/atoms, candidate and channel
+sets, frozen means, row keys, labels, and graph edges—are bounded indexed
+sequences. Numeric frames are exact-profile typed 2-D buffers or one Arrow
+record batch. The boundary does not execute arbitrary Python iterators or
+callbacks to construct candidates or ingest unbounded data.
+
+`EvidenceReport.context` retains the original row domain, provenance, row count,
+role, and per-channel kind/semantic binding. It is a durable record of declared
+context—not evidence that a caller-provided split, provenance string, labels,
+or graph is statistically valid or leakage-free.
+
+Evidence evaluation accepts discovery or holdout snapshots only. Inference
+snapshots are transform-only and are rejected before any native evidence work.
+
+The documented lifecycle is explicit: begin a round, declare bounded programs,
+evaluate named channels, select through a named policy, then pass accepted
+programs to a later round or transform them on a compatible snapshot.
+`begin_round()` accepts either one `AcceptedSet` or a bounded indexed sequence
+of independently accepted sets; it unions their native acceptance records, not
+raw `Candidate` handles. `transform()` remains a single-`AcceptedSet`
+operation. A new round invalidates old report selection; a compatible schema
+alone does not authorize a foreign handle or rebind labels/graphs to a
+different frame.
+
 ## Explicit Module and Compatibility Exports
 
 These names are indexed so their presence is deliberate rather than an
@@ -127,6 +192,7 @@ unexplained import accident.
 | `gafime.compile` | `compile`, `CompileFlags`, `CompiledGafime`, `NativeCompiledGafime` | callable module and top-level aliases |
 | `gafime.compile.exports` | `ExportHandles`, `unsupported_export` | deprecated handle compatibility |
 | `gafime.compile.scenario` | `ChunkRange`, `ContinuousArityDescriptor`, `DEFAULT_CHUNK_SIZE`, `DEFAULT_UNKNOWN_POWER_USER_FEATURE_CAP`, `ScenarioPlan`, `TimeSeriesDescriptor`, `UINT32_MAX`, `UINT64_MAX`, `UINT128_MAX`, `build_scenario_plan`, `build_scenario_plan_from_shape` | bounded compatibility metadata; Rust plans remain authoritative |
+| `gafime.semantic` | `TabularSession`, `Snapshot`, `Candidate`, `CandidateSet`, `AcceptedSet`, `Evidence`, `Constraint`, `SelectionPolicy`, `EvidenceReport`, `Labels`, `Graph`, `FeatureTable` | additive Rust-owned tabular lifecycle; all handles remain module-scoped and opaque |
 
 Compatibility record fields are also explicit: `ExportHandles` has
 `backend_name`, `feature_matrix_handle`, `result_table_handle`, and
@@ -158,8 +224,10 @@ The supported CLI entry points are `gafime` and `python -m gafime`, with
 
 Private names, internal adapter functions, native C ABI symbols, backend runtime
 types, experimental RT/OptiX code, and future Candidate IR/decorator/JIT ideas
-are not public Python API. Documentation helpers and skills consume the API
-above; they do not authorize additional runtime surfaces.
+are not public Python API. In particular, semantic handle IDs, executor/cache
+internals, native operation descriptors, Python callbacks, and arbitrary
+serialized semantic programs are not public API. Documentation helpers and
+skills consume the API above; they do not authorize additional runtime surfaces.
 
 ## Input-validation coverage
 

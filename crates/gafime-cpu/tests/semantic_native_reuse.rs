@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use gafime_cpu::semantic::CoreEvidenceExecutor;
 use gafime_orchestrator::semantic::{
-    CandidateRegistry, Direction, EvaluationRole, EvidenceChannel, EvidenceDefinition,
-    FeatureFrame, MissingEvidence, NativeEvidenceExecutor, NumericColumn, ProgramLimits,
-    SelectionPolicy, SemanticSession,
+    AssociationContext, AssociationStatistic, CandidateRegistry, Direction, EvaluationRole,
+    EvidenceChannel, EvidenceDefinition, FeatureFrame, MissingEvidence, NativeEvidenceExecutor,
+    NumericColumn, ProgramLimits, SelectionPolicy, SemanticSession,
 };
 use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CPU};
 
@@ -71,15 +71,21 @@ fn duplicate_bound_channel_runs_one_numerical_primitive_and_acceptance_hits_cach
     };
     let first = EvidenceChannel::new(
         "first self Pearson".into(),
-        EvidenceDefinition::Redundancy {
-            reference: candidate,
+        EvidenceDefinition::Association {
+            statistic: AssociationStatistic::Pearson,
+            context: AssociationContext::Reference {
+                reference: candidate,
+            },
         },
     )
     .unwrap();
     let duplicate = EvidenceChannel::new(
         "duplicate self Pearson".into(),
-        EvidenceDefinition::Redundancy {
-            reference: candidate,
+        EvidenceDefinition::Association {
+            statistic: AssociationStatistic::Pearson,
+            context: AssociationContext::Reference {
+                reference: candidate,
+            },
         },
     )
     .unwrap();

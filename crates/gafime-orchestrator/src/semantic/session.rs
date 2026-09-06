@@ -1,9 +1,14 @@
 use std::{
+    any::Any,
     collections::{BTreeMap, BTreeSet},
+    fmt,
     sync::Arc,
 };
 
-use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CPU};
+use gafime_types::{
+    BackendKind, PrecisionProfile, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
+    GAFIME_BACKEND_ROCM,
+};
 
 use super::{
     next_identity, CandidateRegistry, EvidenceChannel, EvidenceDefinition, EvidenceRecord,
@@ -14,11 +19,52 @@ use super::{
 /// Context-bound values, distinct from durable candidate programs. Only native
 /// execution constructs these; this internal safe interface validates shape and
 /// ownership, but cannot certify the arithmetic of an arbitrary executor.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MaterializedColumns {
     frame_id: u64,
     profile: PrecisionProfile,
-    columns: BTreeMap<FeatureId, NumericColumn>,
+    backend: BackendKind,
+    storage: MaterializedStorage,
+}
+
+/// An executor-owned, process-local residency lease.  The orchestrator never
+/// interprets the object behind this handle: it only retains it with the
+/// physical slot map and passes it back to the same backend executor.
+pub type ResidentMaterializationLease = Arc<dyn Any + Send + Sync>;
+
+#[derive(Clone)]
+enum MaterializedStorage {
+    Host(BTreeMap<FeatureId, NumericColumn>),
+    Resident {
+        slots: BTreeMap<FeatureId, u32>,
+        bytes: usize,
+        // An empty transform result has no physical bank.  It still carries
+        // selected-backend/context identity rather than becoming fake Core
+        // storage or forcing a dummy device allocation.
+        lease: Option<ResidentMaterializationLease>,
+    },
+}
+
+impl fmt::Debug for MaterializedColumns {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut output = f.debug_struct("MaterializedColumns");
+        output
+            .field("frame_id", &self.frame_id)
+            .field("profile", &self.profile)
+            .field("backend", &self.backend);
+        match &self.storage {
+            MaterializedStorage::Host(columns) => {
+                output.field("storage", &"host").field("columns", columns);
+            }
+            MaterializedStorage::Resident { slots, bytes, .. } => {
+                output
+                    .field("storage", &"resident")
+                    .field("slots", slots)
+                    .field("bytes", bytes);
+            }
+        }
+        output.finish()
+    }
 }
 
 impl MaterializedColumns {
@@ -44,7 +90,82 @@ impl MaterializedColumns {
         Ok(Self {
             frame_id: frame.id(),
             profile: frame.profile(),
-            columns,
+            backend: GAFIME_BACKEND_CPU,
+            storage: MaterializedStorage::Host(columns),
+        })
+    }
+
+    /// Construct a context-bound resident bank after the backend has already
+    /// validated its physical allocation and slot map.  Semantic identities
+    /// remain Rust-owned: this method verifies that each logical feature is
+    /// registry-owned before accepting an opaque native lease.
+    pub fn from_resident(
+        registry: &CandidateRegistry,
+        frame: &FeatureFrame,
+        backend: BackendKind,
+        slots: BTreeMap<FeatureId, u32>,
+        bytes: usize,
+        lease: ResidentMaterializationLease,
+    ) -> SemanticResult<Self> {
+        if !matches!(
+            backend,
+            GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
+        ) || registry.schema() != frame.schema()
+            || registry.precision() != frame.profile()
+            || slots.is_empty()
+            || bytes == 0
+        {
+            return Err(SemanticError::Invalid(
+                "invalid resident semantic materialization",
+            ));
+        }
+        let mut seen_slots = BTreeSet::new();
+        for (&id, &slot) in &slots {
+            registry.program(id)?;
+            if !seen_slots.insert(slot) {
+                return Err(SemanticError::Invalid(
+                    "resident materialization maps multiple features to one slot",
+                ));
+            }
+        }
+        Ok(Self {
+            frame_id: frame.id(),
+            profile: frame.profile(),
+            backend,
+            storage: MaterializedStorage::Resident {
+                slots,
+                bytes,
+                lease: Some(lease),
+            },
+        })
+    }
+
+    /// A truthful zero-column resident result for an empty accepted set.  No
+    /// native bank is allocated and no host values are fabricated.
+    pub fn empty_resident(
+        registry: &CandidateRegistry,
+        frame: &FeatureFrame,
+        backend: BackendKind,
+    ) -> SemanticResult<Self> {
+        if !matches!(
+            backend,
+            GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
+        ) || registry.schema() != frame.schema()
+            || registry.precision() != frame.profile()
+        {
+            return Err(SemanticError::Invalid(
+                "invalid empty resident semantic materialization",
+            ));
+        }
+        Ok(Self {
+            frame_id: frame.id(),
+            profile: frame.profile(),
+            backend,
+            storage: MaterializedStorage::Resident {
+                slots: BTreeMap::new(),
+                bytes: 0,
+                lease: None,
+            },
         })
     }
     pub fn frame_id(&self) -> u64 {
@@ -54,20 +175,66 @@ impl MaterializedColumns {
         self.get_typed(id)?.as_f32()
     }
     pub fn get_typed(&self, id: FeatureId) -> SemanticResult<&NumericColumn> {
-        self.columns
-            .get(&id)
-            .ok_or(SemanticError::Invalid("feature is not materialized"))
+        match &self.storage {
+            MaterializedStorage::Host(columns) => columns
+                .get(&id)
+                .ok_or(SemanticError::Invalid("feature is not materialized")),
+            MaterializedStorage::Resident { .. } => Err(SemanticError::Unsupported(
+                "resident materialization requires an explicit backend download",
+            )),
+        }
     }
     pub fn profile(&self) -> PrecisionProfile {
         self.profile
     }
-    pub fn bytes(&self) -> usize {
-        self.columns
-            .values()
-            .fold(0, |sum, column| sum.saturating_add(column.bytes()))
+    pub fn backend_kind(&self) -> BackendKind {
+        self.backend
     }
-    pub fn columns(&self) -> &BTreeMap<FeatureId, NumericColumn> {
-        &self.columns
+    pub fn contains(&self, id: FeatureId) -> bool {
+        match &self.storage {
+            MaterializedStorage::Host(columns) => columns.contains_key(&id),
+            MaterializedStorage::Resident { slots, .. } => slots.contains_key(&id),
+        }
+    }
+    pub fn bytes(&self) -> usize {
+        match &self.storage {
+            MaterializedStorage::Host(columns) => columns
+                .values()
+                .fold(0, |sum, column| sum.saturating_add(column.bytes())),
+            MaterializedStorage::Resident { bytes, .. } => *bytes,
+        }
+    }
+    pub fn columns(&self) -> SemanticResult<&BTreeMap<FeatureId, NumericColumn>> {
+        match &self.storage {
+            MaterializedStorage::Host(columns) => Ok(columns),
+            MaterializedStorage::Resident { .. } => Err(SemanticError::Unsupported(
+                "resident materialization requires an explicit backend download",
+            )),
+        }
+    }
+    pub fn resident_slots(&self) -> SemanticResult<&BTreeMap<FeatureId, u32>> {
+        match &self.storage {
+            MaterializedStorage::Resident { slots, .. } => Ok(slots),
+            MaterializedStorage::Host(_) => Err(SemanticError::Invalid(
+                "host materialization has no resident slot map",
+            )),
+        }
+    }
+    pub fn resident_lease(&self) -> SemanticResult<&ResidentMaterializationLease> {
+        match &self.storage {
+            MaterializedStorage::Resident {
+                lease: Some(lease), ..
+            } => Ok(lease),
+            MaterializedStorage::Resident { lease: None, .. } => Err(SemanticError::Invalid(
+                "empty resident materialization has no native bank",
+            )),
+            MaterializedStorage::Host(_) => Err(SemanticError::Invalid(
+                "host materialization has no resident lease",
+            )),
+        }
+    }
+    pub fn is_resident(&self) -> bool {
+        matches!(self.storage, MaterializedStorage::Resident { .. })
     }
 }
 
@@ -93,6 +260,38 @@ pub trait NativeEvidenceExecutor {
         paired: Option<&MaterializedColumns>,
         max_bytes: usize,
     ) -> SemanticResult<Vec<EvidenceValue>>;
+
+    /// Retain only accepted values, optionally merging a same-context retained
+    /// bank.  Backends must validate frame, profile, schema and backend
+    /// identity before allocating; `max_live_bytes` covers all old, source,
+    /// output and temporary resident allocations while this operation runs.
+    fn retain(
+        &mut self,
+        _registry: &CandidateRegistry,
+        _frame: &FeatureFrame,
+        _source: &MaterializedColumns,
+        _prior: Option<&MaterializedColumns>,
+        _selected: &[FeatureId],
+        _max_live_bytes: usize,
+    ) -> SemanticResult<MaterializedColumns> {
+        Err(SemanticError::Unsupported(
+            "semantic executor does not support retained materializations",
+        ))
+    }
+
+    /// Materialize resident values into an explicit host-owned representation.
+    /// This is an output transfer, never a CPU fallback for native arithmetic.
+    fn download(
+        &mut self,
+        _registry: &CandidateRegistry,
+        _frame: &FeatureFrame,
+        _source: &MaterializedColumns,
+        _max_bytes: usize,
+    ) -> SemanticResult<MaterializedColumns> {
+        Err(SemanticError::Unsupported(
+            "semantic executor does not support resident materialization download",
+        ))
+    }
 }
 
 /// A recorded decision, not a promise of usefulness on another dataset. The
@@ -147,6 +346,18 @@ impl SessionLimits {
         Ok(self)
     }
 }
+
+/// Closed built-in proposal operators. Centered products require caller-owned
+/// frozen means and therefore remain explicit declarations rather than bulk
+/// proposals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProposalOperator {
+    Source,
+    Softsign,
+    AbsoluteDifference,
+}
+
+const MAX_PROPOSAL_CANDIDATES: usize = 65_536;
 
 /// Exclusive declaration scope for a discovery round. Only raw sources,
 /// explicitly supplied accepted atoms, and programs constructed in this round
@@ -206,6 +417,105 @@ impl DiscoveryRound<'_> {
         self.eligible.insert(id);
         Ok(id)
     }
+
+    /// Deterministically declare a bounded built-in catalog from eligible
+    /// atoms. Supplied operator order is retained, while atoms are sorted by
+    /// `FeatureId`; duplicate atoms are harmless, duplicate operators are not.
+    /// A failed batch rolls back every newly appended registry program before
+    /// returning, so no unreturned identity becomes eligible or observable.
+    pub fn propose(
+        &mut self,
+        operators: &[ProposalOperator],
+        atoms: &[FeatureId],
+        max_candidates: usize,
+    ) -> SemanticResult<Vec<FeatureId>> {
+        if operators.is_empty() {
+            return Err(SemanticError::Invalid(
+                "proposal requires at least one operator",
+            ));
+        }
+        if atoms.is_empty() {
+            return Err(SemanticError::Invalid(
+                "proposal requires at least one atom",
+            ));
+        }
+        if max_candidates == 0 || max_candidates > MAX_PROPOSAL_CANDIDATES {
+            return Err(SemanticError::Invalid(
+                "proposal candidate limit must be between one and 65536",
+            ));
+        }
+        if operators.iter().copied().collect::<BTreeSet<_>>().len() != operators.len() {
+            return Err(SemanticError::Invalid("proposal operators must be unique"));
+        }
+        let atoms = atoms.iter().copied().collect::<BTreeSet<_>>();
+        for &atom in &atoms {
+            self.operand(atom)?;
+        }
+        let atoms = atoms.into_iter().collect::<Vec<_>>();
+
+        let checkpoint = self.registry.mutation_checkpoint();
+        let result: SemanticResult<Vec<FeatureId>> = (|| {
+            let mut proposed = Vec::new();
+            let mut seen = BTreeSet::new();
+            'operators: for &operator in operators {
+                match operator {
+                    ProposalOperator::Source => {
+                        for &atom in &atoms {
+                            if !matches!(self.registry.program(atom)?.op(), FeatureOp::Source(_)) {
+                                continue;
+                            }
+                            push_proposal(&mut proposed, &mut seen, atom, max_candidates);
+                            if proposed.len() == max_candidates {
+                                break 'operators;
+                            }
+                        }
+                    }
+                    ProposalOperator::Softsign => {
+                        for &atom in &atoms {
+                            let candidate = self.registry.softsign(atom)?;
+                            push_proposal(&mut proposed, &mut seen, candidate, max_candidates);
+                            if proposed.len() == max_candidates {
+                                break 'operators;
+                            }
+                        }
+                    }
+                    ProposalOperator::AbsoluteDifference => {
+                        for (index, &left) in atoms.iter().enumerate() {
+                            for &right in &atoms[index + 1..] {
+                                let candidate = self.registry.abs_difference(left, right)?;
+                                push_proposal(&mut proposed, &mut seen, candidate, max_candidates);
+                                if proposed.len() == max_candidates {
+                                    break 'operators;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(proposed)
+        })();
+        match result {
+            Ok(proposed) => {
+                self.eligible.extend(proposed.iter().copied());
+                Ok(proposed)
+            }
+            Err(error) => {
+                self.registry.rollback_mutations(checkpoint);
+                Err(error)
+            }
+        }
+    }
+}
+
+fn push_proposal(
+    proposed: &mut Vec<FeatureId>,
+    seen: &mut BTreeSet<FeatureId>,
+    candidate: FeatureId,
+    limit: usize,
+) {
+    if proposed.len() < limit && seen.insert(candidate) {
+        proposed.push(candidate);
+    }
 }
 
 impl AcceptedFeature {
@@ -236,6 +546,7 @@ pub struct SemanticSession {
     id: u64,
     registry: Option<CandidateRegistry>,
     cache: Option<MaterializedColumns>,
+    backend: BackendKind,
     limits: SessionLimits,
     round: u64,
     eligible: Option<BTreeSet<FeatureId>>,
@@ -254,9 +565,12 @@ impl SemanticSession {
         backend: u32,
         limits: SessionLimits,
     ) -> SemanticResult<Self> {
-        if backend != GAFIME_BACKEND_CPU {
-            return Err(SemanticError::Unsupported(
-                "semantic evidence currently requires explicit Core; no GPU or auto fallback",
+        if !matches!(
+            backend,
+            GAFIME_BACKEND_CPU | GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
+        ) {
+            return Err(SemanticError::Invalid(
+                "semantic session requires one concrete backend kind",
             ));
         }
         let limits = limits.validate()?;
@@ -264,6 +578,7 @@ impl SemanticSession {
             id: next_identity()?,
             registry: Some(registry),
             cache: None,
+            backend,
             limits,
             round: 0,
             eligible: None,
@@ -300,8 +615,33 @@ impl SemanticSession {
             eligible: self.eligible.as_mut().expect("round initialized"),
         })
     }
+
+    /// Borrow the currently active declaration scope without beginning another
+    /// round or changing its eligible atom set. This is for one round's
+    /// independent declarations; it is not an authority to revive an old one.
+    pub fn current_round(&mut self) -> SemanticResult<DiscoveryRound<'_>> {
+        if self.registry.is_none() {
+            return Err(SemanticError::Closed);
+        }
+        if self.eligible.is_none() {
+            return Err(SemanticError::Invalid(
+                "no active discovery round is available",
+            ));
+        }
+        Ok(DiscoveryRound {
+            registry: self.registry.as_mut().expect("open registry checked"),
+            eligible: self.eligible.as_mut().expect("active round checked"),
+        })
+    }
+
     pub fn round(&self) -> u64 {
         self.round
+    }
+    /// The explicit execution backend selected before this session was
+    /// constructed.  Operation-level capability negotiation is performed by
+    /// its executor before each native lowering; no implicit fallback exists.
+    pub const fn backend_kind(&self) -> BackendKind {
+        self.backend
     }
     pub fn retained_bytes(&self) -> usize {
         self.cache.as_ref().map_or(0, MaterializedColumns::bytes)
@@ -337,9 +677,9 @@ impl SemanticSession {
 
     fn validate_executor(&self, executor: &impl NativeEvidenceExecutor) -> SemanticResult<()> {
         self.registry()?;
-        if executor.backend_kind() != GAFIME_BACKEND_CPU {
-            return Err(SemanticError::Unsupported(
-                "semantic executor does not match explicit Core selection",
+        if executor.backend_kind() != self.backend {
+            return Err(SemanticError::Invalid(
+                "semantic executor does not match the selected backend",
             ));
         }
         Ok(())
@@ -354,6 +694,13 @@ impl SemanticSession {
     ) -> SemanticResult<EvidenceTable> {
         self.validate_executor(executor)?;
         let registry = self.registry()?;
+        // Inference executes already-accepted programs. It is not an admission
+        // context that may mint new acceptance records, even when labels exist.
+        if frame.role() == super::EvaluationRole::Inference {
+            return Err(SemanticError::Invalid(
+                "inference frames cannot be used for evidence evaluation",
+            ));
+        }
         if frame.schema() != registry.schema()
             || frame.profile() != registry.precision()
             || candidates.is_empty()
@@ -386,9 +733,9 @@ impl SemanticSession {
         }
         for channel in channels {
             channel.definition().validate(registry, &frame)?;
-            if let EvidenceDefinition::Redundancy { reference } = channel.definition() {
-                self.eligible(*reference)?;
-                roots.push(*reference);
+            if let Some(reference) = channel.definition().reference() {
+                self.eligible(reference)?;
+                roots.push(reference);
             }
         }
         roots.sort();
@@ -398,19 +745,18 @@ impl SemanticSession {
             if channels[..index].iter().any(|old| old.same_work(channel)) {
                 continue;
             }
-            let rows = match channel.definition() {
-                EvidenceDefinition::GraphEnergy { graph } => graph.edges().len(),
-                EvidenceDefinition::LabeledAssociation {
-                    labels: Some(labels),
-                } => labels.rows().len(),
-                EvidenceDefinition::LabeledAssociation { labels: None } => 0,
-                EvidenceDefinition::PairedConsistency { view } => {
-                    work = work
-                        .checked_add(dependency_work(registry, view.rows(), &candidates)?)
-                        .ok_or(SemanticError::Invalid("semantic work count overflow"))?;
-                    frame.rows()
-                }
-                _ => frame.rows(),
+            let definition = channel.definition();
+            let rows = if let Some(graph) = definition.graph() {
+                graph.edges().len()
+            } else if let Some(labels) = definition.labels() {
+                labels.as_ref().map_or(0, |labels| labels.rows().len())
+            } else if let Some(view) = definition.paired_view() {
+                work = work
+                    .checked_add(dependency_work(registry, view.rows(), &candidates)?)
+                    .ok_or(SemanticError::Invalid("semantic work count overflow"))?;
+                frame.rows()
+            } else {
+                frame.rows()
             };
             work = work
                 .checked_add(
@@ -431,7 +777,14 @@ impl SemanticSession {
         // The native budget includes its dependency bank and worker allocations.
         let budget = (self.limits.max_bytes - self.retained_bytes()) / 2;
         let materialized = executor.materialize(registry, &frame, &roots, retained, budget)?;
-        validate_output(registry, &frame, &roots, &materialized, budget)?;
+        validate_output(
+            registry,
+            &frame,
+            self.backend,
+            &roots,
+            &materialized,
+            budget,
+        )?;
         let mut channel_values: Vec<Vec<EvidenceValue>> = Vec::with_capacity(channels.len());
         for (index, channel) in channels.iter().enumerate() {
             if let Some(previous) = channels[..index]
@@ -441,14 +794,13 @@ impl SemanticSession {
                 channel_values.push(channel_values[previous].clone());
                 continue;
             }
-            let paired =
-                if let EvidenceDefinition::PairedConsistency { view } = channel.definition() {
-                    let result = executor.materialize(registry, view, &candidates, None, budget)?;
-                    validate_output(registry, view, &candidates, &result, budget)?;
-                    Some(result)
-                } else {
-                    None
-                };
+            let paired = if let Some(view) = channel.definition().paired_view() {
+                let result = executor.materialize(registry, view, &candidates, None, budget)?;
+                validate_output(registry, view, self.backend, &candidates, &result, budget)?;
+                Some(result)
+            } else {
+                None
+            };
             let values = executor.evaluate_channel(
                 channel.definition(),
                 &candidates,
@@ -495,43 +847,125 @@ impl SemanticSession {
             channels: channels.to_vec(),
             records,
             materialized,
+            backend: self.backend,
         })
     }
 
+    /// Apply selection once and retain accepted values through the selected
+    /// backend.  A resident executor must preserve device ownership during
+    /// retention; it must not download values merely to rebuild a cache.
+    pub fn accept_with(
+        &mut self,
+        executor: &mut impl NativeEvidenceExecutor,
+        table: &EvidenceTable,
+        policy: &SelectionPolicy,
+    ) -> SemanticResult<Vec<AcceptedFeature>> {
+        self.validate_executor(executor)?;
+        let selected = self.select_for_accept(table, policy)?;
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let registry = self.registry()?;
+        let prior = self
+            .cache
+            .as_ref()
+            .filter(|cache| cache.frame_id == table.frame.id());
+        let retained = executor.retain(
+            registry,
+            &table.frame,
+            &table.materialized,
+            prior,
+            &selected,
+            self.limits.max_bytes,
+        )?;
+        self.finish_accept(table, policy, selected, retained)
+    }
+
+    /// Compatibility adapter for existing Core callers.  It shares the same
+    /// selection and acceptance path as [`Self::accept_with`], but is limited
+    /// to host columns and therefore never turns resident GPU values into an
+    /// undocumented CPU path.
     pub fn accept(
         &mut self,
         table: &EvidenceTable,
         policy: &SelectionPolicy,
     ) -> SemanticResult<Vec<AcceptedFeature>> {
+        if table.materialized.is_resident() {
+            return Err(SemanticError::Unsupported(
+                "resident materializations require accept_with on their selected backend",
+            ));
+        }
+        if self.backend != GAFIME_BACKEND_CPU {
+            return Err(SemanticError::Unsupported(
+                "non-Core semantic sessions require accept_with",
+            ));
+        }
+        let selected = self.select_for_accept(table, policy)?;
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let registry = self.registry()?;
+        let mut retained = match self
+            .cache
+            .as_ref()
+            .filter(|cache| cache.frame_id == table.frame.id())
+        {
+            Some(cache) => cache.columns()?.clone(),
+            None => BTreeMap::new(),
+        };
+        let source = table.materialized.columns()?;
+        for &feature in &selected {
+            retained.insert(
+                feature,
+                source
+                    .get(&feature)
+                    .ok_or(SemanticError::ForeignIdentity)?
+                    .shared_clone(),
+            );
+        }
+        let retained = MaterializedColumns::from_columns(registry, &table.frame, retained)?;
+        self.finish_accept(table, policy, selected, retained)
+    }
+
+    fn select_for_accept(
+        &self,
+        table: &EvidenceTable,
+        policy: &SelectionPolicy,
+    ) -> SemanticResult<Vec<FeatureId>> {
         self.registry()?;
         if table.owner != self.id {
             return Err(SemanticError::ForeignIdentity);
+        }
+        if table.backend != self.backend || table.materialized.backend_kind() != self.backend {
+            return Err(SemanticError::Invalid(
+                "evidence table backend does not match the selected session backend",
+            ));
         }
         if table.round != self.round {
             return Err(SemanticError::Invalid(
                 "cannot accept evidence from a previous discovery round",
             ));
         }
-        let selected = policy.select(table)?;
-        if selected.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut retained = self
-            .cache
-            .as_ref()
-            .filter(|c| c.frame_id == table.frame.id())
-            .map_or_else(BTreeMap::new, |c| c.columns.clone());
-        for &feature in &selected {
-            retained.insert(feature, table.materialized.get_typed(feature)?.clone());
-        }
-        let retained_bytes = retained
-            .values()
-            .fold(0usize, |sum, column| sum.saturating_add(column.bytes()));
-        if retained_bytes > self.limits.max_retained_bytes {
+        policy.select(table)
+    }
+
+    fn finish_accept(
+        &mut self,
+        table: &EvidenceTable,
+        policy: &SelectionPolicy,
+        selected: Vec<FeatureId>,
+        retained: MaterializedColumns,
+    ) -> SemanticResult<Vec<AcceptedFeature>> {
+        if retained.frame_id != table.frame.id()
+            || retained.profile != table.frame.profile()
+            || retained.backend != self.backend
+            || retained.bytes() > self.limits.max_retained_bytes
+            || selected.iter().any(|&feature| !retained.contains(feature))
+        {
             return Err(SemanticError::Invalid("accepted materialization retention limit exceeded; clear retained values explicitly"));
         }
         let mut accepted = Vec::with_capacity(selected.len());
-        for feature in selected {
+        for &feature in &selected {
             let row = table
                 .candidates
                 .binary_search(&feature)
@@ -547,11 +981,7 @@ impl SemanticSession {
                 evidence: table.records[start..start + table.channels.len()].to_vec(),
             });
         }
-        self.cache = Some(MaterializedColumns {
-            frame_id: table.frame.id(),
-            profile: table.frame.profile(),
-            columns: retained,
-        });
+        self.cache = Some(retained);
         Ok(accepted)
     }
 
@@ -595,21 +1025,26 @@ impl SemanticSession {
         validate_output(
             self.registry()?,
             frame,
+            self.backend,
             &ids,
             &result,
             self.limits.max_bytes - self.retained_bytes(),
         )?;
-        let mut columns = self
-            .cache
-            .as_ref()
-            .map_or_else(BTreeMap::new, |cache| cache.columns.clone());
-        columns.extend(result.columns.clone());
-        let cache = MaterializedColumns {
-            frame_id: frame.id(),
-            profile: frame.profile(),
-            columns,
-        };
-        if cache.bytes() > self.limits.max_retained_bytes {
+        let cache = executor.retain(
+            self.registry()?,
+            frame,
+            &result,
+            self.cache
+                .as_ref()
+                .filter(|cache| cache.frame_id == frame.id()),
+            &ids,
+            self.limits.max_bytes,
+        )?;
+        if cache.frame_id != frame.id()
+            || cache.profile != frame.profile()
+            || cache.backend != self.backend
+            || cache.bytes() > self.limits.max_retained_bytes
+        {
             return Err(SemanticError::Invalid(
                 "accepted inference retention limit exceeded",
             ));
@@ -622,17 +1057,25 @@ impl SemanticSession {
 fn validate_output(
     registry: &CandidateRegistry,
     frame: &FeatureFrame,
+    backend: BackendKind,
     roots: &[FeatureId],
     output: &MaterializedColumns,
     budget: usize,
 ) -> SemanticResult<()> {
-    if output.frame_id != frame.id() || output.profile != frame.profile() || output.bytes() > budget
+    if output.frame_id != frame.id()
+        || output.profile != frame.profile()
+        || output.backend != backend
+        || output.bytes() > budget
     {
         return Err(SemanticError::Invalid("native output context mismatch"));
     }
     for &root in roots {
         registry.program(root)?;
-        output.get_typed(root)?;
+        if !output.contains(root) {
+            return Err(SemanticError::Invalid(
+                "native output omitted a requested feature",
+            ));
+        }
     }
     Ok(())
 }
@@ -751,6 +1194,119 @@ mod tests {
     }
 
     #[test]
+    fn current_round_reuses_active_scope_without_advancing_it() {
+        let registry = CandidateRegistry::new(
+            vec!["a".into()],
+            PrecisionProfile::Mixed,
+            ProgramLimits::default(),
+        )
+        .unwrap();
+        let mut session = SemanticSession::new(registry, GAFIME_BACKEND_CPU, 1024).unwrap();
+        assert!(matches!(
+            session.current_round(),
+            Err(SemanticError::Invalid(_))
+        ));
+        session.begin_round(&[]).unwrap();
+        let first_round = session.round();
+        {
+            let round = session.current_round().unwrap();
+            assert!(round.source(0).is_ok());
+        }
+        assert_eq!(session.round(), first_round);
+        session.close();
+        assert!(matches!(
+            session.current_round(),
+            Err(SemanticError::Closed)
+        ));
+    }
+
+    #[test]
+    fn bounded_proposal_is_deterministic_and_rolls_back_failed_batches() {
+        let registry = CandidateRegistry::new(
+            vec!["a".into(), "b".into(), "c".into()],
+            PrecisionProfile::Mixed,
+            ProgramLimits::default(),
+        )
+        .unwrap();
+        let mut session = SemanticSession::new(registry, GAFIME_BACKEND_CPU, 1024).unwrap();
+        let proposed = {
+            let mut round = session.begin_round(&[]).unwrap();
+            let a = round.source(0).unwrap();
+            let b = round.source(1).unwrap();
+            let c = round.source(2).unwrap();
+            round
+                .propose(
+                    &[
+                        ProposalOperator::AbsoluteDifference,
+                        ProposalOperator::Source,
+                        ProposalOperator::Softsign,
+                    ],
+                    &[c, a, b, a],
+                    16,
+                )
+                .unwrap()
+        };
+        assert_eq!(proposed.len(), 9);
+        let registry = session.registry().unwrap();
+        assert!(matches!(
+            registry.program(proposed[0]).unwrap().op(),
+            FeatureOp::AbsoluteDifference(_, _)
+        ));
+        assert!(matches!(
+            registry.program(proposed[1]).unwrap().op(),
+            FeatureOp::AbsoluteDifference(_, _)
+        ));
+        assert!(matches!(
+            registry.program(proposed[2]).unwrap().op(),
+            FeatureOp::AbsoluteDifference(_, _)
+        ));
+        assert!(matches!(
+            registry.program(proposed[3]).unwrap().op(),
+            FeatureOp::Source(0)
+        ));
+        assert!(matches!(
+            registry.program(proposed[6]).unwrap().op(),
+            FeatureOp::Softsign(_)
+        ));
+        assert_eq!(session.round(), 1);
+
+        let limited = CandidateRegistry::new(
+            vec!["a".into(), "b".into()],
+            PrecisionProfile::Mixed,
+            ProgramLimits {
+                max_nodes: 3,
+                ..ProgramLimits::default()
+            },
+        )
+        .unwrap();
+        let mut limited = SemanticSession::new(limited, GAFIME_BACKEND_CPU, 1024).unwrap();
+        let (a, b) = {
+            let round = limited.begin_round(&[]).unwrap();
+            (round.source(0).unwrap(), round.source(1).unwrap())
+        };
+        assert!(limited
+            .current_round()
+            .unwrap()
+            .propose(&[ProposalOperator::Softsign], &[a, b], 2)
+            .is_err());
+        let recovered = limited
+            .current_round()
+            .unwrap()
+            .propose(&[ProposalOperator::AbsoluteDifference], &[a, b], 1)
+            .unwrap();
+        assert_eq!(recovered.len(), 1, "failed proposal must not retain a node");
+        assert!(limited
+            .current_round()
+            .unwrap()
+            .propose(
+                &[ProposalOperator::Source, ProposalOperator::Source],
+                &[a],
+                1,
+            )
+            .is_err());
+    }
+
+    #[test]
     fn executor_output_cannot_expand_the_admitted_bank_budget() {
         let registry = CandidateRegistry::new(
             vec!["a".into()],
@@ -774,7 +1330,11 @@ mod tests {
             BTreeMap::from([(source, NumericColumn::from(vec![0.0f32, 1.0]))]),
         )
         .unwrap();
-        assert!(validate_output(&registry, &frame, &[source], &output, 7).is_err());
-        assert!(validate_output(&registry, &frame, &[source], &output, 8).is_ok());
+        assert!(
+            validate_output(&registry, &frame, GAFIME_BACKEND_CPU, &[source], &output, 7,).is_err()
+        );
+        assert!(
+            validate_output(&registry, &frame, GAFIME_BACKEND_CPU, &[source], &output, 8,).is_ok()
+        );
     }
 }

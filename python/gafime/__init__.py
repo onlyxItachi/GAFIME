@@ -19,6 +19,7 @@ from .io import GafimeStreamer
 from .reporting import BackendInfo, Decision, DiagnosticReport, InteractionResult
 from .sklearn import GafimeSelector
 from . import subfunctions as subfunctions
+from . import semantic as semantic
 from .tutorial import generate_tutorial
 from .v1_adapter import NativeCompiledGafime
 
@@ -53,4 +54,5 @@ __all__ = [
     "generate_tutorial",
     "require_family_supported",
     "subfunctions",
+    "semantic",
 ]

@@ -129,6 +129,17 @@ Core fp32/mixed/fp64 slice does not add a frozen Python/native ABI or authorize 
 into a v1.0 stabilization branch. Never reinterpret supervised target/metric
 slots as a generic evidence protocol or claim unsupported GPU evidence support.
 
+The additive tabular product milestone is specified separately in
+`docs/v1.1-tabular-semantic-product.md`. `gafime.semantic` is a declaration-only
+Python namespace over that same Rust lifecycle, not another semantic owner.
+Contextual evidence may combine labels, reference features, paired views and
+graphs without a universal scalar quality score. Inputs are immutable owned
+snapshots; accepted programs and evidence/materialization contexts remain
+distinct. Operation-specific capabilities, resource bounds and fail-closed
+behavior govern native lowering. Existing supervised APIs and frozen ABIs
+remain compatible. This mainline milestone authorizes no release-branch change,
+full compiler/frontend, future-domain objective, or release operation.
+
 Candidate stabilization branches use `release/v<canonical-semver>` and may be
 cut only from an exact `main` commit whose required checks are green. Creating
 one is source-control coordination only: it does not change version identity,

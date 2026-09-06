@@ -67,13 +67,19 @@ fn run(profile: PrecisionProfile, workers: usize) -> SemanticResult<()> {
             )?);
             let redundancy = EvidenceChannel::new(
                 "reference".into(),
-                EvidenceDefinition::Redundancy { reference: anchor },
+                EvidenceDefinition::Association {
+                    statistic: AssociationStatistic::Pearson,
+                    context: AssociationContext::Reference { reference: anchor },
+                },
             )?;
             let channels = vec![
                 redundancy.clone(),
                 EvidenceChannel::new(
                     "paired".into(),
-                    EvidenceDefinition::PairedConsistency { view },
+                    EvidenceDefinition::Association {
+                        statistic: AssociationStatistic::Pearson,
+                        context: AssociationContext::PairedView { view },
+                    },
                 )?,
                 EvidenceChannel::new("graph".into(), EvidenceDefinition::GraphEnergy { graph })?,
                 EvidenceChannel::new(

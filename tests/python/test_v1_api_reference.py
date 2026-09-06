@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import fields
+import importlib
 import importlib.util
 import inspect
 import json
 import os
-from pathlib import Path
 import re
 import sys
+from dataclasses import fields
+from pathlib import Path
 from types import ModuleType
-
 
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON_SRC = ROOT / "python"
@@ -21,7 +21,6 @@ if (
     sys.path.insert(0, str(PYTHON_SRC))
 
 import gafime  # noqa: E402
-
 
 GENERATOR_PATH = ROOT / "docs" / "notebooks" / "generate_v1_api_reference.py"
 NOTEBOOK_PATH = ROOT / "docs" / "notebooks" / "gafime_v1_api_reference.ipynb"
@@ -84,11 +83,11 @@ def test_v1_reference_code_cells_compile_and_selected_examples_execute() -> None
         source = "".join(cell["source"])
         compiled = compile(source, f"gafime_v1_api_reference[{index}]", "exec")
         group = cell.get("metadata", {}).get("gafime_test", "syntax")
-        if group in {"core", "sklearn", "polars"}:
+        if group in {"core", "semantic", "sklearn", "polars"}:
             exec(compiled, namespace)
             executed_groups.add(group)
 
-    assert executed_groups == {"core", "sklearn", "polars"}
+    assert executed_groups == {"core", "semantic", "sklearn", "polars"}
 
 
 def test_reference_inventory_matches_top_level_exports_and_coverage() -> None:
@@ -102,6 +101,38 @@ def test_reference_inventory_matches_top_level_exports_and_coverage() -> None:
     for name in generator.TOP_LEVEL_PUBLIC_API:
         assert f"`gafime.{name}`" in notebook_source
         assert f"`gafime.{name}`" in coverage
+
+
+def _semantic_public_members(model: type) -> set[str]:
+    special = {"__arrow_c_array__", "__enter__", "__exit__", "__getitem__", "__len__"}
+    return {name for name in dir(model) if not name.startswith("_") or name in special}
+
+
+def test_semantic_reference_inventory_and_method_coverage_match_native_surface() -> (
+    None
+):
+    generator = _load_generator()
+    semantic = importlib.import_module("gafime.semantic")
+
+    assert gafime.semantic is semantic
+    assert tuple(semantic.__all__) == generator.SEMANTIC_PUBLIC_API
+    assert set(semantic.__all__) == set(generator.SEMANTIC_PUBLIC_API)
+
+    notebook_source = _source_text(_notebook())
+    coverage = COVERAGE_PATH.read_text(encoding="utf-8")
+    for name in generator.SEMANTIC_PUBLIC_API:
+        assert hasattr(semantic, name)
+        assert f"`{name}`" in notebook_source
+        assert f"`{name}`" in coverage
+
+    for model_name, documented in generator.SEMANTIC_METHOD_COVERAGE.items():
+        model = getattr(semantic, model_name)
+        assert _semantic_public_members(model) == set(documented)
+        for member in documented:
+            assert any(
+                token in notebook_source
+                for token in (f"`{member}`", f".{member}", f"{member}(")
+            ), f"semantic reference omits {model_name}.{member}"
 
 
 def test_reference_covers_all_configuration_and_result_fields() -> None:
@@ -306,6 +337,8 @@ def test_public_python_symbols_have_authored_source_docstrings() -> None:
         (ROOT / "python" / "gafime" / "subfunctions.py").read_text(encoding="utf-8")
     )
     assert ast.get_docstring(subfunctions)
+    semantic = ast.parse((ROOT / "python" / "gafime" / "semantic.py").read_text())
+    assert ast.get_docstring(semantic)
 
 
 _MARKDOWN_LINK = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -327,6 +360,9 @@ def test_documentation_hierarchy_and_local_links_are_valid() -> None:
     }
     for path, required in hierarchy.items():
         assert required in path.read_text(encoding="utf-8")
+
+    docs_index = (ROOT / "docs" / "README.md").read_text(encoding="utf-8")
+    assert "v1.1-tabular-semantic-product.md" in docs_index
 
     markdown_sources = {
         ROOT / "README.md": (ROOT / "README.md").read_text(encoding="utf-8"),
@@ -370,5 +406,10 @@ def test_reference_records_current_non_api_boundaries() -> None:
         "validated at construction and through `set_params()`",
         "validated before the reader evaluates the source row count",
         "validated before the file is opened",
+        "Core-only development namespace",
+        "not a universal quality score",
+        "not a weighted score or Pareto optimizer",
+        "No Python feature-computation loop",
+        "Cross-session/stale handles",
     ):
         assert required in source

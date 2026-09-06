@@ -749,7 +749,7 @@ mod tests {
 /// empty no-op stream so the capsule destructor doesn't double-release; arrow-rs
 /// owns the rest of the FFI lifecycle. Callers should `.rechunk()` so the frame
 /// arrives as one record batch.
-fn import_arrow_struct(obj: &Bound<'_, PyAny>) -> PyResult<StructArray> {
+pub(crate) fn import_arrow_struct(obj: &Bound<'_, PyAny>) -> PyResult<StructArray> {
     let capsule = obj.call_method0("__arrow_c_stream__")?;
     let cap: Bound<'_, PyCapsule> = capsule.extract()?;
     let ptr = cap
@@ -765,6 +765,13 @@ fn import_arrow_struct(obj: &Bound<'_, PyAny>) -> PyResult<StructArray> {
     let mut batches = Vec::new();
     for batch in reader {
         batches.push(batch.map_err(|err| PyValueError::new_err(format!("arrow batch: {err}")))?);
+        // One batch is the contracted ingest surface. Do not drain an
+        // arbitrarily large stream merely to discover that it is unsupported.
+        if batches.len() > 1 {
+            return Err(PyValueError::new_err(
+                "multi-chunk Arrow input; call .rechunk() before ingest",
+            ));
+        }
     }
     if batches.is_empty() {
         return Err(PyValueError::new_err("empty Arrow stream"));
