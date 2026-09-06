@@ -803,10 +803,10 @@ fn backend_context_identity_and_closed_sessions_fail_closed() {
         ProgramLimits::default(),
     )
     .unwrap();
-    assert!(matches!(
-        SemanticSession::new(registry, GAFIME_BACKEND_CUDA, EXECUTION_BUDGET),
-        Err(SemanticError::Unsupported(_))
-    ));
+    // A declared backend is not proof of an executable lowering. The common
+    // lifecycle may represent CUDA, but a Core executor must never satisfy it.
+    let mut gpu_session =
+        SemanticSession::new(registry, GAFIME_BACKEND_CUDA, EXECUTION_BUDGET).unwrap();
 
     let input = frame(
         &schema,
@@ -821,6 +821,19 @@ fn backend_context_identity_and_closed_sessions_fail_closed() {
     let mut semantic = session(&schema);
     let candidate = semantic.registry().unwrap().source(0).unwrap();
     let mut executor = CoreEvidenceExecutor::default();
+    let gpu_candidate = gpu_session.begin_round(&[]).unwrap().source(0).unwrap();
+    let gpu_channel =
+        EvidenceChannel::new("reference".to_owned(), pearson_reference(gpu_candidate)).unwrap();
+    assert!(matches!(
+        gpu_session.evaluate(
+            &mut executor,
+            Arc::clone(&input),
+            &[gpu_candidate],
+            &[gpu_channel]
+        ),
+        Err(SemanticError::Invalid(_))
+    ));
+    assert_eq!(executor.materialized_nodes(), 0);
 
     let misaligned_rows = frame(
         &schema,

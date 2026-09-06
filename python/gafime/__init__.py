@@ -19,12 +19,28 @@ from .io import GafimeStreamer
 from .reporting import BackendInfo, Decision, DiagnosticReport, InteractionResult
 from .sklearn import GafimeSelector
 from . import subfunctions as subfunctions
-from . import semantic as semantic
 from .tutorial import generate_tutorial
 from .v1_adapter import NativeCompiledGafime
 
 CompiledGafime = NativeCompiledGafime
 compile = _compile
+
+
+def __getattr__(name: str):
+    # Existing declaration/import workflows may run before the native extension
+    # is built. Only an explicit semantic request requires its native classes;
+    # do not break unrelated legacy imports or install diagnostics at import time.
+    if name == "semantic":
+        from importlib import import_module
+
+        module = import_module(".semantic", __name__)
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | {"semantic"})
 
 __all__ = [
     "BackendInfo",

@@ -772,8 +772,20 @@ def check_semantic_public_reexport_boundary() -> None:
     package_source = (ROOT / "python" / "gafime" / "__init__.py").read_text(
         encoding="utf-8"
     )
-    assert "from . import semantic as semantic" in package_source, (
-        "top-level package must expose only the semantic module namespace"
+    assert "from . import semantic as semantic" not in package_source, (
+        "top-level import must not eagerly require the native semantic boundary"
+    )
+    assert 'if name == "semantic":' in package_source, (
+        "top-level package must lazily expose the semantic module namespace"
+    )
+    assert 'import_module(".semantic", __name__)' in package_source, (
+        "semantic namespace must resolve through its one native re-export module"
+    )
+    assert 'globals()[name] = module' in package_source, (
+        "lazy semantic namespace must cache only the resolved module"
+    )
+    assert 'return sorted(set(globals()) | {"semantic"})' in package_source, (
+        "semantic namespace must remain discoverable without importing its extension"
     )
     assert "from .semantic import" not in package_source, (
         "semantic handle classes must remain module-scoped rather than top-level"

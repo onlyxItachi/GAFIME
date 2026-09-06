@@ -74,6 +74,13 @@ os.environ["GAFIME_V1_BOUNDARY_MODULE"] = boundary.__name__
 
 import gafime
 
+# The source-only compatibility path intentionally has only the fake legacy
+# boundary above.  `gafime.semantic` must therefore be discoverable without
+# eagerly importing its real PyO3 extension.
+assert "semantic" in gafime.__all__
+assert "semantic" in dir(gafime)
+assert "semantic" not in vars(gafime)
+
 
 class FrameLike:
     columns = ["a", "b"]
