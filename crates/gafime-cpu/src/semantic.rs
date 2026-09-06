@@ -16,7 +16,8 @@ use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CPU};
 use rayon::prelude::*;
 
 use crate::kernels::precision::{
-    multiply_centered_into_f32, multiply_centered_into_f64, pearson_f32, pearson_f64, pearson_mixed,
+    multiply_centered_into_f32, multiply_centered_into_f64, pearson_f32_checked,
+    pearson_f64_checked, pearson_mixed_checked,
 };
 
 const MAX_NATIVE_BYTES: usize = 512 * 1024 * 1024;
@@ -523,11 +524,16 @@ fn correlation_f32(left: &[f32], right: &[f32], absolute: bool) -> (EvidenceValu
             false,
         );
     }
-    let value = pearson_f32(left, right);
-    (
-        EvidenceValue::measured_f32(if absolute { value.abs() } else { value }, left.len()),
-        true,
-    )
+    match pearson_f32_checked(left, right) {
+        Some(value) => (
+            EvidenceValue::measured_f32(if absolute { value.abs() } else { value }, left.len()),
+            true,
+        ),
+        None => (
+            unavailable(UnavailableReason::DegenerateReduction, left.len()),
+            true,
+        ),
+    }
 }
 
 fn correlation_mixed(left: &[f32], right: &[f32], absolute: bool) -> (EvidenceValue, bool) {
@@ -552,11 +558,16 @@ fn correlation_mixed(left: &[f32], right: &[f32], absolute: bool) -> (EvidenceVa
             false,
         );
     }
-    let value = pearson_mixed(left, right);
-    (
-        EvidenceValue::measured(if absolute { value.abs() } else { value }, left.len()),
-        true,
-    )
+    match pearson_mixed_checked(left, right) {
+        Some(value) => (
+            EvidenceValue::measured(if absolute { value.abs() } else { value }, left.len()),
+            true,
+        ),
+        None => (
+            unavailable(UnavailableReason::DegenerateReduction, left.len()),
+            true,
+        ),
+    }
 }
 
 fn correlation_f64(left: &[f64], right: &[f64], absolute: bool) -> (EvidenceValue, bool) {
@@ -581,11 +592,16 @@ fn correlation_f64(left: &[f64], right: &[f64], absolute: bool) -> (EvidenceValu
             false,
         );
     }
-    let value = pearson_f64(left, right);
-    (
-        EvidenceValue::measured(if absolute { value.abs() } else { value }, left.len()),
-        true,
-    )
+    match pearson_f64_checked(left, right) {
+        Some(value) => (
+            EvidenceValue::measured(if absolute { value.abs() } else { value }, left.len()),
+            true,
+        ),
+        None => (
+            unavailable(UnavailableReason::DegenerateReduction, left.len()),
+            true,
+        ),
+    }
 }
 
 fn labeled_association(
@@ -804,6 +820,12 @@ fn graph_energy_mixed(
         numerator += weight * (left - right) * (left - right);
         denominator += weight * (left * left + right * right);
     }
+    if !numerator.is_finite() || !denominator.is_finite() {
+        return Ok((
+            unavailable(UnavailableReason::NonFiniteReduction, graph.edges().len()),
+            true,
+        ));
+    }
     Ok((
         EvidenceValue::measured(numerator / denominator, graph.edges().len()),
         true,
@@ -844,6 +866,12 @@ fn graph_energy_f64(
         numerator += weight * (left - right) * (left - right);
         denominator += weight * (left * left + right * right);
     }
+    if !numerator.is_finite() || !denominator.is_finite() {
+        return Ok((
+            unavailable(UnavailableReason::NonFiniteReduction, graph.edges().len()),
+            true,
+        ));
+    }
     Ok((
         EvidenceValue::measured(numerator / denominator, graph.edges().len()),
         true,
@@ -883,6 +911,12 @@ fn graph_energy_ordered_f32(
             .ok_or(SemanticError::Invalid("graph endpoint out of bounds"))?;
         numerator += weight * (left - right) * (left - right);
         denominator += weight * (left * left + right * right);
+    }
+    if !numerator.is_finite() || !denominator.is_finite() {
+        return Ok((
+            unavailable(UnavailableReason::NonFiniteReduction, graph.edges().len()),
+            true,
+        ));
     }
     Ok((
         EvidenceValue::measured_f32(numerator / denominator, graph.edges().len()),

@@ -165,6 +165,7 @@ pub enum UnavailableReason {
     MissingLabels,
     InsufficientSupport,
     ConstantOperand,
+    DegenerateReduction,
     NonFiniteReduction,
 }
 

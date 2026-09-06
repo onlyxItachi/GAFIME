@@ -511,6 +511,12 @@ pub fn pearson_f32(x: &[f32], y: &[f32]) -> f32 {
     crate::simd::pearson_corr_f32(x, y)
 }
 
+/// Internal definedness-aware companion to pearson_f32. It reuses the exact
+/// same f32 moment reduction without changing legacy public zero output.
+pub(crate) fn pearson_f32_checked(x: &[f32], y: &[f32]) -> Option<f32> {
+    crate::simd::pearson_corr_f32_checked(x, y)
+}
+
 /// Mixed Pearson uses binary32 inputs and interactions, then widens exactly at
 /// the reduction boundary and keeps the binary64 result public.
 pub fn pearson_mixed(x: &[f32], y: &[f32]) -> f64 {
@@ -521,10 +527,44 @@ pub fn pearson_mixed(x: &[f32], y: &[f32]) -> f64 {
     crate::simd::finalize_correlation_f64(sums.sxx, sums.syy, sums.sxy)
 }
 
+/// Internal definedness-aware companion to pearson_mixed. The mixed route
+/// keeps its existing f32-to-f64 SIMD sums and f64 finalizer.
+pub(crate) fn pearson_mixed_checked(x: &[f32], y: &[f32]) -> Option<f64> {
+    let sums = crate::simd::pearson_sums(x, y);
+    if sums.n == 0 {
+        return None;
+    }
+    if !sums.sxx.is_finite()
+        || !sums.syy.is_finite()
+        || !sums.sxy.is_finite()
+        || sums.sxx < 0.0
+        || sums.syy < 0.0
+    {
+        return Some(crate::simd::finalize_correlation_f64(
+            sums.sxx, sums.syy, sums.sxy,
+        ));
+    }
+    if sums.sxx == 0.0 || sums.syy == 0.0 {
+        return None;
+    }
+    let product = sums.sxx * sums.syy;
+    if product == 0.0 {
+        return None;
+    }
+    let value = crate::simd::finalize_correlation_f64(sums.sxx, sums.syy, sums.sxy);
+    Some(value)
+}
+
 /// Full fp64 Pearson with no f32 conversion on any numeric input, intermediate,
 /// or result path. The Core SIMD dispatch loads and reduces f64 lanes directly.
 pub fn pearson_f64(x: &[f64], y: &[f64]) -> f64 {
     crate::simd::pearson_corr_f64(x, y)
+}
+
+/// Internal definedness-aware companion to pearson_f64. It reuses the exact
+/// same f64 moment reduction without changing legacy public zero output.
+pub(crate) fn pearson_f64_checked(x: &[f64], y: &[f64]) -> Option<f64> {
+    crate::simd::pearson_corr_f64_checked(x, y)
 }
 
 pub fn spearman_f32(x: &[f32], y: &[f32]) -> f32 {

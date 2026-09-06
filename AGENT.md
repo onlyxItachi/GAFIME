@@ -161,7 +161,7 @@ Do not merge, fast-forward, force-push, or otherwise land work on `main` while a
 Mainline v1.1 semantic development follows
 `docs/v1.1-semantic-evidence-spine.md`: Rust owns candidate/dependency/evidence/
 selection identity, while native engines own arithmetic. The bounded internal
-Core/mixed slice does not add a frozen Python/native ABI or authorize promotion
+Core fp32/mixed/fp64 slice does not add a frozen Python/native ABI or authorize promotion
 into a v1.0 stabilization branch. Never reinterpret supervised target/metric
 slots as a generic evidence protocol or claim unsupported GPU evidence support.
 

@@ -11,7 +11,7 @@ selection and acceptance; native Core owns its arithmetic. Semantic identities
 must not be substituted with execution ordinals, target slots or metric IDs.
 Evidence and accepted values remain context-bound; accepted program identity is
 independent of its scores. Unsupported backend/profile/evidence requests fail
-closed. This first internal slice is explicit Core/mixed only, with no change to
+closed. This bounded internal slice supports explicit Core fp32/mixed/fp64, with no change to
 the existing supervised backend/profile contract or release-branch scope.
 
 ## Repository Layout
