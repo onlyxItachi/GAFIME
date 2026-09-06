@@ -5,3 +5,7 @@
 mod probe;
 #[path = "../examples/issue73_probe/tests.rs"]
 mod tests;
+
+#[allow(dead_code)] // Shared standalone experiment module; no product API.
+#[path = "../../../tests/release_measure/issue73_candidates.rs"]
+mod candidate_bank_tests;

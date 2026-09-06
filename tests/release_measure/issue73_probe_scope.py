@@ -13,7 +13,6 @@ import json
 import subprocess
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 PROBE = "crates/gafime-cpu/examples/issue73_probe/"
 GROUPS = {
@@ -24,6 +23,14 @@ GROUPS = {
     ],
     "accounting_tool": ["tests/release_measure/issue73_probe_scope.py"],
     "design_record": ["docs/issue-73-native-evidence-feasibility.md"],
+    "native_expansion_and_validation": [
+        "tests/release_measure/issue73_candidates.rs",
+        "tests/release_measure/issue73_gpu_reuse.rs",
+        "tests/release_measure/issue73_quality_cuda.rs",
+        "crates/gafime-gpu-sys/tests/issue73_reuse.rs",
+    ],
+    "local_evidence_runner": ["tests/release_measure/run_issue73_quality_cuda.py"],
+    "cuda_quality_design": ["docs/issue-73-cuda-quality-experiment.md"],
 }
 ALLOWED = {path for paths in GROUPS.values() for path in paths} | {"docs/README.md"}
 
@@ -75,7 +82,9 @@ def main() -> None:
                 "base_sha": base,
                 "head_sha": git("rev-parse", "HEAD"),
                 "working_tree_dirty": bool(git("status", "--porcelain")),
-                "scope": "nonshipping Core mixed evidence experiment",
+                "scope": (
+                    "nonshipping mixed evidence and existing Core/CUDA scorer reuse"
+                ),
                 "shipping_runtime_abi_dependency_version_files_unchanged": True,
                 "changed_files": sorted(changed),
                 "files": files,

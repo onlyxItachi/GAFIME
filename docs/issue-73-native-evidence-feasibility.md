@@ -4,6 +4,10 @@ Status: **branch-only design experiment; not a supported public API or a
 release feature**. This does not complete [#73](https://github.com/onlyxItachi/GAFIME/issues/73)
 or activate [#72](https://github.com/onlyxItachi/GAFIME/issues/72).
 
+This document retains the first Core-only checkpoint. The separately authorized
+[quality and CUDA-reuse extension](issue-73-cuda-quality-experiment.md) records
+later scope, source cost and local evidence without rewriting that checkpoint.
+
 The maintainer authorized this bounded experiment on 2026-09-06 in advance of
 the full #73 specification. The authorization and its limits are recorded in
 [the issue](https://github.com/onlyxItachi/GAFIME/issues/73#issuecomment-5559795172).
