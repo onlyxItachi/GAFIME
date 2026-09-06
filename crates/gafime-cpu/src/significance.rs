@@ -22,12 +22,10 @@ use rayon::prelude::*;
 
 use gafime_orchestrator::{
     plan::{
-        combos::{
-            legacy_higher_feature_order, legacy_higher_feature_order_f64,
-            legacy_unary_feature_order, select_adaptive_mi_bins_for_backend,
-        },
+        combos::{legacy_unary_feature_order, select_adaptive_mi_bins_for_backend},
         DescriptorBatchSource, DEFAULT_DESCRIPTOR_BATCH_WORDS,
     },
+    semantic::supervised::SupervisedStrengths,
     CompiledPlan, OrchestratorError, OrchestratorResult,
 };
 use gafime_types::{BackendKind, PrecisionProfile, GAFIME_BACKEND_CPU, GAFIME_FAMILY_CONTINUOUS};
@@ -4115,6 +4113,30 @@ fn precision_screening_strength_f64(scores: &[f64], metrics: &[MetricKernel]) ->
         .fold(f64::NEG_INFINITY, f64::max)
 }
 
+/// Apply the canonical supervised shortlist ordering to strengths that this
+/// significance path has already reduced.  The reducers above intentionally
+/// remain local: in particular, the fp64 path maps nonfinite scores to
+/// negative infinity before its maximum, unlike public unary-screening
+/// compatibility reduction.
+fn canonical_higher_feature_order(
+    mut strengths: SupervisedStrengths,
+    search: &AdaptiveSearchSpec<'_>,
+    backend_kind: BackendKind,
+) -> Vec<u32> {
+    if backend_kind == GAFIME_BACKEND_CPU {
+        // Published Core inserted scheduler results by ascending feature ID,
+        // while GPU mappings retained unary-plan order. Stable score sorting
+        // therefore uses this order only as the Core tie-break contract.
+        strengths.sort_by_feature();
+    }
+    strengths.higher_feature_order(
+        search.candidate_feature_count,
+        search.max_combinations_per_arity,
+        search.top_features_for_higher_arity,
+        search.planning_seed_words,
+    )
+}
+
 fn adaptive_precision_maxima_f32(
     matrix: &CpuPrecisionMatrix,
     shuffled: &[f32],
@@ -4142,17 +4164,10 @@ fn adaptive_precision_maxima_f32(
         update_precision_max_f32(&mut maxima, scores, metrics);
         unary_strengths.push((feature, screening_strength(scores, metrics)));
     }
-    if params.backend_kind == GAFIME_BACKEND_CPU {
-        // Preserve established stable score ties on Core before the structural
-        // scheduling shuffle selects the higher-order input order.
-        unary_strengths.sort_by_key(|(feature, _)| *feature);
-    }
-    let higher_features = legacy_higher_feature_order(
-        search.candidate_feature_count,
-        search.max_combinations_per_arity,
-        search.top_features_for_higher_arity,
-        search.planning_seed_words,
-        &unary_strengths,
+    let higher_features = canonical_higher_feature_order(
+        SupervisedStrengths::F32(unary_strengths),
+        search,
+        params.backend_kind,
     );
     let max_arity = search.max_arity.min(search.candidate_feature_count) as usize;
     for arity in 2..=max_arity {
@@ -4212,15 +4227,10 @@ fn adaptive_precision_maxima_mixed(
         update_precision_max_f64(&mut maxima, scores, metrics);
         unary_strengths.push((feature, precision_screening_strength_f64(scores, metrics)));
     }
-    if params.backend_kind == GAFIME_BACKEND_CPU {
-        unary_strengths.sort_by_key(|(feature, _)| *feature);
-    }
-    let higher_features = legacy_higher_feature_order_f64(
-        search.candidate_feature_count,
-        search.max_combinations_per_arity,
-        search.top_features_for_higher_arity,
-        search.planning_seed_words,
-        &unary_strengths,
+    let higher_features = canonical_higher_feature_order(
+        SupervisedStrengths::F64(unary_strengths),
+        search,
+        params.backend_kind,
     );
     let max_arity = search.max_arity.min(search.candidate_feature_count) as usize;
     for arity in 2..=max_arity {
@@ -4280,15 +4290,10 @@ fn adaptive_precision_maxima_f64(
         update_precision_max_f64(&mut maxima, scores, metrics);
         unary_strengths.push((feature, precision_screening_strength_f64(scores, metrics)));
     }
-    if params.backend_kind == GAFIME_BACKEND_CPU {
-        unary_strengths.sort_by_key(|(feature, _)| *feature);
-    }
-    let higher_features = legacy_higher_feature_order_f64(
-        search.candidate_feature_count,
-        search.max_combinations_per_arity,
-        search.top_features_for_higher_arity,
-        search.planning_seed_words,
-        &unary_strengths,
+    let higher_features = canonical_higher_feature_order(
+        SupervisedStrengths::F64(unary_strengths),
+        search,
+        params.backend_kind,
     );
     let max_arity = search.max_arity.min(search.candidate_feature_count) as usize;
     for arity in 2..=max_arity {
@@ -4483,16 +4488,10 @@ fn adaptive_permutation_maxima(
         update_permutation_max(&mut maxima, &score_scratch, metrics);
         unary_strengths.push((feature, screening_strength(&score_scratch, metrics)));
     }
-    if backend_kind == GAFIME_BACKEND_CPU {
-        // Match observed Core insertion order before the stable score sort.
-        unary_strengths.sort_by_key(|(feature, _)| *feature);
-    }
-    let higher_features = legacy_higher_feature_order(
-        search.candidate_feature_count,
-        search.max_combinations_per_arity,
-        search.top_features_for_higher_arity,
-        search.planning_seed_words,
-        &unary_strengths,
+    let higher_features = canonical_higher_feature_order(
+        SupervisedStrengths::F32(unary_strengths),
+        &search,
+        backend_kind,
     );
 
     let max_arity = search.max_arity.min(search.candidate_feature_count) as usize;
@@ -4718,6 +4717,39 @@ mod tests {
             backend_kind: GAFIME_BACKEND_CPU,
             mi_approximate: true,
         }
+    }
+
+    #[test]
+    fn adaptive_shortlist_keeps_producer_order_and_existing_fp64_reduction() {
+        let search = AdaptiveSearchSpec {
+            unary_features: &[0, 1, 2, 3],
+            candidate_feature_count: 4,
+            max_arity: 2,
+            max_combinations_per_arity: 10,
+            top_features_for_higher_arity: 3,
+            planning_seed_words: &[7],
+        };
+        let producer_order = vec![(3, 1.0), (2, 1.0), (1, 1.0), (0, 1.0)];
+
+        let core = canonical_higher_feature_order(
+            SupervisedStrengths::F32(producer_order.clone()),
+            &search,
+            GAFIME_BACKEND_CPU,
+        );
+        let cuda = canonical_higher_feature_order(
+            SupervisedStrengths::F32(producer_order),
+            &search,
+            GAFIME_BACKEND_CUDA,
+        );
+        assert_eq!(core, vec![2, 0, 1]);
+        assert_eq!(cuda, vec![1, 3, 2]);
+
+        // This path intentionally retains its pre-existing nonfinite reducer;
+        // only its final ordering migrated to SupervisedStrengths.
+        assert_eq!(
+            precision_screening_strength_f64(&[f64::NAN], &[MetricKernel::Pearson]),
+            f64::NEG_INFINITY
+        );
     }
 
     fn precision_parity_data(rows: usize, cols: usize) -> (Vec<f32>, Vec<f32>) {

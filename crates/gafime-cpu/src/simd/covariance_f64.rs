@@ -25,6 +25,32 @@ impl PearsonMomentsF64 {
         }
         finalize_correlation_f64(self.variance_x, self.variance_y, self.covariance)
     }
+
+    /// Preserve the reduction's numeric result while exposing whether its
+    /// binary64 normalization is defined. None means zero or underflowed
+    /// normalization; Some(NaN) preserves an arithmetic failure.
+    #[inline]
+    fn finish_checked(self) -> Option<f64> {
+        if self.n == 0 {
+            return None;
+        }
+        if !self.variance_x.is_finite()
+            || !self.variance_y.is_finite()
+            || !self.covariance.is_finite()
+            || self.variance_x < 0.0
+            || self.variance_y < 0.0
+        {
+            return Some(self.finish());
+        }
+        if self.variance_x == 0.0 || self.variance_y == 0.0 {
+            return None;
+        }
+        let product = self.variance_x * self.variance_y;
+        if product == 0.0 {
+            return None;
+        }
+        Some(self.finish())
+    }
 }
 
 /// Computes Pearson correlation entirely in binary64 arithmetic.
@@ -35,6 +61,14 @@ impl PearsonMomentsF64 {
 #[inline]
 pub fn pearson_corr_f64(x: &[f64], y: &[f64]) -> f64 {
     pearson_moments_f64(x, y).finish()
+}
+
+/// Crate-internal Pearson result preserving definedness from the same f64
+/// moments used by pearson_corr_f64. Public callers retain legacy zero
+/// behavior for a zero variance.
+#[inline]
+pub(crate) fn pearson_corr_f64_checked(x: &[f64], y: &[f64]) -> Option<f64> {
+    pearson_moments_f64(x, y).finish_checked()
 }
 
 #[inline]
