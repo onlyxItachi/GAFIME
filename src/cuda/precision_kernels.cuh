@@ -12,6 +12,7 @@
 
 #include "cuda_api.hpp"
 #include "kernels.cuh"
+#include "../common/gafime_semantic_primitives_abi.hpp"
 
 namespace gafime_cuda_v1 {
 
@@ -194,6 +195,93 @@ const CudaPrecisionKernelSet* cuda_precision_kernel_set(GafimePrecisionProfile p
 
 // Internal ABI 1.0 adapter set. This is not a fourth public profile.
 const CudaPrecisionKernelSet* cuda_legacy_kernel_set();
+
+/* Compiler-owned typed arithmetic used by the optional resident semantic
+ * table.  This intentionally does not carry target pointers, metric IDs,
+ * evidence IDs, or selection state. */
+struct CudaSemanticKernelSet {
+    size_t storage_bytes;
+    size_t accumulation_bytes;
+    size_t result_bytes;
+
+    cudaError_t (*absolute_difference)(
+        void* columns,
+        uint64_t rows,
+        uint32_t left_slot,
+        uint32_t right_slot,
+        uint32_t output_slot,
+        const CudaKernelLaunchPolicy& launch_policy,
+        cudaStream_t stream
+    );
+    cudaError_t (*softsign)(
+        void* columns,
+        uint64_t rows,
+        uint32_t input_slot,
+        uint32_t output_slot,
+        const CudaKernelLaunchPolicy& launch_policy,
+        cudaStream_t stream
+    );
+    cudaError_t (*centered_product)(
+        void* columns,
+        uint64_t rows,
+        const uint32_t* operand_slots,
+        const uint64_t* mean_bits,
+        uint32_t operand_count,
+        uint32_t output_slot,
+        const CudaKernelLaunchPolicy& launch_policy,
+        cudaStream_t stream
+    );
+    cudaError_t (*reject_nonfinite_output)(
+        const void* columns,
+        uint64_t rows,
+        uint32_t slot,
+        uint32_t* nonfinite_out,
+        const CudaKernelLaunchPolicy& launch_policy,
+        cudaStream_t stream
+    );
+    cudaError_t (*pairwise_pearson)(
+        const void* left_columns,
+        const void* right_columns,
+        uint64_t rows,
+        const uint32_t* left_slots,
+        const uint32_t* right_slots,
+        uint64_t pair_count,
+        uint32_t mode,
+        void* values,
+        uint32_t* states,
+        uint64_t* supports,
+        const CudaKernelLaunchPolicy& launch_policy,
+        cudaStream_t stream
+    );
+    cudaError_t (*ordered_edge_energy)(
+        const void* columns,
+        uint64_t rows,
+        const uint32_t* candidate_slots,
+        uint64_t candidate_count,
+        const GafimeSemanticEdge* edges,
+        const void* weights,
+        uint64_t edge_count,
+        void* values,
+        uint32_t* states,
+        uint64_t* supports,
+        const CudaKernelLaunchPolicy& launch_policy,
+        cudaStream_t stream
+    );
+    cudaError_t (*sparse_gather)(
+        const void* source_columns,
+        uint64_t source_rows,
+        void* destination_columns,
+        uint64_t destination_rows,
+        const uint32_t* source_slots,
+        const uint32_t* destination_slots,
+        uint64_t slot_count,
+        const uint64_t* row_indices,
+        const CudaKernelLaunchPolicy& launch_policy,
+        cudaStream_t stream
+    );
+};
+
+const CudaSemanticKernelSet* cuda_semantic_kernel_set(GafimePrecisionProfile profile);
 
 }  // namespace gafime_cuda_v1
 

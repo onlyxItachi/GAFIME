@@ -36,6 +36,7 @@ mod loader_abi_lifecycle;
 mod local_cmake_experiment;
 mod metal;
 mod rocm;
+mod semantic;
 
 #[test]
 #[allow(clippy::type_complexity)]

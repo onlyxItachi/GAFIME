@@ -43,6 +43,41 @@ gafime --check --backend cuda --precision fp64
 The latter exits nonzero when CUDA is unavailable. Core-only installations work
 with `--backend core` or with `--backend auto` when auto resolves to Core.
 
+## Tabular semantic capability record
+
+`gafime.semantic.TabularSession.capabilities` is a separate, more narrowly
+scoped record than `backend_capabilities()`. It describes the operation/context
+vocabulary admitted by a bounded semantic session; it is not a generic backend
+probe and does not make a physical-execution claim.
+
+| Requested backend | Selected semantic route | Vocabulary boundary |
+|---|---|---|
+| `core` | Core | Complete current tabular vocabulary: four programs, all three profiles, Pearson/Spearman/fixed corrected NMI/graph energy and all declared contexts |
+| `auto` | Core | Core is selected deliberately because the accelerator subset is not the complete vocabulary |
+| `cuda` / `rocm` | Explicit GPU only | Requires a loaded complete optional semantic primitive table and a Rust lowering for the selected profile/operation/context; reports their runtime intersection |
+| `metal` | None | Explicitly unsupported for the tabular semantic product |
+
+The current CUDA/ROCm lowering may admit the four program operations plus
+Pearson reference/paired measurements, sparse partial labels, and graph energy
+when the negotiated capability bits allow each one. It intentionally does not
+admit Spearman or fixed corrected NMI. A missing, old, partial, or insufficient
+payload is an explicit request failure, never a Core fallback.
+
+For GPU semantic sessions, `diagnostics` contains only the selected backend,
+retained bytes, and `native_work_counters_available=False`; no timing, kernel
+counter, occupancy, or cache-performance measurement is synthesized. CUDA and
+ROCm installed-payload lifecycle/parity validation has completed for the named
+configurations: CUDA device 0 on an RTX 4060 Laptop (`sm89`, driver
+`610.57.04`) passed 29/29 hardware-conditional public cases; ROCm device 0 on
+AMD Radeon Graphics (`gfx1150`, runtime `70253211`, system LLVM `21.1.8`)
+also passed 29/29. The frozen legacy C ABI CMake fixtures separately passed
+CUDA 11/11 and ROCm 10/10. This is configuration-specific correctness evidence,
+not a performance, timing, counter, occupancy, cache, or general hardware-
+availability claim. See
+[optional tabular semantic primitive ABI](semantic-primitives-abi.md) for the
+separate table contract; it does not alter the frozen ABI 1.0 or standard
+numeric-route ABI 1.1 contracts below.
+
 ## Family Placement
 
 | Family | Generation placement | Scoring placement | Graph scope | Significance support |

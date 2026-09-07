@@ -36,6 +36,8 @@ documents that own each subject.
   candidate/evidence semantics and staged migration boundary.
 - [v1.1 tabular semantic product](v1.1-tabular-semantic-product.md) — the
   bounded public `gafime.semantic` lifecycle and its explicit support limits.
+- [Optional tabular semantic primitive ABI](semantic-primitives-abi.md) — the
+  separate accelerator primitive-table boundary and validation status.
 
 ## Build and Contribution
 

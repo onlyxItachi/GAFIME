@@ -1522,29 +1522,42 @@ def _cells() -> list:
             """
             ### `gafime.semantic`: bounded tabular lifecycle
 
-            `gafime.semantic` is an additive, Core-only development namespace for
-            an explicit candidate/evidence/selection lifecycle. It is separate from
-            `GafimeEngine.analyze()` and `compile()`: it does not inherit legacy
-            metrics, candidate-family, significance, ranking, or budget defaults.
-            `EngineConfig` contributes only `backend`, `device_id`, and `precision`;
-            a non-default unrelated field is rejected rather than silently changing
-            semantic behavior. Backend intent is normalized once: `cpu`, `rust`,
-            and `v1-rust-cpu` select Core, while `hip` normalizes to ROCm. Today
-            `core` and `auto` execute on Core; CUDA, ROCm,
-            Metal and asynchronous scheduling are not semantic product capabilities.
-            No Python feature-computation loop is admitted.
+            `gafime.semantic` is an additive Rust-owned namespace for an explicit
+            candidate/evidence/selection lifecycle. Core supplies the complete
+            current vocabulary. Explicit CUDA/ROCm sessions can instead negotiate
+            a deliberately smaller runtime intersection from a complete optional
+            semantic primitive table and the installed Rust lowering; they never
+            silently substitute Core. The executable reference stays on Core and
+            makes no physical accelerator-execution claim. Metal is explicitly
+            unsupported for this product, and `auto` deliberately selects Core for
+            the complete vocabulary.
 
-            `TabularSession.capabilities` is an operation-specific static record:
-            it preserves the configured `device_id` as `configured_device_id` and
-            reports `selected_device_id=None` for Core, then lists the supported
-            program/evidence vocabulary and explains why Core, rather than a legacy
-            supervised GPU route, was selected. It is not a GPU probe or
-            physical-execution record. `diagnostics` reports
-            completed native materialization/evidence counters and retained bytes;
-            it is neither an elapsed-time claim nor a modeled cache/RSS account.
-            `describe(candidate)` exposes bounded program metadata and opaque
-            operand handles for inspection, not a serializable candidate IR or
-            native launch descriptor.
+            Separately, the installed-payload semantic lifecycle/parity suite passed
+            29/29 hardware-conditional public cases on CUDA device 0 / RTX 4060
+            Laptop (`sm89`, driver `610.57.04`) and 29/29 on ROCm device 0 / AMD
+            Radeon Graphics (`gfx1150`, runtime `70253211`, system LLVM `21.1.8`).
+            Frozen legacy C ABI CMake fixtures separately passed CUDA 11/11 and
+            ROCm 10/10. This is configuration-specific correctness evidence, not a
+            performance, timing, counter, or general hardware-availability claim;
+            the Core-only executable reference itself still proves no GPU execution.
+
+            The namespace is separate from `GafimeEngine.analyze()` and `compile()`:
+            it does not inherit legacy metrics, candidate-family, significance,
+            ranking, or budget defaults. `EngineConfig` contributes only `backend`,
+            `device_id`, and `precision`; a non-default unrelated field is rejected
+            rather than silently changing semantic behavior. Backend intent is
+            normalized once: `cpu`, `rust`, and `v1-rust-cpu` select Core, while
+            `hip` normalizes to ROCm. No Python feature-computation loop is admitted.
+
+            `TabularSession.capabilities` is operation-specific. Core has a static
+            complete record; a GPU session reports only its runtime payload/lowering
+            intersection and configured/selected device identity. GPU diagnostics
+            report backend, retained bytes, and unavailable native work counters;
+            they do not invent elapsed time, cache speed, process RSS, Arrow copies,
+            or a device probe. The session is synchronous and thread-affine;
+            `close()` is terminal and idempotent, including getters. `describe()`
+            supplies bounded program metadata and opaque operand handles only,
+            never a serializable/native launch descriptor.
 
             The module exports `TabularSession`, `Snapshot`, `Candidate`,
             `CandidateSet`, `AcceptedSet`, `Evidence`, `Constraint`,
@@ -1713,8 +1726,10 @@ def _cells() -> list:
               `gafime.compile.exports` exposes deprecated handle compatibility.
             - `gafime.semantic`: Rust-owned `TabularSession` lifecycle plus opaque
               candidates/accepted values, contextual evidence, explicit selection,
-              and Arrow-output result objects. It is additive and Core-only today;
-              it is not a generic candidate IR, Python data plane, or GPU route.
+              and Arrow-output result objects. It is additive: Core owns the
+              complete vocabulary while explicit CUDA/ROCm may expose a bounded
+              negotiated subset without Core substitution. It is not a generic
+              candidate IR or Python data plane.
             - `gafime.subfunctions`: the advanced native compatibility proxy. Prefer
               the top-level safe engine/capability APIs for new application code.
 

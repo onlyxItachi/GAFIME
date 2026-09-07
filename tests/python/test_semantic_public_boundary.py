@@ -228,12 +228,6 @@ def test_semantic_constructor_rejects_implicit_legacy_controls_and_invalid_inges
             config=EngineConfig(metric_names=("pearson",)),
             **constructor,
         )
-    with pytest.raises(NotImplementedError, match="not supported"):
-        semantic.TabularSession(
-            matrix,
-            config=EngineConfig(backend="cuda"),
-            **constructor,
-        )
     for alias in ("cpu", " RUST ", "v1-rust-cpu"):
         alias_session, alias_storage = _session(config=EngineConfig(backend=alias))
         try:
@@ -242,13 +236,6 @@ def test_semantic_constructor_rejects_implicit_legacy_controls_and_invalid_inges
         finally:
             alias_session.close()
             _ = alias_storage
-    with pytest.raises(NotImplementedError, match="not supported"):
-        semantic.TabularSession(
-            matrix,
-            config=EngineConfig(backend=" HIP "),
-            **constructor,
-        )
-
     configured_session, configured_storage = _session(config=EngineConfig(device_id=7))
     try:
         assert configured_session.capabilities["configured_device_id"] == 7
@@ -307,6 +294,90 @@ def test_semantic_constructor_rejects_implicit_legacy_controls_and_invalid_inges
     finally:
         fp64_session.close()
         _ = fp64_storage
+        _ = storage
+
+
+@pytest.mark.parametrize(
+    ("backend", "payload_env"),
+    (
+        ("cuda", "GAFIME_CUDA_V1_LIB"),
+        ("rocm", "GAFIME_ROCM_V1_LIB"),
+        (" HIP ", "GAFIME_ROCM_V1_LIB"),
+    ),
+)
+def test_explicit_accelerator_negotiation_never_substitutes_core(
+    monkeypatch: pytest.MonkeyPatch, backend: str, payload_env: str
+) -> None:
+    """An explicit request reaches the native payload boundary or fails there.
+
+    Discovery is disabled only for this deterministic missing-payload contract
+    test.  Physical accelerator execution is covered separately by installed
+    hardware-conditional lifecycle tests; this test must never become a Core
+    execution disguised as a GPU request.
+    """
+
+    import gafime._payloads as payloads
+
+    monkeypatch.delenv(payload_env, raising=False)
+    monkeypatch.setattr(payloads, "discover_payloads", lambda _backend: {})
+    storage, matrix = _matrix(_ROWS)
+    with pytest.raises(RuntimeError, match=payload_env) as error:
+        semantic.TabularSession(
+            matrix,
+            config=EngineConfig(backend=backend),
+            feature_names=list(_NAMES),
+            row_keys=list(_KEYS),
+            row_domain="missing-accelerator-payload",
+            provenance="missing-accelerator-payload",
+        )
+    assert "core" not in str(error.value).lower()
+    _ = storage
+
+
+def test_metal_semantic_request_is_explicitly_unsupported_not_core() -> None:
+    storage, matrix = _matrix(_ROWS)
+    with pytest.raises(
+        NotImplementedError,
+        match="Metal does not implement the tabular semantic primitive lowering",
+    ):
+        semantic.TabularSession(
+            matrix,
+            config=EngineConfig(backend="metal", precision="fp32"),
+            feature_names=list(_NAMES),
+            row_keys=list(_KEYS),
+            row_domain="unsupported-metal-semantic",
+            provenance="unsupported-metal-semantic",
+        )
+    _ = storage
+
+
+@pytest.mark.parametrize(
+    ("precision", "typecode"), (("fp32", "f"), ("mixed", "f"), ("fp64", "d"))
+)
+def test_auto_semantic_keeps_core_for_the_complete_vocabulary(
+    precision: str, typecode: str
+) -> None:
+    session, storage = _session(
+        config=EngineConfig(backend="auto", precision=precision), typecode=typecode
+    )
+    try:
+        assert session.configured_backend == "auto"
+        assert session.selected_backend == "core"
+        assert session.capabilities["source"] == "static"
+        assert session.capabilities["statistics"] == [
+            "pearson",
+            "spearman",
+            "fixed_nmi",
+            "graph_energy",
+        ]
+        assert session.capabilities["contexts"] == [
+            "reference",
+            "paired_view",
+            "labels",
+            "graph",
+        ]
+    finally:
+        session.close()
         _ = storage
 
 

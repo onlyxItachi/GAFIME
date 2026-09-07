@@ -26,6 +26,15 @@ operation support. Existing public supervised behavior and frozen native ABIs
 remain compatible. This development scope does not promote new capabilities
 into the isolated v1.0 release branch or activate future-domain/compiler work.
 
+The optional [typed arithmetic boundary](semantic-primitives-abi.md) carries
+physical slots and bounded resource requests, never candidate IDs, evidence
+policy or acceptance authority. Its separate version domain preserves the
+frozen standard ABI tables. Initialized native slots are immutable; accepted
+reuse lowers to retention/gather, not a second native semantic catalog.
+CUDA/ROCm support is operation-specific. Unsupported Metal/statistic requests
+fail closed, and semantic `auto` selects Core's complete vocabulary without
+claiming GPU execution.
+
 ## Repository Layout
 
 Tracked project source, runtime, test, and documentation content must converge into:

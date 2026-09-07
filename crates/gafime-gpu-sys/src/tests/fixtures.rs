@@ -475,6 +475,17 @@ pub(crate) fn complete_test_function_table() -> GpuFunctionTable {
         permutation_pvalues_v2: None,
         interaction_diagnostics_v2: None,
         matrix_free_v2: None,
+        semantic_capabilities_v1: None,
+        semantic_bank_alloc_v1: None,
+        semantic_bank_upload_v1: None,
+        semantic_materialize_v1: None,
+        semantic_pairwise_pearson_v1: None,
+        semantic_ordered_edge_energy_v1: None,
+        semantic_sparse_gather_v1: None,
+        semantic_forecast_v1: None,
+        semantic_bank_retain_v1: None,
+        semantic_bank_download_v1: None,
+        semantic_bank_free_v1: None,
         #[cfg(feature = "local-cmake-experiment")]
         local_cmake_experiment: Default::default(),
     }

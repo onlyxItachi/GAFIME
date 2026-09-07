@@ -453,6 +453,7 @@ def _validate_release_docs() -> None:
     for link in (
         "contract.md",
         "abi-evolution.md",
+        "semantic-primitives-abi.md",
         "agent-skills.md",
         "releases/release-operations.md",
         "releases/release-artifact-matrix.md",

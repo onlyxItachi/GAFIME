@@ -422,6 +422,15 @@ def test_staged_payload_uses_release_optimization_and_complete_sources(
     source_root = output / "src" / backend
     for name in sources:
         assert (source_root / name).is_file()
+    # Launcher includes must survive the explicit sdist whitelist; a root-tree
+    # build alone cannot detect missing vendor-package headers.
+    for name in (
+        "gafime_semantic_primitives_abi.hpp",
+        "semantic_primitives_abi_impl.hpp",
+    ):
+        assert (output / "src" / "common" / name).read_bytes() == (
+            ROOT / "src" / "common" / name
+        ).read_bytes()
     assert not any(path.name.startswith("rt_") for path in source_root.iterdir())
 
 

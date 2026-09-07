@@ -95,6 +95,29 @@ impl MaterializedColumns {
         })
     }
 
+    /// Construct host-readable values that were explicitly downloaded from a
+    /// non-Core executor.  The values remain tagged with the producing
+    /// backend: callers may consume them as host output, but may not present
+    /// them to that backend as resident input for further native arithmetic.
+    pub fn from_downloaded(
+        registry: &CandidateRegistry,
+        frame: &FeatureFrame,
+        backend: BackendKind,
+        columns: BTreeMap<FeatureId, NumericColumn>,
+    ) -> SemanticResult<Self> {
+        if !matches!(
+            backend,
+            GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
+        ) {
+            return Err(SemanticError::Invalid(
+                "downloaded semantic output must retain a non-Core backend origin",
+            ));
+        }
+        let mut output = Self::from_columns(registry, frame, columns)?;
+        output.backend = backend;
+        Ok(output)
+    }
+
     /// Construct a context-bound resident bank after the backend has already
     /// validated its physical allocation and slot map.  Semantic identities
     /// remain Rust-owned: this method verifies that each logical feature is
@@ -675,7 +698,7 @@ impl SemanticSession {
         self.eligible = None;
     }
 
-    fn validate_executor(&self, executor: &impl NativeEvidenceExecutor) -> SemanticResult<()> {
+    fn validate_executor(&self, executor: &dyn NativeEvidenceExecutor) -> SemanticResult<()> {
         self.registry()?;
         if executor.backend_kind() != self.backend {
             return Err(SemanticError::Invalid(
@@ -687,7 +710,7 @@ impl SemanticSession {
 
     pub fn evaluate(
         &mut self,
-        executor: &mut impl NativeEvidenceExecutor,
+        executor: &mut dyn NativeEvidenceExecutor,
         frame: Arc<FeatureFrame>,
         candidates: &[FeatureId],
         channels: &[EvidenceChannel],
@@ -856,7 +879,7 @@ impl SemanticSession {
     /// retention; it must not download values merely to rebuild a cache.
     pub fn accept_with(
         &mut self,
-        executor: &mut impl NativeEvidenceExecutor,
+        executor: &mut dyn NativeEvidenceExecutor,
         table: &EvidenceTable,
         policy: &SelectionPolicy,
     ) -> SemanticResult<Vec<AcceptedFeature>> {
@@ -959,6 +982,7 @@ impl SemanticSession {
         if retained.frame_id != table.frame.id()
             || retained.profile != table.frame.profile()
             || retained.backend != self.backend
+            || (self.backend != GAFIME_BACKEND_CPU && !retained.is_resident())
             || retained.bytes() > self.limits.max_retained_bytes
             || selected.iter().any(|&feature| !retained.contains(feature))
         {
@@ -989,7 +1013,7 @@ impl SemanticSession {
     /// or reapplying their discovery policy. Same-context columns may be reused.
     pub fn materialize_accepted(
         &mut self,
-        executor: &mut impl NativeEvidenceExecutor,
+        executor: &mut dyn NativeEvidenceExecutor,
         frame: &FeatureFrame,
         accepted: &[AcceptedFeature],
     ) -> SemanticResult<MaterializedColumns> {
@@ -1043,6 +1067,7 @@ impl SemanticSession {
         if cache.frame_id != frame.id()
             || cache.profile != frame.profile()
             || cache.backend != self.backend
+            || (self.backend != GAFIME_BACKEND_CPU && !cache.is_resident())
             || cache.bytes() > self.limits.max_retained_bytes
         {
             return Err(SemanticError::Invalid(
@@ -1051,6 +1076,69 @@ impl SemanticSession {
         }
         self.cache = Some(cache);
         Ok(result)
+    }
+
+    /// Explicitly transfer a resident materialization to host-owned output.
+    /// This is deliberately outside native arithmetic: the returned values
+    /// retain their producing backend tag and cannot be supplied to a non-Core
+    /// executor as a resident materialization on a later call.
+    pub fn download_materialization(
+        &self,
+        executor: &mut dyn NativeEvidenceExecutor,
+        frame: &FeatureFrame,
+        source: &MaterializedColumns,
+    ) -> SemanticResult<MaterializedColumns> {
+        self.validate_executor(executor)?;
+        let registry = self.registry()?;
+        if frame.schema() != registry.schema()
+            || frame.profile() != registry.precision()
+            || source.frame_id() != frame.id()
+            || source.profile() != frame.profile()
+            || source.backend_kind() != self.backend
+            || !source.is_resident()
+        {
+            return Err(SemanticError::Invalid(
+                "resident materialization download context or backend mismatch",
+            ));
+        }
+        let source_slots = source.resident_slots()?;
+        for &feature in source_slots.keys() {
+            registry.program(feature)?;
+        }
+
+        // The retained bank, source bank and explicit host output coexist for
+        // this transfer.  The executor receives only the remaining host-output
+        // allowance; it cannot treat a download as an unaccounted copy.
+        let output_budget = self
+            .limits
+            .max_bytes
+            .checked_sub(self.retained_bytes())
+            .and_then(|remaining| remaining.checked_sub(source.bytes()))
+            .ok_or(SemanticError::Invalid(
+                "resident materialization download exceeds session budget",
+            ))?;
+        let output = executor.download(registry, frame, source, output_budget)?;
+        if output.frame_id() != frame.id()
+            || output.profile() != frame.profile()
+            || output.backend_kind() != self.backend
+            || output.is_resident()
+            || output.bytes() > output_budget
+        {
+            return Err(SemanticError::Invalid(
+                "downloaded materialization violates context, storage, or budget",
+            ));
+        }
+        let columns = output.columns()?;
+        if columns.len() != source_slots.len()
+            || source_slots
+                .keys()
+                .any(|feature| !columns.contains_key(feature))
+        {
+            return Err(SemanticError::Invalid(
+                "downloaded materialization omitted or added a resident feature",
+            ));
+        }
+        Ok(output)
     }
 }
 
@@ -1065,6 +1153,7 @@ fn validate_output(
     if output.frame_id != frame.id()
         || output.profile != frame.profile()
         || output.backend != backend
+        || (backend != GAFIME_BACKEND_CPU && !output.is_resident())
         || output.bytes() > budget
     {
         return Err(SemanticError::Invalid("native output context mismatch"));
@@ -1112,7 +1201,7 @@ fn dependency_work(
 mod tests {
     use super::*;
     use crate::semantic::{EvaluationRole, ProgramLimits};
-    use gafime_types::PrecisionProfile;
+    use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CUDA};
 
     struct MustNotExecute;
     impl NativeEvidenceExecutor for MustNotExecute {
@@ -1336,5 +1425,142 @@ mod tests {
         assert!(
             validate_output(&registry, &frame, GAFIME_BACKEND_CPU, &[source], &output, 8,).is_ok()
         );
+    }
+
+    #[test]
+    fn downloaded_gpu_values_remain_host_output_not_resident_gpu_input() {
+        let registry = CandidateRegistry::new(
+            vec!["a".into()],
+            PrecisionProfile::Mixed,
+            ProgramLimits::default(),
+        )
+        .unwrap();
+        let source = registry.source(0).unwrap();
+        let frame = FeatureFrame::new(
+            vec!["a".into()],
+            "rows".into(),
+            vec![0, 1],
+            EvaluationRole::Discovery,
+            "test".into(),
+            vec![vec![0.0, 1.0]],
+        )
+        .unwrap();
+        let downloaded = MaterializedColumns::from_downloaded(
+            &registry,
+            &frame,
+            GAFIME_BACKEND_CUDA,
+            BTreeMap::from([(source, NumericColumn::from(vec![0.0f32, 1.0]))]),
+        )
+        .unwrap();
+
+        assert_eq!(downloaded.backend_kind(), GAFIME_BACKEND_CUDA);
+        assert!(!downloaded.is_resident());
+        assert_eq!(downloaded.get(source).unwrap(), &[0.0, 1.0]);
+        assert!(validate_output(
+            &registry,
+            &frame,
+            GAFIME_BACKEND_CUDA,
+            &[source],
+            &downloaded,
+            downloaded.bytes(),
+        )
+        .is_err());
+    }
+
+    struct DownloadOnlyCuda {
+        calls: usize,
+        output_budget: Option<usize>,
+    }
+
+    impl NativeEvidenceExecutor for DownloadOnlyCuda {
+        fn backend_kind(&self) -> u32 {
+            GAFIME_BACKEND_CUDA
+        }
+
+        fn materialize(
+            &mut self,
+            _: &CandidateRegistry,
+            _: &FeatureFrame,
+            _: &[FeatureId],
+            _: Option<&MaterializedColumns>,
+            _: usize,
+        ) -> SemanticResult<MaterializedColumns> {
+            panic!("download fixture must not materialize")
+        }
+
+        fn evaluate_channel(
+            &mut self,
+            _: &EvidenceDefinition,
+            _: &[FeatureId],
+            _: &MaterializedColumns,
+            _: Option<&MaterializedColumns>,
+            _: usize,
+        ) -> SemanticResult<Vec<EvidenceValue>> {
+            panic!("download fixture must not evaluate evidence")
+        }
+
+        fn download(
+            &mut self,
+            registry: &CandidateRegistry,
+            frame: &FeatureFrame,
+            source: &MaterializedColumns,
+            max_bytes: usize,
+        ) -> SemanticResult<MaterializedColumns> {
+            self.calls += 1;
+            self.output_budget = Some(max_bytes);
+            let columns = source
+                .resident_slots()?
+                .keys()
+                .map(|&feature| (feature, NumericColumn::from(vec![1.0f32; frame.rows()])))
+                .collect();
+            MaterializedColumns::from_downloaded(registry, frame, GAFIME_BACKEND_CUDA, columns)
+        }
+    }
+
+    #[test]
+    fn explicit_download_is_budgeted_host_output_and_cannot_reenter_cuda() {
+        let registry = CandidateRegistry::new(
+            vec!["a".into()],
+            PrecisionProfile::Mixed,
+            ProgramLimits::default(),
+        )
+        .unwrap();
+        let source = registry.source(0).unwrap();
+        let frame = FeatureFrame::new(
+            vec!["a".into()],
+            "rows".into(),
+            vec![0, 1],
+            EvaluationRole::Discovery,
+            "test".into(),
+            vec![vec![0.0, 1.0]],
+        )
+        .unwrap();
+        let resident = MaterializedColumns::from_resident(
+            &registry,
+            &frame,
+            GAFIME_BACKEND_CUDA,
+            BTreeMap::from([(source, 0)]),
+            8,
+            Arc::new(()),
+        )
+        .unwrap();
+        let session = SemanticSession::new(registry, GAFIME_BACKEND_CUDA, 64).unwrap();
+        let mut executor = DownloadOnlyCuda {
+            calls: 0,
+            output_budget: None,
+        };
+
+        let downloaded = session
+            .download_materialization(&mut executor, &frame, &resident)
+            .unwrap();
+        assert_eq!(executor.calls, 1);
+        assert_eq!(executor.output_budget, Some(56));
+        assert_eq!(downloaded.get(source).unwrap(), &[1.0, 1.0]);
+        assert!(!downloaded.is_resident());
+
+        assert!(session
+            .download_materialization(&mut executor, &frame, &downloaded)
+            .is_err());
+        assert_eq!(executor.calls, 1);
     }
 }

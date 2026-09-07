@@ -2,10 +2,14 @@ use std::{error::Error, fmt, path::PathBuf};
 
 use gafime_types::{
     BackendKind, GafimeConstBufferView, GafimeGpuDeviceInfo, GafimeGpuGraphCapability,
-    GafimeGpuMatrix, GafimeInteractionDiagnosticBatch, GafimeLaunchProtocol, GafimeMatrixDesc,
-    GafimeNumericInteractionDiagnosticBatch, GafimeNumericLaunchProtocol, GafimeNumericMatrixDesc,
-    GafimeNumericResultTable, GafimeNumericRoute, GafimeNumericSignificanceTable,
-    GafimePermutationSignificanceTable, GafimeResultTable, GafimeStatus, PrecisionProfile,
+    GafimeGpuMatrix, GafimeGpuSemanticBank, GafimeInteractionDiagnosticBatch, GafimeLaunchProtocol,
+    GafimeMatrixDesc, GafimeMutableBufferView, GafimeNumericInteractionDiagnosticBatch,
+    GafimeNumericLaunchProtocol, GafimeNumericMatrixDesc, GafimeNumericResultTable,
+    GafimeNumericRoute, GafimeNumericSignificanceTable, GafimePermutationSignificanceTable,
+    GafimeResultTable, GafimeSemanticBankDesc, GafimeSemanticCapabilities,
+    GafimeSemanticEdgeEnergyBatch, GafimeSemanticForecastRequest, GafimeSemanticMemoryForecast,
+    GafimeSemanticPearsonBatch, GafimeSemanticProgramBatch, GafimeSemanticScalarResultTable,
+    GafimeSemanticSparseGatherBatch, GafimeSliceU32, GafimeStatus, PrecisionProfile,
     GAFIME_STATUS_OK,
 };
 use libloading::Library;
@@ -112,6 +116,63 @@ pub type GafimeGpuInteractionDiagnosticsV2Fn = unsafe extern "C" fn(
     diagnostics: *mut GafimeNumericInteractionDiagnosticBatch,
 ) -> GafimeStatus;
 pub type GafimeGpuMatrixFreeV2Fn = unsafe extern "C" fn(matrix: GafimeGpuMatrix) -> GafimeStatus;
+
+/// Optional all-or-nothing resident semantic-arithmetic table.  These
+/// callbacks carry only typed physical slots; Rust retains semantic identity,
+/// context and policy above this ABI boundary.
+pub type GafimeGpuSemanticCapabilitiesV1Fn = unsafe extern "C" fn(
+    device_id: u32,
+    consumer_abi_version: u32,
+    capabilities_out: *mut GafimeSemanticCapabilities,
+) -> GafimeStatus;
+pub type GafimeGpuSemanticBankAllocV1Fn = unsafe extern "C" fn(
+    device_id: u32,
+    desc: *const GafimeSemanticBankDesc,
+    bank_out: *mut GafimeGpuSemanticBank,
+) -> GafimeStatus;
+pub type GafimeGpuSemanticBankUploadV1Fn = unsafe extern "C" fn(
+    bank: GafimeGpuSemanticBank,
+    route: *const GafimeNumericRoute,
+    source_columns: *const GafimeConstBufferView,
+) -> GafimeStatus;
+pub type GafimeGpuSemanticMaterializeV1Fn = unsafe extern "C" fn(
+    bank: GafimeGpuSemanticBank,
+    batch: *const GafimeSemanticProgramBatch,
+) -> GafimeStatus;
+pub type GafimeGpuSemanticPairwisePearsonV1Fn = unsafe extern "C" fn(
+    left_bank: GafimeGpuSemanticBank,
+    right_bank: GafimeGpuSemanticBank,
+    batch: *const GafimeSemanticPearsonBatch,
+    results_out: *mut GafimeSemanticScalarResultTable,
+) -> GafimeStatus;
+pub type GafimeGpuSemanticOrderedEdgeEnergyV1Fn = unsafe extern "C" fn(
+    bank: GafimeGpuSemanticBank,
+    batch: *const GafimeSemanticEdgeEnergyBatch,
+    results_out: *mut GafimeSemanticScalarResultTable,
+) -> GafimeStatus;
+pub type GafimeGpuSemanticSparseGatherV1Fn = unsafe extern "C" fn(
+    source_bank: GafimeGpuSemanticBank,
+    destination_bank: GafimeGpuSemanticBank,
+    batch: *const GafimeSemanticSparseGatherBatch,
+) -> GafimeStatus;
+pub type GafimeGpuSemanticForecastV1Fn = unsafe extern "C" fn(
+    bank: GafimeGpuSemanticBank,
+    request: *const GafimeSemanticForecastRequest,
+    forecast_out: *mut GafimeSemanticMemoryForecast,
+) -> GafimeStatus;
+pub type GafimeGpuSemanticBankRetainV1Fn = unsafe extern "C" fn(
+    source_bank: GafimeGpuSemanticBank,
+    slots: GafimeSliceU32,
+    retained_bank_out: *mut GafimeGpuSemanticBank,
+) -> GafimeStatus;
+pub type GafimeGpuSemanticBankDownloadV1Fn = unsafe extern "C" fn(
+    bank: GafimeGpuSemanticBank,
+    slots: GafimeSliceU32,
+    route: *const GafimeNumericRoute,
+    columns_out: *mut GafimeMutableBufferView,
+) -> GafimeStatus;
+pub type GafimeGpuSemanticBankFreeV1Fn =
+    unsafe extern "C" fn(bank: GafimeGpuSemanticBank) -> GafimeStatus;
 #[derive(Clone, Copy)]
 pub struct GpuFunctionTable {
     pub device_info: Option<GafimeGpuDeviceInfoFn>,
@@ -135,6 +196,17 @@ pub struct GpuFunctionTable {
     pub permutation_pvalues_v2: Option<GafimeGpuPermutationPvaluesV2Fn>,
     pub interaction_diagnostics_v2: Option<GafimeGpuInteractionDiagnosticsV2Fn>,
     pub matrix_free_v2: Option<GafimeGpuMatrixFreeV2Fn>,
+    pub semantic_capabilities_v1: Option<GafimeGpuSemanticCapabilitiesV1Fn>,
+    pub semantic_bank_alloc_v1: Option<GafimeGpuSemanticBankAllocV1Fn>,
+    pub semantic_bank_upload_v1: Option<GafimeGpuSemanticBankUploadV1Fn>,
+    pub semantic_materialize_v1: Option<GafimeGpuSemanticMaterializeV1Fn>,
+    pub semantic_pairwise_pearson_v1: Option<GafimeGpuSemanticPairwisePearsonV1Fn>,
+    pub semantic_ordered_edge_energy_v1: Option<GafimeGpuSemanticOrderedEdgeEnergyV1Fn>,
+    pub semantic_sparse_gather_v1: Option<GafimeGpuSemanticSparseGatherV1Fn>,
+    pub semantic_forecast_v1: Option<GafimeGpuSemanticForecastV1Fn>,
+    pub semantic_bank_retain_v1: Option<GafimeGpuSemanticBankRetainV1Fn>,
+    pub semantic_bank_download_v1: Option<GafimeGpuSemanticBankDownloadV1Fn>,
+    pub semantic_bank_free_v1: Option<GafimeGpuSemanticBankFreeV1Fn>,
     #[cfg(feature = "local-cmake-experiment")]
     pub local_cmake_experiment: crate::local_cmake_experiment::LocalCmakeExperimentFunctions,
 }
@@ -178,6 +250,86 @@ impl GpuFunctionTable {
             || self.permutation_pvalues_v2.is_some()
             || self.interaction_diagnostics_v2.is_some()
             || self.matrix_free_v2.is_some()
+    }
+
+    fn has_any_semantic_surface(&self) -> bool {
+        self.semantic_capabilities_v1.is_some()
+            || self.semantic_bank_alloc_v1.is_some()
+            || self.semantic_bank_upload_v1.is_some()
+            || self.semantic_materialize_v1.is_some()
+            || self.semantic_pairwise_pearson_v1.is_some()
+            || self.semantic_ordered_edge_energy_v1.is_some()
+            || self.semantic_sparse_gather_v1.is_some()
+            || self.semantic_forecast_v1.is_some()
+            || self.semantic_bank_retain_v1.is_some()
+            || self.semantic_bank_download_v1.is_some()
+            || self.semantic_bank_free_v1.is_some()
+    }
+
+    /// Validate the optional semantic table as one indivisible contract.  An
+    /// older payload with no symbols remains usable for its frozen ABI routes;
+    /// a partial semantic table fails closed rather than becoming an accidental
+    /// per-operation fallback surface.
+    pub(crate) fn require_semantic_common(&self) -> Result<(), GpuSysError> {
+        if self.semantic_capabilities_v1.is_none() {
+            if self.has_any_semantic_surface() {
+                return Err(GpuSysError::MissingFunction(
+                    "gafime_gpu_semantic_capabilities_v1",
+                ));
+            }
+            return Err(GpuSysError::SemanticAbiUnavailable);
+        }
+        if self.semantic_bank_alloc_v1.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_semantic_bank_alloc_v1",
+            ));
+        }
+        if self.semantic_bank_upload_v1.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_semantic_bank_upload_v1",
+            ));
+        }
+        if self.semantic_materialize_v1.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_semantic_materialize_v1",
+            ));
+        }
+        if self.semantic_pairwise_pearson_v1.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_semantic_pairwise_pearson_v1",
+            ));
+        }
+        if self.semantic_ordered_edge_energy_v1.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_semantic_ordered_edge_energy_v1",
+            ));
+        }
+        if self.semantic_sparse_gather_v1.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_semantic_sparse_gather_v1",
+            ));
+        }
+        if self.semantic_forecast_v1.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_semantic_forecast_v1",
+            ));
+        }
+        if self.semantic_bank_retain_v1.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_semantic_bank_retain_v1",
+            ));
+        }
+        if self.semantic_bank_download_v1.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_semantic_bank_download_v1",
+            ));
+        }
+        if self.semantic_bank_free_v1.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_semantic_bank_free_v1",
+            ));
+        }
+        Ok(())
     }
 
     /// Validate the complete ABI 1.1 operation table shared by every
@@ -256,6 +408,7 @@ pub enum GpuSysError {
         message: String,
     },
     PrecisionAbiUnavailable,
+    SemanticAbiUnavailable,
     MissingFunction(&'static str),
     InvalidInput(&'static str),
     AbiVersionMismatch {
@@ -290,6 +443,10 @@ impl fmt::Display for GpuSysError {
             Self::PrecisionAbiUnavailable => write!(
                 f,
                 "canonical precision profiles require GPU ABI 1.1; the loaded payload exposes only legacy ABI 1.0"
+            ),
+            Self::SemanticAbiUnavailable => write!(
+                f,
+                "loaded GPU payload does not expose the optional semantic-arithmetic ABI"
             ),
             Self::MissingFunction(symbol) => write!(f, "GPU ABI function {symbol} is missing"),
             Self::InvalidInput(message) => write!(f, "invalid GPU adapter input: {message}"),
@@ -413,6 +570,53 @@ pub(crate) unsafe fn load_function_table(
             matrix_free_v2: load_optional_symbol::<GafimeGpuMatrixFreeV2Fn>(
                 library,
                 "gafime_gpu_matrix_free_v2",
+            ),
+            semantic_capabilities_v1: load_optional_symbol::<GafimeGpuSemanticCapabilitiesV1Fn>(
+                library,
+                "gafime_gpu_semantic_capabilities_v1",
+            ),
+            semantic_bank_alloc_v1: load_optional_symbol::<GafimeGpuSemanticBankAllocV1Fn>(
+                library,
+                "gafime_gpu_semantic_bank_alloc_v1",
+            ),
+            semantic_bank_upload_v1: load_optional_symbol::<GafimeGpuSemanticBankUploadV1Fn>(
+                library,
+                "gafime_gpu_semantic_bank_upload_v1",
+            ),
+            semantic_materialize_v1: load_optional_symbol::<GafimeGpuSemanticMaterializeV1Fn>(
+                library,
+                "gafime_gpu_semantic_materialize_v1",
+            ),
+            semantic_pairwise_pearson_v1: load_optional_symbol::<
+                GafimeGpuSemanticPairwisePearsonV1Fn,
+            >(
+                library, "gafime_gpu_semantic_pairwise_pearson_v1"
+            ),
+            semantic_ordered_edge_energy_v1: load_optional_symbol::<
+                GafimeGpuSemanticOrderedEdgeEnergyV1Fn,
+            >(
+                library,
+                "gafime_gpu_semantic_ordered_edge_energy_v1",
+            ),
+            semantic_sparse_gather_v1: load_optional_symbol::<GafimeGpuSemanticSparseGatherV1Fn>(
+                library,
+                "gafime_gpu_semantic_sparse_gather_v1",
+            ),
+            semantic_forecast_v1: load_optional_symbol::<GafimeGpuSemanticForecastV1Fn>(
+                library,
+                "gafime_gpu_semantic_forecast_v1",
+            ),
+            semantic_bank_retain_v1: load_optional_symbol::<GafimeGpuSemanticBankRetainV1Fn>(
+                library,
+                "gafime_gpu_semantic_bank_retain_v1",
+            ),
+            semantic_bank_download_v1: load_optional_symbol::<GafimeGpuSemanticBankDownloadV1Fn>(
+                library,
+                "gafime_gpu_semantic_bank_download_v1",
+            ),
+            semantic_bank_free_v1: load_optional_symbol::<GafimeGpuSemanticBankFreeV1Fn>(
+                library,
+                "gafime_gpu_semantic_bank_free_v1",
             ),
             #[cfg(feature = "local-cmake-experiment")]
             local_cmake_experiment: crate::local_cmake_experiment::load_function_table(library),

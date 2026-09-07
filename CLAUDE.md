@@ -140,6 +140,14 @@ behavior govern native lowering. Existing supervised APIs and frozen ABIs
 remain compatible. This mainline milestone authorizes no release-branch change,
 full compiler/frontend, future-domain objective, or release operation.
 
+The optional typed arithmetic boundary in `docs/semantic-primitives-abi.md`
+may carry physical slots and bounded resource requests, never candidate IDs,
+evidence policy or acceptance authority. It preserves the frozen standard ABI
+tables. Native banks use immutable initialized slots; accepted reuse is lowered
+to retention/gather, not a second native semantic catalog. CUDA/ROCm support is
+operation-specific; unsupported Metal/statistic requests fail closed, and
+semantic `auto` selects Core's complete vocabulary without claiming GPU work.
+
 Candidate stabilization branches use `release/v<canonical-semver>` and may be
 cut only from an exact `main` commit whose required checks are green. Creating
 one is source-control coordination only: it does not change version identity,

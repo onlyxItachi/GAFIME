@@ -365,6 +365,7 @@ def test_documentation_hierarchy_and_local_links_are_valid() -> None:
 
     docs_index = (ROOT / "docs" / "README.md").read_text(encoding="utf-8")
     assert "v1.1-tabular-semantic-product.md" in docs_index
+    assert "semantic-primitives-abi.md" in docs_index
 
     markdown_sources = {
         ROOT / "README.md": (ROOT / "README.md").read_text(encoding="utf-8"),
@@ -379,6 +380,18 @@ def test_documentation_hierarchy_and_local_links_are_valid() -> None:
             ROOT / "docs" / "releases" / "STATUS.md"
         ).read_text(encoding="utf-8"),
         COVERAGE_PATH: COVERAGE_PATH.read_text(encoding="utf-8"),
+        ROOT / "docs" / "v1.1-tabular-semantic-product.md": (
+            ROOT / "docs" / "v1.1-tabular-semantic-product.md"
+        ).read_text(encoding="utf-8"),
+        ROOT / "docs" / "semantic-primitives-abi.md": (
+            ROOT / "docs" / "semantic-primitives-abi.md"
+        ).read_text(encoding="utf-8"),
+        ROOT / "docs" / "abi-evolution.md": (
+            ROOT / "docs" / "abi-evolution.md"
+        ).read_text(encoding="utf-8"),
+        ROOT / "docs" / "capabilities.md": (
+            ROOT / "docs" / "capabilities.md"
+        ).read_text(encoding="utf-8"),
     }
     notebook_markdown = "\n".join(
         "".join(cell["source"])
@@ -408,7 +421,9 @@ def test_reference_records_current_non_api_boundaries() -> None:
         "validated at construction and through `set_params()`",
         "validated before the reader evaluates the source row count",
         "validated before the file is opened",
-        "Core-only development namespace",
+        "The executable reference stays on Core",
+        "they never silently substitute Core",
+        "makes no physical accelerator-execution claim",
         "not a universal quality score",
         "not a weighted score or Pareto optimizer",
         "No Python feature-computation loop",

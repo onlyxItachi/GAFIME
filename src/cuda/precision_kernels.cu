@@ -1788,6 +1788,438 @@ cudaError_t launch_accumulate_exceedances_erased(
     return cudaGetLastError();
 }
 
+// -------------------------------------------------------------------------
+// Optional resident semantic-arithmetic table.
+//
+// Ordered graph energy uses one serial reduction per requested scalar to
+// preserve declared edge order.  Pairwise Pearson instead uses one block per
+// scalar with a typed block reduction; neither path borrows the
+// target-oriented continuous engine.
+
+template <typename Storage>
+__global__ void semantic_absolute_difference_kernel(
+    Storage* columns,
+    uint64_t rows,
+    uint32_t left_slot,
+    uint32_t right_slot,
+    uint32_t output_slot
+) {
+    const uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const Storage left = columns[static_cast<uint64_t>(left_slot) * rows + row];
+    const Storage right = columns[static_cast<uint64_t>(right_slot) * rows + row];
+    columns[static_cast<uint64_t>(output_slot) * rows + row] = device_abs(left - right);
+}
+
+template <typename Storage>
+__global__ void semantic_softsign_kernel(
+    Storage* columns,
+    uint64_t rows,
+    uint32_t input_slot,
+    uint32_t output_slot
+) {
+    const uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const Storage value = columns[static_cast<uint64_t>(input_slot) * rows + row];
+    columns[static_cast<uint64_t>(output_slot) * rows + row] =
+        value / (static_cast<Storage>(1) + device_abs(value));
+}
+
+template <typename Storage>
+__device__ Storage semantic_mean_from_bits(uint64_t bits);
+
+template <>
+__device__ float semantic_mean_from_bits<float>(uint64_t bits) {
+    return __uint_as_float(static_cast<unsigned int>(bits));
+}
+
+template <>
+__device__ double semantic_mean_from_bits<double>(uint64_t bits) {
+    return __longlong_as_double(static_cast<unsigned long long>(bits));
+}
+
+template <typename Storage>
+__global__ void semantic_centered_product_kernel(
+    Storage* columns,
+    uint64_t rows,
+    const uint32_t* operand_slots,
+    const uint64_t* mean_bits,
+    uint32_t operand_count,
+    uint32_t output_slot
+) {
+    const uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    Storage product = static_cast<Storage>(1);
+    for (uint32_t operand = 0; operand < operand_count; ++operand) {
+        const uint32_t slot = operand_slots[operand];
+        const Storage value = columns[static_cast<uint64_t>(slot) * rows + row];
+        product *= value - semantic_mean_from_bits<Storage>(mean_bits[operand]);
+    }
+    columns[static_cast<uint64_t>(output_slot) * rows + row] = product;
+}
+
+template <typename Storage>
+__global__ void semantic_reject_nonfinite_output_kernel(
+    const Storage* columns,
+    uint64_t rows,
+    uint32_t slot,
+    uint32_t* nonfinite_out
+) {
+    const uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    if (!device_isfinite(columns[static_cast<uint64_t>(slot) * rows + row])) {
+        atomicExch(nonfinite_out, 1u);
+    }
+}
+
+template <typename Storage, typename Accumulation, typename Result>
+__global__ void semantic_pairwise_pearson_kernel(
+    const Storage* left_columns,
+    const Storage* right_columns,
+    uint64_t rows,
+    const uint32_t* left_slots,
+    const uint32_t* right_slots,
+    uint64_t pair_count,
+    uint32_t mode,
+    Result* values,
+    uint32_t* states,
+    uint64_t* supports
+) {
+    const uint64_t pair = blockIdx.x;
+    if (pair >= pair_count) return;
+    const Storage* left = left_columns + static_cast<uint64_t>(left_slots[pair]) * rows;
+    const Storage* right = right_columns + static_cast<uint64_t>(right_slots[pair]) * rows;
+    __shared__ Accumulation left_sums[kThreads];
+    __shared__ Accumulation right_sums[kThreads];
+    __shared__ Accumulation left_variances[kThreads];
+    __shared__ Accumulation right_variances[kThreads];
+    __shared__ Accumulation covariances[kThreads];
+    __shared__ uint32_t nonfinite[kThreads];
+    __shared__ uint32_t left_changed[kThreads];
+    __shared__ uint32_t right_changed[kThreads];
+    __shared__ Accumulation left_mean;
+    __shared__ Accumulation right_mean;
+    __shared__ uint32_t result_state;
+
+    const Storage left_first = rows == 0 ? static_cast<Storage>(0) : left[0];
+    const Storage right_first = rows == 0 ? static_cast<Storage>(0) : right[0];
+    Accumulation local_left_sum = static_cast<Accumulation>(0);
+    Accumulation local_right_sum = static_cast<Accumulation>(0);
+    uint32_t local_nonfinite = 0;
+    uint32_t local_left_changed = 0;
+    uint32_t local_right_changed = 0;
+    for (uint64_t row = threadIdx.x; row < rows; row += blockDim.x) {
+        const Storage left_value = left[row];
+        const Storage right_value = right[row];
+        if (!device_isfinite(left_value) || !device_isfinite(right_value)) {
+            local_nonfinite = 1;
+        }
+        local_left_changed |= left_value != left_first;
+        local_right_changed |= right_value != right_first;
+        local_left_sum += static_cast<Accumulation>(left_value);
+        local_right_sum += static_cast<Accumulation>(right_value);
+    }
+    left_sums[threadIdx.x] = local_left_sum;
+    right_sums[threadIdx.x] = local_right_sum;
+    nonfinite[threadIdx.x] = local_nonfinite;
+    left_changed[threadIdx.x] = local_left_changed;
+    right_changed[threadIdx.x] = local_right_changed;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            left_sums[threadIdx.x] += left_sums[threadIdx.x + stride];
+            right_sums[threadIdx.x] += right_sums[threadIdx.x + stride];
+            nonfinite[threadIdx.x] |= nonfinite[threadIdx.x + stride];
+            left_changed[threadIdx.x] |= left_changed[threadIdx.x + stride];
+            right_changed[threadIdx.x] |= right_changed[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        supports[pair] = rows;
+        result_state = rows < 2 ? GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT :
+            nonfinite[0] != 0 ? GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION :
+            left_changed[0] == 0 || right_changed[0] == 0
+                ? GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND
+                : GAFIME_SEMANTIC_SCALAR_MEASURED;
+        if (result_state == GAFIME_SEMANTIC_SCALAR_MEASURED) {
+            left_mean = left_sums[0] / static_cast<Accumulation>(rows);
+            right_mean = right_sums[0] / static_cast<Accumulation>(rows);
+        }
+    }
+    __syncthreads();
+    if (result_state != GAFIME_SEMANTIC_SCALAR_MEASURED) {
+        if (threadIdx.x == 0) {
+            states[pair] = result_state;
+            values[pair] = static_cast<Result>(0);
+        }
+        return;
+    }
+    Accumulation local_left_variance = static_cast<Accumulation>(0);
+    Accumulation local_right_variance = static_cast<Accumulation>(0);
+    Accumulation local_covariance = static_cast<Accumulation>(0);
+    for (uint64_t row = threadIdx.x; row < rows; row += blockDim.x) {
+        const Accumulation left_delta = static_cast<Accumulation>(left[row]) - left_mean;
+        const Accumulation right_delta = static_cast<Accumulation>(right[row]) - right_mean;
+        local_left_variance += left_delta * left_delta;
+        local_right_variance += right_delta * right_delta;
+        local_covariance += left_delta * right_delta;
+    }
+    left_variances[threadIdx.x] = local_left_variance;
+    right_variances[threadIdx.x] = local_right_variance;
+    covariances[threadIdx.x] = local_covariance;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            left_variances[threadIdx.x] += left_variances[threadIdx.x + stride];
+            right_variances[threadIdx.x] += right_variances[threadIdx.x + stride];
+            covariances[threadIdx.x] += covariances[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const Accumulation left_variance = left_variances[0];
+        const Accumulation right_variance = right_variances[0];
+        const Accumulation covariance = covariances[0];
+        if (left_variance == static_cast<Accumulation>(0) ||
+            right_variance == static_cast<Accumulation>(0)) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_DEGENERATE_REDUCTION;
+            values[pair] = static_cast<Result>(0);
+            return;
+        }
+        // Preserve Core's checked-Pearson distinction: finite, nonconstant
+        // operands whose positive variance product underflows to zero are a
+        // degenerate reduction, not a nonfinite arithmetic result.
+        if (device_isfinite(left_variance) && device_isfinite(right_variance) &&
+            device_isfinite(covariance) && left_variance > static_cast<Accumulation>(0) &&
+            right_variance > static_cast<Accumulation>(0) &&
+            left_variance * right_variance == static_cast<Accumulation>(0)) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_DEGENERATE_REDUCTION;
+            values[pair] = static_cast<Result>(0);
+            return;
+        }
+        Result correlation = finalize_correlation<Accumulation, Result>(
+            left_variance, right_variance, covariance);
+        if (!device_isfinite(correlation)) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+            values[pair] = static_cast<Result>(0);
+            return;
+        }
+        if (mode == GAFIME_SEMANTIC_PEARSON_ABSOLUTE) correlation = device_abs(correlation);
+        states[pair] = GAFIME_SEMANTIC_SCALAR_MEASURED;
+        values[pair] = correlation;
+    }
+}
+
+template <typename Storage, typename Accumulation, typename Result>
+__global__ void semantic_ordered_edge_energy_kernel(
+    const Storage* columns,
+    uint64_t rows,
+    const uint32_t* candidate_slots,
+    uint64_t candidate_count,
+    const GafimeSemanticEdge* edges,
+    const Storage* weights,
+    uint64_t edge_count,
+    Result* values,
+    uint32_t* states,
+    uint64_t* supports
+) {
+    const uint64_t candidate = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (candidate >= candidate_count) return;
+    supports[candidate] = edge_count;
+    if (rows == 0) {
+        states[candidate] = GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT;
+        values[candidate] = static_cast<Result>(0);
+        return;
+    }
+    const Storage* column = columns + static_cast<uint64_t>(candidate_slots[candidate]) * rows;
+    const Storage first = column[0];
+    bool constant = true;
+    for (uint64_t row = 0; row < rows; ++row) constant = constant && column[row] == first;
+    if (constant) {
+        states[candidate] = GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND;
+        values[candidate] = static_cast<Result>(0);
+        return;
+    }
+    Accumulation numerator = static_cast<Accumulation>(0);
+    Accumulation denominator = static_cast<Accumulation>(0);
+    for (uint64_t edge_index = 0; edge_index < edge_count; ++edge_index) {
+        const GafimeSemanticEdge edge = edges[edge_index];
+        const Accumulation left = static_cast<Accumulation>(column[edge.left_row]);
+        const Accumulation right = static_cast<Accumulation>(column[edge.right_row]);
+        const Accumulation weight = static_cast<Accumulation>(weights[edge_index]);
+        const Accumulation difference = left - right;
+        numerator += weight * difference * difference;
+        denominator += weight * (left * left + right * right);
+    }
+    if (!device_isfinite(numerator) || !device_isfinite(denominator)) {
+        states[candidate] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+        values[candidate] = static_cast<Result>(0);
+        return;
+    }
+    const Accumulation ratio = numerator / denominator;
+    if (!device_isfinite(ratio)) {
+        states[candidate] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+        values[candidate] = static_cast<Result>(0);
+        return;
+    }
+    states[candidate] = GAFIME_SEMANTIC_SCALAR_MEASURED;
+    values[candidate] = static_cast<Result>(ratio);
+}
+
+template <typename Storage>
+__global__ void semantic_sparse_gather_kernel(
+    const Storage* source_columns,
+    uint64_t source_rows,
+    Storage* destination_columns,
+    uint64_t destination_rows,
+    const uint32_t* source_slots,
+    const uint32_t* destination_slots,
+    uint64_t slot_count,
+    const uint64_t* row_indices
+) {
+    const uint64_t element = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t total = slot_count * destination_rows;
+    if (element >= total) return;
+    const uint64_t slot_index = element / destination_rows;
+    const uint64_t destination_row = element % destination_rows;
+    const uint64_t source_row = row_indices[destination_row];
+    destination_columns[static_cast<uint64_t>(destination_slots[slot_index]) * destination_rows +
+        destination_row] = source_columns[static_cast<uint64_t>(source_slots[slot_index]) * source_rows +
+        source_row];
+}
+
+inline uint32_t semantic_grid_blocks(uint64_t items, const CudaKernelLaunchPolicy& policy) {
+    if (items == 0) return 0;
+    const uint64_t blocks = (items + policy.threads_per_block - 1) / policy.threads_per_block;
+    return blocks > static_cast<uint64_t>(UINT32_MAX) ? 0 : static_cast<uint32_t>(blocks);
+}
+
+template <GafimePrecisionProfile Profile>
+cudaError_t launch_semantic_absolute_difference_erased(
+    void* columns, uint64_t rows, uint32_t left_slot, uint32_t right_slot, uint32_t output_slot,
+    const CudaKernelLaunchPolicy& policy, cudaStream_t stream
+) {
+    const uint32_t blocks = semantic_grid_blocks(rows, policy);
+    if (rows != 0 && blocks == 0) return cudaErrorInvalidConfiguration;
+    if (blocks == 0) return cudaSuccess;
+    semantic_absolute_difference_kernel<StorageFor<Profile>><<<blocks, policy.threads_per_block, 0, stream>>>(
+        static_cast<StorageFor<Profile>*>(columns), rows, left_slot, right_slot, output_slot);
+    return cudaGetLastError();
+}
+
+template <GafimePrecisionProfile Profile>
+cudaError_t launch_semantic_softsign_erased(
+    void* columns, uint64_t rows, uint32_t input_slot, uint32_t output_slot,
+    const CudaKernelLaunchPolicy& policy, cudaStream_t stream
+) {
+    const uint32_t blocks = semantic_grid_blocks(rows, policy);
+    if (rows != 0 && blocks == 0) return cudaErrorInvalidConfiguration;
+    if (blocks == 0) return cudaSuccess;
+    semantic_softsign_kernel<StorageFor<Profile>><<<blocks, policy.threads_per_block, 0, stream>>>(
+        static_cast<StorageFor<Profile>*>(columns), rows, input_slot, output_slot);
+    return cudaGetLastError();
+}
+
+template <GafimePrecisionProfile Profile>
+cudaError_t launch_semantic_centered_product_erased(
+    void* columns, uint64_t rows, const uint32_t* operand_slots, const uint64_t* mean_bits,
+    uint32_t operand_count, uint32_t output_slot, const CudaKernelLaunchPolicy& policy,
+    cudaStream_t stream
+) {
+    const uint32_t blocks = semantic_grid_blocks(rows, policy);
+    if (rows != 0 && blocks == 0) return cudaErrorInvalidConfiguration;
+    if (blocks == 0) return cudaSuccess;
+    semantic_centered_product_kernel<StorageFor<Profile>><<<blocks, policy.threads_per_block, 0, stream>>>(
+        static_cast<StorageFor<Profile>*>(columns), rows, operand_slots, mean_bits, operand_count,
+        output_slot);
+    return cudaGetLastError();
+}
+
+template <GafimePrecisionProfile Profile>
+cudaError_t launch_semantic_reject_nonfinite_output_erased(
+    const void* columns, uint64_t rows, uint32_t slot, uint32_t* nonfinite_out,
+    const CudaKernelLaunchPolicy& policy, cudaStream_t stream
+) {
+    const uint32_t blocks = semantic_grid_blocks(rows, policy);
+    if (rows != 0 && blocks == 0) return cudaErrorInvalidConfiguration;
+    if (blocks == 0) return cudaSuccess;
+    semantic_reject_nonfinite_output_kernel<StorageFor<Profile>><<<
+        blocks, policy.threads_per_block, 0, stream>>>(
+        static_cast<const StorageFor<Profile>*>(columns), rows, slot, nonfinite_out);
+    return cudaGetLastError();
+}
+
+template <GafimePrecisionProfile Profile>
+cudaError_t launch_semantic_pairwise_pearson_erased(
+    const void* left_columns, const void* right_columns, uint64_t rows, const uint32_t* left_slots,
+    const uint32_t* right_slots, uint64_t pair_count, uint32_t mode, void* values,
+    uint32_t* states, uint64_t* supports, const CudaKernelLaunchPolicy& policy, cudaStream_t stream
+) {
+    if (pair_count == 0) return cudaSuccess;
+    if (pair_count > static_cast<uint64_t>(UINT32_MAX)) return cudaErrorInvalidConfiguration;
+    semantic_pairwise_pearson_kernel<StorageFor<Profile>, AccumulationFor<Profile>, ResultFor<Profile>><<<
+        static_cast<uint32_t>(pair_count), policy.threads_per_block, 0, stream>>>(
+        static_cast<const StorageFor<Profile>*>(left_columns),
+        static_cast<const StorageFor<Profile>*>(right_columns), rows, left_slots, right_slots,
+        pair_count, mode, static_cast<ResultFor<Profile>*>(values), states, supports);
+    return cudaGetLastError();
+}
+
+template <GafimePrecisionProfile Profile>
+cudaError_t launch_semantic_ordered_edge_energy_erased(
+    const void* columns, uint64_t rows, const uint32_t* candidate_slots, uint64_t candidate_count,
+    const GafimeSemanticEdge* edges, const void* weights, uint64_t edge_count, void* values,
+    uint32_t* states, uint64_t* supports, const CudaKernelLaunchPolicy& policy, cudaStream_t stream
+) {
+    const uint32_t blocks = semantic_grid_blocks(candidate_count, policy);
+    if (candidate_count != 0 && blocks == 0) return cudaErrorInvalidConfiguration;
+    if (blocks == 0) return cudaSuccess;
+    semantic_ordered_edge_energy_kernel<StorageFor<Profile>, AccumulationFor<Profile>, ResultFor<Profile>><<<
+        blocks, policy.threads_per_block, 0, stream>>>(
+        static_cast<const StorageFor<Profile>*>(columns), rows, candidate_slots, candidate_count,
+        edges, static_cast<const StorageFor<Profile>*>(weights), edge_count,
+        static_cast<ResultFor<Profile>*>(values), states, supports);
+    return cudaGetLastError();
+}
+
+template <GafimePrecisionProfile Profile>
+cudaError_t launch_semantic_sparse_gather_erased(
+    const void* source_columns, uint64_t source_rows, void* destination_columns,
+    uint64_t destination_rows, const uint32_t* source_slots, const uint32_t* destination_slots,
+    uint64_t slot_count, const uint64_t* row_indices, const CudaKernelLaunchPolicy& policy,
+    cudaStream_t stream
+) {
+    if (slot_count != 0 && destination_rows > UINT64_MAX / slot_count) {
+        return cudaErrorInvalidValue;
+    }
+    const uint64_t total = slot_count * destination_rows;
+    const uint32_t blocks = semantic_grid_blocks(total, policy);
+    if (total != 0 && blocks == 0) return cudaErrorInvalidConfiguration;
+    if (blocks == 0) return cudaSuccess;
+    semantic_sparse_gather_kernel<StorageFor<Profile>><<<blocks, policy.threads_per_block, 0, stream>>>(
+        static_cast<const StorageFor<Profile>*>(source_columns), source_rows,
+        static_cast<StorageFor<Profile>*>(destination_columns), destination_rows, source_slots,
+        destination_slots, slot_count, row_indices);
+    return cudaGetLastError();
+}
+
+template <GafimePrecisionProfile Profile>
+CudaSemanticKernelSet make_semantic_kernel_set() {
+    CudaSemanticKernelSet set{};
+    set.storage_bytes = sizeof(StorageFor<Profile>);
+    set.accumulation_bytes = sizeof(AccumulationFor<Profile>);
+    set.result_bytes = sizeof(ResultFor<Profile>);
+    set.absolute_difference = &launch_semantic_absolute_difference_erased<Profile>;
+    set.softsign = &launch_semantic_softsign_erased<Profile>;
+    set.centered_product = &launch_semantic_centered_product_erased<Profile>;
+    set.reject_nonfinite_output = &launch_semantic_reject_nonfinite_output_erased<Profile>;
+    set.pairwise_pearson = &launch_semantic_pairwise_pearson_erased<Profile>;
+    set.ordered_edge_energy = &launch_semantic_ordered_edge_energy_erased<Profile>;
+    set.sparse_gather = &launch_semantic_sparse_gather_erased<Profile>;
+    return set;
+}
+
 template <GafimePrecisionProfile Profile>
 CudaPrecisionKernelSet make_kernel_set() {
     using Storage = StorageFor<Profile>;
@@ -1852,6 +2284,25 @@ const CudaPrecisionKernelSet* cuda_legacy_kernel_set() {
     static const CudaPrecisionKernelSet legacy =
         precision_kernel::make_legacy_kernel_set<GAFIME_PRECISION_FP32>();
     return &legacy;
+}
+
+const CudaSemanticKernelSet* cuda_semantic_kernel_set(GafimePrecisionProfile profile) {
+    static const CudaSemanticKernelSet fp32 =
+        precision_kernel::make_semantic_kernel_set<GAFIME_PRECISION_FP32>();
+    static const CudaSemanticKernelSet mixed =
+        precision_kernel::make_semantic_kernel_set<GAFIME_PRECISION_MIXED>();
+    static const CudaSemanticKernelSet fp64 =
+        precision_kernel::make_semantic_kernel_set<GAFIME_PRECISION_FP64>();
+    switch (profile) {
+    case GAFIME_PRECISION_FP32:
+        return &fp32;
+    case GAFIME_PRECISION_MIXED:
+        return &mixed;
+    case GAFIME_PRECISION_FP64:
+        return &fp64;
+    default:
+        return nullptr;
+    }
 }
 
 }  // namespace gafime_cuda_v1

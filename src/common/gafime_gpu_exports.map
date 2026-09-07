@@ -21,6 +21,17 @@
     gafime_gpu_permutation_pvalues_v2;
     gafime_gpu_interaction_diagnostics_v2;
     gafime_gpu_matrix_free_v2;
+    gafime_gpu_semantic_capabilities_v1;
+    gafime_gpu_semantic_bank_alloc_v1;
+    gafime_gpu_semantic_bank_upload_v1;
+    gafime_gpu_semantic_materialize_v1;
+    gafime_gpu_semantic_pairwise_pearson_v1;
+    gafime_gpu_semantic_ordered_edge_energy_v1;
+    gafime_gpu_semantic_sparse_gather_v1;
+    gafime_gpu_semantic_forecast_v1;
+    gafime_gpu_semantic_bank_retain_v1;
+    gafime_gpu_semantic_bank_download_v1;
+    gafime_gpu_semantic_bank_free_v1;
   local:
     *;
 };

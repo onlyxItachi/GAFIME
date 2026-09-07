@@ -47,7 +47,7 @@ Coverage classes:
 | `gafime.family_capability` | primary | lookup/failure semantics | family sections | family smoke | exact-name lookup |
 | `gafime.generate_tutorial` | integration | generator contract | documentation hierarchy | deterministic tutorial parity test | generates the compact practice notebook only |
 | `gafime.require_family_supported` | primary | lookup/failure semantics | family sections | family smoke | fail-closed family admission |
-| `gafime.semantic` | explicit namespace | bounded lifecycle and support boundary | semantic lifecycle/API index | semantic boundary and installed-wheel lifecycle smokes | additive Core-only development namespace; explicit import only, deliberately omitted from legacy wildcard exports; its handles are not copied to the top level |
+| `gafime.semantic` | explicit namespace | bounded lifecycle and support boundary | semantic lifecycle/API index | semantic boundary, installed-wheel lifecycle, and hardware-conditional accelerator smokes | additive Rust-owned namespace: complete Core vocabulary plus a conditional CUDA/ROCm subset; explicit import only, deliberately omitted from legacy wildcard exports; its handles are not copied to the top level |
 | `gafime.subfunctions` | advanced compatibility | proxy and compatibility boundary | compatibility/API-index section | existing compatibility tests | prefer top-level safe APIs for new code |
 
 The table covers every name in `gafime.__all__` plus the public runtime version
@@ -127,7 +127,7 @@ the legacy supervised APIs. The detailed contract is
 
 | Symbol | Classification | Supported purpose | Important boundary |
 |---|---|---|---|
-| `TabularSession` | primary | owns a bounded Core discovery/inference lifecycle | `capabilities` separates selected operation support from legacy backend availability; `diagnostics` reports completed native work, not timing; `close()` is terminal and idempotent |
+| `TabularSession` | primary | owns a bounded Core discovery/inference lifecycle and an explicit conditional CUDA/ROCm subset | `capabilities` separates selected operation support from legacy backend availability; GPU support is a runtime intersection, not a Core fallback; `diagnostics` reports completed native work, not timing; `close()` is terminal and idempotent |
 | `Snapshot` | result model | immutable Rust-owned frame identity | row keys/domain, profile, role, schema, and provenance are explicit; caller mutation after ingest does not alter it |
 | `Candidate`, `CandidateSet`, `AcceptedSet` | result model | opaque session-local program handles and bounded ordered collections | no integer constructor, serialization, cross-session reuse, or authority from output ordinals |
 | `Evidence` | primary declaration | named reference, paired-view, labels, or graph measurement | a named measurement is not a universal quality score or a fabricated target |
@@ -138,24 +138,46 @@ the legacy supervised APIs. The detailed contract is
 
 The semantic constructor uses `EngineConfig` only for `backend`, `device_id`,
 and `precision`; non-default legacy scoring, family, significance, or budget
-fields are rejected rather than silently becoming semantic policy. The current
-implementation admits `core` or `auto` and reports `core` as the selected
-backend. Native normalization maps `cpu`, `rust`, and `v1-rust-cpu` to `core`
-and `hip` to `rocm`; the latter remains unsupported by this semantic product.
-It does not claim a CUDA, ROCm, Metal, asynchronous, or Python data-plane
+fields are rejected rather than silently becoming semantic policy. `core` and
+`auto` select Core, with `auto` deliberately retaining Core for the complete
+vocabulary. Explicit CUDA/ROCm requests require a complete compatible optional
+semantic primitive payload table and then admit only the runtime intersection
+of payload capabilities and Rust lowering for the selected profile. Native
+normalization maps `cpu`, `rust`, and `v1-rust-cpu` to `core` and `hip` to
+`rocm`. Metal is explicitly unsupported for this semantic product. No request
+silently substitutes Core, and none admits an asynchronous or Python data-plane
 semantic execution path.
 
-`TabularSession.capabilities` records the configured/selected backend, the
-requested `configured_device_id`, and `selected_device_id=None` for the current
-Core execution, along with the accepted program vocabulary, contextual evidence
-vocabulary, statistics, and why Core was selected. It is operation-specific
-static support information, not a GPU probe or physical-execution record.
-`TabularSession.diagnostics` contains
-cumulative completed materialization/evidence counters and retained bytes; it
-does not model cache performance, elapsed time, process RSS, or Arrow-output
-copies. `describe(candidate)` returns bounded operation/dependency metadata and
-opaque operand handles for inspection only; it does not make a candidate
-serializable or a public native descriptor.
+`TabularSession.capabilities` records configured/selected backend, requested
+and selected device identity, selected profile, accepted program/context/
+statistic vocabulary, and the selection reason. Core reports static complete
+vocabulary. A GPU session reports only the runtime intersection of its loaded
+payload and installed Rust lowering; the payload path and separate primitive
+ABI version identify that observation. This is operation-specific support
+information, not a GPU probe or physical-execution record. GPU `diagnostics`
+contains only backend identity, retained bytes, and
+`native_work_counters_available=False`; it does not model or fabricate timing,
+kernel counters, cache performance, process RSS, or Arrow-output copies. Core
+retains its detailed completed-work diagnostics. `describe(candidate)` returns
+bounded operation/dependency metadata and opaque operand handles for inspection
+only; it does not make a candidate serializable or a public native descriptor.
+
+The current explicit CUDA/ROCm subset can negotiate source, absolute difference,
+softsign, and ordered frozen centered product; Pearson reference/paired context,
+sparse partial labels, and graph energy are admitted only when their individual
+capability bits are available. Spearman and fixed corrected NMI are unsupported
+there and fail rather than falling back to Core. Hardware-conditional public
+tests make a missing corresponding payload a clear skip; a configured but
+insufficient payload is a failure. The installed-payload public suite passed
+29/29 cases on CUDA device 0 / RTX 4060 Laptop (`sm89`, driver `610.57.04`) and
+29/29 on ROCm device 0 / AMD Radeon Graphics (`gfx1150`, runtime `70253211`,
+system LLVM `21.1.8`); separate frozen legacy C ABI CMake fixtures passed CUDA
+11/11 and ROCm 10/10. That record is limited to those configurations and
+correctness paths, not a performance or general hardware-availability claim. A
+successful host-only Core test, payload discovery, or a skip remains not
+physical accelerator evidence. See
+[the optional semantic primitive ABI record](semantic-primitives-abi.md) for the
+separate ABI version domain and current validation status.
 
 Collection arguments—including proposal operators/atoms, candidate and channel
 sets, frozen means, row keys, labels, and graph edges—are bounded indexed

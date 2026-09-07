@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <new>
 #include <type_traits>
 #include <vector>
@@ -14,6 +15,7 @@
 #include "../common/covariance_policy.hpp"
 #include "../common/gpu_abi_impl.hpp"
 #include "../common/gafime_gpu_internal_abi.hpp"
+#include "../common/semantic_primitives_abi_impl.hpp"
 
 #ifndef GAFIME_GPU_MI_ACCUMULATION_FP64
 #define GAFIME_GPU_MI_ACCUMULATION_FP64 0
@@ -720,6 +722,131 @@ hipError_t launch_copy_selected_metric_rows(
         selected_metric_values, stream);
 }
 
+inline bool semantic_grid_blocks(uint64_t items, uint32_t* blocks_out) {
+    if (blocks_out == nullptr) return false;
+    if (items == 0) {
+        *blocks_out = 0;
+        return true;
+    }
+    const uint64_t blocks = (items + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    if (blocks > static_cast<uint64_t>(UINT32_MAX)) return false;
+    *blocks_out = static_cast<uint32_t>(blocks);
+    return true;
+}
+
+template <typename StorageT>
+hipError_t launch_semantic_absolute_difference(
+    StorageT* columns, uint64_t rows, uint32_t left_slot, uint32_t right_slot,
+    uint32_t output_slot, hipStream_t stream
+) {
+    uint32_t blocks = 0;
+    if (!semantic_grid_blocks(rows, &blocks)) return hipErrorInvalidValue;
+    if (blocks == 0) return hipSuccess;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME((kernel::precision_kernel::semantic_absolute_difference_kernel<StorageT>)),
+        dim3(blocks), dim3(kThreadsPerBlock), 0, stream,
+        columns, rows, left_slot, right_slot, output_slot);
+    return hipGetLastError();
+}
+
+template <typename StorageT>
+hipError_t launch_semantic_softsign(
+    StorageT* columns, uint64_t rows, uint32_t input_slot, uint32_t output_slot, hipStream_t stream
+) {
+    uint32_t blocks = 0;
+    if (!semantic_grid_blocks(rows, &blocks)) return hipErrorInvalidValue;
+    if (blocks == 0) return hipSuccess;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME((kernel::precision_kernel::semantic_softsign_kernel<StorageT>)),
+        dim3(blocks), dim3(kThreadsPerBlock), 0, stream, columns, rows, input_slot, output_slot);
+    return hipGetLastError();
+}
+
+template <typename StorageT>
+hipError_t launch_semantic_centered_product(
+    StorageT* columns, uint64_t rows, const uint32_t* operand_slots, const uint64_t* mean_bits,
+    uint32_t operand_count, uint32_t output_slot, hipStream_t stream
+) {
+    uint32_t blocks = 0;
+    if (!semantic_grid_blocks(rows, &blocks)) return hipErrorInvalidValue;
+    if (blocks == 0) return hipSuccess;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME((kernel::precision_kernel::semantic_centered_product_kernel<StorageT>)),
+        dim3(blocks), dim3(kThreadsPerBlock), 0, stream, columns, rows, operand_slots, mean_bits,
+        operand_count, output_slot);
+    return hipGetLastError();
+}
+
+template <typename StorageT>
+hipError_t launch_semantic_reject_nonfinite_output(
+    const StorageT* columns,
+    uint64_t rows,
+    uint32_t slot,
+    uint32_t* nonfinite_out,
+    hipStream_t stream
+) {
+    uint32_t blocks = 0;
+    if (!semantic_grid_blocks(rows, &blocks)) return hipErrorInvalidValue;
+    if (blocks == 0) return hipSuccess;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME((kernel::precision_kernel::semantic_reject_nonfinite_output_kernel<StorageT>)),
+        dim3(blocks), dim3(kThreadsPerBlock), 0, stream, columns, rows, slot, nonfinite_out);
+    return hipGetLastError();
+}
+
+template <typename StorageT, typename AccumT, typename ResultT>
+hipError_t launch_semantic_pairwise_pearson(
+    const StorageT* left_columns, const StorageT* right_columns, uint64_t rows,
+    const uint32_t* left_slots, const uint32_t* right_slots, uint64_t pair_count, uint32_t mode,
+    ResultT* values, uint32_t* states, uint64_t* supports, hipStream_t stream
+) {
+    if (pair_count == 0) return hipSuccess;
+    if (pair_count > static_cast<uint64_t>(UINT32_MAX)) return hipErrorInvalidValue;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME((kernel::precision_kernel::semantic_pairwise_pearson_kernel<
+            StorageT, AccumT, ResultT>)),
+        dim3(static_cast<uint32_t>(pair_count)), dim3(kThreadsPerBlock), 0, stream,
+        left_columns, right_columns, rows, left_slots, right_slots, pair_count, mode, values, states,
+        supports);
+    return hipGetLastError();
+}
+
+template <typename StorageT, typename AccumT, typename ResultT>
+hipError_t launch_semantic_ordered_edge_energy(
+    const StorageT* columns, uint64_t rows, const uint32_t* candidate_slots,
+    uint64_t candidate_count, const GafimeSemanticEdge* edges, const StorageT* weights,
+    uint64_t edge_count, ResultT* values, uint32_t* states, uint64_t* supports, hipStream_t stream
+) {
+    uint32_t blocks = 0;
+    if (!semantic_grid_blocks(candidate_count, &blocks)) return hipErrorInvalidValue;
+    if (blocks == 0) return hipSuccess;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME((kernel::precision_kernel::semantic_ordered_edge_energy_kernel<
+            StorageT, AccumT, ResultT>)),
+        dim3(blocks), dim3(kThreadsPerBlock), 0, stream, columns, rows, candidate_slots,
+        candidate_count, edges, weights, edge_count, values, states, supports);
+    return hipGetLastError();
+}
+
+template <typename StorageT>
+hipError_t launch_semantic_sparse_gather(
+    const StorageT* source_columns, uint64_t source_rows, StorageT* destination_columns,
+    uint64_t destination_rows, const uint32_t* source_slots, const uint32_t* destination_slots,
+    uint64_t slot_count, const uint64_t* row_indices, hipStream_t stream
+) {
+    if (slot_count != 0 && destination_rows > std::numeric_limits<uint64_t>::max() / slot_count) {
+        return hipErrorInvalidValue;
+    }
+    uint32_t blocks = 0;
+    if (!semantic_grid_blocks(slot_count * destination_rows, &blocks)) return hipErrorInvalidValue;
+    if (blocks == 0) return hipSuccess;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME((kernel::precision_kernel::semantic_sparse_gather_kernel<StorageT>)),
+        dim3(blocks), dim3(kThreadsPerBlock), 0, stream, source_columns, source_rows,
+        destination_columns, destination_rows, source_slots, destination_slots, slot_count, row_indices);
+    return hipGetLastError();
+}
+
 }  // namespace gafime_rocm_v1
 
 namespace {
@@ -750,9 +877,25 @@ static_assert(
 // Both ABI generations now share one opaque resident owner.  The magic guards
 // the frozen and generic entry points before either interprets the handle.
 constexpr uint64_t kPrecisionHipMatrixMagic = 0x4741464849505032ull;  // GAFHIPP2
+constexpr uint64_t kSemanticHipBankMagic = 0x47414653454D4831ull;  // GAFSEMH1
 
 struct HipMatrixHeader {
     uint64_t magic;
+};
+
+struct SemanticHipBank : HipMatrixHeader {
+    uint32_t device_id;
+    uint32_t device_flags;
+    uint64_t arch_class;
+    uint32_t profile;
+    bool unified_memory;
+    uint64_t rows;
+    uint32_t source_slots;
+    uint32_t slot_capacity;
+    GafimeNumericRoute route;
+    void* columns;
+    bool sources_uploaded;
+    std::vector<uint8_t> initialized_slots;
 };
 
 struct PrecisionGraphChunkShape {
@@ -3488,6 +3631,707 @@ int precision_permutation_pvalues_host(
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
+SemanticHipBank* semantic_bank_from_handle(GafimeGpuSemanticBank handle) {
+    auto* bank = static_cast<SemanticHipBank*>(handle);
+    return bank != nullptr && bank->magic == kSemanticHipBankMagic ? bank : nullptr;
+}
+
+int require_semantic_bank(const SemanticHipBank* bank) {
+    return bank != nullptr && bank->magic == kSemanticHipBankMagic && bank->columns != nullptr &&
+            (bank->profile == GAFIME_PRECISION_FP32 || bank->profile == GAFIME_PRECISION_MIXED ||
+                bank->profile == GAFIME_PRECISION_FP64)
+        ? GAFIME_STATUS_OK
+        : GAFIME_STATUS_INVALID_ARGUMENT;
+}
+
+bool semantic_slots_initialized(
+    const SemanticHipBank* bank,
+    const uint32_t* slots,
+    uint64_t count
+) {
+    if (bank == nullptr || (slots == nullptr && count != 0)) return false;
+    for (uint64_t index = 0; index < count; ++index) {
+        if (slots[index] >= bank->initialized_slots.size() || !bank->initialized_slots[slots[index]]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int semantic_bank_free(SemanticHipBank* bank) {
+    if (bank == nullptr || bank->magic != kSemanticHipBankMagic) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // Device selection is part of ownership, not optional teardown advice.
+    // Report a failed switch/free without invalidating the caller's handle.
+    if (bank->columns != nullptr) {
+        ScopedHipDevice device(bank->device_id);
+        int status = hip_status(device.status());
+        if (status != GAFIME_STATUS_OK) return status;
+        status = hip_status(hipFree(bank->columns));
+        if (status != GAFIME_STATUS_OK) return status;
+    }
+    bank->columns = nullptr;
+    bank->magic = 0;
+    delete bank;
+    return GAFIME_STATUS_OK;
+}
+
+int semantic_launch_absolute_difference(
+    SemanticHipBank* bank, uint32_t left, uint32_t right, uint32_t output
+) {
+    switch (bank->profile) {
+    case GAFIME_PRECISION_FP32:
+    case GAFIME_PRECISION_MIXED:
+        return hip_status(gafime_rocm_v1::launch_semantic_absolute_difference(
+            static_cast<float*>(bank->columns), bank->rows, left, right, output, nullptr));
+    case GAFIME_PRECISION_FP64:
+        return hip_status(gafime_rocm_v1::launch_semantic_absolute_difference(
+            static_cast<double*>(bank->columns), bank->rows, left, right, output, nullptr));
+    default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+}
+
+int semantic_launch_softsign(SemanticHipBank* bank, uint32_t input, uint32_t output) {
+    switch (bank->profile) {
+    case GAFIME_PRECISION_FP32:
+    case GAFIME_PRECISION_MIXED:
+        return hip_status(gafime_rocm_v1::launch_semantic_softsign(
+            static_cast<float*>(bank->columns), bank->rows, input, output, nullptr));
+    case GAFIME_PRECISION_FP64:
+        return hip_status(gafime_rocm_v1::launch_semantic_softsign(
+            static_cast<double*>(bank->columns), bank->rows, input, output, nullptr));
+    default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+}
+
+int semantic_launch_centered_product(
+    SemanticHipBank* bank,
+    const uint32_t* operand_slots,
+    const uint64_t* mean_bits,
+    uint32_t operand_count,
+    uint32_t output
+) {
+    switch (bank->profile) {
+    case GAFIME_PRECISION_FP32:
+    case GAFIME_PRECISION_MIXED:
+        return hip_status(gafime_rocm_v1::launch_semantic_centered_product(
+            static_cast<float*>(bank->columns), bank->rows, operand_slots, mean_bits, operand_count,
+            output, nullptr));
+    case GAFIME_PRECISION_FP64:
+        return hip_status(gafime_rocm_v1::launch_semantic_centered_product(
+            static_cast<double*>(bank->columns), bank->rows, operand_slots, mean_bits, operand_count,
+            output, nullptr));
+    default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+}
+
+int semantic_launch_reject_nonfinite_output(
+    SemanticHipBank* bank,
+    uint32_t slot,
+    uint32_t* nonfinite_out
+) {
+    switch (bank->profile) {
+    case GAFIME_PRECISION_FP32:
+    case GAFIME_PRECISION_MIXED:
+        return hip_status(gafime_rocm_v1::launch_semantic_reject_nonfinite_output(
+            static_cast<const float*>(bank->columns), bank->rows, slot, nonfinite_out, nullptr));
+    case GAFIME_PRECISION_FP64:
+        return hip_status(gafime_rocm_v1::launch_semantic_reject_nonfinite_output(
+            static_cast<const double*>(bank->columns), bank->rows, slot, nonfinite_out, nullptr));
+    default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+}
+
+int semantic_launch_pairwise_pearson(
+    SemanticHipBank* left,
+    SemanticHipBank* right,
+    const uint32_t* left_slots,
+    const uint32_t* right_slots,
+    uint64_t pair_count,
+    uint32_t mode,
+    void* values,
+    uint32_t* states,
+    uint64_t* supports
+) {
+    switch (left->profile) {
+    case GAFIME_PRECISION_FP32:
+        return hip_status(gafime_rocm_v1::launch_semantic_pairwise_pearson<float, float, float>(
+            static_cast<const float*>(left->columns), static_cast<const float*>(right->columns), left->rows,
+            left_slots, right_slots, pair_count, mode, static_cast<float*>(values), states, supports, nullptr));
+    case GAFIME_PRECISION_MIXED:
+        return hip_status(gafime_rocm_v1::launch_semantic_pairwise_pearson<float, double, double>(
+            static_cast<const float*>(left->columns), static_cast<const float*>(right->columns), left->rows,
+            left_slots, right_slots, pair_count, mode, static_cast<double*>(values), states, supports, nullptr));
+    case GAFIME_PRECISION_FP64:
+        return hip_status(gafime_rocm_v1::launch_semantic_pairwise_pearson<double, double, double>(
+            static_cast<const double*>(left->columns), static_cast<const double*>(right->columns), left->rows,
+            left_slots, right_slots, pair_count, mode, static_cast<double*>(values), states, supports, nullptr));
+    default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+}
+
+int semantic_launch_edge_energy(
+    SemanticHipBank* bank,
+    const uint32_t* candidates,
+    uint64_t candidate_count,
+    const GafimeSemanticEdge* edges,
+    const void* weights,
+    uint64_t edge_count,
+    void* values,
+    uint32_t* states,
+    uint64_t* supports
+) {
+    switch (bank->profile) {
+    case GAFIME_PRECISION_FP32:
+        return hip_status(gafime_rocm_v1::launch_semantic_ordered_edge_energy<float, float, float>(
+            static_cast<const float*>(bank->columns), bank->rows, candidates, candidate_count, edges,
+            static_cast<const float*>(weights), edge_count, static_cast<float*>(values), states, supports,
+            nullptr));
+    case GAFIME_PRECISION_MIXED:
+        return hip_status(gafime_rocm_v1::launch_semantic_ordered_edge_energy<float, double, double>(
+            static_cast<const float*>(bank->columns), bank->rows, candidates, candidate_count, edges,
+            static_cast<const float*>(weights), edge_count, static_cast<double*>(values), states, supports,
+            nullptr));
+    case GAFIME_PRECISION_FP64:
+        return hip_status(gafime_rocm_v1::launch_semantic_ordered_edge_energy<double, double, double>(
+            static_cast<const double*>(bank->columns), bank->rows, candidates, candidate_count, edges,
+            static_cast<const double*>(weights), edge_count, static_cast<double*>(values), states, supports,
+            nullptr));
+    default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+}
+
+int semantic_launch_sparse_gather(
+    SemanticHipBank* source,
+    SemanticHipBank* destination,
+    const uint32_t* source_slots,
+    const uint32_t* destination_slots,
+    uint64_t slot_count,
+    const uint64_t* row_indices
+) {
+    switch (source->profile) {
+    case GAFIME_PRECISION_FP32:
+    case GAFIME_PRECISION_MIXED:
+        return hip_status(gafime_rocm_v1::launch_semantic_sparse_gather(
+            static_cast<const float*>(source->columns), source->rows,
+            static_cast<float*>(destination->columns), destination->rows, source_slots,
+            destination_slots, slot_count, row_indices, nullptr));
+    case GAFIME_PRECISION_FP64:
+        return hip_status(gafime_rocm_v1::launch_semantic_sparse_gather(
+            static_cast<const double*>(source->columns), source->rows,
+            static_cast<double*>(destination->columns), destination->rows, source_slots,
+            destination_slots, slot_count, row_indices, nullptr));
+    default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+}
+
+int semantic_bank_alloc_internal(
+    uint32_t device_id,
+    const GafimeSemanticBankDesc* desc,
+    GafimeGpuSemanticBank* bank_out
+) {
+    if (bank_out == nullptr || device_id > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    *bank_out = nullptr;
+    int status = gafime_semantic_abi::validate_bank_desc(desc);
+    if (status != GAFIME_STATUS_OK) return status;
+    ScopedHipDevice device(device_id);
+    status = hip_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    hipDeviceProp_t props{};
+    status = hip_status(hipGetDeviceProperties(&props, static_cast<int>(device_id)));
+    if (status != GAFIME_STATUS_OK) return status;
+    const uint32_t profile = desc->route.profile;
+    const size_t storage_bytes = profile == GAFIME_PRECISION_FP64 ? sizeof(double) :
+        profile == GAFIME_PRECISION_FP32 || profile == GAFIME_PRECISION_MIXED ? sizeof(float) : 0;
+    if (storage_bytes == 0 || storage_bytes != gafime_gpu_abi::dtype_size(desc->route.storage_dtype)) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    // Keep host metadata owned if slot-vector allocation throws before any
+    // device allocation. Publish the raw handle only after full construction.
+    std::unique_ptr<SemanticHipBank, decltype(&semantic_bank_free)> bank(
+        new SemanticHipBank{}, &semantic_bank_free);
+    bank->magic = kSemanticHipBankMagic;
+    bank->device_id = device_id;
+    bank->device_flags = rocm_device_flags(props);
+    bank->arch_class = rocm_arch_class(props);
+    bank->profile = profile;
+    bank->unified_memory = rocm_use_managed_memory(props);
+    bank->rows = desc->rows;
+    bank->source_slots = desc->source_slots;
+    bank->slot_capacity = desc->slot_capacity;
+    bank->route = desc->route;
+    bank->initialized_slots.assign(desc->slot_capacity, 0);
+    status = allocate_hip_storage(&bank->columns, static_cast<size_t>(desc->bytes), bank->unified_memory);
+    if (status != GAFIME_STATUS_OK) return status;
+    *bank_out = static_cast<GafimeGpuSemanticBank>(bank.release());
+    return GAFIME_STATUS_OK;
+}
+
+int semantic_bank_upload_internal(
+    SemanticHipBank* bank,
+    const GafimeNumericRoute* route,
+    const GafimeConstBufferView* source_columns
+) {
+    int status = require_semantic_bank(bank);
+    if (status != GAFIME_STATUS_OK) return status;
+    // A semantic bank has one immutable source-content epoch. A re-upload
+    // could make already materialized derived slots stale, so reject it before
+    // copying or changing any initialized state.
+    if (bank->sources_uploaded) return GAFIME_STATUS_INVALID_ARGUMENT;
+    status = gafime_gpu_abi::validate_numeric_route(route);
+    if (status != GAFIME_STATUS_OK || !gafime_gpu_abi::route_fields_equal(*route, bank->route)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t elements = 0;
+    if (!checked_mul_u64(bank->rows, bank->source_slots, &elements)) return GAFIME_STATUS_INVALID_ARGUMENT;
+    status = gafime_gpu_abi::validate_const_buffer(source_columns, route->storage_dtype, elements);
+    if (status != GAFIME_STATUS_OK) return status;
+    ScopedHipDevice device(bank->device_id);
+    status = hip_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    status = copy_to_hip_storage(
+        bank->columns, source_columns->data,
+        static_cast<size_t>(elements) * gafime_gpu_abi::dtype_size(route->storage_dtype),
+        bank->unified_memory);
+    if (status != GAFIME_STATUS_OK) return status;
+    for (uint32_t slot = 0; slot < bank->source_slots; ++slot) bank->initialized_slots[slot] = 1;
+    bank->sources_uploaded = true;
+    return GAFIME_STATUS_OK;
+}
+
+int semantic_materialize_internal(
+    SemanticHipBank* bank,
+    const GafimeSemanticProgramBatch* batch
+) {
+    int status = require_semantic_bank(bank);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_program_batch(
+        batch, bank->profile, bank->source_slots, bank->slot_capacity, bank->initialized_slots);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (batch->node_count > gafime_semantic_abi::kSemanticMaxProgramNodes) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    std::vector<uint8_t> initialized = bank->initialized_slots;
+    for (uint32_t index = 0; index < batch->node_count; ++index) {
+        const GafimeSemanticProgramNode& node = batch->nodes[index];
+        for (uint32_t operand = 0; operand < node.operand_count; ++operand) {
+            if (!initialized[batch->operand_slots.ptr[node.operand_offset + operand]]) {
+                return GAFIME_STATUS_INVALID_ARGUMENT;
+            }
+        }
+        initialized[node.output_slot] = 1;
+    }
+    if (batch->node_count == 0) return GAFIME_STATUS_OK;
+    ScopedHipDevice device(bank->device_id);
+    status = hip_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    HipTransientBuffer<uint32_t> operand_slots(bank->unified_memory);
+    HipTransientBuffer<uint64_t> mean_bits(bank->unified_memory);
+    // Match CUDA's one-word nonfinite sentinel for every nonempty batch so
+    // forecast accounting remains exact even when the batch contains only
+    // source no-ops.  Derived slots are scanned before state is committed.
+    HipTransientBuffer<uint32_t> derived_nonfinite(bank->unified_memory);
+    // The descriptor arrays stay immutable until all queued program kernels
+    // complete.  Plain host writes into managed memory are not stream-ordered
+    // with an earlier asynchronous kernel's descriptor reads.
+    status = operand_slots.allocate(batch->operand_slots.len);
+    if (status == GAFIME_STATUS_OK) status = mean_bits.allocate(batch->mean_bits.len);
+    if (status == GAFIME_STATUS_OK) status = derived_nonfinite.allocate(1);
+    if (status == GAFIME_STATUS_OK) {
+        status = hip_status(hipMemset(derived_nonfinite.get(), 0, sizeof(uint32_t)));
+    }
+    if (status == GAFIME_STATUS_OK && batch->operand_slots.len != 0) {
+        status = copy_to_hip_storage(
+            operand_slots.get(), batch->operand_slots.ptr,
+            static_cast<size_t>(batch->operand_slots.len) * sizeof(uint32_t), bank->unified_memory);
+    }
+    if (status == GAFIME_STATUS_OK && batch->mean_bits.len != 0) {
+        status = copy_to_hip_storage(
+            mean_bits.get(), batch->mean_bits.ptr,
+            static_cast<size_t>(batch->mean_bits.len) * sizeof(uint64_t), bank->unified_memory);
+    }
+    if (status != GAFIME_STATUS_OK) return status;
+    for (uint32_t index = 0; index < batch->node_count; ++index) {
+        const GafimeSemanticProgramNode& node = batch->nodes[index];
+        if (node.opcode == GAFIME_SEMANTIC_PROGRAM_SOURCE) continue;
+        switch (node.opcode) {
+        case GAFIME_SEMANTIC_PROGRAM_ABSOLUTE_DIFFERENCE:
+            status = semantic_launch_absolute_difference(
+                bank, batch->operand_slots.ptr[node.operand_offset],
+                batch->operand_slots.ptr[node.operand_offset + 1], node.output_slot);
+            break;
+        case GAFIME_SEMANTIC_PROGRAM_SOFTSIGN:
+            status = semantic_launch_softsign(
+                bank, batch->operand_slots.ptr[node.operand_offset], node.output_slot);
+            break;
+        case GAFIME_SEMANTIC_PROGRAM_CENTERED_PRODUCT:
+            status = semantic_launch_centered_product(
+                bank, operand_slots.get() + node.operand_offset,
+                mean_bits.get() + node.mean_offset, node.operand_count, node.output_slot);
+            break;
+        default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
+        if (status != GAFIME_STATUS_OK) return status;
+        status = semantic_launch_reject_nonfinite_output(
+            bank, node.output_slot, derived_nonfinite.get());
+        if (status != GAFIME_STATUS_OK) return status;
+    }
+    status = hip_status(hipDeviceSynchronize());
+    if (status != GAFIME_STATUS_OK) return status;
+    uint32_t has_nonfinite = 0;
+    status = copy_from_hip_storage(
+        &has_nonfinite, derived_nonfinite.get(), sizeof(has_nonfinite), bank->unified_memory);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (has_nonfinite != 0) return GAFIME_STATUS_INVALID_ARGUMENT;
+    bank->initialized_slots = std::move(initialized);
+    return GAFIME_STATUS_OK;
+}
+
+int semantic_pairwise_pearson_internal(
+    SemanticHipBank* left,
+    SemanticHipBank* right,
+    const GafimeSemanticPearsonBatch* batch,
+    GafimeSemanticScalarResultTable* results
+) {
+    int status = require_semantic_bank(left);
+    if (status != GAFIME_STATUS_OK || require_semantic_bank(right) != GAFIME_STATUS_OK) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (left->device_id != right->device_id || left->rows != right->rows ||
+        !gafime_gpu_abi::route_fields_equal(left->route, right->route)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    status = gafime_semantic_abi::validate_pearson_batch(
+        batch, left->slot_capacity, right->slot_capacity);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_scalar_results(results, left->route, batch->left_slots.len);
+    if (status != GAFIME_STATUS_OK ||
+        !semantic_slots_initialized(left, batch->left_slots.ptr, batch->left_slots.len) ||
+        !semantic_slots_initialized(right, batch->right_slots.ptr, batch->right_slots.len)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch->left_slots.len == 0) return GAFIME_STATUS_OK;
+    const size_t result_bytes = left->profile == GAFIME_PRECISION_FP32 ? sizeof(float) : sizeof(double);
+    uint64_t value_bytes = 0;
+    if (!checked_mul_u64(batch->left_slots.len, result_bytes, &value_bytes) ||
+        !allocation_fits_size_t(value_bytes, sizeof(uint8_t))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    ScopedHipDevice device(left->device_id);
+    status = hip_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    HipTransientBuffer<uint32_t> left_slots(left->unified_memory);
+    HipTransientBuffer<uint32_t> right_slots(left->unified_memory);
+    HipTransientBuffer<uint8_t> values(left->unified_memory);
+    HipTransientBuffer<uint32_t> states(left->unified_memory);
+    HipTransientBuffer<uint64_t> supports(left->unified_memory);
+    status = left_slots.allocate(batch->left_slots.len);
+    if (status == GAFIME_STATUS_OK) status = right_slots.allocate(batch->right_slots.len);
+    if (status == GAFIME_STATUS_OK) status = values.allocate(value_bytes);
+    if (status == GAFIME_STATUS_OK) status = states.allocate(batch->left_slots.len);
+    if (status == GAFIME_STATUS_OK) status = supports.allocate(batch->left_slots.len);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = copy_to_hip_storage(left_slots.get(), batch->left_slots.ptr,
+        static_cast<size_t>(batch->left_slots.len) * sizeof(uint32_t), left->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = copy_to_hip_storage(right_slots.get(), batch->right_slots.ptr,
+        static_cast<size_t>(batch->right_slots.len) * sizeof(uint32_t), left->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = semantic_launch_pairwise_pearson(
+        left, right, left_slots.get(), right_slots.get(), batch->left_slots.len, batch->mode,
+        values.get(), states.get(), supports.get());
+    if (status == GAFIME_STATUS_OK) status = hip_status(hipDeviceSynchronize());
+    if (status == GAFIME_STATUS_OK) status = copy_from_hip_storage(
+        results->values.data, values.get(), static_cast<size_t>(value_bytes), left->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = copy_from_hip_storage(
+        results->states, states.get(), static_cast<size_t>(batch->left_slots.len) * sizeof(uint32_t),
+        left->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = copy_from_hip_storage(
+        results->supports, supports.get(), static_cast<size_t>(batch->left_slots.len) * sizeof(uint64_t),
+        left->unified_memory);
+    if (status == GAFIME_STATUS_OK) results->count = batch->left_slots.len;
+    return status;
+}
+
+int semantic_edge_energy_internal(
+    SemanticHipBank* bank,
+    const GafimeSemanticEdgeEnergyBatch* batch,
+    GafimeSemanticScalarResultTable* results
+) {
+    int status = require_semantic_bank(bank);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_edge_energy_batch(
+        batch, bank->route, bank->rows, bank->slot_capacity);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_scalar_results(
+        results, bank->route, batch->candidate_slots.len);
+    if (status != GAFIME_STATUS_OK ||
+        !semantic_slots_initialized(bank, batch->candidate_slots.ptr, batch->candidate_slots.len)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch->candidate_slots.len == 0) return GAFIME_STATUS_OK;
+    const size_t storage_bytes = bank->profile == GAFIME_PRECISION_FP64 ? sizeof(double) : sizeof(float);
+    const size_t result_bytes = bank->profile == GAFIME_PRECISION_FP32 ? sizeof(float) : sizeof(double);
+    uint64_t values_bytes = 0;
+    uint64_t weights_bytes = 0;
+    if (!checked_mul_u64(batch->candidate_slots.len, result_bytes, &values_bytes) ||
+        !checked_mul_u64(batch->edge_count, storage_bytes, &weights_bytes) ||
+        !allocation_fits_size_t(values_bytes, sizeof(uint8_t)) ||
+        !allocation_fits_size_t(weights_bytes, sizeof(uint8_t))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    ScopedHipDevice device(bank->device_id);
+    status = hip_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    HipTransientBuffer<uint32_t> candidates(bank->unified_memory);
+    HipTransientBuffer<GafimeSemanticEdge> edges(bank->unified_memory);
+    HipTransientBuffer<uint8_t> weights(bank->unified_memory);
+    HipTransientBuffer<uint8_t> values(bank->unified_memory);
+    HipTransientBuffer<uint32_t> states(bank->unified_memory);
+    HipTransientBuffer<uint64_t> supports(bank->unified_memory);
+    status = candidates.allocate(batch->candidate_slots.len);
+    if (status == GAFIME_STATUS_OK) status = edges.allocate(batch->edge_count);
+    if (status == GAFIME_STATUS_OK) status = weights.allocate(weights_bytes);
+    if (status == GAFIME_STATUS_OK) status = values.allocate(values_bytes);
+    if (status == GAFIME_STATUS_OK) status = states.allocate(batch->candidate_slots.len);
+    if (status == GAFIME_STATUS_OK) status = supports.allocate(batch->candidate_slots.len);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = copy_to_hip_storage(candidates.get(), batch->candidate_slots.ptr,
+        static_cast<size_t>(batch->candidate_slots.len) * sizeof(uint32_t), bank->unified_memory);
+    if (status == GAFIME_STATUS_OK && batch->edge_count != 0) status = copy_to_hip_storage(
+        edges.get(), batch->edges, static_cast<size_t>(batch->edge_count) * sizeof(GafimeSemanticEdge),
+        bank->unified_memory);
+    if (status == GAFIME_STATUS_OK && weights_bytes != 0) status = copy_to_hip_storage(
+        weights.get(), batch->weights.data, static_cast<size_t>(weights_bytes), bank->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = semantic_launch_edge_energy(
+        bank, candidates.get(), batch->candidate_slots.len, edges.get(), weights.get(), batch->edge_count,
+        values.get(), states.get(), supports.get());
+    if (status == GAFIME_STATUS_OK) status = hip_status(hipDeviceSynchronize());
+    if (status == GAFIME_STATUS_OK) status = copy_from_hip_storage(
+        results->values.data, values.get(), static_cast<size_t>(values_bytes), bank->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = copy_from_hip_storage(
+        results->states, states.get(), static_cast<size_t>(batch->candidate_slots.len) * sizeof(uint32_t),
+        bank->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = copy_from_hip_storage(
+        results->supports, supports.get(), static_cast<size_t>(batch->candidate_slots.len) * sizeof(uint64_t),
+        bank->unified_memory);
+    if (status == GAFIME_STATUS_OK) results->count = batch->candidate_slots.len;
+    return status;
+}
+
+int semantic_sparse_gather_internal(
+    SemanticHipBank* source,
+    SemanticHipBank* destination,
+    const GafimeSemanticSparseGatherBatch* batch
+) {
+    int status = require_semantic_bank(source);
+    if (status != GAFIME_STATUS_OK || require_semantic_bank(destination) != GAFIME_STATUS_OK) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (source == destination) return GAFIME_STATUS_INVALID_ARGUMENT;
+    if (source->device_id != destination->device_id ||
+        !gafime_gpu_abi::route_fields_equal(source->route, destination->route)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    status = gafime_semantic_abi::validate_gather_batch(
+        batch, source->rows, source->slot_capacity, destination->rows, destination->slot_capacity);
+    if (status != GAFIME_STATUS_OK ||
+        !semantic_slots_initialized(source, batch->source_slots.ptr, batch->source_slots.len)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch->row_indices.len > gafime_semantic_abi::kSemanticMaxGatherRows) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    for (uint64_t index = 0; index < batch->destination_slots.len; ++index) {
+        const uint32_t slot = batch->destination_slots.ptr[index];
+        if (destination->initialized_slots[slot]) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    if (batch->source_slots.len == 0 || batch->row_indices.len == 0) return GAFIME_STATUS_OK;
+    ScopedHipDevice device(source->device_id);
+    status = hip_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    HipTransientBuffer<uint32_t> source_slots(source->unified_memory);
+    HipTransientBuffer<uint32_t> destination_slots(source->unified_memory);
+    HipTransientBuffer<uint64_t> rows(source->unified_memory);
+    status = source_slots.allocate(batch->source_slots.len);
+    if (status == GAFIME_STATUS_OK) status = destination_slots.allocate(batch->destination_slots.len);
+    if (status == GAFIME_STATUS_OK) status = rows.allocate(batch->row_indices.len);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = copy_to_hip_storage(source_slots.get(), batch->source_slots.ptr,
+        static_cast<size_t>(batch->source_slots.len) * sizeof(uint32_t), source->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = copy_to_hip_storage(destination_slots.get(),
+        batch->destination_slots.ptr, static_cast<size_t>(batch->destination_slots.len) * sizeof(uint32_t),
+        source->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = copy_to_hip_storage(rows.get(), batch->row_indices.ptr,
+        static_cast<size_t>(batch->row_indices.len) * sizeof(uint64_t), source->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = semantic_launch_sparse_gather(
+        source, destination, source_slots.get(), destination_slots.get(), batch->source_slots.len,
+        rows.get());
+    if (status == GAFIME_STATUS_OK) status = hip_status(hipDeviceSynchronize());
+    if (status != GAFIME_STATUS_OK) return status;
+    for (uint64_t index = 0; index < batch->destination_slots.len; ++index) {
+        destination->initialized_slots[batch->destination_slots.ptr[index]] = 1;
+    }
+    return GAFIME_STATUS_OK;
+}
+
+int semantic_forecast_internal(
+    SemanticHipBank* bank,
+    const GafimeSemanticForecastRequest* request,
+    GafimeSemanticMemoryForecast* forecast
+) {
+    int status = require_semantic_bank(bank);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_forecast_request(request);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_forecast(forecast);
+    if (status != GAFIME_STATUS_OK) return status;
+    const size_t storage_bytes = bank->profile == GAFIME_PRECISION_FP64 ? sizeof(double) : sizeof(float);
+    const size_t result_bytes = bank->profile == GAFIME_PRECISION_FP32 ? sizeof(float) : sizeof(double);
+    uint64_t resident = 0;
+    uint64_t pair_bytes = 0;
+    uint64_t graph_bytes = 0;
+    uint64_t retained = 0;
+    uint64_t program_operand_bytes = 0;
+    uint64_t program_mean_bytes = 0;
+    uint64_t program_descriptor = 0;
+    uint64_t program_nonfinite_flag = 0;
+    uint64_t gather_descriptor = 0;
+    uint64_t pair_slots = 0;
+    uint64_t pair_results = 0;
+    uint64_t graph_candidates = 0;
+    uint64_t graph_edges = 0;
+    uint64_t gather_slots = 0;
+    uint64_t gather_rows = 0;
+    if (!checked_mul_u64(bank->rows, bank->slot_capacity, &resident) ||
+        !checked_mul_u64(resident, storage_bytes, &resident) ||
+        !checked_mul_u64(request->program_operand_count, sizeof(uint32_t), &program_operand_bytes) ||
+        !checked_mul_u64(request->program_mean_count, sizeof(uint64_t), &program_mean_bytes) ||
+        !checked_add_u64(program_operand_bytes, program_mean_bytes, &program_descriptor) ||
+        !checked_mul_u64(request->program_operand_count == 0 ? 0 : 1,
+            sizeof(uint32_t), &program_nonfinite_flag) ||
+        !checked_mul_u64(request->pair_count, 2 * sizeof(uint32_t), &pair_slots) ||
+        !checked_mul_u64(request->pair_count,
+            result_bytes + sizeof(uint32_t) + sizeof(uint64_t), &pair_results) ||
+        !checked_mul_u64(request->graph_candidate_count,
+            sizeof(uint32_t) + result_bytes + sizeof(uint32_t) + sizeof(uint64_t),
+            &graph_candidates) ||
+        !checked_mul_u64(request->graph_edge_count,
+            sizeof(GafimeSemanticEdge) + storage_bytes, &graph_edges) ||
+        !checked_mul_u64(request->gather_slot_count, 2 * sizeof(uint32_t), &gather_slots) ||
+        !checked_mul_u64(request->gather_row_count, sizeof(uint64_t), &gather_rows) ||
+        !checked_mul_u64(bank->rows, request->retained_slot_count, &retained) ||
+        !checked_mul_u64(retained, storage_bytes, &retained) ||
+        !checked_add_u64(pair_slots, pair_results, &pair_bytes) ||
+        !checked_add_u64(graph_candidates, graph_edges, &graph_bytes) ||
+        !checked_add_u64(gather_slots, gather_rows, &gather_descriptor) ||
+        !checked_add_u64(program_descriptor, program_nonfinite_flag, &program_descriptor)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (request->pair_count == 0) pair_bytes = 0;
+    if (request->graph_candidate_count == 0) graph_bytes = 0;
+    if (request->gather_slot_count == 0 || request->gather_row_count == 0) {
+        gather_descriptor = 0;
+    }
+    forecast->resident_bytes = resident;
+    forecast->transient_bytes = std::max(
+        std::max(pair_bytes, graph_bytes), std::max(program_descriptor, gather_descriptor));
+    forecast->retained_bytes = retained;
+    return GAFIME_STATUS_OK;
+}
+
+int semantic_retain_internal(
+    SemanticHipBank* source,
+    GafimeSliceU32 slots,
+    GafimeGpuSemanticBank* retained_out
+) {
+    if (retained_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    *retained_out = nullptr;
+    int status = require_semantic_bank(source);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_slot_slice(slots, source->slot_capacity);
+    if (status != GAFIME_STATUS_OK || slots.len == 0 ||
+        slots.len > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) ||
+        !semantic_slots_initialized(source, slots.ptr, slots.len)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t storage_bytes = source->profile == GAFIME_PRECISION_FP64 ? sizeof(double) : sizeof(float);
+    uint64_t elements = 0;
+    uint64_t bytes = 0;
+    if (!checked_mul_u64(source->rows, slots.len, &elements) ||
+        !checked_mul_u64(elements, storage_bytes, &bytes)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    GafimeSemanticBankDesc desc{};
+    desc.abi_version = GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION;
+    desc.struct_size = sizeof(desc);
+    desc.route = source->route;
+    desc.layout = GAFIME_MATRIX_COLUMN_MAJOR;
+    desc.rows = source->rows;
+    desc.source_slots = static_cast<uint32_t>(slots.len);
+    desc.slot_capacity = static_cast<uint32_t>(slots.len);
+    desc.bytes = bytes;
+    status = semantic_bank_alloc_internal(source->device_id, &desc, retained_out);
+    if (status != GAFIME_STATUS_OK) return status;
+    auto* retained = semantic_bank_from_handle(*retained_out);
+    ScopedHipDevice device(source->device_id);
+    status = hip_status(device.status());
+    if (status == GAFIME_STATUS_OK) {
+        for (uint64_t index = 0; index < slots.len; ++index) {
+            status = hip_status(hipMemcpy(
+                static_cast<uint8_t*>(retained->columns) +
+                    static_cast<size_t>(index * source->rows * storage_bytes),
+                static_cast<const uint8_t*>(source->columns) +
+                    static_cast<size_t>(static_cast<uint64_t>(slots.ptr[index]) * source->rows * storage_bytes),
+                static_cast<size_t>(source->rows * storage_bytes), hipMemcpyDeviceToDevice));
+            if (status != GAFIME_STATUS_OK) break;
+        }
+    }
+    if (status != GAFIME_STATUS_OK) {
+        const int cleanup_status = semantic_bank_free(retained);
+        // A failed cleanup retains caller ownership, even though copying the
+        // values did not succeed. The non-null handle is for freeing only.
+        if (cleanup_status != GAFIME_STATUS_OK) return cleanup_status;
+        *retained_out = nullptr;
+        return status;
+    }
+    std::fill(retained->initialized_slots.begin(), retained->initialized_slots.end(), uint8_t{1});
+    retained->sources_uploaded = true;
+    return GAFIME_STATUS_OK;
+}
+
+int semantic_download_internal(
+    SemanticHipBank* bank,
+    GafimeSliceU32 slots,
+    const GafimeNumericRoute* route,
+    GafimeMutableBufferView* columns_out
+) {
+    int status = require_semantic_bank(bank);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_download(
+        slots, bank->slot_capacity, bank->rows, route, bank->profile, columns_out);
+    if (status != GAFIME_STATUS_OK || !gafime_gpu_abi::route_fields_equal(*route, bank->route) ||
+        !semantic_slots_initialized(bank, slots.ptr, slots.len)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t storage_bytes = bank->profile == GAFIME_PRECISION_FP64 ? sizeof(double) : sizeof(float);
+    ScopedHipDevice device(bank->device_id);
+    status = hip_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    for (uint64_t index = 0; index < slots.len; ++index) {
+        status = copy_from_hip_storage(
+            static_cast<uint8_t*>(columns_out->data) + static_cast<size_t>(index * bank->rows * storage_bytes),
+            static_cast<const uint8_t*>(bank->columns) +
+                static_cast<size_t>(static_cast<uint64_t>(slots.ptr[index]) * bank->rows * storage_bytes),
+            static_cast<size_t>(bank->rows * storage_bytes), bank->unified_memory);
+        if (status != GAFIME_STATUS_OK) return status;
+    }
+    return GAFIME_STATUS_OK;
+}
+
 }  // namespace
 
 extern "C" {
@@ -4014,6 +4858,149 @@ GAFIME_GPU_API int gafime_gpu_matrix_free_v2(GafimeGpuMatrix matrix_handle) {
     // generation may release the one canonical resident owner.
     precision_matrix_free(matrix);
     return GAFIME_STATUS_OK;
+}
+
+/* Optional typed resident-column arithmetic.  This remains a lowering table:
+ * evidence/context/provenance and policy are intentionally outside HIP. */
+GAFIME_GPU_API int gafime_gpu_semantic_capabilities_v1(
+    uint32_t device_id,
+    uint32_t consumer_abi_version,
+    GafimeSemanticCapabilities* capabilities_out
+) {
+    if (capabilities_out == nullptr || !gafime_gpu_abi::naturally_aligned(capabilities_out)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (GAFIME_ABI_VERSION_MAJOR_OF(consumer_abi_version) !=
+            GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR ||
+        GAFIME_ABI_VERSION_MINOR_OF(consumer_abi_version) <
+            GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    ScopedHipDevice device(device_id);
+    int status = hip_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    hipDeviceProp_t props{};
+    status = hip_status(hipGetDeviceProperties(&props, static_cast<int>(device_id)));
+    if (status != GAFIME_STATUS_OK) return status;
+    std::memset(capabilities_out, 0, sizeof(*capabilities_out));
+    capabilities_out->abi_version = GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION;
+    capabilities_out->struct_size = sizeof(*capabilities_out);
+    capabilities_out->backend_kind = GAFIME_BACKEND_ROCM;
+    capabilities_out->device_id = device_id;
+    capabilities_out->profile_mask = GAFIME_PRECISION_PROFILE_MASK_FP32 |
+        GAFIME_PRECISION_PROFILE_MASK_MIXED | GAFIME_PRECISION_PROFILE_MASK_FP64;
+    capabilities_out->program_op_mask = GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOURCE |
+        GAFIME_SEMANTIC_PROGRAM_OP_MASK_ABSOLUTE_DIFFERENCE |
+        GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOFTSIGN |
+        GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT;
+    capabilities_out->primitive_mask = GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON |
+        GAFIME_SEMANTIC_PRIMITIVE_MASK_ORDERED_EDGE_ENERGY |
+        GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER;
+    capabilities_out->association_statistic_mask = GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON;
+    capabilities_out->max_program_nodes = gafime_semantic_abi::kSemanticMaxProgramNodes;
+    capabilities_out->max_slot_count = std::numeric_limits<uint32_t>::max();
+    capabilities_out->max_rows = std::numeric_limits<uint64_t>::max() / sizeof(double);
+    capabilities_out->max_gather_rows = gafime_semantic_abi::kSemanticMaxGatherRows;
+    return GAFIME_STATUS_OK;
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_bank_alloc_v1(
+    uint32_t device_id,
+    const GafimeSemanticBankDesc* desc,
+    GafimeGpuSemanticBank* bank_out
+) try {
+    return semantic_bank_alloc_internal(device_id, desc, bank_out);
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_bank_upload_v1(
+    GafimeGpuSemanticBank bank_handle,
+    const GafimeNumericRoute* route,
+    const GafimeConstBufferView* source_columns
+) {
+    return semantic_bank_upload_internal(semantic_bank_from_handle(bank_handle), route, source_columns);
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_materialize_v1(
+    GafimeGpuSemanticBank bank_handle,
+    const GafimeSemanticProgramBatch* batch
+) try {
+    return semantic_materialize_internal(semantic_bank_from_handle(bank_handle), batch);
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_pairwise_pearson_v1(
+    GafimeGpuSemanticBank left_bank_handle,
+    GafimeGpuSemanticBank right_bank_handle,
+    const GafimeSemanticPearsonBatch* batch,
+    GafimeSemanticScalarResultTable* results_out
+) {
+    return semantic_pairwise_pearson_internal(
+        semantic_bank_from_handle(left_bank_handle), semantic_bank_from_handle(right_bank_handle),
+        batch, results_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_ordered_edge_energy_v1(
+    GafimeGpuSemanticBank bank_handle,
+    const GafimeSemanticEdgeEnergyBatch* batch,
+    GafimeSemanticScalarResultTable* results_out
+) {
+    return semantic_edge_energy_internal(semantic_bank_from_handle(bank_handle), batch, results_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_sparse_gather_v1(
+    GafimeGpuSemanticBank source_bank_handle,
+    GafimeGpuSemanticBank destination_bank_handle,
+    const GafimeSemanticSparseGatherBatch* batch
+) try {
+    return semantic_sparse_gather_internal(
+        semantic_bank_from_handle(source_bank_handle), semantic_bank_from_handle(destination_bank_handle), batch);
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_forecast_v1(
+    GafimeGpuSemanticBank bank_handle,
+    const GafimeSemanticForecastRequest* request,
+    GafimeSemanticMemoryForecast* forecast_out
+) {
+    return semantic_forecast_internal(semantic_bank_from_handle(bank_handle), request, forecast_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_bank_retain_v1(
+    GafimeGpuSemanticBank source_bank_handle,
+    GafimeSliceU32 slots,
+    GafimeGpuSemanticBank* retained_bank_out
+) try {
+    return semantic_retain_internal(semantic_bank_from_handle(source_bank_handle), slots, retained_bank_out);
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_bank_download_v1(
+    GafimeGpuSemanticBank bank_handle,
+    GafimeSliceU32 slots,
+    const GafimeNumericRoute* route,
+    GafimeMutableBufferView* columns_out
+) {
+    return semantic_download_internal(
+        semantic_bank_from_handle(bank_handle), slots, route, columns_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_bank_free_v1(GafimeGpuSemanticBank bank_handle) {
+    auto* bank = semantic_bank_from_handle(bank_handle);
+    if (bank == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    return semantic_bank_free(bank);
 }
 
 // Frozen ABI 1.0 exports are deliberately thin adapters into the canonical
