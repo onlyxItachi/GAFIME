@@ -15,13 +15,15 @@ use gafime_types::{
     GafimeNumericMatrixDesc, GafimeNumericResultTable, GafimeNumericRoute,
     GafimeNumericSignificanceTable, GafimePermutationSignificanceTable,
     GafimePrecisionCapabilities, GafimePrecisionLaunchProtocol, GafimeResultTable,
-    GafimeResultTableF64, PrecisionProfile, GAFIME_ABI_REQUIRED_FLAG_MASK, GAFIME_ABI_VERSION,
-    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_BUFFER_FLAG_CONTIGUOUS,
-    GAFIME_BUFFER_FLAG_HOST, GAFIME_DTYPE_F32, GAFIME_DTYPE_F64,
-    GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION, GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL,
-    GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE, GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
-    GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT, GAFIME_MATRIX_ROW_MAJOR,
-    GAFIME_PRECISION_ABI_VERSION, GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
+    GafimeResultTableF64, GafimeSemanticCapabilities, PrecisionProfile,
+    GAFIME_ABI_REQUIRED_FLAG_MASK, GAFIME_ABI_VERSION, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
+    GAFIME_BACKEND_ROCM, GAFIME_BUFFER_FLAG_CONTIGUOUS, GAFIME_BUFFER_FLAG_HOST, GAFIME_DTYPE_F32,
+    GAFIME_DTYPE_F64, GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION,
+    GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL, GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE,
+    GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT,
+    GAFIME_MATRIX_ROW_MAJOR, GAFIME_PRECISION_ABI_VERSION, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+    GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION, GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR,
+    GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
@@ -39,7 +41,9 @@ pub struct GpuBackend {
     pub(crate) device_flags: u32,
     pub(crate) library: Option<Arc<Library>>,
     pub(crate) library_path: Option<PathBuf>,
+    pub(crate) instance_id: Arc<()>,
     numeric_routes_cache: Arc<OnceLock<Result<Arc<[GafimeNumericRoute]>, GpuSysError>>>,
+    semantic_capabilities_cache: Arc<OnceLock<Result<GafimeSemanticCapabilities, GpuSysError>>>,
     #[cfg(feature = "local-cmake-experiment")]
     pub(crate) local_cmake_experiment_lock: Option<Arc<std::sync::Mutex<()>>>,
 }
@@ -83,7 +87,9 @@ impl GpuBackend {
             device_flags: 0,
             library,
             library_path,
+            instance_id: Arc::new(()),
             numeric_routes_cache: Arc::new(OnceLock::new()),
+            semantic_capabilities_cache: Arc::new(OnceLock::new()),
             #[cfg(feature = "local-cmake-experiment")]
             local_cmake_experiment_lock,
         };
@@ -94,6 +100,10 @@ impl GpuBackend {
 
     pub fn device_id(&self) -> u32 {
         self.device_id
+    }
+
+    pub const fn backend_kind(&self) -> BackendKind {
+        self.kind
     }
 
     pub fn loaded_library_path(&self) -> Option<&Path> {
@@ -363,6 +373,87 @@ impl GpuBackend {
             self.functions.require_precision_profile(precision)?;
         }
         Ok(supported)
+    }
+
+    fn query_semantic_capabilities(&self) -> Result<GafimeSemanticCapabilities, GpuSysError> {
+        self.functions.require_semantic_common()?;
+        let capabilities =
+            self.functions
+                .semantic_capabilities_v1
+                .ok_or(GpuSysError::MissingFunction(
+                    "gafime_gpu_semantic_capabilities_v1",
+                ))?;
+        let mut result = GafimeSemanticCapabilities::default();
+        // SAFETY: the loaded payload owns this optional table; `result` is a
+        // fully initialized writable ABI record and the call is synchronous.
+        let status = unsafe {
+            capabilities(
+                self.device_id,
+                GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+                &mut result,
+            )
+        };
+        status_to_gpu_result("gafime_gpu_semantic_capabilities_v1", status)?;
+        let major = result.abi_version >> 16;
+        let minor = result.abi_version & 0xffff;
+        let stable_prefix = std::mem::offset_of!(GafimeSemanticCapabilities, reserved) as u32;
+        if major != u32::from(GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR)
+            || minor < u32::from(gafime_types::GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR)
+            || result.struct_size < stable_prefix
+        {
+            return Err(GpuSysError::AbiVersionMismatch {
+                expected: GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+                actual: result.abi_version,
+            });
+        }
+        if result.backend_kind != self.kind {
+            return Err(GpuSysError::BackendKindMismatch {
+                expected: self.kind,
+                actual: result.backend_kind,
+            });
+        }
+        if result.device_id != self.device_id {
+            return Err(GpuSysError::DeviceIdMismatch {
+                expected: self.device_id,
+                actual: result.device_id,
+            });
+        }
+        if result.profile_mask == 0
+            || result.program_op_mask == 0
+            || result.primitive_mask == 0
+            || result.association_statistic_mask == 0
+            || result.flags & GAFIME_ABI_REQUIRED_FLAG_MASK != 0
+            || result.max_slot_count == 0
+            || result.max_rows == 0
+            || result.max_program_nodes == 0
+            || result.max_gather_rows == 0
+            || (result.struct_size >= std::mem::size_of::<GafimeSemanticCapabilities>() as u32
+                && result.reserved.iter().any(|value| *value != 0))
+        {
+            return Err(GpuSysError::InvalidInput(
+                "GPU payload advertised invalid semantic capabilities",
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Return a validated copy of the optional resident semantic capability
+    /// record.  Absence is explicit: it does not alter frozen matrix ABI use.
+    pub fn semantic_capabilities(&self) -> Result<GafimeSemanticCapabilities, GpuSysError> {
+        match self
+            .semantic_capabilities_cache
+            .get_or_init(|| self.query_semantic_capabilities())
+        {
+            Ok(capabilities) => Ok(*capabilities),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    pub fn supports_semantic_profile(
+        &self,
+        profile: PrecisionProfile,
+    ) -> Result<bool, GpuSysError> {
+        Ok(self.semantic_capabilities()?.profile_mask & profile.capability_mask() != 0)
     }
 
     fn validate_payload_identity(

@@ -79,6 +79,14 @@ add_test(
     COMMAND ${_gafime_validation_contract_target}
 )
 
+set(_gafime_semantic_validation_target
+    "gafime_semantic_abi_validation_${_gafime_abi_suffix}")
+add_executable(${_gafime_semantic_validation_target}
+    semantic_abi_validation_contract_test.cpp)
+gafime_configure_cxx_contract_test(${_gafime_semantic_validation_target})
+add_test(NAME ${_gafime_semantic_validation_target}
+    COMMAND ${_gafime_semantic_validation_target})
+
 set(_gafime_abi10_target "gafime_abi_1_0_c_consumer_${_gafime_abi_suffix}")
 add_executable(${_gafime_abi10_target} abi_1_0_c_consumer.c)
 gafime_configure_c_consumer(${_gafime_abi10_target})

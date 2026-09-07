@@ -5,6 +5,11 @@ boundary. It does not change the Python precision API, backend support matrix,
 numeric contracts, packaging topology, or runtime-ownership policy described in
 [`precision-contract.md`](precision-contract.md) and [`contract.md`](contract.md).
 
+The additive tabular semantic primitive table has a separate version namespace
+and is not an ABI 1.2 numeric-route revision or part of the ten-symbol table
+specified here. Its own boundary is recorded in
+[optional tabular semantic primitive ABI](semantic-primitives-abi.md).
+
 ## ABI generations
 
 ABI 1.0 is frozen. Its exported symbols, structures, offsets, status behavior,

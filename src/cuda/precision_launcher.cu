@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <new>
 #include <type_traits>
 #include <utility>
@@ -18,6 +19,7 @@
 #include "../common/covariance_policy.hpp"
 #include "../common/gpu_abi_impl.hpp"
 #include "../common/gafime_gpu_internal_abi.hpp"
+#include "../common/semantic_primitives_abi_impl.hpp"
 
 #ifndef GAFIME_GPU_MI_ACCUMULATION_FP64
 #define GAFIME_GPU_MI_ACCUMULATION_FP64 0
@@ -30,6 +32,7 @@
 namespace {
 
 constexpr uint64_t kPrecisionCudaMatrixMagic = 0x4741465052454332ull;  // "GAFPREC2"
+constexpr uint64_t kSemanticCudaBankMagic = 0x47414653454D4231ull;  // "GAFSEMB1"
 
 struct PrecisionGraphChunkShape {
     uint32_t arity;
@@ -40,6 +43,23 @@ struct PrecisionGraphChunkShape {
 };
 
 struct PrecisionCudaMatrix;
+
+struct SemanticCudaBank {
+    uint64_t magic;
+    GafimePrecisionProfile profile;
+    const gafime_cuda_v1::CudaSemanticKernelSet* kernels;
+    uint32_t device_id;
+    uint32_t device_flags;
+    uint64_t architecture_class;
+    gafime_cuda_v1::CudaKernelLaunchPolicy launch_policy;
+    uint64_t rows;
+    uint32_t source_slots;
+    uint32_t slot_capacity;
+    GafimeNumericRoute route;
+    void* columns;
+    bool sources_uploaded;
+    std::vector<uint8_t> initialized_slots;
+};
 
 struct PrecisionHostOps {
     int (*upload_f32)(PrecisionCudaMatrix*, const float*, const float*, uint64_t, uint32_t);
@@ -1981,6 +2001,572 @@ void free_precision_matrix(PrecisionCudaMatrix* matrix) {
     delete matrix;
 }
 
+SemanticCudaBank* semantic_bank_from_handle(GafimeGpuSemanticBank handle) {
+    auto* bank = static_cast<SemanticCudaBank*>(handle);
+    return bank != nullptr && bank->magic == kSemanticCudaBankMagic ? bank : nullptr;
+}
+
+int require_semantic_bank(const SemanticCudaBank* bank) {
+    return bank != nullptr && bank->magic == kSemanticCudaBankMagic && bank->kernels != nullptr &&
+            bank->columns != nullptr && profile_is_valid(static_cast<uint32_t>(bank->profile))
+        ? GAFIME_STATUS_OK
+        : GAFIME_STATUS_INVALID_ARGUMENT;
+}
+
+bool semantic_slots_initialized(
+    const SemanticCudaBank* bank,
+    const uint32_t* slots,
+    uint64_t count
+) {
+    if (bank == nullptr || slots == nullptr && count != 0) return false;
+    for (uint64_t index = 0; index < count; ++index) {
+        if (slots[index] >= bank->initialized_slots.size() || !bank->initialized_slots[slots[index]]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int free_semantic_cuda_bank(SemanticCudaBank* bank) {
+    if (bank == nullptr || bank->magic != kSemanticCudaBankMagic) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // A failed device switch must not free through the caller's previous
+    // device. Keep the handle intact on failure so direct ABI callers receive
+    // the failure and retain its ownership instead of a false successful free.
+    if (bank->columns != nullptr) {
+        ScopedCudaDevice device(bank->device_id);
+        int status = cuda_status(device.status());
+        if (status != GAFIME_STATUS_OK) return status;
+        status = cuda_status(cudaFree(bank->columns));
+        if (status != GAFIME_STATUS_OK) return status;
+    }
+    bank->columns = nullptr;
+    bank->magic = 0;
+    delete bank;
+    return GAFIME_STATUS_OK;
+}
+
+int cuda_semantic_bank_alloc_internal(
+    uint32_t device_id,
+    const GafimeSemanticBankDesc* desc,
+    GafimeGpuSemanticBank* bank_out
+) {
+    if (bank_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    *bank_out = nullptr;
+    int status = gafime_semantic_abi::validate_bank_desc(desc);
+    if (status != GAFIME_STATUS_OK) return status;
+    ScopedCudaDevice device(device_id);
+    status = cuda_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    cudaDeviceProp props{};
+    status = cuda_status(cudaGetDeviceProperties(&props, static_cast<int>(device_id)));
+    if (status != GAFIME_STATUS_OK) return status;
+    const auto policy = gafime_cuda_v1::cuda_kernel_launch_policy_for_device(
+        static_cast<uint32_t>(props.major), static_cast<uint32_t>(props.maxThreadsPerBlock));
+    if (!gafime_cuda_v1::cuda_kernel_launch_policy_supported(policy)) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    const auto profile = static_cast<GafimePrecisionProfile>(desc->route.profile);
+    const auto* kernels = gafime_cuda_v1::cuda_semantic_kernel_set(profile);
+    if (kernels == nullptr || kernels->storage_bytes != dtype_size(desc->route.storage_dtype)) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    // Structural allocation may throw before cudaMalloc; keep even this
+    // partially initialized host owner under RAII until publishing its handle.
+    std::unique_ptr<SemanticCudaBank, decltype(&free_semantic_cuda_bank)> bank(
+        new SemanticCudaBank{}, &free_semantic_cuda_bank);
+    bank->magic = kSemanticCudaBankMagic;
+    bank->profile = profile;
+    bank->kernels = kernels;
+    bank->device_id = device_id;
+    bank->device_flags = precision_cuda_device_flags(props, device_id);
+    bank->architecture_class = cuda_architecture_class(props);
+    bank->launch_policy = policy;
+    bank->rows = desc->rows;
+    bank->source_slots = desc->source_slots;
+    bank->slot_capacity = desc->slot_capacity;
+    bank->route = desc->route;
+    bank->initialized_slots.assign(desc->slot_capacity, 0);
+    status = cuda_status(cudaMalloc(&bank->columns, static_cast<size_t>(desc->bytes)));
+    if (status != GAFIME_STATUS_OK) return status;
+    *bank_out = static_cast<GafimeGpuSemanticBank>(bank.release());
+    return GAFIME_STATUS_OK;
+}
+
+int cuda_semantic_bank_upload_internal(
+    SemanticCudaBank* bank,
+    const GafimeNumericRoute* route,
+    const GafimeConstBufferView* source_columns
+) {
+    int status = require_semantic_bank(bank);
+    if (status != GAFIME_STATUS_OK) return status;
+    // A semantic bank is one immutable source-content epoch. Re-uploading
+    // would leave already materialized derived slots stale, so fail before
+    // any device transfer or initialized-state mutation.
+    if (bank->sources_uploaded) return GAFIME_STATUS_INVALID_ARGUMENT;
+    status = gafime_gpu_abi::validate_numeric_route(route);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (!gafime_gpu_abi::route_fields_equal(*route, bank->route)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t elements = 0;
+    if (!checked_mul(bank->rows, bank->source_slots, &elements)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    status = gafime_gpu_abi::validate_const_buffer(
+        source_columns, route->storage_dtype, elements);
+    if (status != GAFIME_STATUS_OK) return status;
+    ScopedCudaDevice device(bank->device_id);
+    status = cuda_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    if (elements != 0) {
+        status = cuda_status(cudaMemcpy(
+            bank->columns,
+            source_columns->data,
+            static_cast<size_t>(elements) * bank->kernels->storage_bytes,
+            cudaMemcpyHostToDevice));
+        if (status != GAFIME_STATUS_OK) return status;
+    }
+    for (uint32_t slot = 0; slot < bank->source_slots; ++slot) {
+        bank->initialized_slots[slot] = 1;
+    }
+    bank->sources_uploaded = true;
+    return GAFIME_STATUS_OK;
+}
+
+int cuda_semantic_materialize_internal(
+    SemanticCudaBank* bank,
+    const GafimeSemanticProgramBatch* batch
+) {
+    int status = require_semantic_bank(bank);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_program_batch(
+        batch, bank->profile, bank->source_slots, bank->slot_capacity, bank->initialized_slots);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (batch->node_count > gafime_semantic_abi::kSemanticMaxProgramNodes) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    std::vector<uint8_t> initialized = bank->initialized_slots;
+    for (uint32_t index = 0; index < batch->node_count; ++index) {
+        const auto& node = batch->nodes[index];
+        for (uint32_t operand = 0; operand < node.operand_count; ++operand) {
+            const uint32_t slot = batch->operand_slots.ptr[node.operand_offset + operand];
+            if (!initialized[slot]) return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        initialized[node.output_slot] = 1;
+    }
+    if (batch->node_count == 0) return GAFIME_STATUS_OK;
+    ScopedCudaDevice device(bank->device_id);
+    status = cuda_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    PrecisionCudaTransientBuffer<uint32_t> operand_slots;
+    PrecisionCudaTransientBuffer<uint64_t> mean_bits;
+    // Every nonempty program batch reserves this one-word device flag so the
+    // forecast has an exact, profile-independent accounting term.  Only
+    // derived outputs are scanned; source nodes leave it clear.
+    PrecisionCudaTransientBuffer<uint32_t> derived_nonfinite;
+    // Upload each flattened descriptor exactly once before any arithmetic
+    // kernel launches.  A subsequent node must never overwrite a descriptor
+    // which an earlier asynchronous centered-product kernel still reads.
+    status = operand_slots.allocate(batch->operand_slots.len);
+    if (status == GAFIME_STATUS_OK) status = mean_bits.allocate(batch->mean_bits.len);
+    if (status == GAFIME_STATUS_OK) status = derived_nonfinite.allocate(1);
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemset(derived_nonfinite.get(), 0, sizeof(uint32_t)));
+    if (status == GAFIME_STATUS_OK && batch->operand_slots.len != 0) {
+        status = cuda_status(cudaMemcpy(
+            operand_slots.get(), batch->operand_slots.ptr,
+            static_cast<size_t>(batch->operand_slots.len) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    }
+    if (status == GAFIME_STATUS_OK && batch->mean_bits.len != 0) {
+        status = cuda_status(cudaMemcpy(
+            mean_bits.get(), batch->mean_bits.ptr,
+            static_cast<size_t>(batch->mean_bits.len) * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    }
+    if (status != GAFIME_STATUS_OK) return status;
+    for (uint32_t index = 0; index < batch->node_count; ++index) {
+        const auto& node = batch->nodes[index];
+        if (node.opcode == GAFIME_SEMANTIC_PROGRAM_SOURCE) continue;
+        switch (node.opcode) {
+        case GAFIME_SEMANTIC_PROGRAM_ABSOLUTE_DIFFERENCE:
+            status = cuda_status(bank->kernels->absolute_difference(
+                bank->columns, bank->rows, batch->operand_slots.ptr[node.operand_offset],
+                batch->operand_slots.ptr[node.operand_offset + 1], node.output_slot,
+                bank->launch_policy, nullptr));
+            break;
+        case GAFIME_SEMANTIC_PROGRAM_SOFTSIGN:
+            status = cuda_status(bank->kernels->softsign(
+                bank->columns, bank->rows, batch->operand_slots.ptr[node.operand_offset],
+                node.output_slot, bank->launch_policy, nullptr));
+            break;
+        case GAFIME_SEMANTIC_PROGRAM_CENTERED_PRODUCT:
+            status = cuda_status(bank->kernels->centered_product(
+                bank->columns, bank->rows, operand_slots.get() + node.operand_offset,
+                mean_bits.get() + node.mean_offset, node.operand_count,
+                node.output_slot, bank->launch_policy, nullptr));
+            break;
+        default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
+        if (status != GAFIME_STATUS_OK) return status;
+        status = cuda_status(bank->kernels->reject_nonfinite_output(
+            bank->columns, bank->rows, node.output_slot, derived_nonfinite.get(),
+            bank->launch_policy, nullptr));
+        if (status != GAFIME_STATUS_OK) return status;
+    }
+    status = cuda_status(cudaDeviceSynchronize());
+    if (status != GAFIME_STATUS_OK) return status;
+    uint32_t has_nonfinite = 0;
+    status = cuda_status(cudaMemcpy(
+        &has_nonfinite, derived_nonfinite.get(), sizeof(has_nonfinite), cudaMemcpyDeviceToHost));
+    if (status != GAFIME_STATUS_OK) return status;
+    if (has_nonfinite != 0) return GAFIME_STATUS_INVALID_ARGUMENT;
+    bank->initialized_slots = std::move(initialized);
+    return GAFIME_STATUS_OK;
+}
+
+int cuda_semantic_pairwise_pearson_internal(
+    SemanticCudaBank* left,
+    SemanticCudaBank* right,
+    const GafimeSemanticPearsonBatch* batch,
+    GafimeSemanticScalarResultTable* results
+) {
+    int status = require_semantic_bank(left);
+    if (status != GAFIME_STATUS_OK || require_semantic_bank(right) != GAFIME_STATUS_OK) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (left->device_id != right->device_id || left->rows != right->rows ||
+        !gafime_gpu_abi::route_fields_equal(left->route, right->route)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    status = gafime_semantic_abi::validate_pearson_batch(
+        batch, left->slot_capacity, right->slot_capacity);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_scalar_results(results, left->route, batch->left_slots.len);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (!semantic_slots_initialized(left, batch->left_slots.ptr, batch->left_slots.len) ||
+        !semantic_slots_initialized(right, batch->right_slots.ptr, batch->right_slots.len)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch->left_slots.len == 0) return GAFIME_STATUS_OK;
+    uint64_t value_bytes = 0;
+    if (!checked_mul(batch->left_slots.len, left->kernels->result_bytes, &value_bytes) ||
+        !fits_size_t(value_bytes, sizeof(uint8_t))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    ScopedCudaDevice device(left->device_id);
+    status = cuda_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    PrecisionCudaTransientBuffer<uint32_t> left_slots;
+    PrecisionCudaTransientBuffer<uint32_t> right_slots;
+    PrecisionCudaTransientBuffer<uint32_t> states;
+    PrecisionCudaTransientBuffer<uint64_t> supports;
+    PrecisionCudaTransientBuffer<uint8_t> values;
+    status = left_slots.allocate(batch->left_slots.len);
+    if (status == GAFIME_STATUS_OK) status = right_slots.allocate(batch->right_slots.len);
+    if (status == GAFIME_STATUS_OK) status = states.allocate(batch->left_slots.len);
+    if (status == GAFIME_STATUS_OK) status = supports.allocate(batch->left_slots.len);
+    if (status == GAFIME_STATUS_OK) status = values.allocate(value_bytes);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = cuda_status(cudaMemcpy(left_slots.get(), batch->left_slots.ptr,
+        static_cast<size_t>(batch->left_slots.len) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(right_slots.get(), batch->right_slots.ptr,
+        static_cast<size_t>(batch->right_slots.len) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(left->kernels->pairwise_pearson(
+        left->columns, right->columns, left->rows, left_slots.get(), right_slots.get(),
+        batch->left_slots.len, batch->mode, values.get(), states.get(), supports.get(),
+        left->launch_policy, nullptr));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaDeviceSynchronize());
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(
+        results->values.data, values.get(), static_cast<size_t>(value_bytes), cudaMemcpyDeviceToHost));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(
+        results->states, states.get(), static_cast<size_t>(batch->left_slots.len) * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(
+        results->supports, supports.get(), static_cast<size_t>(batch->left_slots.len) * sizeof(uint64_t),
+        cudaMemcpyDeviceToHost));
+    if (status == GAFIME_STATUS_OK) results->count = batch->left_slots.len;
+    return status;
+}
+
+int cuda_semantic_edge_energy_internal(
+    SemanticCudaBank* bank,
+    const GafimeSemanticEdgeEnergyBatch* batch,
+    GafimeSemanticScalarResultTable* results
+) {
+    int status = require_semantic_bank(bank);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_edge_energy_batch(
+        batch, bank->route, bank->rows, bank->slot_capacity);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_scalar_results(
+        results, bank->route, batch->candidate_slots.len);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (!semantic_slots_initialized(bank, batch->candidate_slots.ptr, batch->candidate_slots.len)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch->candidate_slots.len == 0) return GAFIME_STATUS_OK;
+    uint64_t value_bytes = 0;
+    uint64_t weight_bytes = 0;
+    if (!checked_mul(batch->candidate_slots.len, bank->kernels->result_bytes, &value_bytes) ||
+        !checked_mul(batch->edge_count, bank->kernels->storage_bytes, &weight_bytes) ||
+        !fits_size_t(value_bytes, sizeof(uint8_t)) || !fits_size_t(weight_bytes, sizeof(uint8_t))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    ScopedCudaDevice device(bank->device_id);
+    status = cuda_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    PrecisionCudaTransientBuffer<uint32_t> candidates;
+    PrecisionCudaTransientBuffer<GafimeSemanticEdge> edges;
+    PrecisionCudaTransientBuffer<uint8_t> weights;
+    PrecisionCudaTransientBuffer<uint8_t> values;
+    PrecisionCudaTransientBuffer<uint32_t> states;
+    PrecisionCudaTransientBuffer<uint64_t> supports;
+    status = candidates.allocate(batch->candidate_slots.len);
+    if (status == GAFIME_STATUS_OK) status = edges.allocate(batch->edge_count);
+    if (status == GAFIME_STATUS_OK) status = weights.allocate(weight_bytes);
+    if (status == GAFIME_STATUS_OK) status = values.allocate(value_bytes);
+    if (status == GAFIME_STATUS_OK) status = states.allocate(batch->candidate_slots.len);
+    if (status == GAFIME_STATUS_OK) status = supports.allocate(batch->candidate_slots.len);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = cuda_status(cudaMemcpy(candidates.get(), batch->candidate_slots.ptr,
+        static_cast<size_t>(batch->candidate_slots.len) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    if (status == GAFIME_STATUS_OK && batch->edge_count != 0) status = cuda_status(cudaMemcpy(
+        edges.get(), batch->edges, static_cast<size_t>(batch->edge_count) * sizeof(GafimeSemanticEdge),
+        cudaMemcpyHostToDevice));
+    if (status == GAFIME_STATUS_OK && weight_bytes != 0) status = cuda_status(cudaMemcpy(
+        weights.get(), batch->weights.data, static_cast<size_t>(weight_bytes), cudaMemcpyHostToDevice));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(bank->kernels->ordered_edge_energy(
+        bank->columns, bank->rows, candidates.get(), batch->candidate_slots.len, edges.get(), weights.get(),
+        batch->edge_count, values.get(), states.get(), supports.get(), bank->launch_policy, nullptr));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaDeviceSynchronize());
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(
+        results->values.data, values.get(), static_cast<size_t>(value_bytes), cudaMemcpyDeviceToHost));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(
+        results->states, states.get(), static_cast<size_t>(batch->candidate_slots.len) * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(
+        results->supports, supports.get(), static_cast<size_t>(batch->candidate_slots.len) * sizeof(uint64_t),
+        cudaMemcpyDeviceToHost));
+    if (status == GAFIME_STATUS_OK) results->count = batch->candidate_slots.len;
+    return status;
+}
+
+int cuda_semantic_sparse_gather_internal(
+    SemanticCudaBank* source,
+    SemanticCudaBank* destination,
+    const GafimeSemanticSparseGatherBatch* batch
+) {
+    int status = require_semantic_bank(source);
+    if (status != GAFIME_STATUS_OK || require_semantic_bank(destination) != GAFIME_STATUS_OK) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (source == destination) return GAFIME_STATUS_INVALID_ARGUMENT;
+    if (source->device_id != destination->device_id ||
+        !gafime_gpu_abi::route_fields_equal(source->route, destination->route)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    status = gafime_semantic_abi::validate_gather_batch(
+        batch, source->rows, source->slot_capacity, destination->rows, destination->slot_capacity);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (batch->row_indices.len > gafime_semantic_abi::kSemanticMaxGatherRows) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (!semantic_slots_initialized(source, batch->source_slots.ptr, batch->source_slots.len)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    for (uint64_t index = 0; index < batch->destination_slots.len; ++index) {
+        const uint32_t slot = batch->destination_slots.ptr[index];
+        if (destination->initialized_slots[slot]) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    if (batch->source_slots.len == 0 || batch->row_indices.len == 0) return GAFIME_STATUS_OK;
+    ScopedCudaDevice device(source->device_id);
+    status = cuda_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    PrecisionCudaTransientBuffer<uint32_t> source_slots;
+    PrecisionCudaTransientBuffer<uint32_t> destination_slots;
+    PrecisionCudaTransientBuffer<uint64_t> rows;
+    status = source_slots.allocate(batch->source_slots.len);
+    if (status == GAFIME_STATUS_OK) status = destination_slots.allocate(batch->destination_slots.len);
+    if (status == GAFIME_STATUS_OK) status = rows.allocate(batch->row_indices.len);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = cuda_status(cudaMemcpy(source_slots.get(), batch->source_slots.ptr,
+        static_cast<size_t>(batch->source_slots.len) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(destination_slots.get(),
+        batch->destination_slots.ptr, static_cast<size_t>(batch->destination_slots.len) * sizeof(uint32_t),
+        cudaMemcpyHostToDevice));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(rows.get(), batch->row_indices.ptr,
+        static_cast<size_t>(batch->row_indices.len) * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(source->kernels->sparse_gather(
+        source->columns, source->rows, destination->columns, destination->rows, source_slots.get(),
+        destination_slots.get(), batch->source_slots.len, rows.get(), source->launch_policy, nullptr));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaDeviceSynchronize());
+    if (status != GAFIME_STATUS_OK) return status;
+    for (uint64_t index = 0; index < batch->destination_slots.len; ++index) {
+        destination->initialized_slots[batch->destination_slots.ptr[index]] = 1;
+    }
+    return GAFIME_STATUS_OK;
+}
+
+int cuda_semantic_forecast_internal(
+    SemanticCudaBank* bank,
+    const GafimeSemanticForecastRequest* request,
+    GafimeSemanticMemoryForecast* forecast
+) {
+    int status = require_semantic_bank(bank);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_forecast_request(request);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_forecast(forecast);
+    if (status != GAFIME_STATUS_OK) return status;
+    uint64_t resident = 0;
+    uint64_t pair_bytes = 0;
+    uint64_t graph_bytes = 0;
+    uint64_t retained = 0;
+    uint64_t program_operand_bytes = 0;
+    uint64_t program_mean_bytes = 0;
+    uint64_t program_descriptor_bytes = 0;
+    uint64_t program_nonfinite_flag_bytes = 0;
+    uint64_t gather_descriptor_bytes = 0;
+    uint64_t pair_slot_bytes = 0;
+    uint64_t pair_result_bytes = 0;
+    uint64_t graph_candidate_bytes = 0;
+    uint64_t graph_edge_bytes = 0;
+    uint64_t gather_slot_bytes = 0;
+    uint64_t gather_row_bytes = 0;
+    if (!checked_mul(bank->rows, bank->slot_capacity, &resident) ||
+        !checked_mul(resident, bank->kernels->storage_bytes, &resident) ||
+        !checked_mul(request->program_operand_count, sizeof(uint32_t), &program_operand_bytes) ||
+        !checked_mul(request->program_mean_count, sizeof(uint64_t), &program_mean_bytes) ||
+        !checked_add(program_operand_bytes, program_mean_bytes, &program_descriptor_bytes) ||
+        !checked_mul(request->program_operand_count == 0 ? 0 : 1,
+            sizeof(uint32_t), &program_nonfinite_flag_bytes) ||
+        !checked_mul(request->pair_count, 2 * sizeof(uint32_t), &pair_slot_bytes) ||
+        !checked_mul(request->pair_count,
+            bank->kernels->result_bytes + sizeof(uint32_t) + sizeof(uint64_t), &pair_result_bytes) ||
+        !checked_mul(request->graph_candidate_count,
+            sizeof(uint32_t) + bank->kernels->result_bytes + sizeof(uint32_t) + sizeof(uint64_t),
+            &graph_candidate_bytes) ||
+        !checked_mul(request->graph_edge_count,
+            sizeof(GafimeSemanticEdge) + bank->kernels->storage_bytes, &graph_edge_bytes) ||
+        !checked_mul(request->gather_slot_count, 2 * sizeof(uint32_t), &gather_slot_bytes) ||
+        !checked_mul(request->gather_row_count, sizeof(uint64_t), &gather_row_bytes) ||
+        !checked_mul(bank->rows, request->retained_slot_count, &retained) ||
+        !checked_mul(retained, bank->kernels->storage_bytes, &retained) ||
+        !checked_add(pair_slot_bytes, pair_result_bytes, &pair_bytes) ||
+        !checked_add(graph_candidate_bytes, graph_edge_bytes, &graph_bytes) ||
+        !checked_add(gather_slot_bytes, gather_row_bytes, &gather_descriptor_bytes) ||
+        !checked_add(program_descriptor_bytes, program_nonfinite_flag_bytes,
+            &program_descriptor_bytes)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // Native launchers return before device allocation for no-op pair, graph,
+    // or gather work.  Preserve that exact zero-count lifetime here.
+    if (request->pair_count == 0) pair_bytes = 0;
+    if (request->graph_candidate_count == 0) graph_bytes = 0;
+    if (request->gather_slot_count == 0 || request->gather_row_count == 0) {
+        gather_descriptor_bytes = 0;
+    }
+    const uint64_t transient = std::max(
+        std::max(pair_bytes, graph_bytes), std::max(program_descriptor_bytes, gather_descriptor_bytes));
+    forecast->resident_bytes = resident;
+    forecast->transient_bytes = transient;
+    forecast->retained_bytes = retained;
+    return GAFIME_STATUS_OK;
+}
+
+int cuda_semantic_retain_internal(
+    SemanticCudaBank* source,
+    GafimeSliceU32 slots,
+    GafimeGpuSemanticBank* retained_out
+) {
+    if (retained_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    *retained_out = nullptr;
+    int status = require_semantic_bank(source);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_slot_slice(slots, source->slot_capacity);
+    if (status != GAFIME_STATUS_OK || slots.len == 0 ||
+        slots.len > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) ||
+        !semantic_slots_initialized(source, slots.ptr, slots.len)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t elements = 0;
+    uint64_t bytes = 0;
+    if (!checked_mul(source->rows, slots.len, &elements) ||
+        !checked_mul(elements, source->kernels->storage_bytes, &bytes)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    GafimeSemanticBankDesc desc{};
+    desc.abi_version = GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION;
+    desc.struct_size = sizeof(desc);
+    desc.route = source->route;
+    desc.layout = GAFIME_MATRIX_COLUMN_MAJOR;
+    desc.rows = source->rows;
+    desc.source_slots = static_cast<uint32_t>(slots.len);
+    desc.slot_capacity = static_cast<uint32_t>(slots.len);
+    desc.bytes = bytes;
+    status = cuda_semantic_bank_alloc_internal(source->device_id, &desc, retained_out);
+    if (status != GAFIME_STATUS_OK) return status;
+    auto* retained = semantic_bank_from_handle(*retained_out);
+    ScopedCudaDevice device(source->device_id);
+    status = cuda_status(device.status());
+    if (status == GAFIME_STATUS_OK) {
+        for (uint64_t index = 0; index < slots.len; ++index) {
+            status = cuda_status(cudaMemcpy(
+                static_cast<uint8_t*>(retained->columns) +
+                    static_cast<size_t>(index * source->rows * source->kernels->storage_bytes),
+                static_cast<const uint8_t*>(source->columns) +
+                    static_cast<size_t>(static_cast<uint64_t>(slots.ptr[index]) * source->rows *
+                        source->kernels->storage_bytes),
+                static_cast<size_t>(source->rows * source->kernels->storage_bytes),
+                cudaMemcpyDeviceToDevice));
+            if (status != GAFIME_STATUS_OK) break;
+        }
+    }
+    if (status != GAFIME_STATUS_OK) {
+        const int cleanup_status = free_semantic_cuda_bank(retained);
+        // If cleanup itself fails, preserve the owned handle for the caller
+        // instead of losing an allocation behind a null error output.
+        if (cleanup_status != GAFIME_STATUS_OK) return cleanup_status;
+        *retained_out = nullptr;
+        return status;
+    }
+    std::fill(retained->initialized_slots.begin(), retained->initialized_slots.end(), uint8_t{1});
+    retained->sources_uploaded = true;
+    return GAFIME_STATUS_OK;
+}
+
+int cuda_semantic_download_internal(
+    SemanticCudaBank* bank,
+    GafimeSliceU32 slots,
+    const GafimeNumericRoute* route,
+    GafimeMutableBufferView* columns_out
+) {
+    int status = require_semantic_bank(bank);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_download(
+        slots, bank->slot_capacity, bank->rows, route, bank->profile, columns_out);
+    if (status != GAFIME_STATUS_OK || !gafime_gpu_abi::route_fields_equal(*route, bank->route) ||
+        !semantic_slots_initialized(bank, slots.ptr, slots.len)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    ScopedCudaDevice device(bank->device_id);
+    status = cuda_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    for (uint64_t index = 0; index < slots.len; ++index) {
+        status = cuda_status(cudaMemcpy(
+            static_cast<uint8_t*>(columns_out->data) +
+                static_cast<size_t>(index * bank->rows * bank->kernels->storage_bytes),
+            static_cast<const uint8_t*>(bank->columns) +
+                static_cast<size_t>(static_cast<uint64_t>(slots.ptr[index]) * bank->rows *
+                    bank->kernels->storage_bytes),
+            static_cast<size_t>(bank->rows * bank->kernels->storage_bytes), cudaMemcpyDeviceToHost));
+        if (status != GAFIME_STATUS_OK) return status;
+    }
+    return GAFIME_STATUS_OK;
+}
+
 }  // namespace
 
 namespace gafime_cuda_v1::detail {
@@ -2721,6 +3307,164 @@ GAFIME_GPU_API int gafime_gpu_matrix_free_v2(GafimeGpuMatrix matrix_handle) {
     // generation may release the one canonical resident owner.
     free_precision_matrix(matrix);
     return GAFIME_STATUS_OK;
+}
+
+/* -------------------------------------------------------------------------
+ * Optional resident semantic-arithmetic table.  This table is deliberately
+ * separate from the frozen matrix/target ABI: all operands are generic typed
+ * slots, and the Rust semantic owner supplies their context and policy.
+ * ------------------------------------------------------------------------- */
+
+GAFIME_GPU_API int gafime_gpu_semantic_capabilities_v1(
+    uint32_t device_id,
+    uint32_t consumer_abi_version,
+    GafimeSemanticCapabilities* capabilities_out
+) {
+    if (capabilities_out == nullptr ||
+        !gafime_gpu_abi::naturally_aligned(capabilities_out)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (GAFIME_ABI_VERSION_MAJOR_OF(consumer_abi_version) !=
+            GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR ||
+        GAFIME_ABI_VERSION_MINOR_OF(consumer_abi_version) <
+            GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    ScopedCudaDevice device(device_id);
+    int status = cuda_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    cudaDeviceProp props{};
+    status = cuda_status(cudaGetDeviceProperties(&props, static_cast<int>(device_id)));
+    if (status != GAFIME_STATUS_OK) return status;
+    const auto policy = gafime_cuda_v1::cuda_kernel_launch_policy_for_device(
+        static_cast<uint32_t>(props.major), static_cast<uint32_t>(props.maxThreadsPerBlock));
+    if (!gafime_cuda_v1::cuda_kernel_launch_policy_supported(policy)) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    std::memset(capabilities_out, 0, sizeof(*capabilities_out));
+    capabilities_out->abi_version = GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION;
+    capabilities_out->struct_size = sizeof(*capabilities_out);
+    capabilities_out->backend_kind = GAFIME_BACKEND_CUDA;
+    capabilities_out->device_id = device_id;
+    capabilities_out->profile_mask = GAFIME_PRECISION_PROFILE_MASK_FP32 |
+        GAFIME_PRECISION_PROFILE_MASK_MIXED | GAFIME_PRECISION_PROFILE_MASK_FP64;
+    capabilities_out->program_op_mask = GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOURCE |
+        GAFIME_SEMANTIC_PROGRAM_OP_MASK_ABSOLUTE_DIFFERENCE |
+        GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOFTSIGN |
+        GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT;
+    capabilities_out->primitive_mask = GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON |
+        GAFIME_SEMANTIC_PRIMITIVE_MASK_ORDERED_EDGE_ENERGY |
+        GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER;
+    capabilities_out->association_statistic_mask = GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON;
+    capabilities_out->max_program_nodes = gafime_semantic_abi::kSemanticMaxProgramNodes;
+    capabilities_out->max_slot_count = std::numeric_limits<uint32_t>::max();
+    capabilities_out->max_rows = std::numeric_limits<uint64_t>::max() / sizeof(double);
+    capabilities_out->max_gather_rows = gafime_semantic_abi::kSemanticMaxGatherRows;
+    return GAFIME_STATUS_OK;
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_bank_alloc_v1(
+    uint32_t device_id,
+    const GafimeSemanticBankDesc* desc,
+    GafimeGpuSemanticBank* bank_out
+) try {
+    return cuda_semantic_bank_alloc_internal(device_id, desc, bank_out);
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_bank_upload_v1(
+    GafimeGpuSemanticBank bank_handle,
+    const GafimeNumericRoute* route,
+    const GafimeConstBufferView* source_columns
+) {
+    return cuda_semantic_bank_upload_internal(
+        semantic_bank_from_handle(bank_handle), route, source_columns);
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_materialize_v1(
+    GafimeGpuSemanticBank bank_handle,
+    const GafimeSemanticProgramBatch* batch
+) try {
+    return cuda_semantic_materialize_internal(semantic_bank_from_handle(bank_handle), batch);
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_pairwise_pearson_v1(
+    GafimeGpuSemanticBank left_bank_handle,
+    GafimeGpuSemanticBank right_bank_handle,
+    const GafimeSemanticPearsonBatch* batch,
+    GafimeSemanticScalarResultTable* results_out
+) {
+    return cuda_semantic_pairwise_pearson_internal(
+        semantic_bank_from_handle(left_bank_handle), semantic_bank_from_handle(right_bank_handle),
+        batch, results_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_ordered_edge_energy_v1(
+    GafimeGpuSemanticBank bank_handle,
+    const GafimeSemanticEdgeEnergyBatch* batch,
+    GafimeSemanticScalarResultTable* results_out
+) {
+    return cuda_semantic_edge_energy_internal(
+        semantic_bank_from_handle(bank_handle), batch, results_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_sparse_gather_v1(
+    GafimeGpuSemanticBank source_bank_handle,
+    GafimeGpuSemanticBank destination_bank_handle,
+    const GafimeSemanticSparseGatherBatch* batch
+) try {
+    return cuda_semantic_sparse_gather_internal(
+        semantic_bank_from_handle(source_bank_handle), semantic_bank_from_handle(destination_bank_handle),
+        batch);
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_forecast_v1(
+    GafimeGpuSemanticBank bank_handle,
+    const GafimeSemanticForecastRequest* request,
+    GafimeSemanticMemoryForecast* forecast_out
+) {
+    return cuda_semantic_forecast_internal(
+        semantic_bank_from_handle(bank_handle), request, forecast_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_bank_retain_v1(
+    GafimeGpuSemanticBank source_bank_handle,
+    GafimeSliceU32 slots,
+    GafimeGpuSemanticBank* retained_bank_out
+) try {
+    return cuda_semantic_retain_internal(
+        semantic_bank_from_handle(source_bank_handle), slots, retained_bank_out);
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_bank_download_v1(
+    GafimeGpuSemanticBank bank_handle,
+    GafimeSliceU32 slots,
+    const GafimeNumericRoute* route,
+    GafimeMutableBufferView* columns_out
+) {
+    return cuda_semantic_download_internal(
+        semantic_bank_from_handle(bank_handle), slots, route, columns_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_bank_free_v1(GafimeGpuSemanticBank bank_handle) {
+    auto* bank = semantic_bank_from_handle(bank_handle);
+    if (bank == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    return free_semantic_cuda_bank(bank);
 }
 
 }  // extern "C"

@@ -21,6 +21,14 @@ pub const GAFIME_PRECISION_ABI_VERSION_MINOR: u16 = 1;
 pub const GAFIME_PRECISION_ABI_VERSION: u32 =
     ((GAFIME_PRECISION_ABI_VERSION_MAJOR as u32) << 16) | GAFIME_PRECISION_ABI_VERSION_MINOR as u32;
 pub const GAFIME_NUMERIC_ROUTE_ABI_MIN_MINOR: u16 = 1;
+/// Independent version for the optional resident semantic-arithmetic table.
+/// It is additive beside the frozen matrix ABI rather than a revision of it.
+pub const GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR: u16 = 1;
+/// Minor 2 requires immutable-batch descriptor totals for native forecasts.
+pub const GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR: u16 = 2;
+pub const GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION: u32 =
+    ((GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR as u32) << 16)
+        | GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR as u32;
 pub const GAFIME_ABI_IGNORABLE_FLAG_MASK: u32 = 0xffff_0000;
 pub const GAFIME_ABI_REQUIRED_FLAG_MASK: u32 = 0x0000_ffff;
 
@@ -560,6 +568,345 @@ impl Default for GafimeMutableBufferView {
             byte_length: 0,
             byte_stride: 0,
             reserved: [0; 4],
+        }
+    }
+}
+
+/// Opaque owner returned by the optional semantic-arithmetic table.  It is a
+/// physical resident-column bank, never an evidence or feature identity.
+pub type GafimeGpuSemanticBank = *mut c_void;
+
+pub type SemanticProgramOp = u32;
+pub const GAFIME_SEMANTIC_PROGRAM_SOURCE: SemanticProgramOp = 1;
+pub const GAFIME_SEMANTIC_PROGRAM_ABSOLUTE_DIFFERENCE: SemanticProgramOp = 2;
+pub const GAFIME_SEMANTIC_PROGRAM_SOFTSIGN: SemanticProgramOp = 3;
+pub const GAFIME_SEMANTIC_PROGRAM_CENTERED_PRODUCT: SemanticProgramOp = 4;
+pub const GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOURCE: u32 = 0x1;
+pub const GAFIME_SEMANTIC_PROGRAM_OP_MASK_ABSOLUTE_DIFFERENCE: u32 = 0x2;
+pub const GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOFTSIGN: u32 = 0x4;
+pub const GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT: u32 = 0x8;
+
+pub type SemanticPrimitiveKind = u32;
+pub const GAFIME_SEMANTIC_PRIMITIVE_PAIRWISE_PEARSON: SemanticPrimitiveKind = 1;
+pub const GAFIME_SEMANTIC_PRIMITIVE_ORDERED_EDGE_ENERGY: SemanticPrimitiveKind = 2;
+pub const GAFIME_SEMANTIC_PRIMITIVE_SPARSE_GATHER: SemanticPrimitiveKind = 3;
+pub const GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON: u32 = 0x1;
+pub const GAFIME_SEMANTIC_PRIMITIVE_MASK_ORDERED_EDGE_ENERGY: u32 = 0x2;
+pub const GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER: u32 = 0x4;
+pub const GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON: u32 = 0x1;
+pub const GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN: u32 = 0x2;
+pub const GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI: u32 = 0x4;
+
+pub type SemanticPearsonMode = u32;
+pub const GAFIME_SEMANTIC_PEARSON_SIGNED: SemanticPearsonMode = 1;
+pub const GAFIME_SEMANTIC_PEARSON_ABSOLUTE: SemanticPearsonMode = 2;
+
+pub type SemanticScalarState = u32;
+pub const GAFIME_SEMANTIC_SCALAR_MEASURED: SemanticScalarState = 1;
+pub const GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT: SemanticScalarState = 2;
+pub const GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND: SemanticScalarState = 3;
+pub const GAFIME_SEMANTIC_SCALAR_DEGENERATE_REDUCTION: SemanticScalarState = 4;
+pub const GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION: SemanticScalarState = 5;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeSemanticCapabilities {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub backend_kind: BackendKind,
+    pub device_id: u32,
+    pub profile_mask: u32,
+    pub program_op_mask: u32,
+    pub primitive_mask: u32,
+    pub association_statistic_mask: u32,
+    pub flags: u32,
+    pub max_program_nodes: u32,
+    pub max_slot_count: u32,
+    pub max_rows: u64,
+    pub max_gather_rows: u64,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeSemanticCapabilities {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            backend_kind: 0,
+            device_id: 0,
+            profile_mask: 0,
+            program_op_mask: 0,
+            primitive_mask: 0,
+            association_statistic_mask: 0,
+            flags: 0,
+            max_program_nodes: 0,
+            max_slot_count: 0,
+            max_rows: 0,
+            max_gather_rows: 0,
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeSemanticBankDesc {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub route: GafimeNumericRoute,
+    pub layout: MatrixLayout,
+    pub flags: u32,
+    pub rows: u64,
+    pub source_slots: u32,
+    pub slot_capacity: u32,
+    pub bytes: u64,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeSemanticBankDesc {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            route: GafimeNumericRoute::mixed(),
+            layout: GAFIME_MATRIX_COLUMN_MAJOR,
+            flags: 0,
+            rows: 0,
+            source_slots: 0,
+            slot_capacity: 0,
+            bytes: 0,
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GafimeSemanticProgramNode {
+    pub opcode: SemanticProgramOp,
+    pub output_slot: u32,
+    pub operand_offset: u32,
+    pub operand_count: u32,
+    pub mean_offset: u32,
+    pub mean_count: u32,
+    pub reserved: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeSemanticProgramBatch {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub route: GafimeNumericRoute,
+    pub nodes: *const GafimeSemanticProgramNode,
+    pub node_count: u32,
+    pub reserved32: u32,
+    pub operand_slots: GafimeSliceU32,
+    pub mean_bits: GafimeSliceU64,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeSemanticProgramBatch {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            route: GafimeNumericRoute::mixed(),
+            nodes: core::ptr::null(),
+            node_count: 0,
+            reserved32: 0,
+            operand_slots: GafimeSliceU32::default(),
+            mean_bits: GafimeSliceU64::default(),
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeSemanticPearsonBatch {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub mode: SemanticPearsonMode,
+    pub flags: u32,
+    pub left_slots: GafimeSliceU32,
+    pub right_slots: GafimeSliceU32,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeSemanticPearsonBatch {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            mode: GAFIME_SEMANTIC_PEARSON_SIGNED,
+            flags: 0,
+            left_slots: GafimeSliceU32::default(),
+            right_slots: GafimeSliceU32::default(),
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeSemanticEdge {
+    pub left_row: u64,
+    pub right_row: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeSemanticEdgeEnergyBatch {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub flags: u32,
+    pub reserved32: u32,
+    pub edges: *const GafimeSemanticEdge,
+    pub edge_count: u64,
+    pub weights: GafimeConstBufferView,
+    pub candidate_slots: GafimeSliceU32,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeSemanticEdgeEnergyBatch {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            flags: 0,
+            reserved32: 0,
+            edges: core::ptr::null(),
+            edge_count: 0,
+            weights: GafimeConstBufferView::default(),
+            candidate_slots: GafimeSliceU32::default(),
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeSemanticSparseGatherBatch {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub flags: u32,
+    pub reserved32: u32,
+    pub source_slots: GafimeSliceU32,
+    pub destination_slots: GafimeSliceU32,
+    pub row_indices: GafimeSliceU64,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeSemanticSparseGatherBatch {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            flags: 0,
+            reserved32: 0,
+            source_slots: GafimeSliceU32::default(),
+            destination_slots: GafimeSliceU32::default(),
+            row_indices: GafimeSliceU64::default(),
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeSemanticScalarResultTable {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub route: GafimeNumericRoute,
+    pub flags: u32,
+    pub reserved32: u32,
+    pub capacity: u64,
+    pub count: u64,
+    pub values: GafimeMutableBufferView,
+    pub states: *mut SemanticScalarState,
+    pub supports: *mut u64,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeSemanticScalarResultTable {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            route: GafimeNumericRoute::mixed(),
+            flags: 0,
+            reserved32: 0,
+            capacity: 0,
+            count: 0,
+            values: GafimeMutableBufferView::default(),
+            states: core::ptr::null_mut(),
+            supports: core::ptr::null_mut(),
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeSemanticForecastRequest {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    /// Preserved semantic-ABI 1.1 per-node maximum. It is descriptive only
+    /// once the payload uses immutable flattened program descriptors.
+    pub program_max_operand_count: u64,
+    pub pair_count: u64,
+    pub graph_candidate_count: u64,
+    pub graph_edge_count: u64,
+    pub gather_slot_count: u64,
+    pub gather_row_count: u64,
+    pub retained_slot_count: u64,
+    /// Exact `u32` physical-slot descriptor length for one program batch.
+    pub program_operand_count: u64,
+    /// Exact `u64` frozen-mean descriptor length for one program batch.
+    pub program_mean_count: u64,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeSemanticForecastRequest {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            program_max_operand_count: 0,
+            pair_count: 0,
+            graph_candidate_count: 0,
+            graph_edge_count: 0,
+            gather_slot_count: 0,
+            gather_row_count: 0,
+            retained_slot_count: 0,
+            program_operand_count: 0,
+            program_mean_count: 0,
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeSemanticMemoryForecast {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub resident_bytes: u64,
+    pub transient_bytes: u64,
+    pub retained_bytes: u64,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeSemanticMemoryForecast {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            resident_bytes: 0,
+            transient_bytes: 0,
+            retained_bytes: 0,
+            reserved: [0; 8],
         }
     }
 }
@@ -1115,6 +1462,8 @@ mod tests {
     use memoffset::offset_of;
 
     const GPU_ABI_HEADER: &str = include_str!("../../../src/common/gafime_gpu_abi.hpp");
+    const SEMANTIC_ABI_HEADER: &str =
+        include_str!("../../../src/common/gafime_semantic_primitives_abi.hpp");
 
     #[test]
     fn slices_are_c_pointer_len_pairs() {
@@ -1146,6 +1495,59 @@ mod tests {
         let input = GafimeInputDescriptor::default();
         assert_eq!(input.source_kind, GAFIME_INPUT_HOST_F32);
         assert_eq!(input.dtype, GAFIME_DTYPE_F32);
+    }
+
+    #[test]
+    fn semantic_abi_header_and_rust_layouts_stay_in_lockstep() {
+        for needle in [
+            "#define GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR 1u",
+            "#define GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR 2u",
+            "typedef struct GafimeSemanticCapabilities",
+            "typedef struct GafimeSemanticBankDesc",
+            "typedef struct GafimeSemanticProgramNode",
+            "typedef struct GafimeSemanticProgramBatch",
+            "typedef struct GafimeSemanticPearsonBatch",
+            "typedef struct GafimeSemanticEdgeEnergyBatch",
+            "typedef struct GafimeSemanticSparseGatherBatch",
+            "typedef struct GafimeSemanticScalarResultTable",
+            "typedef struct GafimeSemanticForecastRequest",
+            "program_max_operand_count",
+            "program_operand_count",
+            "program_mean_count",
+            "gather_slot_count",
+            "gather_row_count",
+            "gafime_gpu_semantic_bank_download_v1",
+        ] {
+            assert!(
+                SEMANTIC_ABI_HEADER.contains(needle),
+                "missing semantic C ABI header marker: {needle}"
+            );
+        }
+
+        assert_eq!(GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION, (1u32 << 16) | 2);
+        assert_eq!(size_of::<GafimeSemanticCapabilities>(), 128);
+        assert_eq!(offset_of!(GafimeSemanticCapabilities, max_rows), 48);
+        assert_eq!(offset_of!(GafimeSemanticCapabilities, reserved), 64);
+        assert_eq!(size_of::<GafimeSemanticBankDesc>(), 208);
+        assert_eq!(offset_of!(GafimeSemanticBankDesc, route), 8);
+        assert_eq!(offset_of!(GafimeSemanticBankDesc, reserved), 144);
+        assert_eq!(size_of::<GafimeSemanticProgramNode>(), 40);
+        assert_eq!(offset_of!(GafimeSemanticProgramNode, reserved), 24);
+        assert_eq!(size_of::<GafimeSemanticProgramBatch>(), 224);
+        assert_eq!(offset_of!(GafimeSemanticProgramBatch, operand_slots), 128);
+        assert_eq!(size_of::<GafimeSemanticPearsonBatch>(), 112);
+        assert_eq!(offset_of!(GafimeSemanticPearsonBatch, left_slots), 16);
+        assert_eq!(size_of::<GafimeSemanticEdgeEnergyBatch>(), 192);
+        assert_eq!(offset_of!(GafimeSemanticEdgeEnergyBatch, weights), 32);
+        assert_eq!(size_of::<GafimeSemanticSparseGatherBatch>(), 128);
+        assert_eq!(offset_of!(GafimeSemanticSparseGatherBatch, row_indices), 48);
+        assert_eq!(size_of::<GafimeSemanticScalarResultTable>(), 296);
+        assert_eq!(offset_of!(GafimeSemanticScalarResultTable, values), 136);
+        assert_eq!(offset_of!(GafimeSemanticScalarResultTable, reserved), 232);
+        assert_eq!(size_of::<GafimeSemanticForecastRequest>(), 144);
+        assert_eq!(offset_of!(GafimeSemanticForecastRequest, reserved), 80);
+        assert_eq!(size_of::<GafimeSemanticMemoryForecast>(), 96);
+        assert_eq!(offset_of!(GafimeSemanticMemoryForecast, reserved), 32);
     }
 
     #[test]

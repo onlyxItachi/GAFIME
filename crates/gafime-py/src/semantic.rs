@@ -2,16 +2,17 @@
 //! objects. No Python callback, candidate evaluator or policy implementation
 //! exists on this boundary. Handles deliberately have no integer constructor.
 
+mod execution;
 mod input;
 mod output;
 mod request;
 
-use gafime_cpu::semantic::CoreEvidenceExecutor;
+use execution::TabularExecutor;
 use gafime_orchestrator::semantic::{
     AcceptedFeature, CandidateRegistry, EvidenceTable, FeatureId, FeatureOp, FrozenMeans,
     ProgramLimits, ProposalOperator, SemanticError, SemanticSession, SessionLimits,
 };
-use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CPU};
+use gafime_types::PrecisionProfile;
 use input::{PyGraph, PyLabels, PySnapshot};
 use output::{PyEvidenceReport, PyFeatureTable};
 use pyo3::{
@@ -117,11 +118,11 @@ fn candidate_ids(value: &Bound<'_, PyAny>) -> PyResult<Vec<FeatureId>> {
 /// Resource ceilings bound numeric working/retained storage and structural work,
 /// not process RSS. close is terminal/idempotent; exported Arrow outputs remain
 /// owned independently. Session/program persistence and concurrent calls are
-/// unsupported. Arithmetic runs in native Core, not in Python.
+/// unsupported. Arithmetic runs in the selected native lowering, not in Python.
 #[pyclass(name = "TabularSession", module = "gafime.semantic")]
 pub(crate) struct PyTabularSession {
     session: SemanticSession,
-    executor: CoreEvidenceExecutor,
+    executor: Option<TabularExecutor>,
     frame: Option<Arc<gafime_orchestrator::semantic::FeatureFrame>>,
     profile: PrecisionProfile,
     configured_backend: String,
@@ -152,13 +153,7 @@ impl PyTabularSession {
         max_depth: usize,
     ) -> PyResult<Self> {
         let (backend, profile, device_id) = input::execution_intent(config)?;
-        // Operation eligibility precedes hardware ranking. Existing GPU numeric
-        // routes do not prove support for this target-free primitive vocabulary.
-        if backend != "core" && backend != "auto" {
-            return Err(error(SemanticError::Unsupported(
-                "tabular semantic operations are not supported by this backend payload path",
-            )));
-        }
+        let executor = TabularExecutor::new(data.py(), &backend, profile, device_id)?;
         let frame = Arc::new(input::snapshot(
             data,
             profile,
@@ -181,7 +176,7 @@ impl PyTabularSession {
         .map_err(error)?;
         let session = SemanticSession::with_limits(
             registry,
-            GAFIME_BACKEND_CPU,
+            executor.backend_kind(),
             SessionLimits {
                 max_bytes,
                 max_retained_bytes: max_retained_bytes.unwrap_or(max_bytes / 4),
@@ -192,7 +187,7 @@ impl PyTabularSession {
         .map_err(error)?;
         Ok(Self {
             session,
-            executor: CoreEvidenceExecutor::default(),
+            executor: Some(executor),
             frame: Some(frame),
             profile,
             configured_backend: backend,
@@ -218,7 +213,7 @@ impl PyTabularSession {
     fn selected_backend(&self) -> PyResult<&'static str> {
         self.check_thread()?;
         self.session.registry().map_err(error)?;
-        Ok("core")
+        Ok(self.executor_ref()?.name())
     }
     #[getter]
     fn precision(&self) -> PyResult<&'static str> {
@@ -240,49 +235,23 @@ impl PyTabularSession {
     fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         self.check_thread()?;
         self.session.registry().map_err(error)?;
-        let out = pyo3::types::PyDict::new(py);
-        out.set_item("configured_backend", &self.configured_backend)?;
-        out.set_item("selected_backend", self.selected_backend()?)?;
-        out.set_item("precision", self.precision()?)?;
-        out.set_item("configured_device_id", self.device_id)?;
-        out.set_item("selected_device_id", py.None())?;
-        out.set_item(
-            "programs",
-            [
-                "source",
-                "absolute_difference",
-                "softsign",
-                "centered_product",
-            ],
-        )?;
-        out.set_item(
-            "statistics",
-            ["pearson", "spearman", "fixed_nmi", "graph_energy"],
-        )?;
-        out.set_item("contexts", ["reference", "paired_view", "labels", "graph"])?;
-        out.set_item("selection_reason","Core supports the complete tabular semantic vocabulary; supervised GPU route support alone is insufficient")?;
-        out.set_item("source", "static")?;
-        Ok(out)
+        self.executor_ref()?.capabilities(
+            py,
+            &self.configured_backend,
+            self.device_id,
+            self.precision()?,
+        )
     }
 
-    /// Observed cumulative native work, not modeled cache hits or a throughput
-    /// claim. Input snapshots and explicit Arrow output copies are separate.
+    /// Core exposes observed cumulative work, not modeled cache hits. GPU
+    /// exposes residency with an explicit unavailable-work-counter marker.
+    /// Input snapshots and explicit Arrow output copies are separate.
     #[getter]
     fn diagnostics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         self.check_thread()?;
         self.session.registry().map_err(error)?;
-        let out = pyo3::types::PyDict::new(py);
-        out.set_item("materialized_nodes", self.executor.materialized_nodes())?;
-        out.set_item("retained_hits", self.executor.retained_hits())?;
-        out.set_item("source_shares", self.executor.source_shares())?;
-        out.set_item("output_allocations", self.executor.output_allocations())?;
-        out.set_item("output_bytes", self.executor.output_bytes())?;
-        out.set_item(
-            "evidence_kernel_calls",
-            self.executor.evidence_kernel_calls(),
-        )?;
-        out.set_item("retained_bytes", self.session.retained_bytes())?;
-        Ok(out)
+        self.executor_ref()?
+            .diagnostics(py, self.session.retained_bytes())
     }
 
     /// Snapshot another frame in the same precision domain. Equal lengths do not
@@ -520,7 +489,15 @@ impl PyTabularSession {
         };
         let table: EvidenceTable = self
             .session
-            .evaluate(&mut self.executor, frame, &ids, &channels)
+            .evaluate(
+                self.executor
+                    .as_mut()
+                    .ok_or_else(|| error(SemanticError::Closed))?
+                    .native(),
+                frame,
+                &ids,
+                &channels,
+            )
             .map_err(error)?;
         Ok(PyEvidenceReport { table })
     }
@@ -535,7 +512,14 @@ impl PyTabularSession {
         Ok(PyAcceptedSet {
             values: self
                 .session
-                .accept_with(&mut self.executor, &report.table, &policy.policy)
+                .accept_with(
+                    self.executor
+                        .as_mut()
+                        .ok_or_else(|| error(SemanticError::Closed))?
+                        .native(),
+                    &report.table,
+                    &policy.policy,
+                )
                 .map_err(error)?,
         })
     }
@@ -549,9 +533,31 @@ impl PyTabularSession {
         self.check_thread()?;
         let values = self
             .session
-            .materialize_accepted(&mut self.executor, &frame.frame, &accepted.values)
+            .materialize_accepted(
+                self.executor
+                    .as_mut()
+                    .ok_or_else(|| error(SemanticError::Closed))?
+                    .native(),
+                &frame.frame,
+                &accepted.values,
+            )
             .map_err(error)?;
-        output::features(&values, &frame.frame, &accepted.values)
+        if values.is_resident() {
+            let host = self
+                .session
+                .download_materialization(
+                    self.executor
+                        .as_mut()
+                        .ok_or_else(|| error(SemanticError::Closed))?
+                        .native(),
+                    &frame.frame,
+                    &values,
+                )
+                .map_err(error)?;
+            output::features(&host, &frame.frame, &accepted.values)
+        } else {
+            output::features(&values, &frame.frame, &accepted.values)
+        }
     }
     /// Drop retained values without revoking accepted program identity.
     fn clear_materializations(&mut self) -> PyResult<()> {
@@ -563,6 +569,7 @@ impl PyTabularSession {
         self.check_thread()?;
         self.session.close();
         self.frame = None;
+        self.executor = None;
         Ok(())
     }
     fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
@@ -581,6 +588,11 @@ impl PyTabularSession {
 }
 
 impl PyTabularSession {
+    fn executor_ref(&self) -> PyResult<&TabularExecutor> {
+        self.executor
+            .as_ref()
+            .ok_or_else(|| error(SemanticError::Closed))
+    }
     fn check_thread(&self) -> PyResult<()> {
         // PyO3's unsendable marker panics before a method can return an ordinary
         // Python exception. The owned Rust fields are Send + Sync; enforce this

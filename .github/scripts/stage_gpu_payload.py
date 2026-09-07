@@ -503,6 +503,8 @@ def stage_payload(
         "gafime_gpu_internal_abi.hpp",
         "gafime_gpu_exports.map",
         "gpu_abi_impl.hpp",
+        "gafime_semantic_primitives_abi.hpp",
+        "semantic_primitives_abi_impl.hpp",
     )
     for source_name in common_source_names:
         shutil.copy2(

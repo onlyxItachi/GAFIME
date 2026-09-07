@@ -6,6 +6,7 @@
 #include <cstdint>
 
 #include "precision.hpp"
+#include "../common/gafime_semantic_primitives_abi.hpp"
 
 namespace gafime_rocm_v1 {
 
@@ -50,6 +51,43 @@ using UnaryFeatureStatsDevice = PrecisionUnaryFeatureStatsDevice<float>;
 // reinterpreted as a double pointer.  The host selects each instantiation once
 // and stores the resulting function table on the precision matrix.
 namespace kernel::precision_kernel {
+
+/* Optional semantic-arithmetic kernels.  These operate only on physical
+ * resident columns; host code owns semantic IDs, contexts and policy. */
+template <typename StorageT>
+__global__ void semantic_absolute_difference_kernel(
+    StorageT* columns, uint64_t rows, uint32_t left_slot, uint32_t right_slot, uint32_t output_slot);
+
+template <typename StorageT>
+__global__ void semantic_softsign_kernel(
+    StorageT* columns, uint64_t rows, uint32_t input_slot, uint32_t output_slot);
+
+template <typename StorageT>
+__global__ void semantic_centered_product_kernel(
+    StorageT* columns, uint64_t rows, const uint32_t* operand_slots, const uint64_t* mean_bits,
+    uint32_t operand_count, uint32_t output_slot);
+
+template <typename StorageT>
+__global__ void semantic_reject_nonfinite_output_kernel(
+    const StorageT* columns, uint64_t rows, uint32_t slot, uint32_t* nonfinite_out);
+
+template <typename StorageT, typename AccumT, typename ResultT>
+__global__ void semantic_pairwise_pearson_kernel(
+    const StorageT* left_columns, const StorageT* right_columns, uint64_t rows,
+    const uint32_t* left_slots, const uint32_t* right_slots, uint64_t pair_count, uint32_t mode,
+    ResultT* values, uint32_t* states, uint64_t* supports);
+
+template <typename StorageT, typename AccumT, typename ResultT>
+__global__ void semantic_ordered_edge_energy_kernel(
+    const StorageT* columns, uint64_t rows, const uint32_t* candidate_slots,
+    uint64_t candidate_count, const GafimeSemanticEdge* edges, const StorageT* weights,
+    uint64_t edge_count, ResultT* values, uint32_t* states, uint64_t* supports);
+
+template <typename StorageT>
+__global__ void semantic_sparse_gather_kernel(
+    const StorageT* source_columns, uint64_t source_rows, StorageT* destination_columns,
+    uint64_t destination_rows, const uint32_t* source_slots, const uint32_t* destination_slots,
+    uint64_t slot_count, const uint64_t* row_indices);
 
 template <typename StorageT, typename AccumT>
 __global__ void target_stats_kernel(
