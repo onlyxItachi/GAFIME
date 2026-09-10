@@ -15,22 +15,26 @@
  * not know FeatureId, EvidenceId, context, provenance or policy. */
 namespace gafime_semantic_abi {
 
-constexpr uint32_t kCapabilitiesStablePrefixSize =
-    static_cast<uint32_t>(offsetof(GafimeSemanticCapabilities, reserved));
+constexpr uint32_t kCapabilitiesV13StablePrefixSize =
+    static_cast<uint32_t>(offsetof(GafimeSemanticCapabilities, reserved_v3));
 constexpr uint32_t kBankDescStablePrefixSize =
     static_cast<uint32_t>(offsetof(GafimeSemanticBankDesc, reserved));
-constexpr uint32_t kProgramBatchStablePrefixSize =
-    static_cast<uint32_t>(offsetof(GafimeSemanticProgramBatch, reserved));
+constexpr uint32_t kProgramBatchV13StablePrefixSize =
+    static_cast<uint32_t>(offsetof(GafimeSemanticProgramBatch, reserved_v3));
 constexpr uint32_t kPearsonBatchStablePrefixSize =
     static_cast<uint32_t>(offsetof(GafimeSemanticPearsonBatch, reserved));
+constexpr uint32_t kAssociationBatchStablePrefixSize =
+    static_cast<uint32_t>(offsetof(GafimeSemanticAssociationBatch, reserved));
+constexpr uint32_t kColumnMeanBatchStablePrefixSize =
+    static_cast<uint32_t>(offsetof(GafimeSemanticColumnMeanBatch, reserved));
 constexpr uint32_t kEdgeEnergyBatchStablePrefixSize =
     static_cast<uint32_t>(offsetof(GafimeSemanticEdgeEnergyBatch, reserved));
 constexpr uint32_t kGatherBatchStablePrefixSize =
     static_cast<uint32_t>(offsetof(GafimeSemanticSparseGatherBatch, reserved));
 constexpr uint32_t kScalarResultStablePrefixSize =
     static_cast<uint32_t>(offsetof(GafimeSemanticScalarResultTable, reserved));
-constexpr uint32_t kForecastRequestStablePrefixSize =
-    static_cast<uint32_t>(offsetof(GafimeSemanticForecastRequest, reserved));
+constexpr uint32_t kForecastRequestV13StablePrefixSize =
+    static_cast<uint32_t>(offsetof(GafimeSemanticForecastRequest, reserved_v3));
 constexpr uint32_t kForecastStablePrefixSize =
     static_cast<uint32_t>(offsetof(GafimeSemanticMemoryForecast, reserved));
 
@@ -39,6 +43,7 @@ constexpr uint32_t kForecastStablePrefixSize =
 // caller can reject an oversized lowering before a descriptor allocation.
 constexpr uint32_t kSemanticMaxProgramNodes = 65'536u;
 constexpr uint64_t kSemanticMaxGatherRows = 1'000'000ull;
+constexpr uint32_t kSemanticMaxRegionTerms = 64u;
 
 inline bool abi_compatible(uint32_t abi_version, uint32_t struct_size, uint32_t prefix_size) {
     return GAFIME_ABI_VERSION_MAJOR_OF(abi_version) ==
@@ -68,6 +73,53 @@ inline int validate_slot_slice(GafimeSliceU32 slots, uint32_t capacity) {
     }
     for (uint64_t index = 0; index < slots.len; ++index) {
         if (slots.ptr[index] >= capacity) return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    return GAFIME_STATUS_OK;
+}
+
+inline uint32_t fixed_corrected_nmi_bin_capability(uint32_t bins) {
+    switch (bins) {
+    case 2: return GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_2;
+    case 4: return GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_4;
+    case 8: return GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_8;
+    case 12: return GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_12;
+    case 16: return GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_16;
+    case 24: return GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_24;
+    case 32: return GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_32;
+    case 48: return GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_48;
+    case 64: return GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_64;
+    case 96: return GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_96;
+    default: return 0;
+    }
+}
+
+inline bool finite_f32_bits(uint64_t bits) {
+    return (bits >> 32) == 0 && ((static_cast<uint32_t>(bits) >> 23) & 0xffu) != 0xffu;
+}
+
+inline bool finite_f64_bits(uint64_t bits) {
+    return ((bits >> 52) & 0x7ffu) != 0x7ffu;
+}
+
+inline int validate_region_term_slice(
+    GafimeSemanticRegionTermSlice terms,
+    uint32_t expected_profile,
+    uint32_t slot_capacity
+) {
+    if (!aligned_or_empty(terms.ptr, terms.len) ||
+        !fits_host_elements(terms.len, sizeof(GafimeSemanticFrozenRegionTerm))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    for (uint64_t index = 0; index < terms.len; ++index) {
+        const GafimeSemanticFrozenRegionTerm& term = terms.ptr[index];
+        if (term.input_slot >= slot_capacity ||
+            (term.relation != GAFIME_SEMANTIC_REGION_LESS_EQUAL &&
+                term.relation != GAFIME_SEMANTIC_REGION_GREATER_THAN) ||
+            (expected_profile == GAFIME_PRECISION_FP64
+                ? !finite_f64_bits(term.threshold_bits)
+                : !finite_f32_bits(term.threshold_bits))) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
     }
     return GAFIME_STATUS_OK;
 }
@@ -108,7 +160,8 @@ inline int validate_capabilities(
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     if (!abi_compatible(
-            capabilities->abi_version, capabilities->struct_size, kCapabilitiesStablePrefixSize)) {
+            capabilities->abi_version, capabilities->struct_size,
+            kCapabilitiesV13StablePrefixSize)) {
         return GAFIME_STATUS_ABI_MISMATCH;
     }
     if (capabilities->backend_kind != expected_backend || capabilities->device_id != expected_device ||
@@ -119,8 +172,32 @@ inline int validate_capabilities(
         capabilities->max_rows == 0 || capabilities->max_gather_rows == 0) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    if (capabilities->struct_size >= sizeof(GafimeSemanticCapabilities) &&
-        !gafime_gpu_abi::all_zero(capabilities->reserved)) {
+    const bool has_association = capabilities->primitive_mask &
+        GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_ASSOCIATION;
+    const bool has_fixed_nmi = capabilities->association_statistic_mask &
+        GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI;
+    const bool has_spearman = capabilities->association_statistic_mask &
+        GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN;
+    const bool has_region = capabilities->program_op_mask &
+        GAFIME_SEMANTIC_PROGRAM_OP_MASK_FROZEN_REGION_CONJUNCTION;
+    if ((has_fixed_nmi &&
+            (capabilities->fixed_corrected_nmi_bin_mask == 0 ||
+                capabilities->fixed_corrected_nmi_bin_mask &
+                    ~GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_MASK_ALL ||
+                capabilities->max_fixed_corrected_nmi_rows == 0)) ||
+        (!has_fixed_nmi &&
+            (capabilities->fixed_corrected_nmi_bin_mask != 0 ||
+                capabilities->max_fixed_corrected_nmi_rows != 0)) ||
+        (has_spearman && capabilities->max_spearman_rows == 0) ||
+        (!has_spearman && capabilities->max_spearman_rows != 0) ||
+        (has_association && capabilities->max_association_pairs == 0) ||
+        (!has_association && capabilities->max_association_pairs != 0) ||
+        (has_region && (capabilities->max_region_terms == 0 ||
+            capabilities->max_region_terms > kSemanticMaxRegionTerms)) ||
+        (!has_region && capabilities->max_region_terms != 0) ||
+        !gafime_gpu_abi::all_zero(capabilities->reserved) ||
+        (capabilities->struct_size >= sizeof(GafimeSemanticCapabilities) &&
+            !gafime_gpu_abi::all_zero(capabilities->reserved_v3))) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     return GAFIME_STATUS_OK;
@@ -162,12 +239,13 @@ inline int validate_program_batch(
     uint32_t expected_profile,
     uint32_t source_slots,
     uint32_t slot_capacity,
-    const std::vector<uint8_t>& initialized_slots
+    const std::vector<uint8_t>& initialized_slots,
+    uint32_t max_region_terms
 ) {
     if (batch == nullptr || !gafime_gpu_abi::naturally_aligned(batch)) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    if (!abi_compatible(batch->abi_version, batch->struct_size, kProgramBatchStablePrefixSize)) {
+    if (!abi_compatible(batch->abi_version, batch->struct_size, kProgramBatchV13StablePrefixSize)) {
         return GAFIME_STATUS_ABI_MISMATCH;
     }
     int status = gafime_gpu_abi::validate_embedded_numeric_route(&batch->route);
@@ -175,8 +253,11 @@ inline int validate_program_batch(
     if (batch->route.profile != expected_profile || batch->reserved32 != 0 ||
         !aligned_or_empty(batch->nodes, batch->node_count) ||
         !fits_host_elements(batch->node_count, sizeof(GafimeSemanticProgramNode)) ||
+        !gafime_gpu_abi::all_zero(batch->reserved) ||
+        // The accepted v1.3 prefix ends before this optional reserved tail.
+        // A caller may allocate only that prefix, not sizeof(*batch).
         (batch->struct_size >= sizeof(GafimeSemanticProgramBatch) &&
-            !gafime_gpu_abi::all_zero(batch->reserved))) {
+            !gafime_gpu_abi::all_zero(batch->reserved_v3))) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     status = validate_slot_slice(batch->operand_slots, slot_capacity);
@@ -184,6 +265,8 @@ inline int validate_program_batch(
         !fits_host_elements(batch->mean_bits.len, sizeof(uint64_t))) {
         return status == GAFIME_STATUS_OK ? GAFIME_STATUS_INVALID_ARGUMENT : status;
     }
+    status = validate_region_term_slice(batch->region_terms, expected_profile, slot_capacity);
+    if (status != GAFIME_STATUS_OK) return status;
 
     // The physical bank may already contain D2D-gathered retained values in
     // non-source slots.  Validate against that authoritative initialization
@@ -193,8 +276,10 @@ inline int validate_program_batch(
     for (uint32_t node_index = 0; node_index < batch->node_count; ++node_index) {
         const GafimeSemanticProgramNode& node = batch->nodes[node_index];
         if (!gafime_gpu_abi::all_zero(node.reserved) ||
+            !gafime_gpu_abi::all_zero(node.reserved_v3) ||
             !range_within(node.operand_offset, node.operand_count, batch->operand_slots.len) ||
             !range_within(node.mean_offset, node.mean_count, batch->mean_bits.len) ||
+            !range_within(node.region_term_offset, node.region_term_count, batch->region_terms.len) ||
             node.output_slot >= slot_capacity) {
             return GAFIME_STATUS_INVALID_ARGUMENT;
         }
@@ -211,26 +296,42 @@ inline int validate_program_batch(
         switch (node.opcode) {
         case GAFIME_SEMANTIC_PROGRAM_SOURCE:
             if (node.operand_count != 1 || node.mean_count != 0 ||
+                node.region_term_offset != 0 || node.region_term_count != 0 ||
                 node.output_slot != operand(0) || node.output_slot >= source_slots) {
                 return GAFIME_STATUS_INVALID_ARGUMENT;
             }
             break;
         case GAFIME_SEMANTIC_PROGRAM_ABSOLUTE_DIFFERENCE:
             if (node.operand_count != 2 || node.mean_count != 0 || node.output_slot < source_slots ||
+                node.region_term_offset != 0 || node.region_term_count != 0 ||
                 output_was_initialized || output_was_written) {
                 return GAFIME_STATUS_INVALID_ARGUMENT;
             }
             break;
         case GAFIME_SEMANTIC_PROGRAM_SOFTSIGN:
             if (node.operand_count != 1 || node.mean_count != 0 || node.output_slot < source_slots ||
+                node.region_term_offset != 0 || node.region_term_count != 0 ||
                 output_was_initialized || output_was_written) {
                 return GAFIME_STATUS_INVALID_ARGUMENT;
             }
             break;
         case GAFIME_SEMANTIC_PROGRAM_CENTERED_PRODUCT:
             if (node.operand_count == 0 || node.mean_count != node.operand_count ||
+                node.region_term_offset != 0 || node.region_term_count != 0 ||
+                node.output_slot < source_slots || output_was_initialized || output_was_written) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+            break;
+        case GAFIME_SEMANTIC_PROGRAM_FROZEN_REGION_CONJUNCTION:
+            if (node.operand_count != 0 || node.mean_count != 0 ||
+                node.region_term_count == 0 || node.region_term_count > max_region_terms ||
                 node.output_slot < source_slots || output_was_initialized || output_was_written) {
                 return GAFIME_STATUS_INVALID_ARGUMENT;
+            }
+            for (uint32_t offset = 0; offset < node.region_term_count; ++offset) {
+                const GafimeSemanticFrozenRegionTerm& term =
+                    batch->region_terms.ptr[node.region_term_offset + offset];
+                if (!initialized[term.input_slot]) return GAFIME_STATUS_INVALID_ARGUMENT;
             }
             break;
         default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
@@ -274,6 +375,97 @@ inline int validate_pearson_batch(
     int status = validate_slot_slice(batch->left_slots, left_capacity);
     if (status != GAFIME_STATUS_OK) return status;
     return validate_slot_slice(batch->right_slots, right_capacity);
+}
+
+inline int validate_association_batch(
+    const GafimeSemanticAssociationBatch* batch,
+    uint32_t left_capacity,
+    uint32_t right_capacity,
+    uint32_t supported_statistic_mask,
+    uint32_t supported_fixed_nmi_bin_mask,
+    uint64_t max_association_pairs,
+    uint64_t max_spearman_rows,
+    uint64_t max_fixed_nmi_rows,
+    uint64_t rows
+) {
+    if (batch == nullptr || !gafime_gpu_abi::naturally_aligned(batch)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (!abi_compatible(batch->abi_version, batch->struct_size, kAssociationBatchStablePrefixSize)) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    if (!gafime_gpu_abi::flags_supported(batch->flags, 0) ||
+        batch->left_slots.len != batch->right_slots.len ||
+        (batch->struct_size >= sizeof(GafimeSemanticAssociationBatch) &&
+            !gafime_gpu_abi::all_zero(batch->reserved))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch->left_slots.len > max_association_pairs) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    uint32_t required_statistic = 0;
+    switch (batch->statistic) {
+    case GAFIME_SEMANTIC_ASSOCIATION_PEARSON:
+        required_statistic = GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON;
+        if (batch->fixed_nmi_bins != 0 ||
+            (batch->presentation != GAFIME_SEMANTIC_ASSOCIATION_SIGNED &&
+                batch->presentation != GAFIME_SEMANTIC_ASSOCIATION_ABSOLUTE)) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        break;
+    case GAFIME_SEMANTIC_ASSOCIATION_SPEARMAN:
+        required_statistic = GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN;
+        if (batch->fixed_nmi_bins != 0 ||
+            (batch->presentation != GAFIME_SEMANTIC_ASSOCIATION_SIGNED &&
+                batch->presentation != GAFIME_SEMANTIC_ASSOCIATION_ABSOLUTE)) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        if (rows > max_spearman_rows) return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        break;
+    case GAFIME_SEMANTIC_ASSOCIATION_FIXED_CORRECTED_NMI: {
+        required_statistic = GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI;
+        const uint32_t bin_capability = fixed_corrected_nmi_bin_capability(batch->fixed_nmi_bins);
+        // Presentation and descriptor shape are caller errors; a syntactically
+        // valid fixed-bin request beyond this payload's advertised envelope is
+        // an explicit unsupported operation.  Both cases fail before work.
+        if (batch->presentation != GAFIME_SEMANTIC_ASSOCIATION_NONNEGATIVE ||
+            bin_capability == 0) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        if (!(supported_fixed_nmi_bin_mask & bin_capability) ||
+            rows > max_fixed_nmi_rows) {
+            return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
+        break;
+    }
+    default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    if (!(supported_statistic_mask & required_statistic)) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    int status = validate_slot_slice(batch->left_slots, left_capacity);
+    if (status != GAFIME_STATUS_OK) return status;
+    return validate_slot_slice(batch->right_slots, right_capacity);
+}
+
+inline int validate_column_mean_batch(
+    const GafimeSemanticColumnMeanBatch* batch,
+    uint32_t slot_capacity
+) {
+    if (batch == nullptr || !gafime_gpu_abi::naturally_aligned(batch)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (!abi_compatible(batch->abi_version, batch->struct_size, kColumnMeanBatchStablePrefixSize)) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    if (!gafime_gpu_abi::flags_supported(batch->flags, 0) || batch->reserved32 != 0 ||
+        (batch->struct_size >= sizeof(GafimeSemanticColumnMeanBatch) &&
+            !gafime_gpu_abi::all_zero(batch->reserved))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = validate_slot_slice(batch->candidate_slots, slot_capacity);
+    if (status != GAFIME_STATUS_OK) return status;
+    return validate_distinct_slot_slice(batch->candidate_slots);
 }
 
 inline int validate_edge_energy_batch(
@@ -374,11 +566,13 @@ inline int validate_forecast_request(const GafimeSemanticForecastRequest* reques
     if (request == nullptr || !gafime_gpu_abi::naturally_aligned(request)) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    if (!abi_compatible(request->abi_version, request->struct_size, kForecastRequestStablePrefixSize)) {
+    if (!abi_compatible(
+            request->abi_version, request->struct_size, kForecastRequestV13StablePrefixSize)) {
         return GAFIME_STATUS_ABI_MISMATCH;
     }
-    if (request->struct_size >= sizeof(GafimeSemanticForecastRequest) &&
-        !gafime_gpu_abi::all_zero(request->reserved)) {
+    if (!gafime_gpu_abi::all_zero(request->reserved) ||
+        (request->struct_size >= sizeof(GafimeSemanticForecastRequest) &&
+            !gafime_gpu_abi::all_zero(request->reserved_v3))) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     return GAFIME_STATUS_OK;

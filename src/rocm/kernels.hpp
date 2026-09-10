@@ -68,6 +68,16 @@ __global__ void semantic_centered_product_kernel(
     uint32_t operand_count, uint32_t output_slot);
 
 template <typename StorageT>
+__global__ void semantic_frozen_region_conjunction_kernel(
+    StorageT* columns, uint64_t rows, const GafimeSemanticFrozenRegionTerm* terms,
+    uint32_t term_count, uint32_t output_slot);
+
+template <typename StorageT, typename AccumT, typename ResultT>
+__global__ void semantic_column_means_kernel(
+    const StorageT* columns, uint64_t rows, const uint32_t* candidate_slots,
+    uint64_t candidate_count, ResultT* values, uint32_t* states, uint64_t* supports);
+
+template <typename StorageT>
 __global__ void semantic_reject_nonfinite_output_kernel(
     const StorageT* columns, uint64_t rows, uint32_t slot, uint32_t* nonfinite_out);
 
@@ -75,6 +85,18 @@ template <typename StorageT, typename AccumT, typename ResultT>
 __global__ void semantic_pairwise_pearson_kernel(
     const StorageT* left_columns, const StorageT* right_columns, uint64_t rows,
     const uint32_t* left_slots, const uint32_t* right_slots, uint64_t pair_count, uint32_t mode,
+    ResultT* values, uint32_t* states, uint64_t* supports);
+
+template <typename StorageT, typename AccumT, typename ResultT>
+__global__ void semantic_pairwise_spearman_kernel(
+    const StorageT* left_columns, const StorageT* right_columns, uint64_t rows,
+    const uint32_t* left_slots, const uint32_t* right_slots, uint64_t pair_count,
+    uint32_t presentation, ResultT* values, uint32_t* states, uint64_t* supports);
+
+template <typename StorageT, typename AccumT, typename ResultT, uint32_t Bins>
+__global__ void semantic_fixed_corrected_nmi_kernel(
+    const StorageT* left_columns, const StorageT* right_columns, uint64_t rows,
+    const uint32_t* left_slots, const uint32_t* right_slots, uint64_t pair_count,
     ResultT* values, uint32_t* states, uint64_t* supports);
 
 template <typename StorageT, typename AccumT, typename ResultT>

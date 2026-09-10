@@ -6,9 +6,10 @@ use gafime_cpu::{
 };
 use gafime_orchestrator::semantic::{
     AssociationContext, AssociationStatistic, CandidateRegistry, Direction, EvaluationRole,
-    EvidenceChannel, EvidenceConstraint, EvidenceDefinition, EvidenceTable, EvidenceValue,
-    FeatureFrame, FeatureId, GraphEdge, LabelSet, MissingEvidence, NeighborGraph, NumericColumn,
-    ProgramLimits, SelectionPolicy, SemanticSession, UnavailableReason,
+    EvidenceChannel, EvidenceConstraint, EvidenceDefinition, EvidenceObjective, EvidenceTable,
+    EvidenceValue, FeatureFrame, FeatureId, GraphEdge, LabelSet, MissingEvidence, NeighborGraph,
+    NumericColumn, ProgramLimits, SelectionPolicy, SemanticSession, SessionLimits,
+    UnavailableReason,
 };
 use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CPU};
 
@@ -100,11 +101,177 @@ fn selection(
 ) -> SelectionPolicy {
     SelectionPolicy {
         primary: primary.id(),
+        pareto_objectives: Vec::new(),
         direction,
         constraints,
         missing,
         limit: 8,
     }
+}
+
+#[test]
+fn pareto_frontier_preserves_conflicts_ties_and_independent_missingness() {
+    for profile in [
+        PrecisionProfile::Fp32,
+        PrecisionProfile::Mixed,
+        PrecisionProfile::Fp64,
+    ] {
+        let input = frame(
+            profile,
+            &["a", "b", "diagonal", "noisy", "duplicate", "constant"],
+            vec![
+                vec![-1., 1., -1., 1.],
+                vec![-1., -1., 1., 1.],
+                vec![-2., 0., 0., 2.],
+                vec![-12., 10., 10., -8.],
+                vec![-2., 0., 0., 2.],
+                vec![7.; 4],
+            ],
+            EvaluationRole::Discovery,
+            "orthogonal reference axes with noise and exact duplicates",
+        );
+        let mut semantic = session(&input);
+        let candidates = {
+            let round = semantic.begin_round(&[]).unwrap();
+            (0..6)
+                .map(|index| round.source(index).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let a = EvidenceChannel::new("a".into(), pearson_reference(candidates[0])).unwrap();
+        let b = EvidenceChannel::new("b".into(), pearson_reference(candidates[1])).unwrap();
+        let missing = EvidenceChannel::new("absent".into(), pearson_labels(None)).unwrap();
+        let mut core = CoreEvidenceExecutor::default();
+        let table = semantic
+            .evaluate(
+                &mut core,
+                input,
+                &candidates,
+                &[a.clone(), b.clone(), missing.clone()],
+            )
+            .unwrap();
+        let mut policy = selection(
+            &a,
+            Direction::Maximize,
+            vec![],
+            MissingEvidence::RejectCandidate,
+        );
+        policy.pareto_objectives = vec![
+            EvidenceObjective {
+                channel: a.id(),
+                direction: Direction::Maximize,
+            },
+            EvidenceObjective {
+                channel: b.id(),
+                direction: Direction::Maximize,
+            },
+        ];
+        let selected = semantic.accept(&table, &policy).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|item| item.feature())
+                .collect::<Vec<_>>(),
+            vec![candidates[0], candidates[2], candidates[4], candidates[1]]
+        );
+        assert_eq!(selected[0].policy().pareto_objectives.len(), 2);
+
+        // The opposite direction is not another scalar weighting: A now
+        // dominates every other measured row on the declared two axes.
+        policy.pareto_objectives[1].direction = Direction::Minimize;
+        assert_eq!(
+            semantic
+                .accept(&table, &policy)
+                .unwrap()
+                .iter()
+                .map(|item| item.feature())
+                .collect::<Vec<_>>(),
+            vec![candidates[0]]
+        );
+        policy.constraints.push(EvidenceConstraint {
+            channel: missing.id(),
+            minimum: Some(0.),
+            maximum: None,
+            missing: Some(MissingEvidence::IgnoreConstraint),
+        });
+        assert_eq!(semantic.accept(&table, &policy).unwrap().len(), 1);
+        policy.pareto_objectives[1].channel = missing.id();
+        assert!(semantic.accept(&table, &policy).unwrap().is_empty());
+        policy.missing = MissingEvidence::Error;
+        assert!(semantic.accept(&table, &policy).is_err());
+        policy.missing = MissingEvidence::RejectCandidate;
+        policy.pareto_objectives[1].channel = a.id();
+        assert!(
+            semantic.accept(&table, &policy).is_err(),
+            "duplicate objective rejected"
+        );
+    }
+}
+
+#[test]
+fn pareto_comparison_admission_fails_before_acceptance_and_retention() {
+    let names = (0..8).map(|index| format!("x{index}")).collect::<Vec<_>>();
+    let input = frame(
+        PrecisionProfile::Mixed,
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec![vec![-1., 1., -1., 1.]; 8],
+        EvaluationRole::Discovery,
+        "bounded comparison workload",
+    );
+    let registry = CandidateRegistry::new(
+        input.schema().to_vec(),
+        input.profile(),
+        ProgramLimits::default(),
+    )
+    .unwrap();
+    let mut semantic = SemanticSession::with_limits(
+        registry,
+        GAFIME_BACKEND_CPU,
+        SessionLimits {
+            max_work: 100,
+            ..SessionLimits::for_budget(BUDGET)
+        },
+    )
+    .unwrap();
+    let candidates = {
+        let round = semantic.begin_round(&[]).unwrap();
+        (0..8)
+            .map(|index| round.source(index).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let a = EvidenceChannel::new("a".into(), pearson_reference(candidates[0])).unwrap();
+    let b = EvidenceChannel::new("b".into(), pearson_reference(candidates[1])).unwrap();
+    let table = semantic
+        .evaluate(
+            &mut CoreEvidenceExecutor::default(),
+            input,
+            &candidates,
+            &[a.clone(), b.clone()],
+        )
+        .unwrap();
+    let mut policy = selection(
+        &a,
+        Direction::Maximize,
+        vec![],
+        MissingEvidence::RejectCandidate,
+    );
+    policy.pareto_objectives = vec![
+        EvidenceObjective {
+            channel: a.id(),
+            direction: Direction::Maximize,
+        },
+        EvidenceObjective {
+            channel: b.id(),
+            direction: Direction::Minimize,
+        },
+    ];
+    assert!(semantic
+        .accept(&table, &policy)
+        .unwrap_err()
+        .to_string()
+        .contains("comparison work limit"));
+    assert_eq!(semantic.retained_bytes(), 0);
+    policy.pareto_objectives.clear();
+    assert_eq!(semantic.accept(&table, &policy).unwrap().len(), 8);
 }
 
 fn graph_ratio_f32(values: &[f32], edges: &[(usize, usize, f32)]) -> f32 {

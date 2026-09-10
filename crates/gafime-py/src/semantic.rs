@@ -10,7 +10,8 @@ mod request;
 use execution::TabularExecutor;
 use gafime_orchestrator::semantic::{
     AcceptedFeature, CandidateRegistry, EvidenceTable, FeatureId, FeatureOp, FrozenMeans,
-    ProgramLimits, ProposalOperator, SemanticError, SemanticSession, SessionLimits,
+    FrozenThreshold, PredicateComparator, ProgramLimits, ProposalOperator, SemanticError,
+    SemanticSession, SessionLimits,
 };
 use gafime_types::PrecisionProfile;
 use input::{PyGraph, PyLabels, PySnapshot};
@@ -80,6 +81,35 @@ impl PyAcceptedSet {
         Ok(PyCandidate {
             id: self.values[index_of(index, self.values.len())?].feature(),
         })
+    }
+
+    /// Inspect the immutable transitive fitting origins captured at acceptance.
+    /// Later fitting of an equal program cannot rewrite this snapshot. Empty
+    /// means no session-fitted state; manually supplied constants are not audited.
+    fn fitting_origins<'py>(
+        &self,
+        py: Python<'py>,
+        index: isize,
+    ) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        output::fitting_origins(
+            py,
+            self.values[index_of(index, self.values.len())?].training_bindings(),
+        )
+    }
+
+    /// Fitting origins affecting the complete evaluated evidence set at
+    /// acceptance, including fitted contextual references. This immutable audit
+    /// snapshot does not make those references part of the accepted program.
+    /// It includes evaluated channels even when the selection policy ignores them.
+    fn evaluation_origins<'py>(
+        &self,
+        py: Python<'py>,
+        index: isize,
+    ) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        output::fitting_origins(
+            py,
+            &self.values[index_of(index, self.values.len())?].evaluation_training_bindings(),
+        )
     }
 }
 
@@ -336,6 +366,7 @@ impl PyTabularSession {
         out.set_item("logical_arity", program.logical_arity())?;
         out.set_item("source_arity", program.source_arity())?;
         out.set_item("depth", program.depth())?;
+        out.set_item("region_term_count", program.region_term_count())?;
         out.set_item(
             "sources",
             program
@@ -361,11 +392,92 @@ impl PyTabularSession {
                 out.set_item("means", means)?;
                 ("centered_product", operands.clone())
             }
+            FeatureOp::HardPredicate {
+                input,
+                comparison,
+                threshold_bits,
+            } => {
+                out.set_item(
+                    "relation",
+                    match comparison {
+                        PredicateComparator::LessEqual => "le",
+                        PredicateComparator::GreaterThan => "gt",
+                    },
+                )?;
+                let threshold = match threshold_bits {
+                    FrozenThreshold::F32(bits) => f64::from(f32::from_bits(*bits)),
+                    FrozenThreshold::F64(bits) => f64::from_bits(*bits),
+                };
+                out.set_item("threshold", threshold)?;
+                ("hard_predicate", vec![*input])
+            }
+            FeatureOp::DecisionRegion { terms } => ("decision_region", terms.clone()),
         };
         out.set_item("operation", operation)?;
         out.set_item("operands", PyCandidateSet { ids: operands })?;
         out.set_item("precision", self.precision()?)?;
         Ok(out)
+    }
+
+    /// Inspect currently recorded transitive session-fitting origins. These
+    /// describe data access, not proof of statistical independence. Reports and
+    /// accepted sets retain their own immutable snapshots of this metadata.
+    fn fitting_origins<'py>(
+        &self,
+        py: Python<'py>,
+        candidate: PyRef<'_, PyCandidate>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        self.check_thread()?;
+        let bindings = self
+            .session
+            .registry()
+            .map_err(error)?
+            .training_lineage(candidate.id)
+            .map_err(error)?;
+        output::fitting_origins(py, &bindings)
+    }
+
+    /// Declare a frozen finite threshold predicate over an eligible raw/accepted
+    /// atom. relation is 'le' (<=) or 'gt' (>); membership is exact profile-native
+    /// zero/one, with no tolerance or threshold fitting during inference.
+    #[pyo3(signature=(operand, *, relation, threshold))]
+    fn predicate(
+        &mut self,
+        operand: PyRef<'_, PyCandidate>,
+        relation: &str,
+        threshold: f64,
+    ) -> PyResult<PyCandidate> {
+        self.check_thread()?;
+        let comparison = match relation {
+            "le" => PredicateComparator::LessEqual,
+            "gt" => PredicateComparator::GreaterThan,
+            _ => return Err(PyValueError::new_err("predicate relation must be le or gt")),
+        };
+        let profile = self.profile;
+        let mut round = self.session.current_round().map_err(error)?;
+        let id = if profile == PrecisionProfile::Fp64 {
+            round.hard_predicate_f64(operand.id, comparison, threshold)
+        } else {
+            round.hard_predicate(operand.id, comparison, threshold as f32)
+        }
+        .map_err(error)?;
+        Ok(PyCandidate { id })
+    }
+
+    /// Declare a canonical hard conjunction of predicate/region handles.
+    /// Flattened terms are bounded at 64, independently of distinct-atom arity.
+    /// Duplicate bounds, contradictions, foreign IDs and ineligible atoms fail
+    /// closed. This declares a region; it does not train a decision tree.
+    fn decision_region(&mut self, predicates: &Bound<'_, PyAny>) -> PyResult<PyCandidate> {
+        self.check_thread()?;
+        let terms = candidate_ids(predicates)?;
+        let id = self
+            .session
+            .current_round()
+            .map_err(error)?
+            .decision_region(terms)
+            .map_err(error)?;
+        Ok(PyCandidate { id })
     }
     /// Declare abs(a-b) in the pointwise dtype. Requires an active round and
     /// eligible distinct operands; finite-input overflow fails evaluation closed.
@@ -424,7 +536,8 @@ impl PyTabularSession {
     /// requested order and canonical atom order. With atoms=None use raw sources;
     /// otherwise use explicit eligible handles, including accepted later-round
     /// atoms. Supported tokens: source, softsign, absolute_difference. Frozen
-    /// centered products require manual means and are not automatically fitted.
+    /// centered products are not automatically fitted by this method; use
+    /// propose_centered_interactions for discovery-frame-bound native fitting.
     /// Invalid batches roll back new declarations; no partial catalog escapes.
     #[pyo3(signature=(operators, *, atoms=None, limit=256))]
     fn propose(
@@ -467,6 +580,56 @@ impl PyTabularSession {
                 .propose(&operators?, &atoms, limit)
                 .map_err(error)?,
         })
+    }
+
+    /// Fit per-atom means once on an explicit discovery snapshot and propose a
+    /// deterministic bounded prefix of centered interactions. arities selects
+    /// distinct-atom combination sizes; atoms=None uses raw sources. Explicit
+    /// atoms may include accepted earlier-round programs. Fitting and arithmetic
+    /// run in the selected native backend, never Python or hidden Core fallback.
+    /// Frozen profile-native means survive reuse/inference; fitting origins are
+    /// recorded separately from program identity. Non-discovery frames, invalid
+    /// batches, overflow and resource violations fail without partial proposals.
+    #[pyo3(signature=(*, atoms=None, arities=None, limit=256, frame=None))]
+    fn propose_centered_interactions(
+        &mut self,
+        atoms: Option<&Bound<'_, PyAny>>,
+        arities: Option<&Bound<'_, PyAny>>,
+        limit: usize,
+        frame: Option<PyRef<'_, PySnapshot>>,
+    ) -> PyResult<PyCandidateSet> {
+        self.check_thread()?;
+        let registry = self.session.registry().map_err(error)?;
+        let atoms = match atoms {
+            Some(value) => candidate_ids(value)?,
+            None => (0..registry.schema().len())
+                .map(|i| registry.source(i).map_err(error))
+                .collect::<PyResult<Vec<_>>>()?,
+        };
+        let arities = match arities {
+            Some(value) => input::bounded_items(value, 8, "interaction arities")?
+                .map(|x| x?.extract::<usize>())
+                .collect::<PyResult<Vec<_>>>()?,
+            None => vec![2],
+        };
+        let training = match frame {
+            Some(value) => value.frame.clone(),
+            None => self.active_frame()?.clone(),
+        };
+        let ids = self
+            .session
+            .propose_centered_interactions(
+                self.executor
+                    .as_mut()
+                    .ok_or_else(|| error(SemanticError::Closed))?
+                    .native(),
+                &training,
+                &atoms,
+                &arities,
+                limit,
+            )
+            .map_err(error)?;
+        Ok(PyCandidateSet { ids })
     }
     /// Evaluate explicit evidence against candidates on the discovery snapshot or
     /// a supplied compatible snapshot. No channel becomes an implicit target.

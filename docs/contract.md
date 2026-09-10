@@ -31,9 +31,14 @@ physical slots and bounded resource requests, never candidate IDs, evidence
 policy or acceptance authority. Its separate version domain preserves the
 frozen standard ABI tables. Initialized native slots are immutable; accepted
 reuse lowers to retention/gather, not a second native semantic catalog.
-CUDA/ROCm support is operation-specific. Unsupported Metal/statistic requests
-fail closed, and semantic `auto` selects Core's complete vocabulary without
-claiming GPU execution.
+CUDA/ROCm/Metal support is operation-specific. Unsupported profile/statistic/
+resource requests fail closed; Metal remains fp32 only. Semantic `auto`
+preserves its conservative Core policy without claiming GPU execution.
+The [discovery milestone](v1.1-tabular-discovery.md) keeps fitted-state origins
+separate from mathematical identity and snapshots them at evaluation/acceptance.
+Hard predicates/regions, bounded fitted proposals and multi-objective policy
+belong to that same Rust owner, not a second target/metric protocol or future
+compiler frontend. No local RT experiment may change their mathematical meaning.
 
 ## Repository Layout
 

@@ -2,7 +2,10 @@
 //! slice.  This registry deliberately has no ABI or Python representation.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use gafime_types::PrecisionProfile;
 
@@ -17,6 +20,15 @@ static NEXT_REGISTRY_TOKEN: AtomicU64 = AtomicU64::new(1);
 const MAX_PROGRAM_NODES: usize = 65_536;
 const MAX_PROGRAM_ARITY: usize = 64;
 const MAX_PROGRAM_DEPTH: usize = 64;
+// Provenance is metadata rather than numeric materialization, so it has an
+// independent admission ceiling.  This caps all Arc entries copied into one
+// evidence snapshot and prevents a shared fitted ancestor from multiplying
+// report storage by every descendant.
+const MAX_TRAINING_LINEAGE_SNAPSHOT_BINDINGS: usize = 65_536;
+/// A region may carry two predicates for one semantic atom (for example an
+/// open lower and closed upper interval), so this independent physical-term
+/// limit must not be conflated with logical or source arity.
+pub const MAX_REGION_TERMS: usize = 64;
 
 /// An opaque identity owned by one [`CandidateRegistry`].
 ///
@@ -109,6 +121,82 @@ pub enum FrozenMeans {
     F64(Vec<u64>),
 }
 
+/// Exact threshold storage for a hard predicate.  Like frozen means, the raw
+/// IEEE bits are part of the mathematical candidate identity; fitting history
+/// is deliberately kept outside [`FeatureOp`] so later context cannot fork or
+/// rewrite that identity.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum FrozenThreshold {
+    F32(u32),
+    F64(u64),
+}
+
+impl FrozenThreshold {
+    pub fn as_f32_bits(&self) -> SemanticResult<u32> {
+        match self {
+            Self::F32(bits) => Ok(*bits),
+            Self::F64(_) => Err(SemanticError::Invalid("frozen threshold is not f32 bits")),
+        }
+    }
+
+    pub fn as_f64_bits(&self) -> SemanticResult<u64> {
+        match self {
+            Self::F32(_) => Err(SemanticError::Invalid("frozen threshold is not f64 bits")),
+            Self::F64(bits) => Ok(*bits),
+        }
+    }
+}
+
+/// Exact hard-predicate relation.  The two relations form a deterministic
+/// partition for finite values without inventing epsilon semantics.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum PredicateComparator {
+    LessEqual,
+    GreaterThan,
+}
+
+/// Immutable provenance for a state fitted from one discovery snapshot.
+///
+/// This is intentionally not a candidate-ID component: equal frozen bits and
+/// identical program structure remain one reusable candidate even when a
+/// later fitting context independently reaches the same state.  The registry,
+/// evidence table and accepted feature own snapshots of this record instead.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TrainingBinding {
+    frame_id: u64,
+    row_domain: Arc<str>,
+    provenance: Arc<str>,
+}
+
+impl TrainingBinding {
+    pub(crate) fn from_discovery_frame(
+        frame_id: u64,
+        row_domain: Arc<str>,
+        provenance: Arc<str>,
+    ) -> Self {
+        Self {
+            frame_id,
+            row_domain,
+            provenance,
+        }
+    }
+
+    /// Exact immutable snapshot used to fit this state.
+    pub const fn frame_id(&self) -> u64 {
+        self.frame_id
+    }
+
+    /// Caller-declared row domain retained for provenance inspection.
+    pub fn row_domain(&self) -> &str {
+        &self.row_domain
+    }
+
+    /// Caller-declared input provenance retained for provenance inspection.
+    pub fn provenance(&self) -> &str {
+        &self.provenance
+    }
+}
+
 impl FrozenMeans {
     pub fn len(&self) -> usize {
         match self {
@@ -141,9 +229,8 @@ impl FrozenMeans {
 /// `CenteredProduct` preserves operand order because sequential multiplication
 /// in the pointwise dtype is not generally associative.  Frozen means are
 /// caller-declared constants stored as exact profile-bound bits rather than
-/// recomputed from a later frame. This layer neither fits nor estimates them and makes no
-/// declaration about their split or origin; that provenance is outside the
-/// mathematical identity and belongs to the evaluation/acceptance context.
+/// recomputed from a later frame.  Fitted-state provenance is held separately
+/// by the registry/session lifecycle so it cannot change canonical identity.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum FeatureOp {
     Source(u32),
@@ -152,6 +239,17 @@ pub enum FeatureOp {
     CenteredProduct {
         operands: Vec<FeatureId>,
         mean_bits: FrozenMeans,
+    },
+    /// Exact 0/1 membership for one finite semantic atom and frozen threshold.
+    HardPredicate {
+        input: FeatureId,
+        comparison: PredicateComparator,
+        threshold_bits: FrozenThreshold,
+    },
+    /// Canonical flattened hard-AND of [`FeatureOp::HardPredicate`] leaves.
+    /// The terms are program identities rather than a second descriptor/IR.
+    DecisionRegion {
+        terms: Vec<FeatureId>,
     },
 }
 
@@ -162,6 +260,7 @@ pub struct FeatureProgram {
     op: FeatureOp,
     source_dependencies: Vec<u32>,
     logical_arity: usize,
+    region_term_count: usize,
     depth: usize,
 }
 
@@ -191,6 +290,35 @@ impl FeatureProgram {
         self.source_dependencies.len()
     }
 
+    /// Number of flattened hard-predicate terms, or zero for a non-region
+    /// program.  This is intentionally distinct from logical arity: a closed
+    /// interval has two terms but only one semantic input atom.
+    pub const fn region_term_count(&self) -> usize {
+        self.region_term_count
+    }
+
+    /// Return canonical flattened predicate leaves for a decision region.
+    pub fn decision_region_terms(&self) -> Option<&[FeatureId]> {
+        match &self.op {
+            FeatureOp::DecisionRegion { terms } => Some(terms),
+            _ => None,
+        }
+    }
+
+    /// Return the frozen relation and threshold carried by one hard predicate.
+    /// This is presentation metadata for the canonical program, not a mutable
+    /// training-context record.
+    pub fn hard_predicate(&self) -> Option<(FeatureId, PredicateComparator, &FrozenThreshold)> {
+        match &self.op {
+            FeatureOp::HardPredicate {
+                input,
+                comparison,
+                threshold_bits,
+            } => Some((*input, *comparison, threshold_bits)),
+            _ => None,
+        }
+    }
+
     /// Return the number of derived edges from a source program.
     pub const fn depth(&self) -> usize {
         self.depth
@@ -209,6 +337,11 @@ pub struct CandidateRegistry {
     source_ids: Vec<FeatureId>,
     programs: Vec<FeatureProgram>,
     by_operation: BTreeMap<FeatureOp, FeatureId>,
+    /// Per-feature, immutable fitting records.  These do not participate in
+    /// `by_operation`: fitting the same frozen state in another context adds a
+    /// record instead of manufacturing a competing candidate identity.
+    training_bindings: BTreeMap<FeatureId, Vec<Arc<TrainingBinding>>>,
+    training_binding_count: usize,
 }
 
 /// Internal mutation boundary used by bounded bulk declaration. A failed batch
@@ -220,7 +353,16 @@ pub(crate) struct RegistryCheckpoint(usize);
 struct DerivedProgramMetadata {
     source_dependencies: Vec<u32>,
     logical_arity: usize,
+    region_term_count: usize,
     depth: usize,
+}
+
+/// A fully preflighted immutable provenance snapshot.  It remains crate-local:
+/// callers observe lineages through evidence tables and accepted features, not
+/// through another public lifecycle object.
+pub(crate) struct TrainingLineageSnapshot {
+    pub(crate) lineages: Vec<Vec<Arc<TrainingBinding>>>,
+    pub(crate) metadata_work: usize,
 }
 
 impl CandidateRegistry {
@@ -250,6 +392,8 @@ impl CandidateRegistry {
             source_ids: Vec::new(),
             programs: Vec::new(),
             by_operation: BTreeMap::new(),
+            training_bindings: BTreeMap::new(),
+            training_binding_count: 0,
         };
         for source in 0..source_count {
             let id = FeatureId {
@@ -263,6 +407,7 @@ impl CandidateRegistry {
                 op: operation.clone(),
                 source_dependencies: vec![source],
                 logical_arity: 1,
+                region_term_count: 0,
                 depth: 0,
             });
             registry.by_operation.insert(operation, id);
@@ -340,19 +485,9 @@ impl CandidateRegistry {
                 "f32 frozen means do not match an fp64 candidate registry",
             ));
         }
-        let metadata = self.centered_product_metadata(&operands, frozen_means.len())?;
-        if frozen_means.iter().any(|mean| !mean.is_finite()) {
-            return Err(SemanticError::Invalid(
-                "centered product frozen means must be finite",
-            ));
-        }
-        let mean_bits = FrozenMeans::F32(frozen_means.into_iter().map(f32::to_bits).collect());
-        self.insert_derived(
-            FeatureOp::CenteredProduct {
-                operands,
-                mean_bits,
-            },
-            metadata,
+        self.centered_product_from_frozen(
+            operands,
+            FrozenMeans::F32(frozen_means.into_iter().map(f32::to_bits).collect()),
         )
     }
 
@@ -367,13 +502,22 @@ impl CandidateRegistry {
                 "f64 frozen means require an fp64 candidate registry",
             ));
         }
-        let metadata = self.centered_product_metadata(&operands, frozen_means.len())?;
-        if frozen_means.iter().any(|mean| !mean.is_finite()) {
-            return Err(SemanticError::Invalid(
-                "centered product frozen means must be finite",
-            ));
-        }
-        let mean_bits = FrozenMeans::F64(frozen_means.into_iter().map(f64::to_bits).collect());
+        self.centered_product_from_frozen(
+            operands,
+            FrozenMeans::F64(frozen_means.into_iter().map(f64::to_bits).collect()),
+        )
+    }
+
+    /// Add or resolve a centered product from profile-native frozen bits.  This
+    /// is the lifecycle-owned fitting seam; callers cannot use it to change a
+    /// program's mathematical identity after construction.
+    pub(crate) fn centered_product_from_frozen(
+        &mut self,
+        operands: Vec<FeatureId>,
+        mean_bits: FrozenMeans,
+    ) -> SemanticResult<FeatureId> {
+        let metadata = self.centered_product_metadata(&operands, mean_bits.len())?;
+        self.validate_frozen_means(&mean_bits, operands.len())?;
         self.insert_derived(
             FeatureOp::CenteredProduct {
                 operands,
@@ -381,6 +525,71 @@ impl CandidateRegistry {
             },
             metadata,
         )
+    }
+
+    /// Add or resolve a profile-native hard predicate with a caller-declared
+    /// frozen f32 threshold.
+    pub fn hard_predicate(
+        &mut self,
+        input: FeatureId,
+        comparison: PredicateComparator,
+        threshold: f32,
+    ) -> SemanticResult<FeatureId> {
+        if self.precision == PrecisionProfile::Fp64 {
+            return Err(SemanticError::Invalid(
+                "f32 frozen threshold does not match an fp64 candidate registry",
+            ));
+        }
+        if !threshold.is_finite() {
+            return Err(SemanticError::Invalid(
+                "hard predicate frozen threshold must be finite",
+            ));
+        }
+        self.add_derived(
+            FeatureOp::HardPredicate {
+                input,
+                comparison,
+                threshold_bits: FrozenThreshold::F32(threshold.to_bits()),
+            },
+            &[input],
+        )
+    }
+
+    /// Add or resolve a profile-native hard predicate with a caller-declared
+    /// frozen f64 threshold.
+    pub fn hard_predicate_f64(
+        &mut self,
+        input: FeatureId,
+        comparison: PredicateComparator,
+        threshold: f64,
+    ) -> SemanticResult<FeatureId> {
+        if self.precision != PrecisionProfile::Fp64 {
+            return Err(SemanticError::Invalid(
+                "f64 frozen threshold requires an fp64 candidate registry",
+            ));
+        }
+        if !threshold.is_finite() {
+            return Err(SemanticError::Invalid(
+                "hard predicate frozen threshold must be finite",
+            ));
+        }
+        self.add_derived(
+            FeatureOp::HardPredicate {
+                input,
+                comparison,
+                threshold_bits: FrozenThreshold::F64(threshold.to_bits()),
+            },
+            &[input],
+        )
+    }
+
+    /// Add or resolve a canonical flattened hard-AND region.  Inputs may be
+    /// hard predicates or existing regions; the latter are flattened so
+    /// lowering sees one compact term list instead of a second program form.
+    pub fn decision_region(&mut self, terms: Vec<FeatureId>) -> SemanticResult<FeatureId> {
+        let terms = self.flatten_region_terms(&terms)?;
+        let metadata = self.decision_region_metadata(&terms)?;
+        self.insert_derived(FeatureOp::DecisionRegion { terms }, metadata)
     }
 
     /// Resolve one registry-owned identity to its immutable semantic program.
@@ -395,6 +604,212 @@ impl CandidateRegistry {
             .ok_or(SemanticError::Invalid("feature id slot is out of bounds"))
     }
 
+    /// Return a snapshot of direct fitting records for one candidate.  The
+    /// empty result means the program has only caller-declared frozen state or
+    /// no fitted state at all.
+    pub fn training_bindings(&self, id: FeatureId) -> SemanticResult<Vec<Arc<TrainingBinding>>> {
+        self.program(id)?;
+        Ok(self.training_bindings.get(&id).cloned().unwrap_or_default())
+    }
+
+    /// Return a deterministic, deduplicated snapshot of all fitting records
+    /// reachable through one candidate program's dependency DAG.
+    pub fn training_lineage(&self, id: FeatureId) -> SemanticResult<Vec<Arc<TrainingBinding>>> {
+        // A diagnostic query has no session work budget, but it still cannot
+        // turn the bounded registry into an unbounded transitive expansion.
+        let query_work = self
+            .limits
+            .max_nodes
+            .saturating_mul(MAX_PROGRAM_ARITY.saturating_add(2))
+            .saturating_mul(2)
+            .saturating_add(MAX_TRAINING_LINEAGE_SNAPSHOT_BINDINGS);
+        let mut snapshot = self.snapshot_training_lineages(&[id], query_work)?;
+        snapshot
+            .lineages
+            .pop()
+            .ok_or(SemanticError::Invalid("missing training lineage snapshot"))
+    }
+
+    /// Preflight every transitive origin before allocating report-facing
+    /// vectors.  Each root traversal deduplicates its DAG structurally; the
+    /// caller's work ceiling additionally bounds repeated shared-descendant
+    /// traversal across roots.  The second pass runs only after the total Arc
+    /// snapshot count and both traversal passes are known to fit admission.
+    pub(crate) fn snapshot_training_lineages(
+        &self,
+        roots: &[FeatureId],
+        max_work: usize,
+    ) -> SemanticResult<TrainingLineageSnapshot> {
+        if roots.len() > self.limits.max_nodes {
+            return Err(SemanticError::Invalid(
+                "semantic fitting lineage metadata work limit exceeded",
+            ));
+        }
+        // Even the zero-origin fast path must preserve opaque registry
+        // identity validation for diagnostic callers.
+        for &root in roots {
+            self.program(root)?;
+        }
+        // The overwhelmingly common non-fitted path has no reachable origin
+        // by construction. Preserve its existing work admission and avoid a
+        // gratuitous DAG scan while still returning row-aligned empty records.
+        if self.training_binding_count == 0 {
+            return Ok(TrainingLineageSnapshot {
+                lineages: (0..roots.len()).map(|_| Vec::new()).collect(),
+                metadata_work: 0,
+            });
+        }
+        if max_work == 0 {
+            return Err(SemanticError::Invalid(
+                "semantic fitting lineage metadata work limit exceeded",
+            ));
+        }
+        // We make two deterministic passes: one admission pass, then one to
+        // clone Arc handles into table-owned vectors. Reserving half first
+        // guarantees the second structural traversal is charged before any
+        // report-facing allocation begins.
+        let scan_limit = max_work / 2;
+        if scan_limit == 0 {
+            return Err(SemanticError::Invalid(
+                "semantic fitting lineage metadata work limit exceeded",
+            ));
+        }
+        let mut scan_work = 0usize;
+        let mut expected_lengths = Vec::with_capacity(roots.len());
+        let mut snapshot_entries = 0usize;
+        for &root in roots {
+            let lineage =
+                self.collect_training_lineage_bindings(root, &mut scan_work, scan_limit)?;
+            snapshot_entries =
+                snapshot_entries
+                    .checked_add(lineage.len())
+                    .ok_or(SemanticError::Invalid(
+                        "semantic fitting lineage snapshot count overflow",
+                    ))?;
+            if snapshot_entries > MAX_TRAINING_LINEAGE_SNAPSHOT_BINDINGS {
+                return Err(SemanticError::Unsupported(
+                    "semantic fitting lineage snapshot limit exceeded",
+                ));
+            }
+            expected_lengths.push(lineage.len());
+        }
+        let metadata_work = scan_work
+            .checked_mul(2)
+            .and_then(|work| work.checked_add(snapshot_entries))
+            .ok_or(SemanticError::Invalid(
+                "semantic fitting lineage metadata work overflow",
+            ))?;
+        if metadata_work > max_work {
+            return Err(SemanticError::Invalid(
+                "semantic fitting lineage metadata work limit exceeded",
+            ));
+        }
+
+        let mut build_work = 0usize;
+        let mut lineages = Vec::with_capacity(roots.len());
+        for (&root, &expected) in roots.iter().zip(&expected_lengths) {
+            let lineage =
+                self.collect_training_lineage_bindings(root, &mut build_work, scan_limit)?;
+            debug_assert_eq!(lineage.len(), expected);
+            lineages.push(lineage.into_iter().collect());
+        }
+        debug_assert_eq!(build_work, scan_work);
+        Ok(TrainingLineageSnapshot {
+            lineages,
+            metadata_work,
+        })
+    }
+
+    fn collect_training_lineage_bindings(
+        &self,
+        root: FeatureId,
+        work: &mut usize,
+        max_work: usize,
+    ) -> SemanticResult<BTreeSet<Arc<TrainingBinding>>> {
+        let mut pending = vec![root];
+        let mut visited = BTreeSet::new();
+        let mut lineage = BTreeSet::new();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            charge_training_lineage_work(work, 1, max_work)?;
+            let program = self.program(current)?;
+            if let Some(bindings) = self.training_bindings.get(&current) {
+                charge_training_lineage_work(work, bindings.len(), max_work)?;
+                lineage.extend(bindings.iter().cloned());
+            }
+            match program.op() {
+                FeatureOp::Source(_) => {}
+                FeatureOp::AbsoluteDifference(left, right) => {
+                    charge_training_lineage_work(work, 2, max_work)?;
+                    pending.extend([*left, *right]);
+                }
+                FeatureOp::Softsign(input) | FeatureOp::HardPredicate { input, .. } => {
+                    charge_training_lineage_work(work, 1, max_work)?;
+                    pending.push(*input);
+                }
+                FeatureOp::CenteredProduct { operands, .. } => {
+                    charge_training_lineage_work(work, operands.len(), max_work)?;
+                    pending.extend(operands);
+                }
+                FeatureOp::DecisionRegion { terms } => {
+                    charge_training_lineage_work(work, terms.len(), max_work)?;
+                    pending.extend(terms);
+                }
+            }
+        }
+        Ok(lineage)
+    }
+
+    /// Number of bounded direct fitting records currently owned by this
+    /// registry.  This is diagnostic metadata, not candidate-node count.
+    pub const fn training_binding_count(&self) -> usize {
+        self.training_binding_count
+    }
+
+    /// Attach one immutable training binding to every returned candidate in a
+    /// fitted declaration batch.  This is atomic: if the bounded ledger cannot
+    /// admit all new records, no candidate gains a partial provenance update.
+    pub(crate) fn attach_training_binding(
+        &mut self,
+        candidates: &[FeatureId],
+        binding: Arc<TrainingBinding>,
+    ) -> SemanticResult<()> {
+        let candidates = candidates.iter().copied().collect::<BTreeSet<_>>();
+        for &candidate in &candidates {
+            self.program(candidate)?;
+        }
+        let additions = candidates
+            .iter()
+            .filter(|candidate| {
+                self.training_bindings
+                    .get(candidate)
+                    .is_none_or(|bindings| {
+                        !bindings.iter().any(|old| old.as_ref() == binding.as_ref())
+                    })
+            })
+            .count();
+        if self
+            .training_binding_count
+            .checked_add(additions)
+            .is_none_or(|count| count > self.limits.max_nodes)
+        {
+            return Err(SemanticError::Unsupported(
+                "semantic fitting provenance limit exceeded",
+            ));
+        }
+        for candidate in candidates {
+            let bindings = self.training_bindings.entry(candidate).or_default();
+            if !bindings.iter().any(|old| old.as_ref() == binding.as_ref()) {
+                bindings.push(Arc::clone(&binding));
+                bindings.sort();
+                self.training_binding_count += 1;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn mutation_checkpoint(&self) -> RegistryCheckpoint {
         RegistryCheckpoint(self.programs.len())
     }
@@ -407,6 +822,12 @@ impl CandidateRegistry {
                 .pop()
                 .expect("program length was checked before rollback");
             self.by_operation.remove(program.op());
+            if let Some(bindings) = self.training_bindings.remove(&program.id()) {
+                self.training_binding_count = self
+                    .training_binding_count
+                    .checked_sub(bindings.len())
+                    .expect("training binding count tracks registry entries");
+            }
         }
     }
 
@@ -436,6 +857,159 @@ impl CandidateRegistry {
             ));
         }
         self.derived_metadata_from_valid_inputs(operands)
+    }
+
+    fn validate_frozen_means(&self, means: &FrozenMeans, expected: usize) -> SemanticResult<()> {
+        if means.len() != expected {
+            return Err(SemanticError::Invalid(
+                "centered product operands and frozen means must have equal lengths",
+            ));
+        }
+        match (self.precision, means) {
+            (PrecisionProfile::Fp32 | PrecisionProfile::Mixed, FrozenMeans::F32(bits))
+                if bits.iter().all(|bits| f32::from_bits(*bits).is_finite()) =>
+            {
+                Ok(())
+            }
+            (PrecisionProfile::Fp64, FrozenMeans::F64(bits))
+                if bits.iter().all(|bits| f64::from_bits(*bits).is_finite()) =>
+            {
+                Ok(())
+            }
+            (PrecisionProfile::Fp32 | PrecisionProfile::Mixed, FrozenMeans::F64(_)) => {
+                Err(SemanticError::Invalid(
+                    "f64 frozen means do not match the selected candidate profile",
+                ))
+            }
+            (PrecisionProfile::Fp64, FrozenMeans::F32(_)) => Err(SemanticError::Invalid(
+                "f32 frozen means do not match an fp64 candidate registry",
+            )),
+            _ => Err(SemanticError::Invalid(
+                "centered product frozen means must be finite",
+            )),
+        }
+    }
+
+    fn flatten_region_terms(&self, terms: &[FeatureId]) -> SemanticResult<Vec<FeatureId>> {
+        if terms.is_empty() {
+            return Err(SemanticError::Invalid(
+                "decision region requires at least one hard predicate",
+            ));
+        }
+        let mut flattened = Vec::new();
+        for &term in terms {
+            match self.program(term)?.op() {
+                FeatureOp::HardPredicate { .. } => flattened.push(term),
+                FeatureOp::DecisionRegion { terms } => flattened.extend_from_slice(terms),
+                _ => {
+                    return Err(SemanticError::Invalid(
+                        "decision region terms must be hard predicates or regions",
+                    ))
+                }
+            }
+        }
+        flattened.sort();
+        if flattened.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(SemanticError::Invalid(
+                "decision region repeats a hard predicate term",
+            ));
+        }
+        if flattened.len() > MAX_REGION_TERMS {
+            return Err(SemanticError::Unsupported(
+                "decision region exceeds bounded predicate term limit",
+            ));
+        }
+        Ok(flattened)
+    }
+
+    fn decision_region_metadata(
+        &self,
+        terms: &[FeatureId],
+    ) -> SemanticResult<DerivedProgramMetadata> {
+        debug_assert!(!terms.is_empty());
+        let mut atoms = BTreeSet::new();
+        let mut source_dependencies = BTreeSet::new();
+        let mut deepest = 0usize;
+        let mut intervals: BTreeMap<FeatureId, (Option<FrozenThreshold>, Option<FrozenThreshold>)> =
+            BTreeMap::new();
+        for &term in terms {
+            let predicate = self.program(term)?;
+            let FeatureOp::HardPredicate {
+                input,
+                comparison,
+                threshold_bits,
+            } = predicate.op()
+            else {
+                return Err(SemanticError::Invalid(
+                    "decision region did not flatten to hard predicate terms",
+                ));
+            };
+            let input_program = self.program(*input)?;
+            atoms.insert(*input);
+            source_dependencies.extend(input_program.source_dependencies().iter().copied());
+            deepest = deepest.max(predicate.depth());
+            let entry = intervals.entry(*input).or_default();
+            let slot = match comparison {
+                PredicateComparator::GreaterThan => &mut entry.0,
+                PredicateComparator::LessEqual => &mut entry.1,
+            };
+            if slot.replace(threshold_bits.clone()).is_some() {
+                return Err(SemanticError::Invalid(
+                    "decision region repeats a same-direction atom bound",
+                ));
+            }
+        }
+        if atoms.len() > self.limits.max_logical_arity {
+            return Err(SemanticError::Unsupported(
+                "decision region exceeds logical atom arity limit",
+            ));
+        }
+        if source_dependencies.len() > self.limits.max_source_arity {
+            return Err(SemanticError::Unsupported(
+                "semantic program exceeds source arity limit",
+            ));
+        }
+        for (_, (lower, upper)) in intervals {
+            if let (Some(lower), Some(upper)) = (lower, upper) {
+                let order = self.compare_thresholds(&lower, &upper)?;
+                if !order.is_lt() {
+                    return Err(SemanticError::Invalid(
+                        "decision region contains an empty or inverted interval",
+                    ));
+                }
+            }
+        }
+        let depth = deepest.checked_add(1).ok_or(SemanticError::Unsupported(
+            "semantic program depth overflow",
+        ))?;
+        if depth > self.limits.max_depth {
+            return Err(SemanticError::Unsupported(
+                "semantic program exceeds depth limit",
+            ));
+        }
+        Ok(DerivedProgramMetadata {
+            source_dependencies: source_dependencies.into_iter().collect(),
+            logical_arity: atoms.len(),
+            region_term_count: terms.len(),
+            depth,
+        })
+    }
+
+    fn compare_thresholds(
+        &self,
+        left: &FrozenThreshold,
+        right: &FrozenThreshold,
+    ) -> SemanticResult<std::cmp::Ordering> {
+        match self.precision {
+            PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                Ok(f32::from_bits(left.as_f32_bits()?)
+                    .partial_cmp(&f32::from_bits(right.as_f32_bits()?))
+                    .expect("finite frozen predicate thresholds were validated"))
+            }
+            PrecisionProfile::Fp64 => Ok(f64::from_bits(left.as_f64_bits()?)
+                .partial_cmp(&f64::from_bits(right.as_f64_bits()?))
+                .expect("finite frozen predicate thresholds were validated")),
+        }
     }
 
     fn validate_derived_inputs(&self, inputs: &[FeatureId]) -> SemanticResult<()> {
@@ -494,6 +1068,7 @@ impl CandidateRegistry {
         Ok(DerivedProgramMetadata {
             source_dependencies,
             logical_arity: inputs.len(),
+            region_term_count: 0,
             depth,
         })
     }
@@ -523,11 +1098,28 @@ impl CandidateRegistry {
             op: operation.clone(),
             source_dependencies: metadata.source_dependencies,
             logical_arity: metadata.logical_arity,
+            region_term_count: metadata.region_term_count,
             depth: metadata.depth,
         });
         self.by_operation.insert(operation, id);
         Ok(id)
     }
+}
+
+fn charge_training_lineage_work(
+    work: &mut usize,
+    amount: usize,
+    max_work: usize,
+) -> SemanticResult<()> {
+    *work = work.checked_add(amount).ok_or(SemanticError::Invalid(
+        "semantic fitting lineage metadata work overflow",
+    ))?;
+    if *work > max_work {
+        return Err(SemanticError::Invalid(
+            "semantic fitting lineage metadata work limit exceeded",
+        ));
+    }
+    Ok(())
 }
 
 fn allocate_registry_token() -> SemanticResult<u64> {
@@ -664,6 +1256,10 @@ mod tests {
         ));
         assert!(matches!(
             registry.softsign(foreign),
+            Err(SemanticError::ForeignIdentity)
+        ));
+        assert!(matches!(
+            registry.training_lineage(foreign),
             Err(SemanticError::ForeignIdentity)
         ));
 

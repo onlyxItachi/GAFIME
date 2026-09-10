@@ -55,6 +55,24 @@ jobs:
           python .github/scripts/stage_metal_payload.py
           python -m pip wheel . --no-deps -w wheelhouse
 
+      - name: Run current direct Metal semantic CTest
+        shell: bash
+        run: |
+          set -euo pipefail
+          semantic_build="$RUNNER_TEMP/gafime-current-metal-semantic-ctest"
+          cmake -S src/metal -B "$semantic_build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+            -DGAFIME_METAL_BUILD_TESTS=ON
+          cmake --build "$semantic_build" --config Release \
+            --target gafime_metal_semantic_native_test gafime_semantic_abi_validation_metal \
+            --parallel 2
+          GAFIME_METAL_V1_METALLIB="$semantic_build/gafime_metal_v1.metallib" \
+            ctest --test-dir "$semantic_build" \
+              -R 'gafime_metal_semantic_native_test|gafime_semantic_abi_validation_metal' \
+              --output-on-failure
+
       - name: Build pre-immutable same-ABI Metal payload
         shell: bash
         run: |
@@ -84,7 +102,7 @@ jobs:
           python -m venv "$RUNNER_TEMP/gafime-native-platform-venv"
           . "$RUNNER_TEMP/gafime-native-platform-venv/bin/activate"
           python -m pip install --upgrade pip
-          python -m pip install numpy wheelhouse/gafime-*.whl
+          python -m pip install numpy pyarrow scikit-learn pytest wheelhouse/gafime-*.whl
           (
             cd /tmp
             python "$GITHUB_WORKSPACE/tests/release_measure/installed_wheel_smoke.py" \
@@ -97,6 +115,11 @@ jobs:
             python "$GITHUB_WORKSPACE/tests/release_measure/precision_01_end_to_end_profiles.py" \
               --backend core \
               --backend metal
+            GAFIME_TEST_INSTALLED_PACKAGE=1 \
+            GAFIME_METAL_V1_LIB="$GITHUB_WORKSPACE/python/gafime/_metal/libgafime_metal_v1.dylib" \
+            GAFIME_METAL_V1_METALLIB="$GITHUB_WORKSPACE/python/gafime/_metal/gafime_metal_v1.metallib" \
+              python -m pytest -q \
+                "$GITHUB_WORKSPACE/tests/python/test_semantic_native_accelerators.py" -k metal
           )
           run_legacy_payload_compatibility() {
             GAFIME_METAL_V1_LIB="$1" \

@@ -14,28 +14,39 @@ use std::{
 
 use gafime_orchestrator::semantic::{
     AssociationContext, AssociationStatistic, CandidateRegistry, EvidenceDefinition, EvidenceValue,
-    FeatureFrame, FeatureId, FeatureOp, FrozenMeans, MaterializedColumns, NativeEvidenceExecutor,
-    NumericColumn, SemanticError, SemanticResult, UnavailableReason,
+    FeatureFrame, FeatureId, FeatureOp, FrozenMeans, FrozenThreshold, MaterializedColumns,
+    NativeEvidenceExecutor, NumericColumn, PredicateComparator, SemanticError, SemanticResult,
+    UnavailableReason,
 };
 use gafime_types::{
     BackendKind, GafimeConstBufferView, GafimeGpuSemanticBank, GafimeMutableBufferView,
-    GafimeSemanticBankDesc, GafimeSemanticEdge, GafimeSemanticEdgeEnergyBatch,
-    GafimeSemanticForecastRequest, GafimeSemanticMemoryForecast, GafimeSemanticPearsonBatch,
-    GafimeSemanticProgramBatch, GafimeSemanticProgramNode, GafimeSemanticScalarResultTable,
-    GafimeSemanticSparseGatherBatch, GafimeSliceU32, GafimeSliceU64, PrecisionProfile,
-    SemanticScalarState, GAFIME_BUFFER_FLAG_CONTIGUOUS, GAFIME_BUFFER_FLAG_HOST, GAFIME_DTYPE_F32,
-    GAFIME_DTYPE_F64, GAFIME_MATRIX_COLUMN_MAJOR, GAFIME_SEMANTIC_PEARSON_ABSOLUTE,
+    GafimeSemanticAssociationBatch, GafimeSemanticBankDesc, GafimeSemanticColumnMeanBatch,
+    GafimeSemanticEdge, GafimeSemanticEdgeEnergyBatch, GafimeSemanticForecastRequest,
+    GafimeSemanticFrozenRegionTerm, GafimeSemanticMemoryForecast, GafimeSemanticPearsonBatch,
+    GafimeSemanticProgramBatch, GafimeSemanticProgramNode, GafimeSemanticRegionTermSlice,
+    GafimeSemanticScalarResultTable, GafimeSemanticSparseGatherBatch, GafimeSliceU32,
+    GafimeSliceU64, PrecisionProfile, SemanticScalarState, GAFIME_BACKEND_METAL,
+    GAFIME_BUFFER_FLAG_CONTIGUOUS, GAFIME_BUFFER_FLAG_HOST, GAFIME_DTYPE_F32, GAFIME_DTYPE_F64,
+    GAFIME_MATRIX_COLUMN_MAJOR, GAFIME_SEMANTIC_ASSOCIATION_ABSOLUTE,
+    GAFIME_SEMANTIC_ASSOCIATION_FIXED_CORRECTED_NMI, GAFIME_SEMANTIC_ASSOCIATION_NONNEGATIVE,
+    GAFIME_SEMANTIC_ASSOCIATION_PEARSON, GAFIME_SEMANTIC_ASSOCIATION_SIGNED,
+    GAFIME_SEMANTIC_ASSOCIATION_SPEARMAN, GAFIME_SEMANTIC_PEARSON_ABSOLUTE,
     GAFIME_SEMANTIC_PEARSON_SIGNED, GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+    GAFIME_SEMANTIC_PRIMITIVE_MASK_COLUMN_MEANS,
     GAFIME_SEMANTIC_PRIMITIVE_MASK_ORDERED_EDGE_ENERGY,
-    GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON, GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER,
-    GAFIME_SEMANTIC_PROGRAM_ABSOLUTE_DIFFERENCE, GAFIME_SEMANTIC_PROGRAM_CENTERED_PRODUCT,
+    GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_ASSOCIATION,
+    GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER, GAFIME_SEMANTIC_PROGRAM_ABSOLUTE_DIFFERENCE,
+    GAFIME_SEMANTIC_PROGRAM_CENTERED_PRODUCT, GAFIME_SEMANTIC_PROGRAM_FROZEN_REGION_CONJUNCTION,
     GAFIME_SEMANTIC_PROGRAM_OP_MASK_ABSOLUTE_DIFFERENCE,
-    GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT, GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOFTSIGN,
-    GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOURCE, GAFIME_SEMANTIC_PROGRAM_SOFTSIGN,
-    GAFIME_SEMANTIC_PROGRAM_SOURCE, GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND,
-    GAFIME_SEMANTIC_SCALAR_DEGENERATE_REDUCTION, GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT,
-    GAFIME_SEMANTIC_SCALAR_MEASURED, GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION,
-    GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON,
+    GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT,
+    GAFIME_SEMANTIC_PROGRAM_OP_MASK_FROZEN_REGION_CONJUNCTION,
+    GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOFTSIGN, GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOURCE,
+    GAFIME_SEMANTIC_PROGRAM_SOFTSIGN, GAFIME_SEMANTIC_PROGRAM_SOURCE,
+    GAFIME_SEMANTIC_REGION_GREATER_THAN, GAFIME_SEMANTIC_REGION_LESS_EQUAL,
+    GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND, GAFIME_SEMANTIC_SCALAR_DEGENERATE_REDUCTION,
+    GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT, GAFIME_SEMANTIC_SCALAR_MEASURED,
+    GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION, GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI,
+    GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON, GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN,
 };
 use libloading::Library;
 
@@ -64,6 +75,82 @@ pub enum SemanticProgramNode {
         operand_slots: Vec<u32>,
         mean_bits: Vec<u64>,
     },
+    /// Closed hard-AND over physical input slots and exact frozen threshold
+    /// bits. The semantic registry decides which atoms are eligible; native
+    /// arithmetic receives no feature/evidence identity or fitting history.
+    FrozenRegionConjunction {
+        output_slot: u32,
+        terms: Vec<SemanticFrozenRegionTerm>,
+    },
+}
+
+/// Arithmetic association selector for the generic resident-slot ABI entry.
+/// It deliberately carries no contextual provenance: Rust maps reference,
+/// paired-view, and label operands to ordinary physical slots first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeAssociationStatistic {
+    Pearson,
+    Spearman,
+    FixedCorrectedNmi { bins: u32 },
+}
+
+impl NativeAssociationStatistic {
+    const fn raw(self) -> u32 {
+        match self {
+            Self::Pearson => GAFIME_SEMANTIC_ASSOCIATION_PEARSON,
+            Self::Spearman => GAFIME_SEMANTIC_ASSOCIATION_SPEARMAN,
+            Self::FixedCorrectedNmi { .. } => GAFIME_SEMANTIC_ASSOCIATION_FIXED_CORRECTED_NMI,
+        }
+    }
+
+    const fn fixed_nmi_bins(self) -> u32 {
+        match self {
+            Self::FixedCorrectedNmi { bins } => bins,
+            Self::Pearson | Self::Spearman => 0,
+        }
+    }
+}
+
+/// Arithmetic post-processing for association values. It is kept distinct
+/// from semantic evidence names and policies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeAssociationPresentation {
+    Signed,
+    Absolute,
+    Nonnegative,
+}
+
+impl NativeAssociationPresentation {
+    const fn raw(self) -> u32 {
+        match self {
+            Self::Signed => GAFIME_SEMANTIC_ASSOCIATION_SIGNED,
+            Self::Absolute => GAFIME_SEMANTIC_ASSOCIATION_ABSOLUTE,
+            Self::Nonnegative => GAFIME_SEMANTIC_ASSOCIATION_NONNEGATIVE,
+        }
+    }
+}
+
+/// One physical hard-predicate term used by a frozen region conjunction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SemanticFrozenRegionTerm {
+    pub input_slot: u32,
+    pub relation: SemanticRegionRelation,
+    pub threshold_bits: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SemanticRegionRelation {
+    LessEqual,
+    GreaterThan,
+}
+
+impl SemanticRegionRelation {
+    const fn raw(self) -> u32 {
+        match self {
+            Self::LessEqual => GAFIME_SEMANTIC_REGION_LESS_EQUAL,
+            Self::GreaterThan => GAFIME_SEMANTIC_REGION_GREATER_THAN,
+        }
+    }
 }
 
 /// Native Pearson presentation choice.  The operands remain generic columns;
@@ -122,6 +209,7 @@ struct SemanticBankMetadata {
     slot_capacity: u32,
     max_program_nodes: u32,
     max_gather_rows: u64,
+    max_region_terms: u32,
     bytes: u64,
 }
 
@@ -139,6 +227,7 @@ struct SemanticBankInner {
     slot_capacity: u32,
     max_program_nodes: u32,
     max_gather_rows: u64,
+    max_region_terms: u32,
     bytes: u64,
     // Native bank state is mutable (uploads/materialization), so every safe
     // operation takes this lock.  Pair operations acquire unique banks by
@@ -192,6 +281,7 @@ impl std::fmt::Debug for OwnedSemanticBank {
             .field("slot_capacity", &self.slot_capacity())
             .field("max_program_nodes", &self.inner.max_program_nodes)
             .field("max_gather_rows", &self.inner.max_gather_rows)
+            .field("max_region_terms", &self.inner.max_region_terms)
             .field("bytes", &self.bytes())
             .finish_non_exhaustive()
     }
@@ -226,6 +316,7 @@ impl OwnedSemanticBank {
                 slot_capacity: metadata.slot_capacity,
                 max_program_nodes: metadata.max_program_nodes,
                 max_gather_rows: metadata.max_gather_rows,
+                max_region_terms: metadata.max_region_terms,
                 bytes: metadata.bytes,
                 lock: Mutex::new(()),
             }),
@@ -282,6 +373,10 @@ impl OwnedSemanticBank {
 
     fn max_gather_rows(&self) -> u64 {
         self.inner.max_gather_rows
+    }
+
+    fn max_region_terms(&self) -> u32 {
+        self.inner.max_region_terms
     }
 
     fn lock(&self) -> MutexGuard<'_, ()> {
@@ -479,6 +574,7 @@ impl OwnedSemanticBank {
                 SemanticProgramNode::Source { .. } | SemanticProgramNode::Softsign { .. } => 1,
                 SemanticProgramNode::AbsoluteDifference { .. } => 2,
                 SemanticProgramNode::CenteredProduct { operand_slots, .. } => operand_slots.len(),
+                SemanticProgramNode::FrozenRegionConjunction { .. } => 0,
             };
             total.checked_add(count).ok_or(GpuSysError::SizeOverflow)
         })?;
@@ -489,77 +585,176 @@ impl OwnedSemanticBank {
             };
             total.checked_add(count).ok_or(GpuSysError::SizeOverflow)
         })?;
+        let region_capacity = nodes.iter().try_fold(0usize, |total, node| {
+            let count = match node {
+                SemanticProgramNode::FrozenRegionConjunction { terms, .. } => terms.len(),
+                SemanticProgramNode::Source { .. }
+                | SemanticProgramNode::AbsoluteDifference { .. }
+                | SemanticProgramNode::Softsign { .. }
+                | SemanticProgramNode::CenteredProduct { .. } => 0,
+            };
+            total.checked_add(count).ok_or(GpuSysError::SizeOverflow)
+        })?;
         let mut raw_nodes = Vec::with_capacity(nodes.len());
         // Exact capacities make the executor's pre-dispatch host-temporary
         // accounting truthful instead of relying on allocator growth policy.
         let mut operand_slots = Vec::with_capacity(operand_capacity);
         let mut mean_bits = Vec::with_capacity(mean_capacity);
+        let mut region_terms = Vec::with_capacity(region_capacity);
         for node in nodes {
-            let (opcode, output_slot, operands, means) = match node {
-                SemanticProgramNode::Source { output_slot } => (
-                    GAFIME_SEMANTIC_PROGRAM_SOURCE,
-                    *output_slot,
-                    std::slice::from_ref(output_slot),
-                    &[][..],
-                ),
+            match node {
+                SemanticProgramNode::Source { output_slot } => {
+                    if *output_slot >= self.slot_capacity() {
+                        return Err(GpuSysError::InvalidInput(
+                            "semantic source output slot is out of bounds",
+                        ));
+                    }
+                    let operand_offset = u32::try_from(operand_slots.len())
+                        .map_err(|_| GpuSysError::SizeOverflow)?;
+                    operand_slots.push(*output_slot);
+                    raw_nodes.push(GafimeSemanticProgramNode {
+                        opcode: GAFIME_SEMANTIC_PROGRAM_SOURCE,
+                        output_slot: *output_slot,
+                        operand_offset,
+                        operand_count: 1,
+                        mean_offset: u32::try_from(mean_bits.len())
+                            .map_err(|_| GpuSysError::SizeOverflow)?,
+                        mean_count: 0,
+                        ..Default::default()
+                    });
+                }
                 SemanticProgramNode::AbsoluteDifference {
                     output_slot,
                     left_slot,
                     right_slot,
-                } => (
-                    GAFIME_SEMANTIC_PROGRAM_ABSOLUTE_DIFFERENCE,
-                    *output_slot,
-                    &[*left_slot, *right_slot][..],
-                    &[][..],
-                ),
+                } => {
+                    if *output_slot >= self.slot_capacity()
+                        || *left_slot >= self.slot_capacity()
+                        || *right_slot >= self.slot_capacity()
+                    {
+                        return Err(GpuSysError::InvalidInput(
+                            "semantic absolute-difference slot is out of bounds",
+                        ));
+                    }
+                    let operand_offset = u32::try_from(operand_slots.len())
+                        .map_err(|_| GpuSysError::SizeOverflow)?;
+                    operand_slots.extend_from_slice(&[*left_slot, *right_slot]);
+                    raw_nodes.push(GafimeSemanticProgramNode {
+                        opcode: GAFIME_SEMANTIC_PROGRAM_ABSOLUTE_DIFFERENCE,
+                        output_slot: *output_slot,
+                        operand_offset,
+                        operand_count: 2,
+                        mean_offset: u32::try_from(mean_bits.len())
+                            .map_err(|_| GpuSysError::SizeOverflow)?,
+                        mean_count: 0,
+                        ..Default::default()
+                    });
+                }
                 SemanticProgramNode::Softsign {
                     output_slot,
                     input_slot,
-                } => (
-                    GAFIME_SEMANTIC_PROGRAM_SOFTSIGN,
-                    *output_slot,
-                    std::slice::from_ref(input_slot),
-                    &[][..],
-                ),
+                } => {
+                    if *output_slot >= self.slot_capacity() || *input_slot >= self.slot_capacity() {
+                        return Err(GpuSysError::InvalidInput(
+                            "semantic softsign slot is out of bounds",
+                        ));
+                    }
+                    let operand_offset = u32::try_from(operand_slots.len())
+                        .map_err(|_| GpuSysError::SizeOverflow)?;
+                    operand_slots.push(*input_slot);
+                    raw_nodes.push(GafimeSemanticProgramNode {
+                        opcode: GAFIME_SEMANTIC_PROGRAM_SOFTSIGN,
+                        output_slot: *output_slot,
+                        operand_offset,
+                        operand_count: 1,
+                        mean_offset: u32::try_from(mean_bits.len())
+                            .map_err(|_| GpuSysError::SizeOverflow)?,
+                        mean_count: 0,
+                        ..Default::default()
+                    });
+                }
                 SemanticProgramNode::CenteredProduct {
                     output_slot,
-                    operand_slots,
-                    mean_bits,
-                } => (
-                    GAFIME_SEMANTIC_PROGRAM_CENTERED_PRODUCT,
-                    *output_slot,
-                    operand_slots.as_slice(),
-                    mean_bits.as_slice(),
-                ),
-            };
-            if output_slot >= self.slot_capacity()
-                || operands.is_empty()
-                || operands.iter().any(|slot| *slot >= self.slot_capacity())
-                || (opcode == GAFIME_SEMANTIC_PROGRAM_CENTERED_PRODUCT
-                    && operands.len() != means.len())
-            {
-                return Err(GpuSysError::InvalidInput(
-                    "semantic materialization node has invalid physical slots or means",
-                ));
+                    operand_slots: operands,
+                    mean_bits: means,
+                } => {
+                    if *output_slot >= self.slot_capacity()
+                        || operands.is_empty()
+                        || operands.iter().any(|slot| *slot >= self.slot_capacity())
+                        || operands.len() != means.len()
+                    {
+                        return Err(GpuSysError::InvalidInput(
+                            "semantic centered-product slots or frozen means are invalid",
+                        ));
+                    }
+                    let operand_offset = u32::try_from(operand_slots.len())
+                        .map_err(|_| GpuSysError::SizeOverflow)?;
+                    let mean_offset =
+                        u32::try_from(mean_bits.len()).map_err(|_| GpuSysError::SizeOverflow)?;
+                    let operand_count =
+                        u32::try_from(operands.len()).map_err(|_| GpuSysError::SizeOverflow)?;
+                    operand_slots.extend_from_slice(operands);
+                    mean_bits.extend_from_slice(means);
+                    raw_nodes.push(GafimeSemanticProgramNode {
+                        opcode: GAFIME_SEMANTIC_PROGRAM_CENTERED_PRODUCT,
+                        output_slot: *output_slot,
+                        operand_offset,
+                        operand_count,
+                        mean_offset,
+                        mean_count: operand_count,
+                        ..Default::default()
+                    });
+                }
+                SemanticProgramNode::FrozenRegionConjunction { output_slot, terms } => {
+                    if *output_slot >= self.slot_capacity()
+                        || terms.is_empty()
+                        || terms.len()
+                            > usize::try_from(self.max_region_terms())
+                                .map_err(|_| GpuSysError::SizeOverflow)?
+                    {
+                        return Err(GpuSysError::InvalidInput(
+                            "semantic frozen region has an invalid output or term count",
+                        ));
+                    }
+                    let region_term_offset =
+                        u32::try_from(region_terms.len()).map_err(|_| GpuSysError::SizeOverflow)?;
+                    for term in terms {
+                        let finite = match self.profile() {
+                            PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                                term.threshold_bits >> 32 == 0
+                                    && f32::from_bits(term.threshold_bits as u32).is_finite()
+                            }
+                            PrecisionProfile::Fp64 => {
+                                f64::from_bits(term.threshold_bits).is_finite()
+                            }
+                        };
+                        if term.input_slot >= self.slot_capacity() || !finite {
+                            return Err(GpuSysError::InvalidInput(
+                                "semantic frozen region term is out of bounds or nonfinite",
+                            ));
+                        }
+                        region_terms.push(GafimeSemanticFrozenRegionTerm {
+                            input_slot: term.input_slot,
+                            relation: term.relation.raw(),
+                            threshold_bits: term.threshold_bits,
+                        });
+                    }
+                    raw_nodes.push(GafimeSemanticProgramNode {
+                        opcode: GAFIME_SEMANTIC_PROGRAM_FROZEN_REGION_CONJUNCTION,
+                        output_slot: *output_slot,
+                        operand_offset: u32::try_from(operand_slots.len())
+                            .map_err(|_| GpuSysError::SizeOverflow)?,
+                        operand_count: 0,
+                        mean_offset: u32::try_from(mean_bits.len())
+                            .map_err(|_| GpuSysError::SizeOverflow)?,
+                        mean_count: 0,
+                        region_term_offset,
+                        region_term_count: u32::try_from(terms.len())
+                            .map_err(|_| GpuSysError::SizeOverflow)?,
+                        ..Default::default()
+                    });
+                }
             }
-            let operand_offset =
-                u32::try_from(operand_slots.len()).map_err(|_| GpuSysError::SizeOverflow)?;
-            let mean_offset =
-                u32::try_from(mean_bits.len()).map_err(|_| GpuSysError::SizeOverflow)?;
-            let operand_count =
-                u32::try_from(operands.len()).map_err(|_| GpuSysError::SizeOverflow)?;
-            let mean_count = u32::try_from(means.len()).map_err(|_| GpuSysError::SizeOverflow)?;
-            operand_slots.extend_from_slice(operands);
-            mean_bits.extend_from_slice(means);
-            raw_nodes.push(GafimeSemanticProgramNode {
-                opcode,
-                output_slot,
-                operand_offset,
-                operand_count,
-                mean_offset,
-                mean_count,
-                ..Default::default()
-            });
         }
         debug_assert_eq!(raw_nodes.len(), node_count as usize);
         let batch = GafimeSemanticProgramBatch {
@@ -573,6 +768,10 @@ impl OwnedSemanticBank {
             mean_bits: GafimeSliceU64 {
                 ptr: mean_bits.as_ptr(),
                 len: u64::try_from(mean_bits.len()).map_err(|_| GpuSysError::SizeOverflow)?,
+            },
+            region_terms: GafimeSemanticRegionTermSlice {
+                ptr: region_terms.as_ptr(),
+                len: u64::try_from(region_terms.len()).map_err(|_| GpuSysError::SizeOverflow)?,
             },
             ..Default::default()
         };
@@ -691,6 +890,94 @@ impl OwnedSemanticBank {
                 let status = unsafe { pairwise(self.inner.raw, right.inner.raw, &batch, results) };
                 status_to_gpu_result("gafime_gpu_semantic_pairwise_pearson_v1", status)
             })
+        })
+    }
+
+    /// Evaluate one generic association per corresponding physical-slot pair.
+    /// The caller has already selected the contextual operands; this ABI call
+    /// neither infers a target nor receives evidence/policy identity.
+    pub fn pairwise_association(
+        &self,
+        right: &Self,
+        left_slots: &[u32],
+        right_slots: &[u32],
+        statistic: NativeAssociationStatistic,
+        presentation: NativeAssociationPresentation,
+    ) -> Result<Vec<SemanticScalarResult>, GpuSysError> {
+        if left_slots.len() != right_slots.len() {
+            return Err(GpuSysError::InvalidInput(
+                "semantic association slot arrays have different lengths",
+            ));
+        }
+        if left_slots.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.validate_slot_slice(left_slots)?;
+        right.validate_slot_slice(right_slots)?;
+        let pairwise = self
+            .inner
+            .functions
+            .semantic_pairwise_association_v1
+            .ok_or(GpuSysError::MissingFunction(
+                "gafime_gpu_semantic_pairwise_association_v1",
+            ))?;
+        let batch = GafimeSemanticAssociationBatch {
+            statistic: statistic.raw(),
+            presentation: presentation.raw(),
+            fixed_nmi_bins: statistic.fixed_nmi_bins(),
+            left_slots: GafimeSliceU32 {
+                ptr: left_slots.as_ptr(),
+                len: u64::try_from(left_slots.len()).map_err(|_| GpuSysError::SizeOverflow)?,
+            },
+            right_slots: GafimeSliceU32 {
+                ptr: right_slots.as_ptr(),
+                len: u64::try_from(right_slots.len()).map_err(|_| GpuSysError::SizeOverflow)?,
+            },
+            ..Default::default()
+        };
+        self.with_peer_lock(right, || {
+            self.scalar_results(left_slots.len(), |results| {
+                // SAFETY: both live banks were peer-validated and uniquely
+                // locked. The fully initialized generic descriptor and owned
+                // scalar buffers remain live for this synchronous call.
+                let status = unsafe { pairwise(self.inner.raw, right.inner.raw, &batch, results) };
+                status_to_gpu_result("gafime_gpu_semantic_pairwise_association_v1", status)
+            })
+        })
+    }
+
+    /// Fit one profile-lane mean for each requested resident physical slot.
+    /// Native code returns raw typed scalars; freezing identity bits remains a
+    /// Rust semantic-owner step in `GpuNativeEvidenceExecutor::fit_means`.
+    pub fn column_means(
+        &self,
+        candidate_slots: &[u32],
+    ) -> Result<Vec<SemanticScalarResult>, GpuSysError> {
+        if candidate_slots.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.validate_slot_slice(candidate_slots)?;
+        let means =
+            self.inner
+                .functions
+                .semantic_column_means_v1
+                .ok_or(GpuSysError::MissingFunction(
+                    "gafime_gpu_semantic_column_means_v1",
+                ))?;
+        let batch = GafimeSemanticColumnMeanBatch {
+            candidate_slots: GafimeSliceU32 {
+                ptr: candidate_slots.as_ptr(),
+                len: u64::try_from(candidate_slots.len()).map_err(|_| GpuSysError::SizeOverflow)?,
+            },
+            ..Default::default()
+        };
+        let _guard = self.lock();
+        self.scalar_results(candidate_slots.len(), |results| {
+            // SAFETY: this bank is exclusively locked and descriptor/result
+            // buffers are caller-owned, typed and live for the synchronous
+            // native fitting operation.
+            let status = unsafe { means(self.inner.raw, &batch, results) };
+            status_to_gpu_result("gafime_gpu_semantic_column_means_v1", status)
         })
     }
 
@@ -928,6 +1215,7 @@ impl OwnedSemanticBank {
                     slot_capacity: slot_count,
                     max_program_nodes: self.max_program_nodes(),
                     max_gather_rows: self.max_gather_rows(),
+                    max_region_terms: self.max_region_terms(),
                     bytes,
                 },
             )?)
@@ -1061,6 +1349,7 @@ impl GpuBackend {
                 slot_capacity,
                 max_program_nodes: capabilities.max_program_nodes,
                 max_gather_rows: capabilities.max_gather_rows,
+                max_region_terms: capabilities.max_region_terms,
                 bytes,
             },
         )
@@ -1095,6 +1384,46 @@ pub struct GpuNativeEvidenceExecutor {
 }
 
 impl GpuNativeEvidenceExecutor {
+    /// Conservative scalar-work admission for Metal's bounded bitonic-sort
+    /// Spearman lowering. `M` is the padded power-of-two row count and `L`
+    /// its binary logarithm. The sort term deliberately overcharges the
+    /// two-vector compare-exchange work, while the rank phase includes four
+    /// bounded binary searches per original row. CUDA and HIP do not use this
+    /// model: their current average-tie rank primitive remains quadratic.
+    fn metal_spearman_work(pair_count: u64, rows: u64) -> SemanticResult<u64> {
+        let padded_rows = rows
+            .checked_next_power_of_two()
+            .ok_or(SemanticError::Invalid(
+                "Metal Spearman padded row count overflows u64",
+            ))?;
+        let log_rows = u64::from(padded_rows.ilog2());
+        let per_pair = padded_rows
+            .checked_mul(2)
+            .and_then(|value| {
+                padded_rows
+                    .checked_mul(log_rows)
+                    .and_then(|sort| sort.checked_mul(log_rows.checked_add(1)?))
+                    .and_then(|sort| value.checked_add(sort))
+            })
+            .and_then(|value| {
+                rows.checked_mul(4)
+                    .and_then(|rank| rank.checked_mul(log_rows))
+                    .and_then(|rank| value.checked_add(rank))
+            })
+            .and_then(|value| {
+                rows.checked_mul(12)
+                    .and_then(|finalize| value.checked_add(finalize))
+            })
+            .ok_or(SemanticError::Invalid(
+                "Metal Spearman work bound overflows u64",
+            ))?;
+        pair_count
+            .checked_mul(per_pair)
+            .ok_or(SemanticError::Invalid(
+                "Metal Spearman work bound overflows u64",
+            ))
+    }
+
     pub fn new(backend: GpuBackend) -> Result<Self, GpuSysError> {
         let capabilities = backend.semantic_capabilities()?;
         Ok(Self {
@@ -1161,16 +1490,106 @@ impl GpuNativeEvidenceExecutor {
         Ok(())
     }
 
-    fn require_pearson(&self) -> SemanticResult<()> {
-        if self.capabilities.primitive_mask & GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON == 0
-            || self.capabilities.association_statistic_mask & GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON
-                == 0
+    fn require_association(&self, statistic: AssociationStatistic) -> SemanticResult<()> {
+        if self.capabilities.primitive_mask & GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_ASSOCIATION
+            == 0
         {
             return Err(SemanticError::Unsupported(
-                "selected GPU semantic payload does not support Pearson association",
+                "selected GPU semantic payload does not support generic association arithmetic",
+            ));
+        }
+        let supported = match statistic {
+            AssociationStatistic::Pearson => {
+                self.capabilities.association_statistic_mask
+                    & GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON
+                    != 0
+            }
+            AssociationStatistic::Spearman => {
+                self.capabilities.association_statistic_mask
+                    & GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN
+                    != 0
+            }
+            AssociationStatistic::FixedCorrectedNmi { bins } => {
+                self.capabilities.association_statistic_mask
+                    & GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI
+                    != 0
+                    && Self::fixed_nmi_bin_capability(bins).is_some_and(|mask| {
+                        self.capabilities.fixed_corrected_nmi_bin_mask & mask != 0
+                    })
+            }
+        };
+        if !supported {
+            return Err(SemanticError::Unsupported(
+                "selected GPU semantic payload does not support this association statistic",
             ));
         }
         Ok(())
+    }
+
+    fn require_column_means(&self) -> SemanticResult<()> {
+        if self.capabilities.primitive_mask & GAFIME_SEMANTIC_PRIMITIVE_MASK_COLUMN_MEANS == 0 {
+            return Err(SemanticError::Unsupported(
+                "selected GPU semantic payload does not support ordered column means",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_region_terms(&self, count: usize) -> SemanticResult<()> {
+        if u64::try_from(count)
+            .map_err(|_| SemanticError::Invalid("frozen-region term count overflows u64"))?
+            > u64::from(self.capabilities.max_region_terms)
+        {
+            return Err(SemanticError::Unsupported(
+                "frozen-region term count exceeds selected GPU semantic capability",
+            ));
+        }
+        Ok(())
+    }
+
+    const fn fixed_nmi_bin_capability(bins: u32) -> Option<u32> {
+        match bins {
+            2 => Some(gafime_types::GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_2),
+            4 => Some(gafime_types::GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_4),
+            8 => Some(gafime_types::GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_8),
+            12 => Some(gafime_types::GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_12),
+            16 => Some(gafime_types::GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_16),
+            24 => Some(gafime_types::GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_24),
+            32 => Some(gafime_types::GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_32),
+            48 => Some(gafime_types::GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_48),
+            64 => Some(gafime_types::GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_64),
+            96 => Some(gafime_types::GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_96),
+            _ => None,
+        }
+    }
+
+    const fn native_association_statistic(
+        statistic: AssociationStatistic,
+    ) -> NativeAssociationStatistic {
+        match statistic {
+            AssociationStatistic::Pearson => NativeAssociationStatistic::Pearson,
+            AssociationStatistic::Spearman => NativeAssociationStatistic::Spearman,
+            AssociationStatistic::FixedCorrectedNmi { bins } => {
+                NativeAssociationStatistic::FixedCorrectedNmi { bins }
+            }
+        }
+    }
+
+    const fn native_association_presentation(
+        statistic: AssociationStatistic,
+        absolute: bool,
+    ) -> NativeAssociationPresentation {
+        match statistic {
+            AssociationStatistic::FixedCorrectedNmi { .. } => {
+                NativeAssociationPresentation::Nonnegative
+            }
+            AssociationStatistic::Pearson | AssociationStatistic::Spearman if absolute => {
+                NativeAssociationPresentation::Absolute
+            }
+            AssociationStatistic::Pearson | AssociationStatistic::Spearman => {
+                NativeAssociationPresentation::Signed
+            }
+        }
     }
 
     fn require_gather(&self) -> SemanticResult<()> {
@@ -1198,10 +1617,7 @@ impl GpuNativeEvidenceExecutor {
         registry: &CandidateRegistry,
         frame: &FeatureFrame,
     ) -> SemanticResult<()> {
-        if registry.schema() != frame.schema()
-            || registry.precision() != frame.profile()
-            || self.backend.kind == gafime_types::GAFIME_BACKEND_METAL
-        {
+        if registry.schema() != frame.schema() || registry.precision() != frame.profile() {
             return Err(SemanticError::Unsupported(
                 "selected backend cannot lower this semantic context",
             ));
@@ -1251,6 +1667,31 @@ impl GpuNativeEvidenceExecutor {
             .collect()
     }
 
+    fn lower_region_term(
+        profile: PrecisionProfile,
+        slots: &BTreeMap<FeatureId, u32>,
+        input: FeatureId,
+        comparison: PredicateComparator,
+        threshold_bits: &FrozenThreshold,
+    ) -> SemanticResult<SemanticFrozenRegionTerm> {
+        let threshold_bits = match profile {
+            PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                u64::from(threshold_bits.as_f32_bits()?)
+            }
+            PrecisionProfile::Fp64 => threshold_bits.as_f64_bits()?,
+        };
+        Ok(SemanticFrozenRegionTerm {
+            input_slot: slots.get(&input).copied().ok_or(SemanticError::Invalid(
+                "missing frozen-region semantic input slot",
+            ))?,
+            relation: match comparison {
+                PredicateComparator::LessEqual => SemanticRegionRelation::LessEqual,
+                PredicateComparator::GreaterThan => SemanticRegionRelation::GreaterThan,
+            },
+            threshold_bits,
+        })
+    }
+
     fn dependency_ids(
         registry: &CandidateRegistry,
         roots: &[FeatureId],
@@ -1276,6 +1717,19 @@ impl GpuNativeEvidenceExecutor {
                 FeatureOp::AbsoluteDifference(left, right) => pending.extend([*left, *right]),
                 FeatureOp::Softsign(input) => pending.push(*input),
                 FeatureOp::CenteredProduct { operands, .. } => pending.extend(operands),
+                FeatureOp::HardPredicate { input, .. } => pending.push(*input),
+                FeatureOp::DecisionRegion { terms } => {
+                    for term in terms {
+                        match registry.program(*term)?.op() {
+                            FeatureOp::HardPredicate { input, .. } => pending.push(*input),
+                            _ => {
+                                return Err(SemanticError::Invalid(
+                                    "decision-region term is not a hard predicate",
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok((needed, reused))
@@ -1316,6 +1770,7 @@ impl GpuNativeEvidenceExecutor {
                 SemanticProgramNode::Source { .. } | SemanticProgramNode::Softsign { .. } => 1,
                 SemanticProgramNode::AbsoluteDifference { .. } => 2,
                 SemanticProgramNode::CenteredProduct { operand_slots, .. } => operand_slots.len(),
+                SemanticProgramNode::FrozenRegionConjunction { .. } => 0,
             })
             .max()
             .map(|count| {
@@ -1330,40 +1785,50 @@ impl GpuNativeEvidenceExecutor {
     /// Exact flattened native descriptor spans.  The optional semantic table
     /// keeps these arrays immutable for an entire asynchronous program batch,
     /// so a maximum per-node arity would understate the device allocation.
-    fn program_descriptor_counts(nodes: &[SemanticProgramNode]) -> SemanticResult<(u64, u64)> {
-        let (operands, means) =
-            nodes
-                .iter()
-                .try_fold((0usize, 0usize), |(operands, means), node| {
-                    let operand_count = match node {
-                        SemanticProgramNode::Source { .. }
-                        | SemanticProgramNode::Softsign { .. } => 1,
-                        SemanticProgramNode::AbsoluteDifference { .. } => 2,
-                        SemanticProgramNode::CenteredProduct { operand_slots, .. } => {
-                            operand_slots.len()
-                        }
-                    };
-                    let mean_count = match node {
-                        SemanticProgramNode::CenteredProduct { mean_bits, .. } => mean_bits.len(),
-                        _ => 0,
-                    };
-                    Ok::<_, SemanticError>((
-                    operands
-                        .checked_add(operand_count)
-                        .ok_or(SemanticError::Invalid(
+    fn program_descriptor_counts(nodes: &[SemanticProgramNode]) -> SemanticResult<(u64, u64, u64)> {
+        let (operands, means, region_terms) = nodes.iter().try_fold(
+            (0usize, 0usize, 0usize),
+            |(operands, means, region_terms), node| {
+                let operand_count = match node {
+                    SemanticProgramNode::Source { .. } | SemanticProgramNode::Softsign { .. } => 1,
+                    SemanticProgramNode::AbsoluteDifference { .. } => 2,
+                    SemanticProgramNode::CenteredProduct { operand_slots, .. } => operand_slots.len(),
+                    SemanticProgramNode::FrozenRegionConjunction { .. } => 0,
+                };
+                let mean_count = match node {
+                    SemanticProgramNode::CenteredProduct { mean_bits, .. } => mean_bits.len(),
+                    _ => 0,
+                };
+                let region_term_count = match node {
+                    SemanticProgramNode::FrozenRegionConjunction { terms, .. } => terms.len(),
+                    _ => 0,
+                };
+                Ok::<_, SemanticError>((
+                    operands.checked_add(operand_count).ok_or(SemanticError::Invalid(
                         "semantic flattened operand descriptor count overflows host address space",
                     ))?,
                     means.checked_add(mean_count).ok_or(SemanticError::Invalid(
                         "semantic flattened mean descriptor count overflows host address space",
                     ))?,
+                    region_terms
+                        .checked_add(region_term_count)
+                        .ok_or(SemanticError::Invalid(
+                            "semantic flattened region-term descriptor count overflows host address space",
+                        ))?,
                 ))
-                })?;
+            },
+        )?;
         Ok((
             u64::try_from(operands).map_err(|_| {
                 SemanticError::Invalid("semantic flattened operand descriptor count overflows u64")
             })?,
             u64::try_from(means).map_err(|_| {
                 SemanticError::Invalid("semantic flattened mean descriptor count overflows u64")
+            })?,
+            u64::try_from(region_terms).map_err(|_| {
+                SemanticError::Invalid(
+                    "semantic flattened region-term descriptor count overflows u64",
+                )
             })?,
         ))
     }
@@ -1378,7 +1843,9 @@ impl GpuNativeEvidenceExecutor {
                 "semantic host program nodes exceed address space",
             ))?;
         // `OwnedSemanticBank::materialize` copies this typed lowering into one
-        // ABI node array plus exactly pre-sized flattened operand/mean arrays.
+        // ABI node array plus exactly pre-sized flattened operand/mean/region
+        // arrays.  The descriptor vectors remain live together during the
+        // synchronous call, so each one is part of the host peak.
         outer_nodes = outer_nodes
             .checked_add(
                 nodes
@@ -1392,14 +1859,18 @@ impl GpuNativeEvidenceExecutor {
                 "semantic host program descriptors exceed address space",
             ))?;
         nodes.iter().try_fold(outer_nodes, |total, node| {
-            let (operand_capacity, mean_capacity) = match node {
-                SemanticProgramNode::Source { .. } | SemanticProgramNode::Softsign { .. } => (0, 0),
-                SemanticProgramNode::AbsoluteDifference { .. } => (0, 0),
+            let (operand_capacity, mean_capacity, region_capacity) = match node {
+                SemanticProgramNode::Source { .. }
+                | SemanticProgramNode::Softsign { .. }
+                | SemanticProgramNode::AbsoluteDifference { .. } => (0, 0, 0),
                 SemanticProgramNode::CenteredProduct {
                     operand_slots,
                     mean_bits,
                     ..
-                } => (operand_slots.capacity(), mean_bits.capacity()),
+                } => (operand_slots.capacity(), mean_bits.capacity(), 0),
+                SemanticProgramNode::FrozenRegionConjunction { terms, .. } => {
+                    (0, 0, terms.capacity())
+                }
             };
             let outer_operands = operand_capacity
                 .checked_mul(std::mem::size_of::<u32>())
@@ -1411,10 +1882,16 @@ impl GpuNativeEvidenceExecutor {
                 .ok_or(SemanticError::Invalid(
                     "semantic host means exceed address space",
                 ))?;
+            let outer_region_terms = region_capacity
+                .checked_mul(std::mem::size_of::<SemanticFrozenRegionTerm>())
+                .ok_or(SemanticError::Invalid(
+                    "semantic host region terms exceed address space",
+                ))?;
             let flattened_operands = match node {
                 SemanticProgramNode::Source { .. } | SemanticProgramNode::Softsign { .. } => 1,
                 SemanticProgramNode::AbsoluteDifference { .. } => 2,
                 SemanticProgramNode::CenteredProduct { operand_slots, .. } => operand_slots.len(),
+                SemanticProgramNode::FrozenRegionConjunction { .. } => 0,
             }
             .checked_mul(std::mem::size_of::<u32>())
             .ok_or(SemanticError::Invalid(
@@ -1428,11 +1905,21 @@ impl GpuNativeEvidenceExecutor {
             .ok_or(SemanticError::Invalid(
                 "semantic ABI means exceed address space",
             ))?;
+            let flattened_region_terms = match node {
+                SemanticProgramNode::FrozenRegionConjunction { terms, .. } => terms.len(),
+                _ => 0,
+            }
+            .checked_mul(std::mem::size_of::<GafimeSemanticFrozenRegionTerm>())
+            .ok_or(SemanticError::Invalid(
+                "semantic ABI region terms exceed address space",
+            ))?;
             total
                 .checked_add(outer_operands)
                 .and_then(|total| total.checked_add(outer_means))
+                .and_then(|total| total.checked_add(outer_region_terms))
                 .and_then(|total| total.checked_add(flattened_operands))
                 .and_then(|total| total.checked_add(flattened_means))
+                .and_then(|total| total.checked_add(flattened_region_terms))
                 .ok_or(SemanticError::Invalid(
                     "semantic host program temporary exceeds address space",
                 ))
@@ -1457,6 +1944,34 @@ impl GpuNativeEvidenceExecutor {
             ))?)
             .ok_or(SemanticError::Invalid(
                 "semantic scalar result storage exceeds address space",
+            ))
+    }
+
+    /// Peak host storage for a native column-mean result and its exact frozen
+    /// identity representation.  This is deliberately separate from
+    /// `scalar_result_host_bytes`: fitting does not create `EvidenceValue`s.
+    fn mean_result_host_bytes(profile: PrecisionProfile, count: usize) -> SemanticResult<usize> {
+        let native = result_width(profile)
+            .checked_add(std::mem::size_of::<u32>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+            .ok_or(SemanticError::Invalid(
+                "semantic mean result width exceeds address space",
+            ))?;
+        let frozen = match profile {
+            PrecisionProfile::Fp32 | PrecisionProfile::Mixed => std::mem::size_of::<u32>(),
+            PrecisionProfile::Fp64 => std::mem::size_of::<u64>(),
+        };
+        let converted = std::mem::size_of::<SemanticScalarResult>()
+            .checked_add(frozen)
+            .ok_or(SemanticError::Invalid(
+                "semantic mean conversion width exceeds address space",
+            ))?;
+        count
+            .checked_mul(native.checked_add(converted).ok_or(SemanticError::Invalid(
+                "semantic mean result width exceeds address space",
+            ))?)
+            .ok_or(SemanticError::Invalid(
+                "semantic mean result storage exceeds address space",
             ))
     }
 
@@ -1602,20 +2117,181 @@ impl GpuNativeEvidenceExecutor {
     ) -> Vec<EvidenceValue> {
         vec![EvidenceValue::Unavailable { reason, support }; candidates]
     }
-
-    fn require_pearson_statistic(statistic: AssociationStatistic) -> SemanticResult<()> {
-        if statistic != AssociationStatistic::Pearson {
-            return Err(SemanticError::Unsupported(
-                "selected GPU semantic payload supports Pearson only; no Core substitution occurs",
-            ));
-        }
-        Ok(())
-    }
 }
 
 impl NativeEvidenceExecutor for GpuNativeEvidenceExecutor {
     fn backend_kind(&self) -> u32 {
         self.backend.kind
+    }
+
+    fn validate_evidence_admission(
+        &self,
+        definition: &EvidenceDefinition,
+        pair_count: usize,
+        support_rows: usize,
+    ) -> SemanticResult<usize> {
+        let EvidenceDefinition::Association { statistic, .. } = definition else {
+            return Ok(0);
+        };
+        self.require_association(*statistic)?;
+        let pair_count = u64::try_from(pair_count)
+            .map_err(|_| SemanticError::Invalid("association pair count overflows u64"))?;
+        let support_rows = u64::try_from(support_rows)
+            .map_err(|_| SemanticError::Invalid("association support rows overflow u64"))?;
+        if pair_count > self.capabilities.max_association_pairs {
+            return Err(SemanticError::Unsupported(
+                "association pair count exceeds selected GPU semantic capability",
+            ));
+        }
+        match statistic {
+            AssociationStatistic::Pearson => Ok(0),
+            AssociationStatistic::Spearman => {
+                if support_rows > self.capabilities.max_spearman_rows {
+                    return Err(SemanticError::Unsupported(
+                        "Spearman support rows exceed selected GPU semantic capability",
+                    ));
+                }
+                let work = if self.backend.kind == GAFIME_BACKEND_METAL {
+                    Self::metal_spearman_work(pair_count, support_rows)?
+                } else {
+                    pair_count
+                        .checked_mul(support_rows)
+                        .and_then(|value| value.checked_mul(support_rows))
+                        .and_then(|value| value.checked_mul(2))
+                        .ok_or(SemanticError::Invalid(
+                            "GPU Spearman work bound overflows u64",
+                        ))?
+                };
+                usize::try_from(work).map_err(|_| {
+                    SemanticError::Invalid(
+                        "GPU Spearman work exceeds host semantic-work representation",
+                    )
+                })
+            }
+            AssociationStatistic::FixedCorrectedNmi { .. } => {
+                if support_rows > self.capabilities.max_fixed_corrected_nmi_rows {
+                    return Err(SemanticError::Unsupported(
+                        "fixed corrected NMI support rows exceed selected GPU semantic capability",
+                    ));
+                }
+                Ok(0)
+            }
+        }
+    }
+
+    fn fit_means(
+        &mut self,
+        values: &MaterializedColumns,
+        candidates: &[FeatureId],
+        max_bytes: usize,
+    ) -> SemanticResult<FrozenMeans> {
+        self.require_profile(values.profile())?;
+        self.require_column_means()?;
+        if candidates.is_empty() {
+            return Ok(match values.profile() {
+                PrecisionProfile::Fp32 | PrecisionProfile::Mixed => FrozenMeans::F32(Vec::new()),
+                PrecisionProfile::Fp64 => FrozenMeans::F64(Vec::new()),
+            });
+        }
+        if values.backend_kind() != self.backend.kind || !values.is_resident() {
+            return Err(SemanticError::Invalid(
+                "GPU mean fitting requires a resident selected-backend bank",
+            ));
+        }
+        let lease = Arc::clone(values.resident_lease()?);
+        let bank = lease
+            .downcast::<OwnedSemanticBank>()
+            .map_err(|_| SemanticError::Invalid("resident materialization lease is foreign"))?;
+        let bank = (*bank).clone();
+        if !bank.same_backend_owner(&self.backend) || bank.profile() != values.profile() {
+            return Err(SemanticError::Invalid(
+                "GPU mean-fitting bank does not match its executor",
+            ));
+        }
+        let candidate_slots = Self::slots_for(values, candidates)?;
+        let host_temporary = Self::u32_slice_bytes(
+            candidate_slots.len(),
+            "semantic mean slot staging exceeds address space",
+        )?
+        .checked_add(Self::mean_result_host_bytes(
+            values.profile(),
+            candidate_slots.len(),
+        )?)
+        .ok_or(SemanticError::Invalid(
+            "semantic mean fitting staging exceeds address space",
+        ))?;
+        let forecast = self.native_forecast(
+            &bank,
+            GafimeSemanticForecastRequest {
+                mean_slot_count: u64::try_from(candidate_slots.len()).map_err(|_| {
+                    SemanticError::Invalid("semantic mean candidate count overflows u64")
+                })?,
+                ..Default::default()
+            },
+        )?;
+        Self::reserve_forecast(forecast, false, host_temporary, max_bytes)?;
+        let expected_support = bank.rows();
+        let results = bank
+            .column_means(&candidate_slots)
+            .map_err(Self::semantic_error)?;
+        if results.len() != candidates.len() {
+            return Err(SemanticError::Invalid(
+                "GPU mean fitting returned an unexpected result count",
+            ));
+        }
+        match values.profile() {
+            PrecisionProfile::Fp32 => results
+                .into_iter()
+                .map(|result| match result {
+                    SemanticScalarResult {
+                        value: SemanticScalarValue::F32(value),
+                        state: GAFIME_SEMANTIC_SCALAR_MEASURED,
+                        support,
+                    } if support == expected_support && value.is_finite() => Ok(value.to_bits()),
+                    _ => Err(SemanticError::Invalid(
+                        "GPU fp32 mean fitting produced an undefined or nonfinite result",
+                    )),
+                })
+                .collect::<SemanticResult<Vec<_>>>()
+                .map(FrozenMeans::F32),
+            PrecisionProfile::Mixed => results
+                .into_iter()
+                .map(|result| match result {
+                    SemanticScalarResult {
+                        value: SemanticScalarValue::F64(value),
+                        state: GAFIME_SEMANTIC_SCALAR_MEASURED,
+                        support,
+                    } if support == expected_support && value.is_finite() => {
+                        let frozen = value as f32;
+                        if frozen.is_finite() {
+                            Ok(frozen.to_bits())
+                        } else {
+                            Err(SemanticError::Invalid(
+                                "GPU mixed mean fitting cannot freeze a finite f32 constant",
+                            ))
+                        }
+                    }
+                    _ => Err(SemanticError::Invalid(
+                        "GPU mixed mean fitting produced an undefined or nonfinite result",
+                    )),
+                })
+                .collect::<SemanticResult<Vec<_>>>()
+                .map(FrozenMeans::F32),
+            PrecisionProfile::Fp64 => results
+                .into_iter()
+                .map(|result| match result {
+                    SemanticScalarResult {
+                        value: SemanticScalarValue::F64(value),
+                        state: GAFIME_SEMANTIC_SCALAR_MEASURED,
+                        support,
+                    } if support == expected_support && value.is_finite() => Ok(value.to_bits()),
+                    _ => Err(SemanticError::Invalid(
+                        "GPU fp64 mean fitting produced an undefined or nonfinite result",
+                    )),
+                })
+                .collect::<SemanticResult<Vec<_>>>()
+                .map(FrozenMeans::F64),
+        }
     }
 
     fn materialize(
@@ -1748,6 +2424,53 @@ impl NativeEvidenceExecutor for GpuNativeEvidenceExecutor {
                         mean_bits,
                     });
                 }
+                FeatureOp::HardPredicate {
+                    input,
+                    comparison,
+                    threshold_bits,
+                } => {
+                    self.require_program_op(
+                        GAFIME_SEMANTIC_PROGRAM_OP_MASK_FROZEN_REGION_CONJUNCTION,
+                    )?;
+                    self.require_region_terms(1)?;
+                    native_nodes.push(SemanticProgramNode::FrozenRegionConjunction {
+                        output_slot,
+                        terms: vec![Self::lower_region_term(
+                            frame.profile(),
+                            &slots,
+                            *input,
+                            *comparison,
+                            threshold_bits,
+                        )?],
+                    });
+                }
+                FeatureOp::DecisionRegion { terms } => {
+                    self.require_program_op(
+                        GAFIME_SEMANTIC_PROGRAM_OP_MASK_FROZEN_REGION_CONJUNCTION,
+                    )?;
+                    self.require_region_terms(terms.len())?;
+                    let terms = terms
+                        .iter()
+                        .map(|term| match registry.program(*term)?.op() {
+                            FeatureOp::HardPredicate {
+                                input,
+                                comparison,
+                                threshold_bits,
+                            } => Self::lower_region_term(
+                                frame.profile(),
+                                &slots,
+                                *input,
+                                *comparison,
+                                threshold_bits,
+                            ),
+                            _ => Err(SemanticError::Invalid(
+                                "decision-region term is not a hard predicate",
+                            )),
+                        })
+                        .collect::<SemanticResult<Vec<_>>>()?;
+                    native_nodes
+                        .push(SemanticProgramNode::FrozenRegionConjunction { output_slot, terms });
+                }
             }
         }
 
@@ -1815,7 +2538,7 @@ impl NativeEvidenceExecutor for GpuNativeEvidenceExecutor {
             )
             .map_err(Self::semantic_error)?;
 
-        let (program_operand_count, program_mean_count) =
+        let (program_operand_count, program_mean_count, program_region_term_count) =
             Self::program_descriptor_counts(&native_nodes)?;
         let forecast = self.native_forecast(
             &bank,
@@ -1823,6 +2546,7 @@ impl NativeEvidenceExecutor for GpuNativeEvidenceExecutor {
                 program_max_operand_count: Self::maximum_operand_count(&native_nodes)?,
                 program_operand_count,
                 program_mean_count,
+                program_region_term_count,
                 gather_slot_count: u64::try_from(reused.len()).map_err(|_| {
                     SemanticError::Invalid("retained gather slot count overflows u64")
                 })?,
@@ -1960,8 +2684,7 @@ impl NativeEvidenceExecutor for GpuNativeEvidenceExecutor {
                 statistic,
                 context: AssociationContext::Reference { reference },
             } => {
-                Self::require_pearson_statistic(*statistic)?;
-                self.require_pearson()?;
+                self.require_association(*statistic)?;
                 let reference_slot = values.resident_slots()?.get(reference).copied().ok_or(
                     SemanticError::Invalid(
                         "reference feature is absent from resident evidence bank",
@@ -1995,11 +2718,12 @@ impl NativeEvidenceExecutor for GpuNativeEvidenceExecutor {
                 Self::results_to_evidence(
                     values.profile(),
                     values_bank
-                        .pairwise_pearson(
+                        .pairwise_association(
                             &values_bank,
                             &candidate_slots,
                             &right_slots,
-                            SemanticPearsonMode::Absolute,
+                            Self::native_association_statistic(*statistic),
+                            Self::native_association_presentation(*statistic, true),
                         )
                         .map_err(Self::semantic_error)?,
                 )
@@ -2008,8 +2732,7 @@ impl NativeEvidenceExecutor for GpuNativeEvidenceExecutor {
                 statistic,
                 context: AssociationContext::PairedView { view },
             } => {
-                Self::require_pearson_statistic(*statistic)?;
-                self.require_pearson()?;
+                self.require_association(*statistic)?;
                 let paired = paired.ok_or(SemanticError::Invalid(
                     "paired GPU evidence requires a resident paired bank",
                 ))?;
@@ -2044,11 +2767,12 @@ impl NativeEvidenceExecutor for GpuNativeEvidenceExecutor {
                 Self::results_to_evidence(
                     values.profile(),
                     values_bank
-                        .pairwise_pearson(
+                        .pairwise_association(
                             &paired_bank,
                             &candidate_slots,
                             &right_slots,
-                            SemanticPearsonMode::Signed,
+                            Self::native_association_statistic(*statistic),
+                            Self::native_association_presentation(*statistic, false),
                         )
                         .map_err(Self::semantic_error)?,
                 )
@@ -2068,8 +2792,7 @@ impl NativeEvidenceExecutor for GpuNativeEvidenceExecutor {
                         labels: Some(labels),
                     },
             } => {
-                Self::require_pearson_statistic(*statistic)?;
-                self.require_pearson()?;
+                self.require_association(*statistic)?;
                 self.require_gather()?;
                 if labels.frame_id() != values.frame_id() || labels.profile() != values.profile() {
                     return Err(SemanticError::Invalid(
@@ -2174,11 +2897,12 @@ impl NativeEvidenceExecutor for GpuNativeEvidenceExecutor {
                 Self::results_to_evidence(
                     values.profile(),
                     label_bank
-                        .pairwise_pearson(
+                        .pairwise_association(
                             &label_bank,
                             &destination_slots,
                             &label_slots,
-                            SemanticPearsonMode::Absolute,
+                            Self::native_association_statistic(*statistic),
+                            Self::native_association_presentation(*statistic, true),
                         )
                         .map_err(Self::semantic_error)?,
                 )

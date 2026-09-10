@@ -2112,6 +2112,84 @@ __global__ void semantic_centered_product_kernel(
 }
 
 template <typename StorageT>
+__global__ void semantic_frozen_region_conjunction_kernel(
+    StorageT* columns,
+    uint64_t rows,
+    const GafimeSemanticFrozenRegionTerm* terms,
+    uint32_t term_count,
+    uint32_t output_slot
+) {
+    const uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    StorageT membership = static_cast<StorageT>(1);
+    bool undetermined = false;
+    for (uint32_t term_index = 0; term_index < term_count; ++term_index) {
+        const GafimeSemanticFrozenRegionTerm term = terms[term_index];
+        const StorageT value = columns[static_cast<uint64_t>(term.input_slot) * rows + row];
+        if (isnan(value)) {
+            undetermined = true;
+            continue;
+        }
+        const StorageT threshold = semantic_mean_from_bits<StorageT>(term.threshold_bits);
+        const bool matches = term.relation == GAFIME_SEMANTIC_REGION_LESS_EQUAL
+            ? value <= threshold
+            : value > threshold;
+        if (!matches) {
+            membership = static_cast<StorageT>(0);
+            break;
+        }
+    }
+    // Match Core/Metal: ordered infinities compare normally; a false term
+    // dominates NaN regardless of term order. The launcher still rejects an
+    // unresolved final output instead of marking its slot initialized.
+    columns[static_cast<uint64_t>(output_slot) * rows + row] =
+        membership != static_cast<StorageT>(0) && undetermined
+        ? static_cast<StorageT>(NAN) : membership;
+}
+
+// Frozen fitting values participate in semantic identity.  One thread owns
+// each requested column and visits rows in declaration order; only independent
+// columns run concurrently, so there is no reduction regrouping shortcut.
+template <typename StorageT, typename AccumT, typename ResultT>
+__global__ void semantic_column_means_kernel(
+    const StorageT* columns,
+    uint64_t rows,
+    const uint32_t* candidate_slots,
+    uint64_t candidate_count,
+    ResultT* values,
+    uint32_t* states,
+    uint64_t* supports
+) {
+    const uint64_t candidate = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (candidate >= candidate_count) return;
+    supports[candidate] = rows;
+    if (rows == 0) {
+        states[candidate] = GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT;
+        values[candidate] = static_cast<ResultT>(0);
+        return;
+    }
+    const StorageT* column = columns + static_cast<uint64_t>(candidate_slots[candidate]) * rows;
+    AccumT sum = static_cast<AccumT>(0);
+    for (uint64_t row = 0; row < rows; ++row) {
+        const StorageT value = column[row];
+        if (!precision_isfinite(value)) {
+            states[candidate] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+            values[candidate] = static_cast<ResultT>(0);
+            return;
+        }
+        sum += static_cast<AccumT>(value);
+    }
+    const AccumT mean = sum / static_cast<AccumT>(rows);
+    if (!precision_isfinite(mean)) {
+        states[candidate] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+        values[candidate] = static_cast<ResultT>(0);
+        return;
+    }
+    states[candidate] = GAFIME_SEMANTIC_SCALAR_MEASURED;
+    values[candidate] = static_cast<ResultT>(mean);
+}
+
+template <typename StorageT>
 __global__ void semantic_reject_nonfinite_output_kernel(
     const StorageT* columns,
     uint64_t rows,
@@ -2258,6 +2336,324 @@ __global__ void semantic_pairwise_pearson_kernel(
         if (mode == GAFIME_SEMANTIC_PEARSON_ABSOLUTE) correlation = precision_abs(correlation);
         states[pair] = GAFIME_SEMANTIC_SCALAR_MEASURED;
         values[pair] = correlation;
+    }
+}
+
+// The first generic HIP Spearman lowering deliberately reuses the existing
+// count-based average-tie rank semantics.  It is quadratic in rows and its
+// work is explicitly charged by the Rust admission hook before dispatch.
+template <typename StorageT>
+GAFIME_HIP_FORCEINLINE uint64_t semantic_rank_twice_for_value(
+    StorageT value,
+    const StorageT* values,
+    uint64_t rows
+) {
+    uint64_t less = 0;
+    uint64_t equal = 0;
+    for (uint64_t row = 0; row < rows; ++row) {
+        const StorageT candidate = values[row];
+        if (!precision_isfinite(candidate)) continue;
+        if (candidate < value) {
+            ++less;
+        } else if (candidate == value) {
+            ++equal;
+        }
+    }
+    return equal == 0 ? 0 : less * 2u + equal - 1u;
+}
+
+template <typename StorageT, typename AccumT, typename ResultT>
+__global__ void semantic_pairwise_spearman_kernel(
+    const StorageT* left_columns,
+    const StorageT* right_columns,
+    uint64_t rows,
+    const uint32_t* left_slots,
+    const uint32_t* right_slots,
+    uint64_t pair_count,
+    uint32_t presentation,
+    ResultT* values,
+    uint32_t* states,
+    uint64_t* supports
+) {
+    const uint64_t pair = blockIdx.x;
+    if (pair >= pair_count) return;
+    const StorageT* left = left_columns + static_cast<uint64_t>(left_slots[pair]) * rows;
+    const StorageT* right = right_columns + static_cast<uint64_t>(right_slots[pair]) * rows;
+    __shared__ uint32_t nonfinite[kThreadsPerBlock];
+    __shared__ uint32_t left_changed[kThreadsPerBlock];
+    __shared__ uint32_t right_changed[kThreadsPerBlock];
+    __shared__ AccumT sum_x[kThreadsPerBlock];
+    __shared__ AccumT sum_y[kThreadsPerBlock];
+    __shared__ AccumT sum_xx[kThreadsPerBlock];
+    __shared__ AccumT sum_yy[kThreadsPerBlock];
+    __shared__ AccumT sum_xy[kThreadsPerBlock];
+    __shared__ uint64_t counts[kThreadsPerBlock];
+    __shared__ uint32_t result_state;
+
+    const StorageT first_left = rows == 0 ? static_cast<StorageT>(0) : left[0];
+    const StorageT first_right = rows == 0 ? static_cast<StorageT>(0) : right[0];
+    uint32_t local_nonfinite = 0;
+    uint32_t local_left_changed = 0;
+    uint32_t local_right_changed = 0;
+    for (uint64_t row = threadIdx.x; row < rows; row += blockDim.x) {
+        const StorageT left_value = left[row];
+        const StorageT right_value = right[row];
+        local_nonfinite |= !precision_isfinite(left_value) || !precision_isfinite(right_value);
+        local_left_changed |= left_value != first_left;
+        local_right_changed |= right_value != first_right;
+    }
+    nonfinite[threadIdx.x] = local_nonfinite;
+    left_changed[threadIdx.x] = local_left_changed;
+    right_changed[threadIdx.x] = local_right_changed;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            nonfinite[threadIdx.x] |= nonfinite[threadIdx.x + stride];
+            left_changed[threadIdx.x] |= left_changed[threadIdx.x + stride];
+            right_changed[threadIdx.x] |= right_changed[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        supports[pair] = rows;
+        result_state = rows < 2 ? GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT :
+            nonfinite[0] != 0 ? GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION :
+            left_changed[0] == 0 || right_changed[0] == 0
+                ? GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND
+                : GAFIME_SEMANTIC_SCALAR_MEASURED;
+    }
+    __syncthreads();
+    if (result_state != GAFIME_SEMANTIC_SCALAR_MEASURED) {
+        if (threadIdx.x == 0) {
+            states[pair] = result_state;
+            values[pair] = static_cast<ResultT>(0);
+        }
+        return;
+    }
+
+    AccumT local_sum_x = static_cast<AccumT>(0);
+    AccumT local_sum_y = static_cast<AccumT>(0);
+    AccumT local_sum_xx = static_cast<AccumT>(0);
+    AccumT local_sum_yy = static_cast<AccumT>(0);
+    AccumT local_sum_xy = static_cast<AccumT>(0);
+    uint64_t local_count = 0;
+    for (uint64_t row = threadIdx.x; row < rows; row += blockDim.x) {
+        const AccumT rank_x = static_cast<AccumT>(semantic_rank_twice_for_value(
+            left[row], left, rows)) * static_cast<AccumT>(0.5);
+        const AccumT rank_y = static_cast<AccumT>(semantic_rank_twice_for_value(
+            right[row], right, rows)) * static_cast<AccumT>(0.5);
+        local_sum_x += rank_x;
+        local_sum_y += rank_y;
+        local_sum_xx += rank_x * rank_x;
+        local_sum_yy += rank_y * rank_y;
+        local_sum_xy += rank_x * rank_y;
+        ++local_count;
+    }
+    sum_x[threadIdx.x] = local_sum_x;
+    sum_y[threadIdx.x] = local_sum_y;
+    sum_xx[threadIdx.x] = local_sum_xx;
+    sum_yy[threadIdx.x] = local_sum_yy;
+    sum_xy[threadIdx.x] = local_sum_xy;
+    counts[threadIdx.x] = local_count;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sum_x[threadIdx.x] += sum_x[threadIdx.x + stride];
+            sum_y[threadIdx.x] += sum_y[threadIdx.x + stride];
+            sum_xx[threadIdx.x] += sum_xx[threadIdx.x + stride];
+            sum_yy[threadIdx.x] += sum_yy[threadIdx.x + stride];
+            sum_xy[threadIdx.x] += sum_xy[threadIdx.x + stride];
+            counts[threadIdx.x] += counts[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const AccumT count = static_cast<AccumT>(counts[0]);
+        const AccumT covariance = count * sum_xy[0] - sum_x[0] * sum_y[0];
+        const AccumT variance_x = count * sum_xx[0] - sum_x[0] * sum_x[0];
+        const AccumT variance_y = count * sum_yy[0] - sum_y[0] * sum_y[0];
+        if (variance_x == static_cast<AccumT>(0) || variance_y == static_cast<AccumT>(0) ||
+            (precision_isfinite(variance_x) && precision_isfinite(variance_y) &&
+                precision_isfinite(covariance) && variance_x > static_cast<AccumT>(0) &&
+                variance_y > static_cast<AccumT>(0) &&
+                variance_x * variance_y == static_cast<AccumT>(0))) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_DEGENERATE_REDUCTION;
+            values[pair] = static_cast<ResultT>(0);
+            return;
+        }
+        ResultT correlation = precision_finalize_correlation<AccumT, ResultT>(
+            variance_x, variance_y, covariance);
+        if (!precision_isfinite(correlation)) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+            values[pair] = static_cast<ResultT>(0);
+            return;
+        }
+        if (presentation == GAFIME_SEMANTIC_ASSOCIATION_ABSOLUTE) {
+            correlation = precision_abs(correlation);
+        }
+        states[pair] = GAFIME_SEMANTIC_SCALAR_MEASURED;
+        values[pair] = correlation;
+    }
+}
+
+// This shares the existing typed equal-width binning and corrected-MI
+// arithmetic, but receives only generic resident operands.  The final
+// reduction is serial in a block to preserve a declared stable histogram-bin
+// order rather than inventing a target-oriented score pipeline.
+template <typename StorageT, typename AccumT, typename ResultT, uint32_t Bins>
+__global__ void semantic_fixed_corrected_nmi_kernel(
+    const StorageT* left_columns,
+    const StorageT* right_columns,
+    uint64_t rows,
+    const uint32_t* left_slots,
+    const uint32_t* right_slots,
+    uint64_t pair_count,
+    ResultT* values,
+    uint32_t* states,
+    uint64_t* supports
+) {
+    static_assert(Bins >= 2 && Bins <= gafime_rocm_v1::kMaxMutualInfoBins);
+    const uint64_t pair = blockIdx.x;
+    if (pair >= pair_count) return;
+    const StorageT* left = left_columns + static_cast<uint64_t>(left_slots[pair]) * rows;
+    const StorageT* right = right_columns + static_cast<uint64_t>(right_slots[pair]) * rows;
+    __shared__ StorageT minimum_x[kThreadsPerBlock];
+    __shared__ StorageT maximum_x[kThreadsPerBlock];
+    __shared__ StorageT minimum_y[kThreadsPerBlock];
+    __shared__ StorageT maximum_y[kThreadsPerBlock];
+    __shared__ uint32_t nonfinite[kThreadsPerBlock];
+    __shared__ unsigned int hist_x[Bins];
+    __shared__ unsigned int hist_y[Bins];
+    __shared__ unsigned int joint[Bins * Bins];
+    __shared__ uint32_t result_state;
+
+    StorageT local_min_x = static_cast<StorageT>(INFINITY);
+    StorageT local_max_x = static_cast<StorageT>(-INFINITY);
+    StorageT local_min_y = static_cast<StorageT>(INFINITY);
+    StorageT local_max_y = static_cast<StorageT>(-INFINITY);
+    uint32_t local_nonfinite = 0;
+    for (uint64_t row = threadIdx.x; row < rows; row += blockDim.x) {
+        const StorageT x = left[row];
+        const StorageT y = right[row];
+        if (!precision_isfinite(x) || !precision_isfinite(y)) {
+            local_nonfinite = 1;
+            continue;
+        }
+        local_min_x = precision_min(local_min_x, x);
+        local_max_x = precision_max(local_max_x, x);
+        local_min_y = precision_min(local_min_y, y);
+        local_max_y = precision_max(local_max_y, y);
+    }
+    minimum_x[threadIdx.x] = local_min_x;
+    maximum_x[threadIdx.x] = local_max_x;
+    minimum_y[threadIdx.x] = local_min_y;
+    maximum_y[threadIdx.x] = local_max_y;
+    nonfinite[threadIdx.x] = local_nonfinite;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            minimum_x[threadIdx.x] = precision_min(minimum_x[threadIdx.x], minimum_x[threadIdx.x + stride]);
+            maximum_x[threadIdx.x] = precision_max(maximum_x[threadIdx.x], maximum_x[threadIdx.x + stride]);
+            minimum_y[threadIdx.x] = precision_min(minimum_y[threadIdx.x], minimum_y[threadIdx.x + stride]);
+            maximum_y[threadIdx.x] = precision_max(maximum_y[threadIdx.x], maximum_y[threadIdx.x + stride]);
+            nonfinite[threadIdx.x] |= nonfinite[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const StorageT span_x = maximum_x[0] - minimum_x[0];
+    const StorageT span_y = maximum_y[0] - minimum_y[0];
+    if (threadIdx.x == 0) {
+        supports[pair] = rows;
+        const uint64_t minimum_support = static_cast<uint64_t>(Bins) * Bins * 8u;
+        result_state = rows < 2 ? GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT :
+            nonfinite[0] != 0 ? GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION :
+            !precision_isfinite(span_x) || !precision_isfinite(span_y)
+                ? GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION
+                : span_x <= static_cast<StorageT>(0) || span_y <= static_cast<StorageT>(0)
+                    ? GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND
+                    : rows < minimum_support
+                        ? GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT
+                        : GAFIME_SEMANTIC_SCALAR_MEASURED;
+    }
+    __syncthreads();
+    if (result_state != GAFIME_SEMANTIC_SCALAR_MEASURED) {
+        if (threadIdx.x == 0) {
+            states[pair] = result_state;
+            values[pair] = static_cast<ResultT>(0);
+        }
+        return;
+    }
+    for (uint32_t index = threadIdx.x; index < Bins; index += blockDim.x) {
+        hist_x[index] = 0;
+        hist_y[index] = 0;
+    }
+    for (uint32_t index = threadIdx.x; index < Bins * Bins; index += blockDim.x) {
+        joint[index] = 0;
+    }
+    __syncthreads();
+    const StorageT inverse_x = static_cast<StorageT>(Bins) / span_x;
+    const StorageT inverse_y = static_cast<StorageT>(Bins) / span_y;
+    if (!precision_isfinite(inverse_x) || !precision_isfinite(inverse_y)) {
+        if (threadIdx.x == 0) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+            values[pair] = static_cast<ResultT>(0);
+        }
+        return;
+    }
+    for (uint64_t row = threadIdx.x; row < rows; row += blockDim.x) {
+        const uint32_t x_bin = precision_fixed_mi_bin<StorageT>(
+            left[row], minimum_x[0], inverse_x, Bins, 0);
+        const uint32_t y_bin = precision_fixed_mi_bin<StorageT>(
+            right[row], minimum_y[0], inverse_y, Bins, 0);
+        atomicAdd(&hist_x[x_bin], 1u);
+        atomicAdd(&hist_y[y_bin], 1u);
+        atomicAdd(&joint[x_bin * Bins + y_bin], 1u);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        uint32_t active_x = 0;
+        uint32_t active_y = 0;
+        for (uint32_t bin = 0; bin < Bins; ++bin) {
+            active_x += hist_x[bin] != 0;
+            active_y += hist_y[bin] != 0;
+        }
+        if (active_x < 2 || active_y < 2) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_DEGENERATE_REDUCTION;
+            values[pair] = static_cast<ResultT>(0);
+            return;
+        }
+        const AccumT total = static_cast<AccumT>(rows);
+        AccumT mutual_information = static_cast<AccumT>(0);
+        for (uint32_t x_bin = 0; x_bin < Bins; ++x_bin) {
+            for (uint32_t y_bin = 0; y_bin < Bins; ++y_bin) {
+                const unsigned int count = joint[x_bin * Bins + y_bin];
+                if (count == 0) continue;
+                const AccumT pxy = static_cast<AccumT>(count) / total;
+                const AccumT px = static_cast<AccumT>(hist_x[x_bin]) / total;
+                const AccumT py = static_cast<AccumT>(hist_y[y_bin]) / total;
+                mutual_information += pxy * precision_log(pxy / (px * py));
+            }
+        }
+        const AccumT correction =
+            (static_cast<AccumT>(active_x - 1) * static_cast<AccumT>(active_y - 1)) /
+            (static_cast<AccumT>(2) * total);
+        const AccumT corrected = mutual_information > correction
+            ? mutual_information - correction
+            : static_cast<AccumT>(0);
+        const uint32_t normalizer_bins = active_x < active_y ? active_x : active_y;
+        const AccumT normalizer = normalizer_bins > 1
+            ? precision_log(static_cast<AccumT>(normalizer_bins))
+            : static_cast<AccumT>(0);
+        const ResultT result = normalizer > static_cast<AccumT>(0)
+            ? static_cast<ResultT>(corrected / normalizer)
+            : static_cast<ResultT>(0);
+        if (!precision_isfinite(result)) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+            values[pair] = static_cast<ResultT>(0);
+        } else {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_MEASURED;
+            values[pair] = result;
+        }
     }
 }
 
@@ -2424,6 +2820,8 @@ __global__ void semantic_sparse_gather_kernel(
         STORAGE*, uint64_t, uint32_t, uint32_t); \
     template __global__ void precision_kernel::semantic_centered_product_kernel<STORAGE>( \
         STORAGE*, uint64_t, const uint32_t*, const uint64_t*, uint32_t, uint32_t); \
+    template __global__ void precision_kernel::semantic_frozen_region_conjunction_kernel<STORAGE>( \
+        STORAGE*, uint64_t, const GafimeSemanticFrozenRegionTerm*, uint32_t, uint32_t); \
     template __global__ void precision_kernel::semantic_reject_nonfinite_output_kernel<STORAGE>( \
         const STORAGE*, uint64_t, uint32_t, uint32_t*); \
     template __global__ void precision_kernel::semantic_sparse_gather_kernel<STORAGE>( \
@@ -2434,9 +2832,32 @@ __global__ void semantic_sparse_gather_kernel(
     template __global__ void precision_kernel::semantic_pairwise_pearson_kernel<STORAGE, ACCUM, RESULT>( \
         const STORAGE*, const STORAGE*, uint64_t, const uint32_t*, const uint32_t*, uint64_t, \
         uint32_t, RESULT*, uint32_t*, uint64_t*); \
+    template __global__ void precision_kernel::semantic_column_means_kernel<STORAGE, ACCUM, RESULT>( \
+        const STORAGE*, uint64_t, const uint32_t*, uint64_t, RESULT*, uint32_t*, uint64_t*); \
+    template __global__ void precision_kernel::semantic_pairwise_spearman_kernel<STORAGE, ACCUM, RESULT>( \
+        const STORAGE*, const STORAGE*, uint64_t, const uint32_t*, const uint32_t*, uint64_t, \
+        uint32_t, RESULT*, uint32_t*, uint64_t*); \
     template __global__ void precision_kernel::semantic_ordered_edge_energy_kernel<STORAGE, ACCUM, RESULT>( \
         const STORAGE*, uint64_t, const uint32_t*, uint64_t, const GafimeSemanticEdge*, \
         const STORAGE*, uint64_t, RESULT*, uint32_t*, uint64_t*);
+
+#define GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI(STORAGE, ACCUM, RESULT, BINS) \
+    template __global__ void precision_kernel::semantic_fixed_corrected_nmi_kernel< \
+        STORAGE, ACCUM, RESULT, BINS>( \
+            const STORAGE*, const STORAGE*, uint64_t, const uint32_t*, const uint32_t*, uint64_t, \
+            RESULT*, uint32_t*, uint64_t*);
+
+#define GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI_LEVELS(STORAGE, ACCUM, RESULT) \
+    GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI(STORAGE, ACCUM, RESULT, 2) \
+    GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI(STORAGE, ACCUM, RESULT, 4) \
+    GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI(STORAGE, ACCUM, RESULT, 8) \
+    GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI(STORAGE, ACCUM, RESULT, 12) \
+    GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI(STORAGE, ACCUM, RESULT, 16) \
+    GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI(STORAGE, ACCUM, RESULT, 24) \
+    GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI(STORAGE, ACCUM, RESULT, 32) \
+    GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI(STORAGE, ACCUM, RESULT, 48) \
+    GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI(STORAGE, ACCUM, RESULT, 64) \
+    GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI(STORAGE, ACCUM, RESULT, 96)
 
 #define GAFIME_HIP_INSTANTIATE_PRECISION_PROFILE(STORAGE, ACCUM, RESULT) \
     GAFIME_HIP_INSTANTIATE_PRECISION_STATS(STORAGE, ACCUM) \
@@ -2464,6 +2885,9 @@ GAFIME_HIP_INSTANTIATE_SEMANTIC_STORAGE(double)
 GAFIME_HIP_INSTANTIATE_SEMANTIC_STATISTICS(float, float, float)
 GAFIME_HIP_INSTANTIATE_SEMANTIC_STATISTICS(float, double, double)
 GAFIME_HIP_INSTANTIATE_SEMANTIC_STATISTICS(double, double, double)
+GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI_LEVELS(float, float, float)
+GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI_LEVELS(float, double, double)
+GAFIME_HIP_INSTANTIATE_SEMANTIC_NMI_LEVELS(double, double, double)
 GAFIME_HIP_INSTANTIATE_PRECISION_UNARY_ALL_FINITE(float, float, float)
 // ABI 1.0 stores fp32 results but intentionally keeps Spearman rank/covariance
 // arithmetic in fp64. This is the only legacy scoring family that needs a

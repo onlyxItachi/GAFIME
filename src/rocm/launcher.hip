@@ -778,6 +778,47 @@ hipError_t launch_semantic_centered_product(
 }
 
 template <typename StorageT>
+hipError_t launch_semantic_frozen_region_conjunction(
+    StorageT* columns,
+    uint64_t rows,
+    const GafimeSemanticFrozenRegionTerm* terms,
+    uint32_t term_count,
+    uint32_t output_slot,
+    hipStream_t stream
+) {
+    uint32_t blocks = 0;
+    if (!semantic_grid_blocks(rows, &blocks)) return hipErrorInvalidValue;
+    if (blocks == 0) return hipSuccess;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME((kernel::precision_kernel::semantic_frozen_region_conjunction_kernel<StorageT>)),
+        dim3(blocks), dim3(kThreadsPerBlock), 0, stream,
+        columns, rows, terms, term_count, output_slot);
+    return hipGetLastError();
+}
+
+template <typename StorageT, typename AccumT, typename ResultT>
+hipError_t launch_semantic_column_means(
+    const StorageT* columns,
+    uint64_t rows,
+    const uint32_t* candidate_slots,
+    uint64_t candidate_count,
+    ResultT* values,
+    uint32_t* states,
+    uint64_t* supports,
+    hipStream_t stream
+) {
+    uint32_t blocks = 0;
+    if (!semantic_grid_blocks(candidate_count, &blocks)) return hipErrorInvalidValue;
+    if (blocks == 0) return hipSuccess;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME((kernel::precision_kernel::semantic_column_means_kernel<
+            StorageT, AccumT, ResultT>)),
+        dim3(blocks), dim3(kThreadsPerBlock), 0, stream,
+        columns, rows, candidate_slots, candidate_count, values, states, supports);
+    return hipGetLastError();
+}
+
+template <typename StorageT>
 hipError_t launch_semantic_reject_nonfinite_output(
     const StorageT* columns,
     uint64_t rows,
@@ -809,6 +850,120 @@ hipError_t launch_semantic_pairwise_pearson(
         left_columns, right_columns, rows, left_slots, right_slots, pair_count, mode, values, states,
         supports);
     return hipGetLastError();
+}
+
+template <typename StorageT, typename AccumT, typename ResultT>
+hipError_t launch_semantic_pairwise_spearman(
+    const StorageT* left_columns,
+    const StorageT* right_columns,
+    uint64_t rows,
+    const uint32_t* left_slots,
+    const uint32_t* right_slots,
+    uint64_t pair_count,
+    uint32_t presentation,
+    ResultT* values,
+    uint32_t* states,
+    uint64_t* supports,
+    hipStream_t stream
+) {
+    if (pair_count == 0) return hipSuccess;
+    if (pair_count > static_cast<uint64_t>(UINT32_MAX)) return hipErrorInvalidValue;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME((kernel::precision_kernel::semantic_pairwise_spearman_kernel<
+            StorageT, AccumT, ResultT>)),
+        dim3(static_cast<uint32_t>(pair_count)), dim3(kThreadsPerBlock), 0, stream,
+        left_columns, right_columns, rows, left_slots, right_slots, pair_count, presentation,
+        values, states, supports);
+    return hipGetLastError();
+}
+
+template <typename StorageT, typename AccumT, typename ResultT, uint32_t Bins>
+hipError_t launch_semantic_fixed_corrected_nmi(
+    const StorageT* left_columns,
+    const StorageT* right_columns,
+    uint64_t rows,
+    const uint32_t* left_slots,
+    const uint32_t* right_slots,
+    uint64_t pair_count,
+    ResultT* values,
+    uint32_t* states,
+    uint64_t* supports,
+    hipStream_t stream
+) {
+    if (pair_count == 0) return hipSuccess;
+    if (pair_count > static_cast<uint64_t>(UINT32_MAX)) return hipErrorInvalidValue;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME((kernel::precision_kernel::semantic_fixed_corrected_nmi_kernel<
+            StorageT, AccumT, ResultT, Bins>)),
+        dim3(static_cast<uint32_t>(pair_count)), dim3(kMiThreadsPerBlock), 0, stream,
+        left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states, supports);
+    return hipGetLastError();
+}
+
+template <typename StorageT, typename AccumT, typename ResultT>
+hipError_t launch_semantic_pairwise_association(
+    const StorageT* left_columns,
+    const StorageT* right_columns,
+    uint64_t rows,
+    const uint32_t* left_slots,
+    const uint32_t* right_slots,
+    uint64_t pair_count,
+    uint32_t statistic,
+    uint32_t presentation,
+    uint32_t fixed_nmi_bins,
+    ResultT* values,
+    uint32_t* states,
+    uint64_t* supports,
+    hipStream_t stream
+) {
+    switch (statistic) {
+    case GAFIME_SEMANTIC_ASSOCIATION_PEARSON:
+        return launch_semantic_pairwise_pearson<StorageT, AccumT, ResultT>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count,
+            presentation == GAFIME_SEMANTIC_ASSOCIATION_ABSOLUTE
+                ? GAFIME_SEMANTIC_PEARSON_ABSOLUTE
+                : GAFIME_SEMANTIC_PEARSON_SIGNED,
+            values, states, supports, stream);
+    case GAFIME_SEMANTIC_ASSOCIATION_SPEARMAN:
+        return launch_semantic_pairwise_spearman<StorageT, AccumT, ResultT>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, presentation,
+            values, states, supports, stream);
+    case GAFIME_SEMANTIC_ASSOCIATION_FIXED_CORRECTED_NMI:
+        switch (fixed_nmi_bins) {
+        case 2: return launch_semantic_fixed_corrected_nmi<StorageT, AccumT, ResultT, 2>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 4: return launch_semantic_fixed_corrected_nmi<StorageT, AccumT, ResultT, 4>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 8: return launch_semantic_fixed_corrected_nmi<StorageT, AccumT, ResultT, 8>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 12: return launch_semantic_fixed_corrected_nmi<StorageT, AccumT, ResultT, 12>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 16: return launch_semantic_fixed_corrected_nmi<StorageT, AccumT, ResultT, 16>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 24: return launch_semantic_fixed_corrected_nmi<StorageT, AccumT, ResultT, 24>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 32: return launch_semantic_fixed_corrected_nmi<StorageT, AccumT, ResultT, 32>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 48: return launch_semantic_fixed_corrected_nmi<StorageT, AccumT, ResultT, 48>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 64: return launch_semantic_fixed_corrected_nmi<StorageT, AccumT, ResultT, 64>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 96: return launch_semantic_fixed_corrected_nmi<StorageT, AccumT, ResultT, 96>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        default: return hipErrorInvalidValue;
+        }
+    default: return hipErrorInvalidValue;
+    }
 }
 
 template <typename StorageT, typename AccumT, typename ResultT>
@@ -3726,6 +3881,49 @@ int semantic_launch_centered_product(
     }
 }
 
+int semantic_launch_frozen_region_conjunction(
+    SemanticHipBank* bank,
+    const GafimeSemanticFrozenRegionTerm* terms,
+    uint32_t term_count,
+    uint32_t output
+) {
+    switch (bank->profile) {
+    case GAFIME_PRECISION_FP32:
+    case GAFIME_PRECISION_MIXED:
+        return hip_status(gafime_rocm_v1::launch_semantic_frozen_region_conjunction(
+            static_cast<float*>(bank->columns), bank->rows, terms, term_count, output, nullptr));
+    case GAFIME_PRECISION_FP64:
+        return hip_status(gafime_rocm_v1::launch_semantic_frozen_region_conjunction(
+            static_cast<double*>(bank->columns), bank->rows, terms, term_count, output, nullptr));
+    default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+}
+
+int semantic_launch_column_means(
+    SemanticHipBank* bank,
+    const uint32_t* candidate_slots,
+    uint64_t candidate_count,
+    void* values,
+    uint32_t* states,
+    uint64_t* supports
+) {
+    switch (bank->profile) {
+    case GAFIME_PRECISION_FP32:
+        return hip_status(gafime_rocm_v1::launch_semantic_column_means<float, float, float>(
+            static_cast<const float*>(bank->columns), bank->rows, candidate_slots, candidate_count,
+            static_cast<float*>(values), states, supports, nullptr));
+    case GAFIME_PRECISION_MIXED:
+        return hip_status(gafime_rocm_v1::launch_semantic_column_means<float, double, double>(
+            static_cast<const float*>(bank->columns), bank->rows, candidate_slots, candidate_count,
+            static_cast<double*>(values), states, supports, nullptr));
+    case GAFIME_PRECISION_FP64:
+        return hip_status(gafime_rocm_v1::launch_semantic_column_means<double, double, double>(
+            static_cast<const double*>(bank->columns), bank->rows, candidate_slots, candidate_count,
+            static_cast<double*>(values), states, supports, nullptr));
+    default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+}
+
 int semantic_launch_reject_nonfinite_output(
     SemanticHipBank* bank,
     uint32_t slot,
@@ -3767,6 +3965,39 @@ int semantic_launch_pairwise_pearson(
         return hip_status(gafime_rocm_v1::launch_semantic_pairwise_pearson<double, double, double>(
             static_cast<const double*>(left->columns), static_cast<const double*>(right->columns), left->rows,
             left_slots, right_slots, pair_count, mode, static_cast<double*>(values), states, supports, nullptr));
+    default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+}
+
+int semantic_launch_pairwise_association(
+    SemanticHipBank* left,
+    SemanticHipBank* right,
+    const uint32_t* left_slots,
+    const uint32_t* right_slots,
+    uint64_t pair_count,
+    uint32_t statistic,
+    uint32_t presentation,
+    uint32_t fixed_nmi_bins,
+    void* values,
+    uint32_t* states,
+    uint64_t* supports
+) {
+    switch (left->profile) {
+    case GAFIME_PRECISION_FP32:
+        return hip_status(gafime_rocm_v1::launch_semantic_pairwise_association<float, float, float>(
+            static_cast<const float*>(left->columns), static_cast<const float*>(right->columns), left->rows,
+            left_slots, right_slots, pair_count, statistic, presentation, fixed_nmi_bins,
+            static_cast<float*>(values), states, supports, nullptr));
+    case GAFIME_PRECISION_MIXED:
+        return hip_status(gafime_rocm_v1::launch_semantic_pairwise_association<float, double, double>(
+            static_cast<const float*>(left->columns), static_cast<const float*>(right->columns), left->rows,
+            left_slots, right_slots, pair_count, statistic, presentation, fixed_nmi_bins,
+            static_cast<double*>(values), states, supports, nullptr));
+    case GAFIME_PRECISION_FP64:
+        return hip_status(gafime_rocm_v1::launch_semantic_pairwise_association<double, double, double>(
+            static_cast<const double*>(left->columns), static_cast<const double*>(right->columns), left->rows,
+            left_slots, right_slots, pair_count, statistic, presentation, fixed_nmi_bins,
+            static_cast<double*>(values), states, supports, nullptr));
     default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
 }
@@ -3909,7 +4140,8 @@ int semantic_materialize_internal(
     int status = require_semantic_bank(bank);
     if (status != GAFIME_STATUS_OK) return status;
     status = gafime_semantic_abi::validate_program_batch(
-        batch, bank->profile, bank->source_slots, bank->slot_capacity, bank->initialized_slots);
+        batch, bank->profile, bank->source_slots, bank->slot_capacity, bank->initialized_slots,
+        gafime_semantic_abi::kSemanticMaxRegionTerms);
     if (status != GAFIME_STATUS_OK) return status;
     if (batch->node_count > gafime_semantic_abi::kSemanticMaxProgramNodes) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
@@ -3930,6 +4162,7 @@ int semantic_materialize_internal(
     if (status != GAFIME_STATUS_OK) return status;
     HipTransientBuffer<uint32_t> operand_slots(bank->unified_memory);
     HipTransientBuffer<uint64_t> mean_bits(bank->unified_memory);
+    HipTransientBuffer<GafimeSemanticFrozenRegionTerm> region_terms(bank->unified_memory);
     // Match CUDA's one-word nonfinite sentinel for every nonempty batch so
     // forecast accounting remains exact even when the batch contains only
     // source no-ops.  Derived slots are scanned before state is committed.
@@ -3939,6 +4172,7 @@ int semantic_materialize_internal(
     // with an earlier asynchronous kernel's descriptor reads.
     status = operand_slots.allocate(batch->operand_slots.len);
     if (status == GAFIME_STATUS_OK) status = mean_bits.allocate(batch->mean_bits.len);
+    if (status == GAFIME_STATUS_OK) status = region_terms.allocate(batch->region_terms.len);
     if (status == GAFIME_STATUS_OK) status = derived_nonfinite.allocate(1);
     if (status == GAFIME_STATUS_OK) {
         status = hip_status(hipMemset(derived_nonfinite.get(), 0, sizeof(uint32_t)));
@@ -3952,6 +4186,12 @@ int semantic_materialize_internal(
         status = copy_to_hip_storage(
             mean_bits.get(), batch->mean_bits.ptr,
             static_cast<size_t>(batch->mean_bits.len) * sizeof(uint64_t), bank->unified_memory);
+    }
+    if (status == GAFIME_STATUS_OK && batch->region_terms.len != 0) {
+        status = copy_to_hip_storage(
+            region_terms.get(), batch->region_terms.ptr,
+            static_cast<size_t>(batch->region_terms.len) * sizeof(GafimeSemanticFrozenRegionTerm),
+            bank->unified_memory);
     }
     if (status != GAFIME_STATUS_OK) return status;
     for (uint32_t index = 0; index < batch->node_count; ++index) {
@@ -3971,6 +4211,11 @@ int semantic_materialize_internal(
             status = semantic_launch_centered_product(
                 bank, operand_slots.get() + node.operand_offset,
                 mean_bits.get() + node.mean_offset, node.operand_count, node.output_slot);
+            break;
+        case GAFIME_SEMANTIC_PROGRAM_FROZEN_REGION_CONJUNCTION:
+            status = semantic_launch_frozen_region_conjunction(
+                bank, region_terms.get() + node.region_term_offset, node.region_term_count,
+                node.output_slot);
             break;
         default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
         }
@@ -4051,6 +4296,129 @@ int semantic_pairwise_pearson_internal(
         results->supports, supports.get(), static_cast<size_t>(batch->left_slots.len) * sizeof(uint64_t),
         left->unified_memory);
     if (status == GAFIME_STATUS_OK) results->count = batch->left_slots.len;
+    return status;
+}
+
+int semantic_pairwise_association_internal(
+    SemanticHipBank* left,
+    SemanticHipBank* right,
+    const GafimeSemanticAssociationBatch* batch,
+    GafimeSemanticScalarResultTable* results
+) {
+    int status = require_semantic_bank(left);
+    if (status != GAFIME_STATUS_OK || require_semantic_bank(right) != GAFIME_STATUS_OK) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (left->device_id != right->device_id || left->rows != right->rows ||
+        !gafime_gpu_abi::route_fields_equal(left->route, right->route)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    status = gafime_semantic_abi::validate_association_batch(
+        batch, left->slot_capacity, right->slot_capacity,
+        GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON |
+            GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN |
+            GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI,
+        GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_MASK_ALL,
+        std::numeric_limits<uint32_t>::max(), 8192u,
+        std::numeric_limits<uint32_t>::max(), left->rows);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_scalar_results(
+        results, left->route, batch->left_slots.len);
+    if (status != GAFIME_STATUS_OK ||
+        !semantic_slots_initialized(left, batch->left_slots.ptr, batch->left_slots.len) ||
+        !semantic_slots_initialized(right, batch->right_slots.ptr, batch->right_slots.len)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch->left_slots.len == 0) return GAFIME_STATUS_OK;
+    const size_t result_bytes = left->profile == GAFIME_PRECISION_FP32 ? sizeof(float) : sizeof(double);
+    uint64_t value_bytes = 0;
+    if (!checked_mul_u64(batch->left_slots.len, result_bytes, &value_bytes) ||
+        !allocation_fits_size_t(value_bytes, sizeof(uint8_t))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    ScopedHipDevice device(left->device_id);
+    status = hip_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    HipTransientBuffer<uint32_t> left_slots(left->unified_memory);
+    HipTransientBuffer<uint32_t> right_slots(left->unified_memory);
+    HipTransientBuffer<uint8_t> values(left->unified_memory);
+    HipTransientBuffer<uint32_t> states(left->unified_memory);
+    HipTransientBuffer<uint64_t> supports(left->unified_memory);
+    status = left_slots.allocate(batch->left_slots.len);
+    if (status == GAFIME_STATUS_OK) status = right_slots.allocate(batch->right_slots.len);
+    if (status == GAFIME_STATUS_OK) status = values.allocate(value_bytes);
+    if (status == GAFIME_STATUS_OK) status = states.allocate(batch->left_slots.len);
+    if (status == GAFIME_STATUS_OK) status = supports.allocate(batch->left_slots.len);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = copy_to_hip_storage(left_slots.get(), batch->left_slots.ptr,
+        static_cast<size_t>(batch->left_slots.len) * sizeof(uint32_t), left->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = copy_to_hip_storage(right_slots.get(),
+        batch->right_slots.ptr, static_cast<size_t>(batch->right_slots.len) * sizeof(uint32_t),
+        left->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = semantic_launch_pairwise_association(
+        left, right, left_slots.get(), right_slots.get(), batch->left_slots.len, batch->statistic,
+        batch->presentation, batch->fixed_nmi_bins, values.get(), states.get(), supports.get());
+    if (status == GAFIME_STATUS_OK) status = hip_status(hipDeviceSynchronize());
+    if (status == GAFIME_STATUS_OK) status = copy_from_hip_storage(
+        results->values.data, values.get(), static_cast<size_t>(value_bytes), left->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = copy_from_hip_storage(
+        results->states, states.get(), static_cast<size_t>(batch->left_slots.len) * sizeof(uint32_t),
+        left->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = copy_from_hip_storage(
+        results->supports, supports.get(), static_cast<size_t>(batch->left_slots.len) * sizeof(uint64_t),
+        left->unified_memory);
+    if (status == GAFIME_STATUS_OK) results->count = batch->left_slots.len;
+    return status;
+}
+
+int semantic_column_means_internal(
+    SemanticHipBank* bank,
+    const GafimeSemanticColumnMeanBatch* batch,
+    GafimeSemanticScalarResultTable* results
+) {
+    int status = require_semantic_bank(bank);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_column_mean_batch(batch, bank->slot_capacity);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_scalar_results(
+        results, bank->route, batch->candidate_slots.len);
+    if (status != GAFIME_STATUS_OK ||
+        !semantic_slots_initialized(bank, batch->candidate_slots.ptr, batch->candidate_slots.len)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch->candidate_slots.len == 0) return GAFIME_STATUS_OK;
+    const size_t result_bytes = bank->profile == GAFIME_PRECISION_FP32 ? sizeof(float) : sizeof(double);
+    uint64_t value_bytes = 0;
+    if (!checked_mul_u64(batch->candidate_slots.len, result_bytes, &value_bytes) ||
+        !allocation_fits_size_t(value_bytes, sizeof(uint8_t))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    ScopedHipDevice device(bank->device_id);
+    status = hip_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    HipTransientBuffer<uint32_t> candidates(bank->unified_memory);
+    HipTransientBuffer<uint8_t> values(bank->unified_memory);
+    HipTransientBuffer<uint32_t> states(bank->unified_memory);
+    HipTransientBuffer<uint64_t> supports(bank->unified_memory);
+    status = candidates.allocate(batch->candidate_slots.len);
+    if (status == GAFIME_STATUS_OK) status = values.allocate(value_bytes);
+    if (status == GAFIME_STATUS_OK) status = states.allocate(batch->candidate_slots.len);
+    if (status == GAFIME_STATUS_OK) status = supports.allocate(batch->candidate_slots.len);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = copy_to_hip_storage(candidates.get(), batch->candidate_slots.ptr,
+        static_cast<size_t>(batch->candidate_slots.len) * sizeof(uint32_t), bank->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = semantic_launch_column_means(
+        bank, candidates.get(), batch->candidate_slots.len, values.get(), states.get(), supports.get());
+    if (status == GAFIME_STATUS_OK) status = hip_status(hipDeviceSynchronize());
+    if (status == GAFIME_STATUS_OK) status = copy_from_hip_storage(
+        results->values.data, values.get(), static_cast<size_t>(value_bytes), bank->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = copy_from_hip_storage(
+        results->states, states.get(), static_cast<size_t>(batch->candidate_slots.len) * sizeof(uint32_t),
+        bank->unified_memory);
+    if (status == GAFIME_STATUS_OK) status = copy_from_hip_storage(
+        results->supports, supports.get(), static_cast<size_t>(batch->candidate_slots.len) * sizeof(uint64_t),
+        bank->unified_memory);
+    if (status == GAFIME_STATUS_OK) results->count = batch->candidate_slots.len;
     return status;
 }
 
@@ -4197,11 +4565,15 @@ int semantic_forecast_internal(
     uint64_t retained = 0;
     uint64_t program_operand_bytes = 0;
     uint64_t program_mean_bytes = 0;
+    uint64_t program_region_term_bytes = 0;
     uint64_t program_descriptor = 0;
     uint64_t program_nonfinite_flag = 0;
     uint64_t gather_descriptor = 0;
     uint64_t pair_slots = 0;
     uint64_t pair_results = 0;
+    uint64_t mean_slots = 0;
+    uint64_t mean_results = 0;
+    uint64_t mean_bytes = 0;
     uint64_t graph_candidates = 0;
     uint64_t graph_edges = 0;
     uint64_t gather_slots = 0;
@@ -4210,12 +4582,21 @@ int semantic_forecast_internal(
         !checked_mul_u64(resident, storage_bytes, &resident) ||
         !checked_mul_u64(request->program_operand_count, sizeof(uint32_t), &program_operand_bytes) ||
         !checked_mul_u64(request->program_mean_count, sizeof(uint64_t), &program_mean_bytes) ||
+        !checked_mul_u64(
+            request->program_region_term_count, sizeof(GafimeSemanticFrozenRegionTerm),
+            &program_region_term_bytes) ||
         !checked_add_u64(program_operand_bytes, program_mean_bytes, &program_descriptor) ||
-        !checked_mul_u64(request->program_operand_count == 0 ? 0 : 1,
+        !checked_add_u64(program_descriptor, program_region_term_bytes, &program_descriptor) ||
+        !checked_mul_u64(
+            request->program_operand_count == 0 && request->program_region_term_count == 0 ? 0 : 1,
             sizeof(uint32_t), &program_nonfinite_flag) ||
         !checked_mul_u64(request->pair_count, 2 * sizeof(uint32_t), &pair_slots) ||
         !checked_mul_u64(request->pair_count,
             result_bytes + sizeof(uint32_t) + sizeof(uint64_t), &pair_results) ||
+        !checked_mul_u64(request->mean_slot_count, sizeof(uint32_t), &mean_slots) ||
+        !checked_mul_u64(request->mean_slot_count,
+            result_bytes + sizeof(uint32_t) + sizeof(uint64_t), &mean_results) ||
+        !checked_add_u64(mean_slots, mean_results, &mean_bytes) ||
         !checked_mul_u64(request->graph_candidate_count,
             sizeof(uint32_t) + result_bytes + sizeof(uint32_t) + sizeof(uint64_t),
             &graph_candidates) ||
@@ -4238,7 +4619,8 @@ int semantic_forecast_internal(
     }
     forecast->resident_bytes = resident;
     forecast->transient_bytes = std::max(
-        std::max(pair_bytes, graph_bytes), std::max(program_descriptor, gather_descriptor));
+        std::max(pair_bytes, graph_bytes),
+        std::max(std::max(program_descriptor, gather_descriptor), mean_bytes));
     forecast->retained_bytes = retained;
     return GAFIME_STATUS_OK;
 }
@@ -4892,15 +5274,27 @@ GAFIME_GPU_API int gafime_gpu_semantic_capabilities_v1(
     capabilities_out->program_op_mask = GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOURCE |
         GAFIME_SEMANTIC_PROGRAM_OP_MASK_ABSOLUTE_DIFFERENCE |
         GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOFTSIGN |
-        GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT;
-    capabilities_out->primitive_mask = GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON |
+        GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT |
+        GAFIME_SEMANTIC_PROGRAM_OP_MASK_FROZEN_REGION_CONJUNCTION;
+    capabilities_out->primitive_mask = GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_ASSOCIATION |
         GAFIME_SEMANTIC_PRIMITIVE_MASK_ORDERED_EDGE_ENERGY |
-        GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER;
-    capabilities_out->association_statistic_mask = GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON;
+        GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER |
+        GAFIME_SEMANTIC_PRIMITIVE_MASK_COLUMN_MEANS;
+    capabilities_out->association_statistic_mask = GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON |
+        GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN |
+        GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI;
     capabilities_out->max_program_nodes = gafime_semantic_abi::kSemanticMaxProgramNodes;
     capabilities_out->max_slot_count = std::numeric_limits<uint32_t>::max();
     capabilities_out->max_rows = std::numeric_limits<uint64_t>::max() / sizeof(double);
     capabilities_out->max_gather_rows = gafime_semantic_abi::kSemanticMaxGatherRows;
+    capabilities_out->fixed_corrected_nmi_bin_mask =
+        GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_MASK_ALL;
+    capabilities_out->max_region_terms = gafime_semantic_abi::kSemanticMaxRegionTerms;
+    capabilities_out->max_association_pairs = std::numeric_limits<uint32_t>::max();
+    // The generic HIP path uses the existing count-based average-tie rank
+    // primitive. Rust accounts this explicitly quadratic work before launch.
+    capabilities_out->max_spearman_rows = 8192u;
+    capabilities_out->max_fixed_corrected_nmi_rows = std::numeric_limits<uint32_t>::max();
     return GAFIME_STATUS_OK;
 }
 
@@ -4944,6 +5338,33 @@ GAFIME_GPU_API int gafime_gpu_semantic_pairwise_pearson_v1(
     return semantic_pairwise_pearson_internal(
         semantic_bank_from_handle(left_bank_handle), semantic_bank_from_handle(right_bank_handle),
         batch, results_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_pairwise_association_v1(
+    GafimeGpuSemanticBank left_bank_handle,
+    GafimeGpuSemanticBank right_bank_handle,
+    const GafimeSemanticAssociationBatch* batch,
+    GafimeSemanticScalarResultTable* results_out
+) try {
+    return semantic_pairwise_association_internal(
+        semantic_bank_from_handle(left_bank_handle), semantic_bank_from_handle(right_bank_handle),
+        batch, results_out);
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_column_means_v1(
+    GafimeGpuSemanticBank bank_handle,
+    const GafimeSemanticColumnMeanBatch* batch,
+    GafimeSemanticScalarResultTable* results_out
+) try {
+    return semantic_column_means_internal(semantic_bank_from_handle(bank_handle), batch, results_out);
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 GAFIME_GPU_API int gafime_gpu_semantic_ordered_edge_energy_v1(

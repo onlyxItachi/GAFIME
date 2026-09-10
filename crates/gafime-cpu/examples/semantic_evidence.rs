@@ -95,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let policy = SelectionPolicy {
         primary: consistency.id(),
+        pareto_objectives: Vec::new(),
         direction: Direction::Maximize,
         constraints: Vec::new(),
         missing: MissingEvidence::RejectCandidate,

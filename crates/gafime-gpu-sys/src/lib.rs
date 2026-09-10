@@ -18,8 +18,9 @@ pub use abi::{
     GafimeGpuPermutationPvaluesV2Fn, GafimeGpuSemanticBankAllocV1Fn,
     GafimeGpuSemanticBankDownloadV1Fn, GafimeGpuSemanticBankFreeV1Fn,
     GafimeGpuSemanticBankRetainV1Fn, GafimeGpuSemanticBankUploadV1Fn,
-    GafimeGpuSemanticCapabilitiesV1Fn, GafimeGpuSemanticForecastV1Fn,
-    GafimeGpuSemanticMaterializeV1Fn, GafimeGpuSemanticOrderedEdgeEnergyV1Fn,
+    GafimeGpuSemanticCapabilitiesV1Fn, GafimeGpuSemanticColumnMeansV1Fn,
+    GafimeGpuSemanticForecastV1Fn, GafimeGpuSemanticMaterializeV1Fn,
+    GafimeGpuSemanticOrderedEdgeEnergyV1Fn, GafimeGpuSemanticPairwiseAssociationV1Fn,
     GafimeGpuSemanticPairwisePearsonV1Fn, GafimeGpuSemanticSparseGatherV1Fn, GpuFunctionTable,
     GpuSysError,
 };
@@ -30,8 +31,10 @@ pub use local_cmake_experiment::*;
 pub use matrix::OwnedGpuMatrix;
 pub use profile::{architecture_class, has_device_flag, GpuArchitectureClass, GpuDeviceProfile};
 pub use semantic::{
-    GpuNativeEvidenceExecutor, OwnedSemanticBank, SemanticEdge, SemanticMemoryForecast,
-    SemanticPearsonMode, SemanticProgramNode, SemanticScalarResult, SemanticScalarValue,
+    GpuNativeEvidenceExecutor, NativeAssociationPresentation, NativeAssociationStatistic,
+    OwnedSemanticBank, SemanticEdge, SemanticFrozenRegionTerm, SemanticMemoryForecast,
+    SemanticPearsonMode, SemanticProgramNode, SemanticRegionRelation, SemanticScalarResult,
+    SemanticScalarValue,
 };
 
 #[cfg(test)]

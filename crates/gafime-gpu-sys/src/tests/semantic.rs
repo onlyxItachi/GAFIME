@@ -13,10 +13,11 @@ use std::{
 };
 
 use gafime_orchestrator::semantic::{
-    CandidateRegistry, EvaluationRole, FeatureFrame, FeatureId, NativeEvidenceExecutor,
-    ProgramLimits, SemanticError,
+    AssociationContext, AssociationStatistic, CandidateRegistry, EvaluationRole,
+    EvidenceDefinition, FeatureFrame, FeatureId, NativeEvidenceExecutor, ProgramLimits,
+    SemanticError,
 };
-use gafime_types::PrecisionProfile;
+use gafime_types::{PrecisionProfile, GAFIME_PRECISION_FP32};
 
 static CAPABILITY_CALLS: AtomicUsize = AtomicUsize::new(0);
 static PAIRWISE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -29,11 +30,14 @@ static MATERIALIZE_CALLS: AtomicUsize = AtomicUsize::new(0);
 static LAST_MATERIALIZE_NODES: AtomicU32 = AtomicU32::new(0);
 static LAST_MATERIALIZE_OPERANDS: AtomicU64 = AtomicU64::new(0);
 static LAST_MATERIALIZE_MEANS: AtomicU64 = AtomicU64::new(0);
+static LAST_MATERIALIZE_REGION_TERMS: AtomicU64 = AtomicU64::new(0);
 static GATHER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FORECAST_CALLS: AtomicUsize = AtomicUsize::new(0);
 static LAST_FORECAST_MAX_OPERANDS: AtomicU64 = AtomicU64::new(0);
 static LAST_FORECAST_OPERANDS: AtomicU64 = AtomicU64::new(0);
 static LAST_FORECAST_MEANS: AtomicU64 = AtomicU64::new(0);
+static LAST_FORECAST_MEAN_SLOTS: AtomicU64 = AtomicU64::new(0);
+static LAST_FORECAST_REGION_TERMS: AtomicU64 = AtomicU64::new(0);
 static FORECAST_EXTRA_TRANSIENT: AtomicU64 = AtomicU64::new(0);
 static FORECAST_MALFORMED: AtomicU32 = AtomicU32::new(0);
 static CAPABILITY_FLAGS: AtomicU32 = AtomicU32::new(0);
@@ -43,14 +47,17 @@ static MAX_GATHER_ROWS: AtomicU64 = AtomicU64::new(1_024);
 struct MockBank {
     rows: u64,
     storage_bytes: u64,
+    profile: u32,
     bytes: u64,
     uploads: AtomicUsize,
 }
 
-unsafe extern "C" fn semantic_capabilities(
+fn write_semantic_capabilities(
     device_id: u32,
     consumer_abi_version: u32,
     output: *mut GafimeSemanticCapabilities,
+    backend_kind: u32,
+    max_spearman_rows: u64,
 ) -> GafimeStatus {
     if output.is_null() || consumer_abi_version != GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION {
         return GAFIME_STATUS_INVALID_ARGUMENT;
@@ -60,7 +67,7 @@ unsafe extern "C" fn semantic_capabilities(
     // initialized ABI record into the caller-owned output slot.
     unsafe {
         *output = GafimeSemanticCapabilities {
-            backend_kind: GAFIME_BACKEND_CUDA,
+            backend_kind,
             device_id,
             profile_mask: GAFIME_PRECISION_PROFILE_MASK_FP32
                 | GAFIME_PRECISION_PROFILE_MASK_MIXED
@@ -68,20 +75,89 @@ unsafe extern "C" fn semantic_capabilities(
             program_op_mask: GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOURCE
                 | GAFIME_SEMANTIC_PROGRAM_OP_MASK_ABSOLUTE_DIFFERENCE
                 | GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOFTSIGN
-                | GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT,
-            primitive_mask: GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON
+                | GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT
+                | GAFIME_SEMANTIC_PROGRAM_OP_MASK_FROZEN_REGION_CONJUNCTION,
+            primitive_mask: GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_ASSOCIATION
                 | GAFIME_SEMANTIC_PRIMITIVE_MASK_ORDERED_EDGE_ENERGY
-                | GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER,
-            association_statistic_mask: GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON,
+                | GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER
+                | GAFIME_SEMANTIC_PRIMITIVE_MASK_COLUMN_MEANS,
+            association_statistic_mask: GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON
+                | GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN
+                | GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI,
             flags: CAPABILITY_FLAGS.load(Ordering::SeqCst),
             max_program_nodes: MAX_PROGRAM_NODES.load(Ordering::SeqCst),
             max_slot_count: 64,
             max_rows: 1_024,
             max_gather_rows: MAX_GATHER_ROWS.load(Ordering::SeqCst),
+            fixed_corrected_nmi_bin_mask: GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_MASK_ALL,
+            max_region_terms: 64,
+            max_association_pairs: 64,
+            max_spearman_rows,
+            max_fixed_corrected_nmi_rows: 1_024,
             ..Default::default()
         };
     }
     GAFIME_STATUS_OK
+}
+
+unsafe extern "C" fn semantic_capabilities_cuda(
+    device_id: u32,
+    consumer_abi_version: u32,
+    output: *mut GafimeSemanticCapabilities,
+) -> GafimeStatus {
+    write_semantic_capabilities(
+        device_id,
+        consumer_abi_version,
+        output,
+        GAFIME_BACKEND_CUDA,
+        8_192,
+    )
+}
+
+unsafe extern "C" fn semantic_capabilities_metal(
+    device_id: u32,
+    consumer_abi_version: u32,
+    output: *mut GafimeSemanticCapabilities,
+) -> GafimeStatus {
+    write_semantic_capabilities(
+        device_id,
+        consumer_abi_version,
+        output,
+        GAFIME_BACKEND_METAL,
+        32_768,
+    )
+}
+
+unsafe extern "C" fn semantic_metal_device_info(
+    device_id: u32,
+    output: *mut GafimeGpuDeviceInfo,
+) -> GafimeStatus {
+    // SAFETY: this test-only adapter forwards the checked output pointer to
+    // the complete CUDA-shaped fixture before changing only its advertised
+    // backend identity for the separate Metal semantic table.
+    let status = unsafe { test_device_info(device_id, output) };
+    if status == GAFIME_STATUS_OK {
+        // SAFETY: successful `test_device_info` initialized this non-null
+        // caller-owned record, so changing the one test identity field is
+        // valid for the lifetime of this synchronous mock call.
+        unsafe { (*output).backend_kind = GAFIME_BACKEND_METAL };
+    }
+    status
+}
+
+unsafe extern "C" fn semantic_metal_graph_capability(
+    device_id: u32,
+    output: *mut GafimeGpuGraphCapability,
+) -> GafimeStatus {
+    // SAFETY: this mirrors `semantic_metal_device_info`: the complete fixture
+    // initializes the ABI record, then this table-local adapter presents the
+    // matching Metal payload identity required by `GpuBackend::new`.
+    let status = unsafe { test_graph_capability(device_id, output) };
+    if status == GAFIME_STATUS_OK {
+        // SAFETY: a successful fixture call initialized the non-null output.
+        unsafe { (*output).backend_kind = GAFIME_BACKEND_METAL };
+    }
+    status
 }
 
 unsafe extern "C" fn semantic_bank_alloc(
@@ -102,6 +178,7 @@ unsafe extern "C" fn semantic_bank_alloc(
     let bank = Box::new(MockBank {
         rows: desc.rows,
         storage_bytes,
+        profile: desc.route.profile,
         bytes: desc.bytes,
         uploads: AtomicUsize::new(0),
     });
@@ -143,6 +220,7 @@ unsafe extern "C" fn semantic_materialize(
     LAST_MATERIALIZE_NODES.store(batch.node_count, Ordering::SeqCst);
     LAST_MATERIALIZE_OPERANDS.store(batch.operand_slots.len, Ordering::SeqCst);
     LAST_MATERIALIZE_MEANS.store(batch.mean_bits.len, Ordering::SeqCst);
+    LAST_MATERIALIZE_REGION_TERMS.store(batch.region_terms.len, Ordering::SeqCst);
     GAFIME_STATUS_OK
 }
 
@@ -205,6 +283,38 @@ unsafe extern "C" fn semantic_pairwise_pearson(
     unsafe { write_scalar_results(output, count) }
 }
 
+unsafe extern "C" fn semantic_pairwise_association(
+    _: GafimeGpuSemanticBank,
+    _: GafimeGpuSemanticBank,
+    batch: *const GafimeSemanticAssociationBatch,
+    output: *mut GafimeSemanticScalarResultTable,
+) -> GafimeStatus {
+    if batch.is_null() {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    PAIRWISE_CALLS.fetch_add(1, Ordering::SeqCst);
+    // SAFETY: null was rejected above; only the caller-owned pair count is
+    // read by this host-only ABI fixture.
+    let count = unsafe { (*batch).left_slots.len };
+    // SAFETY: `write_scalar_results` validates the caller-owned output.
+    unsafe { write_scalar_results(output, count) }
+}
+
+unsafe extern "C" fn semantic_column_means(
+    _: GafimeGpuSemanticBank,
+    batch: *const GafimeSemanticColumnMeanBatch,
+    output: *mut GafimeSemanticScalarResultTable,
+) -> GafimeStatus {
+    if batch.is_null() {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: null was rejected above; only the requested physical-slot count
+    // is read by this host-only ABI fixture.
+    let count = unsafe { (*batch).candidate_slots.len };
+    // SAFETY: `write_scalar_results` validates the caller-owned output.
+    unsafe { write_scalar_results(output, count) }
+}
+
 unsafe extern "C" fn semantic_ordered_edge_energy(
     _: GafimeGpuSemanticBank,
     batch: *const GafimeSemanticEdgeEnergyBatch,
@@ -243,6 +353,8 @@ unsafe extern "C" fn semantic_forecast(
     LAST_FORECAST_MAX_OPERANDS.store(request.program_max_operand_count, Ordering::SeqCst);
     LAST_FORECAST_OPERANDS.store(request.program_operand_count, Ordering::SeqCst);
     LAST_FORECAST_MEANS.store(request.program_mean_count, Ordering::SeqCst);
+    LAST_FORECAST_MEAN_SLOTS.store(request.mean_slot_count, Ordering::SeqCst);
+    LAST_FORECAST_REGION_TERMS.store(request.program_region_term_count, Ordering::SeqCst);
     let retained_bytes = match bank
         .rows
         .checked_mul(request.retained_slot_count)
@@ -251,7 +363,7 @@ unsafe extern "C" fn semantic_forecast(
         Some(bytes) => bytes,
         None => return GAFIME_STATUS_INVALID_ARGUMENT,
     };
-    let descriptor_bytes = match request
+    let program_descriptor_bytes = match request
         .program_operand_count
         .checked_mul(std::mem::size_of::<u32>() as u64)
         .and_then(|bytes| {
@@ -261,13 +373,47 @@ unsafe extern "C" fn semantic_forecast(
                 .and_then(|means| bytes.checked_add(means))
         })
         .and_then(|bytes| {
-            bytes.checked_add(if request.program_operand_count == 0 {
-                0
-            } else {
-                std::mem::size_of::<u32>() as u64
-            })
+            request
+                .program_region_term_count
+                .checked_mul(std::mem::size_of::<GafimeSemanticFrozenRegionTerm>() as u64)
+                .and_then(|terms| bytes.checked_add(terms))
         })
-        .and_then(|bytes| bytes.checked_add(FORECAST_EXTRA_TRANSIENT.load(Ordering::SeqCst)))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                if request.program_operand_count == 0 && request.program_region_term_count == 0 {
+                    0
+                } else {
+                    std::mem::size_of::<u32>() as u64
+                },
+            )
+        }) {
+        Some(bytes) => bytes,
+        None => return GAFIME_STATUS_INVALID_ARGUMENT,
+    };
+    let result_bytes = if bank.profile == GAFIME_PRECISION_FP32 {
+        std::mem::size_of::<f32>() as u64
+    } else {
+        std::mem::size_of::<f64>() as u64
+    };
+    let mean_bytes = match request
+        .mean_slot_count
+        .checked_mul(std::mem::size_of::<u32>() as u64)
+        .and_then(|slot_bytes| {
+            request
+                .mean_slot_count
+                .checked_mul(
+                    result_bytes
+                        .checked_add(std::mem::size_of::<u32>() as u64)?
+                        .checked_add(std::mem::size_of::<u64>() as u64)?,
+                )
+                .and_then(|result_bytes| slot_bytes.checked_add(result_bytes))
+        }) {
+        Some(bytes) => bytes,
+        None => return GAFIME_STATUS_INVALID_ARGUMENT,
+    };
+    let transient_bytes = match program_descriptor_bytes
+        .max(mean_bytes)
+        .checked_add(FORECAST_EXTRA_TRANSIENT.load(Ordering::SeqCst))
     {
         Some(bytes) => bytes,
         None => return GAFIME_STATUS_INVALID_ARGUMENT,
@@ -282,7 +428,7 @@ unsafe extern "C" fn semantic_forecast(
     unsafe {
         *output = GafimeSemanticMemoryForecast {
             resident_bytes,
-            transient_bytes: descriptor_bytes,
+            transient_bytes,
             retained_bytes,
             ..Default::default()
         }
@@ -312,6 +458,7 @@ unsafe extern "C" fn semantic_bank_retain(
     let bank = Box::new(MockBank {
         rows: source.rows,
         storage_bytes: source.storage_bytes,
+        profile: source.profile,
         bytes,
         // Retained slots are already initialized physical values and must not
         // accept a new source-content epoch.
@@ -362,17 +509,37 @@ unsafe extern "C" fn semantic_bank_free(bank: GafimeGpuSemanticBank) -> GafimeSt
 
 fn complete_semantic_table() -> GpuFunctionTable {
     let mut functions = complete_test_function_table();
-    functions.semantic_capabilities_v1 = Some(semantic_capabilities);
+    functions.semantic_capabilities_v1 = Some(semantic_capabilities_cuda);
     functions.semantic_bank_alloc_v1 = Some(semantic_bank_alloc);
     functions.semantic_bank_upload_v1 = Some(semantic_bank_upload);
     functions.semantic_materialize_v1 = Some(semantic_materialize);
     functions.semantic_pairwise_pearson_v1 = Some(semantic_pairwise_pearson);
+    functions.semantic_pairwise_association_v1 = Some(semantic_pairwise_association);
+    functions.semantic_column_means_v1 = Some(semantic_column_means);
     functions.semantic_ordered_edge_energy_v1 = Some(semantic_ordered_edge_energy);
     functions.semantic_sparse_gather_v1 = Some(semantic_sparse_gather);
     functions.semantic_forecast_v1 = Some(semantic_forecast);
     functions.semantic_bank_retain_v1 = Some(semantic_bank_retain);
     functions.semantic_bank_download_v1 = Some(semantic_bank_download);
     functions.semantic_bank_free_v1 = Some(semantic_bank_free);
+    functions
+}
+
+/// Build a complete mock with immutable function pointers for one advertised
+/// backend. This avoids process-global identity toggles: Rust executes unit
+/// tests concurrently, while a function table itself already models the
+/// payload identity being negotiated.
+fn complete_semantic_table_for_backend(backend_kind: u32) -> GpuFunctionTable {
+    let mut functions = complete_semantic_table();
+    match backend_kind {
+        GAFIME_BACKEND_CUDA => {}
+        GAFIME_BACKEND_METAL => {
+            functions.device_info = Some(semantic_metal_device_info);
+            functions.graph_capability = Some(semantic_metal_graph_capability);
+            functions.semantic_capabilities_v1 = Some(semantic_capabilities_metal);
+        }
+        _ => panic!("test semantic table has no mock for backend kind {backend_kind}"),
+    }
     functions
 }
 
@@ -400,6 +567,26 @@ fn semantic_table_is_optional_for_legacy_and_all_or_nothing_when_present() {
         ))
     ));
     assert_eq!(CAPABILITY_CALLS.load(Ordering::SeqCst), 0);
+
+    let mut missing_association = complete_semantic_table();
+    missing_association.semantic_pairwise_association_v1 = None;
+    let missing_association = GpuBackend::new(GAFIME_BACKEND_CUDA, missing_association).unwrap();
+    assert!(matches!(
+        missing_association.semantic_capabilities(),
+        Err(GpuSysError::MissingFunction(
+            "gafime_gpu_semantic_pairwise_association_v1"
+        ))
+    ));
+
+    let mut missing_means = complete_semantic_table();
+    missing_means.semantic_column_means_v1 = None;
+    let missing_means = GpuBackend::new(GAFIME_BACKEND_CUDA, missing_means).unwrap();
+    assert!(matches!(
+        missing_means.semantic_capabilities(),
+        Err(GpuSysError::MissingFunction(
+            "gafime_gpu_semantic_column_means_v1"
+        ))
+    ));
 
     let complete = GpuBackend::new(GAFIME_BACKEND_CUDA, complete_semantic_table()).unwrap();
     let capabilities = complete.semantic_capabilities().unwrap();
@@ -523,29 +710,60 @@ fn semantic_forecast_uses_immutable_flattened_descriptor_totals() {
     LAST_MATERIALIZE_NODES.store(0, Ordering::SeqCst);
     LAST_MATERIALIZE_OPERANDS.store(0, Ordering::SeqCst);
     LAST_MATERIALIZE_MEANS.store(0, Ordering::SeqCst);
+    LAST_MATERIALIZE_REGION_TERMS.store(0, Ordering::SeqCst);
     LAST_FORECAST_MAX_OPERANDS.store(0, Ordering::SeqCst);
     LAST_FORECAST_OPERANDS.store(0, Ordering::SeqCst);
     LAST_FORECAST_MEANS.store(0, Ordering::SeqCst);
+    LAST_FORECAST_MEAN_SLOTS.store(0, Ordering::SeqCst);
+    LAST_FORECAST_REGION_TERMS.store(0, Ordering::SeqCst);
     FORECAST_EXTRA_TRANSIENT.store(0, Ordering::SeqCst);
     FORECAST_MALFORMED.store(0, Ordering::SeqCst);
 
     let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, complete_semantic_table()).unwrap();
     let mut executor = backend.semantic_executor().unwrap();
     let frame = semantic_fixture_frame();
-    let (registry, _, softened, product) = descriptor_fixture_registry(&frame);
+    let (mut registry, left, softened, product) = descriptor_fixture_registry(&frame);
+    let lower = registry
+        .hard_predicate(
+            left,
+            gafime_orchestrator::semantic::PredicateComparator::GreaterThan,
+            0.5,
+        )
+        .expect("mock lower predicate");
+    let upper = registry
+        .hard_predicate(
+            left,
+            gafime_orchestrator::semantic::PredicateComparator::LessEqual,
+            2.5,
+        )
+        .expect("mock upper predicate");
+    let region = registry
+        .decision_region(vec![lower, upper])
+        .expect("mock closed region");
     let materialized = executor
-        .materialize(&registry, &frame, &[softened, product], None, 1 << 20)
+        .materialize(
+            &registry,
+            &frame,
+            &[softened, product, region],
+            None,
+            1 << 20,
+        )
         .expect("forecast admits the bounded mock materialization");
 
     assert!(materialized.is_resident());
-    // Difference (2) + softsign (1) + product (2) produce five immutable
-    // operand entries and only the product contributes two frozen means.
-    assert_eq!(LAST_MATERIALIZE_NODES.load(Ordering::SeqCst), 3);
+    // Difference (2) + softsign (1) + product (2) + the closed region (0)
+    // produce five immutable operands. Only the product contributes frozen
+    // means; the region carries two typed physical terms rather than abusing
+    // that mean slice.
+    assert_eq!(LAST_MATERIALIZE_NODES.load(Ordering::SeqCst), 4);
     assert_eq!(LAST_MATERIALIZE_OPERANDS.load(Ordering::SeqCst), 5);
     assert_eq!(LAST_MATERIALIZE_MEANS.load(Ordering::SeqCst), 2);
+    assert_eq!(LAST_MATERIALIZE_REGION_TERMS.load(Ordering::SeqCst), 2);
     assert_eq!(LAST_FORECAST_MAX_OPERANDS.load(Ordering::SeqCst), 2);
     assert_eq!(LAST_FORECAST_OPERANDS.load(Ordering::SeqCst), 5);
     assert_eq!(LAST_FORECAST_MEANS.load(Ordering::SeqCst), 2);
+    assert_eq!(LAST_FORECAST_MEAN_SLOTS.load(Ordering::SeqCst), 0);
+    assert_eq!(LAST_FORECAST_REGION_TERMS.load(Ordering::SeqCst), 2);
     assert_eq!(FORECAST_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(UPLOAD_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(MATERIALIZE_CALLS.load(Ordering::SeqCst), 1);
@@ -755,6 +973,54 @@ fn semantic_safe_wrappers_reject_caps_and_same_bank_gather_before_native_dispatc
     ));
     assert_eq!(GATHER_CALLS.load(Ordering::SeqCst), 0);
     MAX_GATHER_ROWS.store(1_024, Ordering::SeqCst);
+}
+
+#[test]
+fn semantic_spearman_admission_uses_the_selected_backend_work_model() {
+    let _guard = ABI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let definition = EvidenceDefinition::Association {
+        statistic: AssociationStatistic::Spearman,
+        context: AssociationContext::Labels { labels: None },
+    };
+
+    let cuda = GpuBackend::new(
+        GAFIME_BACKEND_CUDA,
+        complete_semantic_table_for_backend(GAFIME_BACKEND_CUDA),
+    )
+    .unwrap()
+    .semantic_executor()
+    .unwrap();
+    assert_eq!(
+        cuda.validate_evidence_admission(&definition, 1, 8_192)
+            .expect("CUDA mock admits its exact row cap"),
+        134_217_728,
+    );
+    assert!(matches!(
+        cuda.validate_evidence_admission(&definition, 1, 8_193),
+        Err(SemanticError::Unsupported(
+            "Spearman support rows exceed selected GPU semantic capability"
+        ))
+    ));
+
+    // Metal has a bounded device-side bitonic/rank lowering, not CUDA/HIP's
+    // current count-based quadratic rank primitive. Its separate truthful
+    // cost model must therefore admit one 32K pair under the ordinary 128M
+    // semantic-work budget instead of inheriting the quadratic charge.
+    let metal = GpuBackend::new(
+        GAFIME_BACKEND_METAL,
+        complete_semantic_table_for_backend(GAFIME_BACKEND_METAL),
+    )
+    .unwrap()
+    .semantic_executor()
+    .unwrap();
+    assert_eq!(
+        metal
+            .validate_evidence_admission(&definition, 1, 32_768)
+            .expect("Metal mock admits its truthful bounded sort work"),
+        10_289_152,
+    );
 }
 
 #[test]

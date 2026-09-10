@@ -480,6 +480,8 @@ pub(crate) fn complete_test_function_table() -> GpuFunctionTable {
         semantic_bank_upload_v1: None,
         semantic_materialize_v1: None,
         semantic_pairwise_pearson_v1: None,
+        semantic_pairwise_association_v1: None,
+        semantic_column_means_v1: None,
         semantic_ordered_edge_energy_v1: None,
         semantic_sparse_gather_v1: None,
         semantic_forecast_v1: None,

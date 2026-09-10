@@ -52,28 +52,31 @@ probe and does not make a physical-execution claim.
 
 | Requested backend | Selected semantic route | Vocabulary boundary |
 |---|---|---|
-| `core` | Core | Complete current tabular vocabulary: four programs, all three profiles, Pearson/Spearman/fixed corrected NMI/graph energy and all declared contexts |
-| `auto` | Core | Core is selected deliberately because the accelerator subset is not the complete vocabulary |
+| `core` | Core | Current programs including frozen predicates/regions and training-bound interactions; all three profiles, Pearson/Spearman/fixed corrected NMI/graph energy and declared contexts |
+| `auto` | Core | Deliberately preserves conservative semantic placement; new payload capabilities do not silently change that policy |
 | `cuda` / `rocm` | Explicit GPU only | Requires a loaded complete optional semantic primitive table and a Rust lowering for the selected profile/operation/context; reports their runtime intersection |
-| `metal` | None | Explicitly unsupported for the tabular semantic product |
+| `metal` | Explicit Metal only | fp32; complete optional table plus per-operation/bin/resource admission; mixed/fp64 fail before payload discovery |
 
-The current CUDA/ROCm lowering may admit the four program operations plus
-Pearson reference/paired measurements, sparse partial labels, and graph energy
-when the negotiated capability bits allow each one. It intentionally does not
-admit Spearman or fixed corrected NMI. A missing, old, partial, or insufficient
-payload is an explicit request failure, never a Core fallback.
+CUDA/ROCm/Metal lowering admits only program, fitting and evidence operations
+whose negotiated capability bits and Rust implementation both exist. The
+record includes `fitted_centered_interactions`, exact `fixed_nmi_bins`, and
+GPU `native_limits` for rows, association pairs, Spearman rows, NMI rows and
+region terms. Limits are additional to the session's numerical/structural work
+budgets; a capability bit is not permission for an unbounded request. A
+missing, old, partial, or insufficient payload fails explicitly, never via
+a Core fallback. See the [discovery milestone](v1.1-tabular-discovery.md).
 
 For GPU semantic sessions, `diagnostics` contains only the selected backend,
 retained bytes, and `native_work_counters_available=False`; no timing, kernel
 counter, occupancy, or cache-performance measurement is synthesized. CUDA and
-ROCm installed-payload lifecycle/parity validation has completed for the named
+ROCm predecessor PR #95 installed-payload validation completed for the named
 configurations: CUDA device 0 on an RTX 4060 Laptop (`sm89`, driver
 `610.57.04`) passed 29/29 hardware-conditional public cases; ROCm device 0 on
 AMD Radeon Graphics (`gfx1150`, runtime `70253211`, system LLVM `21.1.8`)
 also passed 29/29. The frozen legacy C ABI CMake fixtures separately passed
 CUDA 11/11 and ROCm 10/10. This is configuration-specific correctness evidence,
 not a performance, timing, counter, occupancy, cache, or general hardware-
-availability claim. See
+availability claim, and does not qualify later source changes. See
 [optional tabular semantic primitive ABI](semantic-primitives-abi.md) for the
 separate table contract; it does not alter the frozen ABI 1.0 or standard
 numeric-route ABI 1.1 contracts below.

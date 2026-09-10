@@ -84,6 +84,10 @@ SEMANTIC_METHOD_COVERAGE = {
         "source",
         "describe",
         "propose",
+        "propose_centered_interactions",
+        "predicate",
+        "decision_region",
+        "fitting_origins",
         "absolute_difference",
         "softsign",
         "centered_product",
@@ -96,7 +100,7 @@ SEMANTIC_METHOD_COVERAGE = {
         "__exit__",
     ),
     "CandidateSet": ("__len__", "__getitem__"),
-    "AcceptedSet": ("__len__", "__getitem__"),
+    "AcceptedSet": ("__len__", "__getitem__", "fitting_origins", "evaluation_origins"),
     "Candidate": (),
     "Constraint": (),
     "SelectionPolicy": (),
@@ -127,6 +131,8 @@ SEMANTIC_METHOD_COVERAGE = {
         "bins",
     ),
     "EvidenceReport": (
+        "fitting_origins",
+        "evaluation_origins",
         "backend",
         "precision",
         "provenance",
@@ -1524,15 +1530,15 @@ def _cells() -> list:
 
             `gafime.semantic` is an additive Rust-owned namespace for an explicit
             candidate/evidence/selection lifecycle. Core supplies the complete
-            current vocabulary. Explicit CUDA/ROCm sessions can instead negotiate
-            a deliberately smaller runtime intersection from a complete optional
+            current vocabulary. Explicit CUDA/ROCm/Metal sessions negotiate
+            an operation-specific runtime intersection from a complete optional
             semantic primitive table and the installed Rust lowering; they never
             silently substitute Core. The executable reference stays on Core and
-            makes no physical accelerator-execution claim. Metal is explicitly
-            unsupported for this product, and `auto` deliberately selects Core for
-            the complete vocabulary.
+            makes no physical accelerator-execution claim. Metal is fp32 only,
+            with smaller fixed-NMI bin and operation-resource limits. `auto`
+            deliberately retains its conservative Core selection policy.
 
-            Separately, the installed-payload semantic lifecycle/parity suite passed
+            At the predecessor PR #95 checkpoint, the installed-payload suite passed
             29/29 hardware-conditional public cases on CUDA device 0 / RTX 4060
             Laptop (`sm89`, driver `610.57.04`) and 29/29 on ROCm device 0 / AMD
             Radeon Graphics (`gfx1150`, runtime `70253211`, system LLVM `21.1.8`).
@@ -1540,6 +1546,9 @@ def _cells() -> list:
             ROCm 10/10. This is configuration-specific correctness evidence, not a
             performance, timing, counter, or general hardware-availability claim;
             the Core-only executable reference itself still proves no GPU execution.
+            Those predecessor results do not qualify later source changes; current
+            implementation and evidence are recorded in the
+            [discovery milestone](../v1.1-tabular-discovery.md).
 
             The namespace is separate from `GafimeEngine.analyze()` and `compile()`:
             it does not inherit legacy metrics, candidate-family, significance,
@@ -1554,7 +1563,9 @@ def _cells() -> list:
             intersection and configured/selected device identity. GPU diagnostics
             report backend, retained bytes, and unavailable native work counters;
             they do not invent elapsed time, cache speed, process RSS, Arrow copies,
-            or a device probe. The session is synchronous and thread-affine;
+            or a device probe. Core additionally reports completed
+            `fitted_mean_columns`/`fitted_mean_rows`, not formula-derived cache
+            hits. The session is synchronous and thread-affine;
             `close()` is terminal and idempotent, including getters. `describe()`
             supplies bounded program metadata and opaque operand handles only,
             never a serializable/native launch descriptor.
@@ -1586,7 +1597,29 @@ def _cells() -> list:
             labels, and graph edges) are bounded indexed sequences; numeric frames
             are exact-profile typed 2-D buffers or one Arrow record batch. This
             boundary does not execute arbitrary generator callbacks. Centered-product
-            means are explicit frozen constants, never fit from later inference rows.
+            means may be explicitly declared, or fitted natively once per atom by
+            `propose_centered_interactions(atoms=None, arities=None, limit=256,
+            frame=None)`. The default arity is two and the default fitting frame
+            is the session's discovery snapshot. A supplied fitting frame must
+            have discovery role. Fitting uses profile-native declared-row-order
+            means, with nonfinite/overflow failures explicit; inference never
+            refits. Equal constants/programs retain one identity even when fitted
+            independently. Session/report/accepted-set `fitting_origins()` records
+            training snapshot identity and caller provenance separately; report
+            and acceptance history cannot be changed by later fitting.
+            Report `evaluation_origins(candidate)` and accepted-set
+            `evaluation_origins(index)` additionally retain fitted contextual
+            reference origins for the complete evaluated evidence set, including
+            channels unused by selection. These do not become candidate fitted
+            state or contaminate later program reuse.
+
+            `predicate(atom, relation="le" or "gt", threshold=...)` declares an
+            exact frozen finite threshold with zero/one membership.
+            `decision_region(predicates)` canonicalizes a bounded hard conjunction
+            of predicate/region handles. An interval on one atom has logical arity
+            one even with two bounds. At most 64 flattened terms are allowed;
+            contradictions, duplicate bounds and ineligible operands fail closed.
+            This is not tree induction, a Python compiler or an RT request.
             Passing one `AcceptedSet`, or a bounded indexed sequence of
             `AcceptedSet` values, to a later `begin_round()` is the only way to
             authorize those accepted atoms there. The union preserves each native
@@ -1607,8 +1640,14 @@ def _cells() -> list:
             `SelectionPolicy` has one named maximize/minimize primary plus
             inclusive `Constraint` bounds in the individual channel units. Missing
             evidence is explicit (`reject`/`error`, with `ignore` only for an
-            optional constraint); the policy is not a weighted score or Pareto
-            optimizer. `EvidenceReport.value(candidate, channel)` returns
+            optional constraint). Optional `pareto=[(channel, "maximize"), ...]`
+            declares two to eight distinct objectives: constraints filter first,
+            nondominated candidates survive, then primary ordering and the result
+            limit apply. Equal objective vectors do not dominate each other.
+            Missing objectives follow reject/error even if a constraint ignores
+            that channel. Pairwise frontier work is checked against `max_work`;
+            there is no universal scalar score or full dominance-layer ranking.
+            `EvidenceReport.value(candidate, channel)` returns
             `state`, `value`, `support`, and `reason`. `EvidenceReport.context`
             retains the original row/channel declarations, but it is not proof of
             split independence, label provenance, graph validity, or leakage
@@ -1709,6 +1748,75 @@ def _cells() -> list:
         ),
         _md(
             """
+            #### Training-bound programs and multi-channel selection
+
+            This small Core example fits only on training rows, combines partial
+            labeled association with target-free redundancy, reuses an accepted
+            interaction, and transforms unlabeled rows. It tests the delivery
+            contract, not general learning efficacy. Use `Evidence.paired()` for
+            a declared aligned view or `Evidence.graph()` for an explicit graph;
+            neither requires a separate feature engine. Pearson/Spearman paired
+            evidence retains sign; paired fixed NMI measures dependence and must
+            not be interpreted as signed invariance (even `z` and `-z` can have
+            high dependence).
+
+            A caller-declared `role="discovery"` is not an automatic leakage
+            detector: create it from the training partition inside each fold.
+            `fitting_origins()` exposes process-local diagnostic snapshot IDs,
+            not persistent handles or certificates of statistical independence.
+            See the [consumer tests](../../tests/python/test_semantic_discovery.py)
+            for four workflow variants and Arrow-to-learner delivery.
+            """
+        ),
+        _code(
+            """
+            import numpy as np
+            from gafime import EngineConfig, semantic
+
+            discovery_data = np.array(
+                [[-2., -3.], [-1., -1.], [1., 1.], [2., 3.]], dtype=np.float32
+            )
+            with semantic.TabularSession(
+                discovery_data, feature_names=["x", "z"], row_keys=[0, 1, 2, 3],
+                row_domain="training", provenance="training partition only",
+                config=EngineConfig(backend="core", precision="mixed"),
+            ) as discovery:
+                discovery.begin_round()
+                interactions = discovery.propose_centered_interactions(arities=[2])
+                assert len(interactions) == 1
+                assert discovery.describe(interactions[0])["means"] == [0.0, 0.0]
+                training_labels = discovery.frame.labels(
+                    row_keys=[0, 1, 2], values=[6., 1., 1.], provenance="partial training labels"
+                )
+                utility = semantic.Evidence.labels("labeled utility", training_labels)
+                redundancy = semantic.Evidence.reference("redundancy", discovery.source("x"))
+                observations = discovery.evaluate(interactions, [utility, redundancy])
+                frontier_policy = semantic.SelectionPolicy(
+                    utility, limit=2,
+                    pareto=[(utility, "maximize"), (redundancy, "minimize")],
+                )
+                selected = discovery.select(observations, frontier_policy)
+                assert len(selected) == 1
+                origins = selected.fitting_origins(0)
+                assert origins[0]["provenance"] == "training partition only"
+                discovery.begin_round(selected)
+                bounded = discovery.softsign(selected[0])
+                next_observations = discovery.evaluate([bounded], [utility, redundancy])
+                final_features = discovery.select(next_observations, frontier_policy)
+                assert final_features.fitting_origins(0) == origins
+                new_rows = discovery.snapshot(
+                    np.array([[10., 11.]], dtype=np.float32), feature_names=["x", "z"],
+                    row_keys=[100], row_domain="inference", provenance="unlabeled input",
+                )
+                delivered = discovery.transform(final_features, new_rows)
+                assert delivered.rows == 1
+                assert delivered.row_keys == [100]
+                assert len(delivered.__arrow_c_array__()) == 2
+            """,
+            test="semantic_discovery",
+        ),
+        _md(
+            """
             Additional explicit module surfaces:
 
             - `gafime.reporting`: `BackendInfo`, `Decision`, `DiagnosticReport`,
@@ -1727,7 +1835,7 @@ def _cells() -> list:
             - `gafime.semantic`: Rust-owned `TabularSession` lifecycle plus opaque
               candidates/accepted values, contextual evidence, explicit selection,
               and Arrow-output result objects. It is additive: Core owns the
-              complete vocabulary while explicit CUDA/ROCm may expose a bounded
+              complete vocabulary while explicit CUDA/ROCm/Metal expose a bounded
               negotiated subset without Core substitution. It is not a generic
               candidate IR or Python data plane.
             - `gafime.subfunctions`: the advanced native compatibility proxy. Prefer
@@ -1749,6 +1857,8 @@ def _cells() -> list:
             `TabularSession.frame`, `configured_backend`, `selected_backend`,
             `precision`, `retained_bytes`, `capabilities`, `diagnostics`,
             `snapshot()`, `begin_round()`, `source()`, `describe()`, `propose()`,
+            `propose_centered_interactions()`, `predicate()`, `decision_region()`,
+            `fitting_origins()`,
             `absolute_difference()`, `softsign()`,
             `centered_product()`, `evaluate()`, `select()`, `transform()`,
             `clear_materializations()`, `close()`, `__enter__()`, and `__exit__()`;
@@ -1757,11 +1867,15 @@ def _cells() -> list:
             `Evidence.reference()`, `paired()`, `labels()`, `graph()`, all four
             `rebind_*()` forms, `name`, `semantics`, and `bins`; collection
             `__len__()`/`__getitem__()`; `EvidenceReport.backend`, `precision`,
-            `provenance`, `candidates`, `context`, `value()`, and
+            `provenance`, `candidates`, `context`, `value()`, `fitting_origins()`,
+            `evaluation_origins()`, and
             `__arrow_c_array__()`; and
             `FeatureTable.feature_names`, `row_keys`, `precision`, `rows`, and
             `__arrow_c_array__()`. `Labels.support`/`provenance` and
             `Graph.edges`/`provenance` are contextual result metadata.
+            `AcceptedSet.evaluation_origins(index)` includes fitted contextual
+            references; `AcceptedSet.fitting_origins(index)` inspects acceptance-time fitting
+            history, distinct from the session's current fitting ledger.
 
             CLI entry points are `gafime` and `python -m gafime`. No future
             Candidate IR/decorator/JIT surface is part of the current API.

@@ -8,7 +8,7 @@ use arrow::{
 };
 use gafime_orchestrator::semantic::{
     AcceptedFeature, EvidenceTable, EvidenceValue, FeatureFrame, MaterializedColumns,
-    NumericColumn, UnavailableReason,
+    NumericColumn, TrainingBinding, UnavailableReason,
 };
 use pyo3::{
     exceptions::PyValueError,
@@ -16,6 +16,24 @@ use pyo3::{
     types::{PyCapsule, PyDict},
 };
 use std::{ffi::CString, sync::Arc};
+
+pub(super) fn fitting_origins<'py>(
+    py: Python<'py>,
+    bindings: &[Arc<TrainingBinding>],
+) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+    let out = pyo3::types::PyList::empty(py);
+    for binding in bindings {
+        let entry = PyDict::new(py);
+        // A process-local diagnostic identity, never a constructor, transferable
+        // capability or persistent key. Keep origins distinct even when callers
+        // reuse their descriptive provenance text on different input snapshots.
+        entry.set_item("snapshot_id", binding.frame_id())?;
+        entry.set_item("row_domain", binding.row_domain())?;
+        entry.set_item("provenance", binding.provenance())?;
+        out.append(entry)?;
+    }
+    Ok(out)
+}
 
 pub(super) fn reason(value: UnavailableReason) -> &'static str {
     match value {
@@ -72,6 +90,36 @@ pub(crate) struct PyEvidenceReport {
 }
 #[pymethods]
 impl PyEvidenceReport {
+    /// Transitive fitting history frozen when these observations were evaluated.
+    /// snapshot_id is diagnostic/process-local, not a reusable handle. Descriptive
+    /// provenance is not certification against leakage or evidence of causality.
+    fn fitting_origins<'py>(
+        &self,
+        py: Python<'py>,
+        candidate: PyRef<'_, PyCandidate>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        fitting_origins(
+            py,
+            self.table.training_bindings(candidate.id).map_err(error)?,
+        )
+    }
+    /// Immutable fitting origins of this candidate and contextual reference
+    /// programs used by its complete evidence set. Unlike fitting_origins,
+    /// this includes fitted state that affects evidence but not program meaning.
+    /// Descriptive provenance does not certify absence of data leakage.
+    fn evaluation_origins<'py>(
+        &self,
+        py: Python<'py>,
+        candidate: PyRef<'_, PyCandidate>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        fitting_origins(
+            py,
+            &self
+                .table
+                .evaluation_training_bindings(candidate.id)
+                .map_err(error)?,
+        )
+    }
     #[getter]
     fn backend(&self) -> &str {
         self.table.backend()

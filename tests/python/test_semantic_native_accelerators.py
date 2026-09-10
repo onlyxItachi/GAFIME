@@ -33,6 +33,7 @@ from gafime import EngineConfig, semantic
 _PAYLOAD_ENV = {
     "cuda": "GAFIME_CUDA_V1_LIB",
     "rocm": "GAFIME_ROCM_V1_LIB",
+    "metal": "GAFIME_METAL_V1_LIB",
 }
 _NAMES = ("left", "right", "anchor")
 _KEYS = tuple(range(10_001, 10_033))
@@ -106,6 +107,10 @@ def _require_accelerator_session(
 ) -> tuple[semantic.TabularSession, array]:
     """Open an explicit accelerator session or report only real absence as skip."""
 
+    if backend == "metal" and precision != "fp32":
+        pytest.skip(
+            "Metal fp32-only; unsupported profiles have a separate fail-closed test"
+        )
     try:
         return _session(backend, precision, **session_kwargs)
     except (NotImplementedError, RuntimeError, ValueError) as error:
@@ -132,12 +137,26 @@ def _assert_gpu_capabilities(
         "absolute_difference",
         "softsign",
         "centered_product",
+        "hard_predicate",
+        "decision_region",
     ]
-    assert capabilities["statistics"] == ["pearson", "graph_energy"]
+    assert capabilities["statistics"] == [
+        "pearson",
+        "spearman",
+        "fixed_nmi",
+        "graph_energy",
+    ]
     assert capabilities["contexts"] == ["reference", "paired_view", "labels", "graph"]
     assert capabilities["source"] == "runtime"
     assert isinstance(capabilities["payload"], str) and capabilities["payload"]
     assert isinstance(capabilities["primitive_abi_version"], int)
+    assert capabilities["fitted_centered_interactions"] is True
+    assert capabilities["fixed_nmi_bins"] == (
+        [2, 4, 8, 12, 16, 24, 32, 48]
+        if backend == "metal"
+        else [2, 4, 8, 12, 16, 24, 32, 48, 64, 96]
+    )
+    assert capabilities["native_limits"]["region_terms"] == 64
     assert "no Core substitution" in capabilities["selection_reason"]
 
 
@@ -272,16 +291,23 @@ def _run_lifecycle(
             len(_GRAPH_LEFT)
         }
 
-        if backend != "core":
-            for statistic, bins in (("spearman", None), ("fixed_nmi", 2)):
-                unsupported = semantic.Evidence.reference(
-                    f"unsupported-{statistic}", right, statistic=statistic, bins=bins
-                )
-                with pytest.raises(
-                    NotImplementedError,
-                    match="Pearson only; no Core substitution occurs",
-                ):
-                    session.evaluate([left], [unsupported])
+        # The same contextual route now lowers rank and fixed-NMI arithmetic;
+        # no target-slot bridge or backend-specific evidence model is introduced.
+        for statistic, bins in (("spearman", None), ("fixed_nmi", 2)):
+            extra_channels = (
+                semantic.Evidence.reference(
+                    f"reference-{statistic}", right, statistic=statistic, bins=bins
+                ),
+                semantic.Evidence.paired(
+                    f"paired-{statistic}", paired, statistic=statistic, bins=bins
+                ),
+                semantic.Evidence.labels(
+                    f"labels-{statistic}", labels, statistic=statistic, bins=bins
+                ),
+            )
+            extra = session.evaluate(candidates, extra_channels)
+            assert extra.backend == backend
+            records += _record_values(extra, candidates, extra_channels)
 
         accepted = session.select(
             report,
@@ -363,7 +389,7 @@ def _run_lifecycle(
         session.close()
 
 
-@pytest.mark.parametrize("backend", ("cuda", "rocm"))
+@pytest.mark.parametrize("backend", ("cuda", "rocm", "metal"))
 @pytest.mark.parametrize("precision", ("fp32", "mixed", "fp64"))
 def test_explicit_accelerator_semantic_lifecycle_matches_core(
     backend: str, precision: str
@@ -453,7 +479,7 @@ def _definedness_records(session: semantic.TabularSession) -> dict[str, dict[str
     }
 
 
-@pytest.mark.parametrize("backend", ("cuda", "rocm"))
+@pytest.mark.parametrize("backend", ("cuda", "rocm", "metal"))
 @pytest.mark.parametrize(
     ("precision", "scale"), (("fp32", 1.0e-15), ("fp64", 1.0e-100))
 )
@@ -575,7 +601,7 @@ def _assert_finite_program_overflow(session: semantic.TabularSession) -> None:
         session.evaluate([product], [channel])
 
 
-@pytest.mark.parametrize("backend", ("cuda", "rocm"))
+@pytest.mark.parametrize("backend", ("cuda", "rocm", "metal"))
 @pytest.mark.parametrize("precision", ("fp32", "mixed", "fp64"))
 def test_explicit_accelerator_matches_core_finite_program_overflow_failures(
     backend: str, precision: str
@@ -655,7 +681,7 @@ def _row_boundary_records(
     return records
 
 
-@pytest.mark.parametrize("backend", ("cuda", "rocm"))
+@pytest.mark.parametrize("backend", ("cuda", "rocm", "metal"))
 @pytest.mark.parametrize("precision", ("fp32", "mixed", "fp64"))
 @pytest.mark.parametrize("row_count", _ROW_BOUNDARY_COUNTS)
 def test_explicit_accelerator_matches_core_across_row_dispatch_boundaries(
@@ -747,7 +773,7 @@ def _batched_centered_product_case(
     return records, columns
 
 
-@pytest.mark.parametrize("backend", ("cuda", "rocm"))
+@pytest.mark.parametrize("backend", ("cuda", "rocm", "metal"))
 @pytest.mark.parametrize("precision", ("fp32", "mixed", "fp64"))
 def test_explicit_accelerator_batched_centered_product_descriptors_match_core(
     backend: str, precision: str
@@ -773,3 +799,198 @@ def test_explicit_accelerator_batched_centered_product_descriptors_match_core(
         accelerator.close()
         _ = core_storage
         _ = accelerator_storage
+
+
+def _fitted_region_lifecycle(session, precision, pa):
+    session.begin_round()
+    left = session.source("left")
+    right = session.source("right")
+    fitted = session.propose_centered_interactions(arities=[2], limit=3)
+    frozen_means = [
+        array(
+            "d" if precision == "fp64" else "f", session.describe(candidate)["means"]
+        ).tobytes()
+        for candidate in fitted
+    ]
+    lower = session.predicate(left, relation="gt", threshold=5)
+    upper = session.predicate(left, relation="le", threshold=25)
+    region = session.decision_region([lower, upper])
+    candidates = [*fitted, region]
+    channel = semantic.Evidence.reference(
+        "rank association", right, statistic="spearman"
+    )
+    report = session.evaluate(candidates, [channel])
+    records = _record_values(report, candidates, [channel])
+    accepted = session.select(report, semantic.SelectionPolicy(channel, limit=4))
+    assert len(accepted) == 4
+    session.begin_round(accepted)
+    reused = session.softsign(accepted[0])
+    second = session.evaluate([reused], [channel])
+    final = session.select(second, semantic.SelectionPolicy(channel, limit=1))
+    _, data = _matrix(
+        ((5, 2, 3), (6, 4, 5), (25, 6, 7), (26, 8, 9)),
+        typecode="d" if precision == "fp64" else "f",
+    )
+    inference = session.snapshot(
+        data,
+        feature_names=list(_NAMES),
+        row_keys=[91, 92, 93, 94],
+        row_domain="new-unlabeled",
+        provenance="no refitting",
+    )
+    out = session.transform(accepted, inference)
+    composite = session.transform(final, inference)
+    columns = _feature_columns(out, pa)
+    composite_columns = _feature_columns(composite, pa)
+    session.close()
+    assert _feature_columns(out, pa) == columns
+    return frozen_means, records, columns, composite_columns
+
+
+@pytest.mark.parametrize("backend", ("cuda", "rocm", "metal"))
+@pytest.mark.parametrize("precision", ("fp32", "mixed", "fp64"))
+def test_fitted_proposals_regions_reuse_and_new_rows_match_core(backend, precision):
+    pa = pytest.importorskip("pyarrow")
+    accelerator, accelerator_storage = _require_accelerator_session(backend, precision)
+    core, core_storage = _session("core", precision)
+    try:
+        expected = _fitted_region_lifecycle(core, precision, pa)
+        actual = _fitted_region_lifecycle(accelerator, precision, pa)
+        # Frozen fitting state is identity, not a tolerance-based evidence score.
+        assert actual[0] == expected[0]
+        _assert_same_records(expected[1], actual[1], precision)
+        _assert_same_feature_columns(expected[2], actual[2], precision)
+        _assert_same_feature_columns(expected[3], actual[3], precision)
+    finally:
+        core.close()
+        accelerator.close()
+        _ = core_storage, accelerator_storage
+
+
+@pytest.mark.parametrize("precision", ("mixed", "fp64"))
+def test_metal_semantic_unsupported_precision_fails_before_payload_discovery(
+    precision, monkeypatch
+):
+    import gafime._payloads
+
+    def must_not_probe(*args, **kwargs):
+        raise AssertionError("unsupported precision reached payload discovery")
+
+    monkeypatch.setattr(gafime._payloads, "discover_payloads", must_not_probe)
+    with pytest.raises(NotImplementedError, match="fp32 only"):
+        _session("metal", precision)
+
+
+@pytest.mark.parametrize("bins", (64, 96))
+def test_metal_fixed_nmi_does_not_clamp_unsupported_explicit_bins(bins):
+    session, storage = _require_accelerator_session("metal", "fp32")
+    try:
+        session.begin_round()
+        candidate = session.source("left")
+        reference = session.source("right")
+        channel = semantic.Evidence.reference(
+            "exact bins", reference, statistic="fixed_nmi", bins=bins
+        )
+        assert bins not in session.capabilities["fixed_nmi_bins"]
+        with pytest.raises(NotImplementedError):
+            session.evaluate([candidate], [channel])
+        assert session.retained_bytes == 0
+    finally:
+        session.close()
+        _ = storage
+
+
+@pytest.mark.parametrize("backend", ("cuda", "rocm", "metal"))
+@pytest.mark.parametrize("precision", ("fp32", "mixed", "fp64"))
+def test_native_fitted_means_preserve_declared_row_order_and_profile_bits(
+    backend, precision
+):
+    # Pairwise/tree regrouping changes the result. These are identity-bearing
+    # fitted constants, so a tolerant score comparison would miss the defect.
+    scale = 1e16 if precision == "fp64" else 1e8
+    rows = ((scale, 0), (1, 1), (-scale, 2), (1, 3))
+    kwargs = dict(rows=rows, feature_names=("a", "b"), row_keys=(1, 2, 3, 4))
+    accelerator, accelerator_storage = _require_accelerator_session(
+        backend, precision, **kwargs
+    )
+    core, core_storage = _session("core", precision, **kwargs)
+    try:
+        observed = []
+        for session in (core, accelerator):
+            session.begin_round()
+            proposal = session.propose_centered_interactions()
+            means = session.describe(proposal[0])["means"]
+            observed.append(array("d" if precision == "fp64" else "f", means).tobytes())
+            assert means == ([0.5, 1.5] if precision == "mixed" else [0.25, 1.5])
+        assert observed[0] == observed[1]
+    finally:
+        core.close()
+        accelerator.close()
+        _ = core_storage, accelerator_storage
+
+
+@pytest.mark.parametrize("backend", ("cuda", "rocm", "metal"))
+@pytest.mark.parametrize("precision", ("fp32", "mixed", "fp64"))
+def test_native_fitting_overflow_cannot_mint_frozen_state(backend, precision):
+    scale = 1e308 if precision == "fp64" else 2e38
+    rows = ((scale, 0), (scale, 1), (-scale, 2), (-scale, 3))
+    session, storage = _require_accelerator_session(
+        backend, precision, rows=rows, feature_names=("a", "b"), row_keys=(1, 2, 3, 4)
+    )
+    try:
+        session.begin_round()
+        if precision == "mixed":
+            proposals = session.propose_centered_interactions()
+            assert session.describe(proposals[0])["means"] == [0.0, 1.5]
+        else:
+            with pytest.raises(ValueError):
+                session.propose_centered_interactions()
+            assert session.retained_bytes == 0
+            # An independent declaration remains valid after failed fitting.
+            assert (
+                session.describe(session.softsign(session.source("b")))["operation"]
+                == "softsign"
+            )
+    finally:
+        session.close()
+        _ = storage
+
+
+@pytest.mark.parametrize("backend", ("core", "cuda", "rocm", "metal"))
+@pytest.mark.parametrize("precision", ("fp32", "mixed", "fp64"))
+def test_paired_dependence_is_not_signed_invariance(backend, precision):
+    opener = _session if backend == "core" else _require_accelerator_session
+    session, storage = opener(backend, precision)
+    try:
+        session.begin_round()
+        source = session.source("left")
+        _, values = _matrix(
+            (tuple(-x for x in row) for row in _ROWS),
+            typecode="d" if precision == "fp64" else "f",
+        )
+        view = session.snapshot(
+            values,
+            feature_names=list(_NAMES),
+            row_keys=list(_KEYS),
+            row_domain="native-semantic-parity",
+            provenance="sign-reversed view",
+            role="discovery",
+        )
+        signed = semantic.Evidence.paired("signed consistency", view)
+        dependence = semantic.Evidence.paired(
+            "dependence", view, statistic="fixed_nmi", bins=2
+        )
+        report = session.evaluate([source], [signed, dependence])
+        assert report.backend == backend
+        assert report.value(source, signed)["value"] == pytest.approx(-1.0, abs=2e-5)
+        assert report.value(source, dependence)["value"] > 0.9
+        rejected = session.select(
+            report,
+            semantic.SelectionPolicy(
+                dependence, constraints=[semantic.Constraint(signed, minimum=0.8)]
+            ),
+        )
+        assert len(rejected) == 0
+    finally:
+        session.close()
+        _ = storage

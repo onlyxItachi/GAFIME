@@ -24,8 +24,10 @@ pub const GAFIME_NUMERIC_ROUTE_ABI_MIN_MINOR: u16 = 1;
 /// Independent version for the optional resident semantic-arithmetic table.
 /// It is additive beside the frozen matrix ABI rather than a revision of it.
 pub const GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR: u16 = 1;
-/// Minor 2 requires immutable-batch descriptor totals for native forecasts.
-pub const GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR: u16 = 2;
+/// Minor 3 adds generic resident-slot association with exact fixed-NMI
+/// capability negotiation. Its program-node element stride changes, so a
+/// v1.2 semantic consumer must fail capability negotiation before decoding it.
+pub const GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR: u16 = 3;
 pub const GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION: u32 =
     ((GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR as u32) << 16)
         | GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR as u32;
@@ -581,21 +583,57 @@ pub const GAFIME_SEMANTIC_PROGRAM_SOURCE: SemanticProgramOp = 1;
 pub const GAFIME_SEMANTIC_PROGRAM_ABSOLUTE_DIFFERENCE: SemanticProgramOp = 2;
 pub const GAFIME_SEMANTIC_PROGRAM_SOFTSIGN: SemanticProgramOp = 3;
 pub const GAFIME_SEMANTIC_PROGRAM_CENTERED_PRODUCT: SemanticProgramOp = 4;
+pub const GAFIME_SEMANTIC_PROGRAM_FROZEN_REGION_CONJUNCTION: SemanticProgramOp = 5;
 pub const GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOURCE: u32 = 0x1;
 pub const GAFIME_SEMANTIC_PROGRAM_OP_MASK_ABSOLUTE_DIFFERENCE: u32 = 0x2;
 pub const GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOFTSIGN: u32 = 0x4;
 pub const GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT: u32 = 0x8;
+pub const GAFIME_SEMANTIC_PROGRAM_OP_MASK_FROZEN_REGION_CONJUNCTION: u32 = 0x10;
 
 pub type SemanticPrimitiveKind = u32;
-pub const GAFIME_SEMANTIC_PRIMITIVE_PAIRWISE_PEARSON: SemanticPrimitiveKind = 1;
+pub const GAFIME_SEMANTIC_PRIMITIVE_PAIRWISE_ASSOCIATION: SemanticPrimitiveKind = 1;
+/// Source-compatible v1.2 spelling for the same physical primitive.
+pub const GAFIME_SEMANTIC_PRIMITIVE_PAIRWISE_PEARSON: SemanticPrimitiveKind =
+    GAFIME_SEMANTIC_PRIMITIVE_PAIRWISE_ASSOCIATION;
 pub const GAFIME_SEMANTIC_PRIMITIVE_ORDERED_EDGE_ENERGY: SemanticPrimitiveKind = 2;
 pub const GAFIME_SEMANTIC_PRIMITIVE_SPARSE_GATHER: SemanticPrimitiveKind = 3;
-pub const GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON: u32 = 0x1;
+pub const GAFIME_SEMANTIC_PRIMITIVE_COLUMN_MEANS: SemanticPrimitiveKind = 4;
+pub const GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_ASSOCIATION: u32 = 0x1;
+/// Source-compatible v1.2 spelling for the same physical primitive bit.
+pub const GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON: u32 =
+    GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_ASSOCIATION;
 pub const GAFIME_SEMANTIC_PRIMITIVE_MASK_ORDERED_EDGE_ENERGY: u32 = 0x2;
 pub const GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER: u32 = 0x4;
+pub const GAFIME_SEMANTIC_PRIMITIVE_MASK_COLUMN_MEANS: u32 = 0x8;
 pub const GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON: u32 = 0x1;
 pub const GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN: u32 = 0x2;
 pub const GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI: u32 = 0x4;
+
+pub type SemanticAssociationStatistic = u32;
+pub const GAFIME_SEMANTIC_ASSOCIATION_PEARSON: SemanticAssociationStatistic = 1;
+pub const GAFIME_SEMANTIC_ASSOCIATION_SPEARMAN: SemanticAssociationStatistic = 2;
+pub const GAFIME_SEMANTIC_ASSOCIATION_FIXED_CORRECTED_NMI: SemanticAssociationStatistic = 3;
+
+pub type SemanticAssociationPresentation = u32;
+pub const GAFIME_SEMANTIC_ASSOCIATION_SIGNED: SemanticAssociationPresentation = 1;
+pub const GAFIME_SEMANTIC_ASSOCIATION_ABSOLUTE: SemanticAssociationPresentation = 2;
+pub const GAFIME_SEMANTIC_ASSOCIATION_NONNEGATIVE: SemanticAssociationPresentation = 3;
+
+pub const GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_2: u32 = 0x001;
+pub const GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_4: u32 = 0x002;
+pub const GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_8: u32 = 0x004;
+pub const GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_12: u32 = 0x008;
+pub const GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_16: u32 = 0x010;
+pub const GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_24: u32 = 0x020;
+pub const GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_32: u32 = 0x040;
+pub const GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_48: u32 = 0x080;
+pub const GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_64: u32 = 0x100;
+pub const GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_96: u32 = 0x200;
+pub const GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_MASK_ALL: u32 = 0x3ff;
+
+pub type SemanticRegionRelation = u32;
+pub const GAFIME_SEMANTIC_REGION_LESS_EQUAL: SemanticRegionRelation = 1;
+pub const GAFIME_SEMANTIC_REGION_GREATER_THAN: SemanticRegionRelation = 2;
 
 pub type SemanticPearsonMode = u32;
 pub const GAFIME_SEMANTIC_PEARSON_SIGNED: SemanticPearsonMode = 1;
@@ -624,7 +662,15 @@ pub struct GafimeSemanticCapabilities {
     pub max_slot_count: u32,
     pub max_rows: u64,
     pub max_gather_rows: u64,
+    /// v1.2 reserved prefix; it remains zero and never moves.
     pub reserved: [u64; 8],
+    /// v1.3 fixed-corrected-NMI capability envelope.
+    pub fixed_corrected_nmi_bin_mask: u32,
+    pub max_region_terms: u32,
+    pub max_association_pairs: u64,
+    pub max_spearman_rows: u64,
+    pub max_fixed_corrected_nmi_rows: u64,
+    pub reserved_v3: [u64; 5],
 }
 
 impl Default for GafimeSemanticCapabilities {
@@ -644,6 +690,12 @@ impl Default for GafimeSemanticCapabilities {
             max_rows: 0,
             max_gather_rows: 0,
             reserved: [0; 8],
+            fixed_corrected_nmi_bin_mask: 0,
+            max_region_terms: 0,
+            max_association_pairs: 0,
+            max_spearman_rows: 0,
+            max_fixed_corrected_nmi_rows: 0,
+            reserved_v3: [0; 5],
         }
     }
 }
@@ -689,7 +741,36 @@ pub struct GafimeSemanticProgramNode {
     pub operand_count: u32,
     pub mean_offset: u32,
     pub mean_count: u32,
+    /// v1.2 reserved prefix; it remains zero and never moves.
     pub reserved: [u64; 2],
+    /// v1.3 range into `GafimeSemanticProgramBatch::region_terms`.
+    pub region_term_offset: u32,
+    pub region_term_count: u32,
+    pub reserved_v3: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GafimeSemanticFrozenRegionTerm {
+    pub input_slot: u32,
+    pub relation: SemanticRegionRelation,
+    pub threshold_bits: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeSemanticRegionTermSlice {
+    pub ptr: *const GafimeSemanticFrozenRegionTerm,
+    pub len: u64,
+}
+
+impl Default for GafimeSemanticRegionTermSlice {
+    fn default() -> Self {
+        Self {
+            ptr: core::ptr::null(),
+            len: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -703,7 +784,11 @@ pub struct GafimeSemanticProgramBatch {
     pub reserved32: u32,
     pub operand_slots: GafimeSliceU32,
     pub mean_bits: GafimeSliceU64,
+    /// v1.2 reserved prefix; it remains zero and never moves.
     pub reserved: [u64; 8],
+    /// v1.3 typed immutable region descriptors.
+    pub region_terms: GafimeSemanticRegionTermSlice,
+    pub reserved_v3: [u64; 6],
 }
 
 impl Default for GafimeSemanticProgramBatch {
@@ -718,6 +803,8 @@ impl Default for GafimeSemanticProgramBatch {
             operand_slots: GafimeSliceU32::default(),
             mean_bits: GafimeSliceU64::default(),
             reserved: [0; 8],
+            region_terms: GafimeSemanticRegionTermSlice::default(),
+            reserved_v3: [0; 6],
         }
     }
 }
@@ -732,6 +819,64 @@ pub struct GafimeSemanticPearsonBatch {
     pub left_slots: GafimeSliceU32,
     pub right_slots: GafimeSliceU32,
     pub reserved: [u64; 8],
+}
+
+/// Generic physical-slot association descriptor.  Native arithmetic does not
+/// receive evidence IDs, labels, context, provenance, or selection policy.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeSemanticAssociationBatch {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub statistic: SemanticAssociationStatistic,
+    pub presentation: SemanticAssociationPresentation,
+    /// Zero except for `FIXED_CORRECTED_NMI`, where it is one exact advertised
+    /// bin count rather than a dynamic approximation knob.
+    pub fixed_nmi_bins: u32,
+    pub flags: u32,
+    pub left_slots: GafimeSliceU32,
+    pub right_slots: GafimeSliceU32,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeSemanticAssociationBatch {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            statistic: GAFIME_SEMANTIC_ASSOCIATION_PEARSON,
+            presentation: GAFIME_SEMANTIC_ASSOCIATION_SIGNED,
+            fixed_nmi_bins: 0,
+            flags: 0,
+            left_slots: GafimeSliceU32::default(),
+            right_slots: GafimeSliceU32::default(),
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeSemanticColumnMeanBatch {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub flags: u32,
+    pub reserved32: u32,
+    pub candidate_slots: GafimeSliceU32,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeSemanticColumnMeanBatch {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            flags: 0,
+            reserved32: 0,
+            candidate_slots: GafimeSliceU32::default(),
+            reserved: [0; 8],
+        }
+    }
 }
 
 impl Default for GafimeSemanticPearsonBatch {
@@ -865,7 +1010,12 @@ pub struct GafimeSemanticForecastRequest {
     pub program_operand_count: u64,
     /// Exact `u64` frozen-mean descriptor length for one program batch.
     pub program_mean_count: u64,
+    /// v1.2 reserved prefix; it remains zero and never moves.
     pub reserved: [u64; 8],
+    /// Exact v1.3 descriptor/result input counts for transient forecasts.
+    pub mean_slot_count: u64,
+    pub program_region_term_count: u64,
+    pub reserved_v3: [u64; 6],
 }
 
 impl Default for GafimeSemanticForecastRequest {
@@ -883,6 +1033,9 @@ impl Default for GafimeSemanticForecastRequest {
             program_operand_count: 0,
             program_mean_count: 0,
             reserved: [0; 8],
+            mean_slot_count: 0,
+            program_region_term_count: 0,
+            reserved_v3: [0; 6],
         }
     }
 }
@@ -1501,12 +1654,14 @@ mod tests {
     fn semantic_abi_header_and_rust_layouts_stay_in_lockstep() {
         for needle in [
             "#define GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR 1u",
-            "#define GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR 2u",
+            "#define GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR 3u",
             "typedef struct GafimeSemanticCapabilities",
             "typedef struct GafimeSemanticBankDesc",
             "typedef struct GafimeSemanticProgramNode",
             "typedef struct GafimeSemanticProgramBatch",
             "typedef struct GafimeSemanticPearsonBatch",
+            "typedef struct GafimeSemanticAssociationBatch",
+            "typedef struct GafimeSemanticColumnMeanBatch",
             "typedef struct GafimeSemanticEdgeEnergyBatch",
             "typedef struct GafimeSemanticSparseGatherBatch",
             "typedef struct GafimeSemanticScalarResultTable",
@@ -1514,6 +1669,12 @@ mod tests {
             "program_max_operand_count",
             "program_operand_count",
             "program_mean_count",
+            "program_region_term_count",
+            "mean_slot_count",
+            "GAFIME_SEMANTIC_PROGRAM_FROZEN_REGION_CONJUNCTION",
+            "GAFIME_SEMANTIC_PRIMITIVE_MASK_COLUMN_MEANS",
+            "gafime_gpu_semantic_pairwise_association_v1",
+            "gafime_gpu_semantic_column_means_v1",
             "gather_slot_count",
             "gather_row_count",
             "gafime_gpu_semantic_bank_download_v1",
@@ -1524,19 +1685,43 @@ mod tests {
             );
         }
 
-        assert_eq!(GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION, (1u32 << 16) | 2);
-        assert_eq!(size_of::<GafimeSemanticCapabilities>(), 128);
+        assert_eq!(GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION, (1u32 << 16) | 3);
+        assert_eq!(size_of::<GafimeSemanticCapabilities>(), 200);
         assert_eq!(offset_of!(GafimeSemanticCapabilities, max_rows), 48);
         assert_eq!(offset_of!(GafimeSemanticCapabilities, reserved), 64);
+        assert_eq!(
+            offset_of!(GafimeSemanticCapabilities, fixed_corrected_nmi_bin_mask),
+            128
+        );
+        assert_eq!(
+            offset_of!(GafimeSemanticCapabilities, max_association_pairs),
+            136
+        );
+        assert_eq!(offset_of!(GafimeSemanticCapabilities, reserved_v3), 160);
         assert_eq!(size_of::<GafimeSemanticBankDesc>(), 208);
         assert_eq!(offset_of!(GafimeSemanticBankDesc, route), 8);
         assert_eq!(offset_of!(GafimeSemanticBankDesc, reserved), 144);
-        assert_eq!(size_of::<GafimeSemanticProgramNode>(), 40);
+        assert_eq!(size_of::<GafimeSemanticProgramNode>(), 64);
         assert_eq!(offset_of!(GafimeSemanticProgramNode, reserved), 24);
-        assert_eq!(size_of::<GafimeSemanticProgramBatch>(), 224);
+        assert_eq!(
+            offset_of!(GafimeSemanticProgramNode, region_term_offset),
+            40
+        );
+        assert_eq!(offset_of!(GafimeSemanticProgramNode, reserved_v3), 48);
+        assert_eq!(size_of::<GafimeSemanticFrozenRegionTerm>(), 16);
+        assert_eq!(size_of::<GafimeSemanticRegionTermSlice>(), 16);
+        assert_eq!(size_of::<GafimeSemanticProgramBatch>(), 288);
         assert_eq!(offset_of!(GafimeSemanticProgramBatch, operand_slots), 128);
+        assert_eq!(offset_of!(GafimeSemanticProgramBatch, region_terms), 224);
         assert_eq!(size_of::<GafimeSemanticPearsonBatch>(), 112);
         assert_eq!(offset_of!(GafimeSemanticPearsonBatch, left_slots), 16);
+        assert_eq!(size_of::<GafimeSemanticAssociationBatch>(), 120);
+        assert_eq!(offset_of!(GafimeSemanticAssociationBatch, left_slots), 24);
+        assert_eq!(size_of::<GafimeSemanticColumnMeanBatch>(), 96);
+        assert_eq!(
+            offset_of!(GafimeSemanticColumnMeanBatch, candidate_slots),
+            16
+        );
         assert_eq!(size_of::<GafimeSemanticEdgeEnergyBatch>(), 192);
         assert_eq!(offset_of!(GafimeSemanticEdgeEnergyBatch, weights), 32);
         assert_eq!(size_of::<GafimeSemanticSparseGatherBatch>(), 128);
@@ -1544,8 +1729,13 @@ mod tests {
         assert_eq!(size_of::<GafimeSemanticScalarResultTable>(), 296);
         assert_eq!(offset_of!(GafimeSemanticScalarResultTable, values), 136);
         assert_eq!(offset_of!(GafimeSemanticScalarResultTable, reserved), 232);
-        assert_eq!(size_of::<GafimeSemanticForecastRequest>(), 144);
+        assert_eq!(size_of::<GafimeSemanticForecastRequest>(), 208);
         assert_eq!(offset_of!(GafimeSemanticForecastRequest, reserved), 80);
+        assert_eq!(
+            offset_of!(GafimeSemanticForecastRequest, mean_slot_count),
+            144
+        );
+        assert_eq!(offset_of!(GafimeSemanticForecastRequest, reserved_v3), 160);
         assert_eq!(size_of::<GafimeSemanticMemoryForecast>(), 96);
         assert_eq!(offset_of!(GafimeSemanticMemoryForecast, reserved), 32);
     }
