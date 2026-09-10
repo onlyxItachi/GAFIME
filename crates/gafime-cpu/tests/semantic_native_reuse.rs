@@ -110,6 +110,7 @@ fn duplicate_bound_channel_runs_one_numerical_primitive_and_acceptance_hits_cach
             &table,
             &SelectionPolicy {
                 primary: first.id(),
+                pareto_objectives: Vec::new(),
                 direction: Direction::Maximize,
                 constraints: Vec::new(),
                 missing: MissingEvidence::RejectCandidate,

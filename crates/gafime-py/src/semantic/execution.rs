@@ -5,12 +5,16 @@ use gafime_cpu::semantic::CoreEvidenceExecutor;
 use gafime_gpu_sys::{GpuBackend, GpuNativeEvidenceExecutor, GpuSysError};
 use gafime_orchestrator::semantic::{NativeEvidenceExecutor, SemanticError};
 use gafime_types::{
-    PrecisionProfile, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA,
+    PrecisionProfile, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
+    GAFIME_SEMANTIC_PRIMITIVE_MASK_COLUMN_MEANS,
     GAFIME_SEMANTIC_PRIMITIVE_MASK_ORDERED_EDGE_ENERGY,
     GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON, GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER,
     GAFIME_SEMANTIC_PROGRAM_OP_MASK_ABSOLUTE_DIFFERENCE,
-    GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT, GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOFTSIGN,
-    GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOURCE, GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON,
+    GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT,
+    GAFIME_SEMANTIC_PROGRAM_OP_MASK_FROZEN_REGION_CONJUNCTION,
+    GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOFTSIGN, GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOURCE,
+    GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI, GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON,
+    GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN,
 };
 use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyDict};
 
@@ -38,17 +42,17 @@ impl TabularExecutor {
         device: i32,
     ) -> PyResult<Self> {
         if matches!(configured, "core" | "auto") {
-            // Auto commits to the supported public vocabulary at construction,
-            // not to an accelerator that will need hidden fallback later. The
-            // current GPU lowering lacks rank/fixed-NMI channels.
+            // Preserve the public semantic auto policy. Accelerator support is
+            // negotiated per operation on explicit requests; extending a payload
+            // does not silently change an existing session's placement policy.
             return Ok(Self::Core(CoreEvidenceExecutor::default()));
         }
-        if configured == "metal" {
+        if configured == "metal" && profile != PrecisionProfile::Fp32 {
             return Err(error(SemanticError::Unsupported(
-                "Metal does not implement the tabular semantic primitive lowering",
+                "Metal semantic execution supports fp32 only",
             )));
         }
-        if !matches!(configured, "cuda" | "rocm") {
+        if !matches!(configured, "cuda" | "rocm" | "metal") {
             return Err(error(SemanticError::Unsupported(
                 "unsupported tabular backend",
             )));
@@ -60,7 +64,8 @@ impl TabularExecutor {
             .call1((configured,))?;
         let backend = match configured {
             "cuda" => GpuBackend::cuda_from_env(device as u32),
-            _ => GpuBackend::rocm_from_env(device as u32),
+            "rocm" => GpuBackend::rocm_from_env(device as u32),
+            _ => GpuBackend::metal_from_env(device as u32),
         }
         .map_err(gpu_error)?;
         let executor = backend.semantic_executor().map_err(gpu_error)?;
@@ -90,6 +95,7 @@ impl TabularExecutor {
         match self {
             Self::Core(_) => "core",
             Self::Gpu(executor) if executor.backend_kind() == GAFIME_BACKEND_CUDA => "cuda",
+            Self::Gpu(executor) if executor.backend_kind() == GAFIME_BACKEND_METAL => "metal",
             Self::Gpu(_) => "rocm",
         }
     }
@@ -116,6 +122,8 @@ impl TabularExecutor {
                         "absolute_difference",
                         "softsign",
                         "centered_product",
+                        "hard_predicate",
+                        "decision_region",
                     ],
                 )?;
                 out.set_item(
@@ -123,7 +131,9 @@ impl TabularExecutor {
                     ["pearson", "spearman", "fixed_nmi", "graph_energy"],
                 )?;
                 out.set_item("contexts", ["reference", "paired_view", "labels", "graph"])?;
-                out.set_item("selection_reason", "Core supports the complete tabular semantic vocabulary; supervised GPU route support alone is insufficient")?;
+                out.set_item("fitted_centered_interactions", true)?;
+                out.set_item("fixed_nmi_bins", [2, 4, 8, 12, 16, 24, 32, 48, 64, 96])?;
+                out.set_item("selection_reason", "Core is the explicit or conservative semantic-auto policy; accelerators require explicit operation-capability negotiation")?;
                 out.set_item("source", "static")?;
             }
             Self::Gpu(executor) => {
@@ -139,6 +149,14 @@ impl TabularExecutor {
                         GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT,
                         "centered_product",
                     ),
+                    (
+                        GAFIME_SEMANTIC_PROGRAM_OP_MASK_FROZEN_REGION_CONJUNCTION,
+                        "hard_predicate",
+                    ),
+                    (
+                        GAFIME_SEMANTIC_PROGRAM_OP_MASK_FROZEN_REGION_CONJUNCTION,
+                        "decision_region",
+                    ),
                 ]
                 .into_iter()
                 .filter_map(|(mask, name)| (caps.program_op_mask & mask != 0).then_some(name))
@@ -147,10 +165,21 @@ impl TabularExecutor {
                 let mut contexts = Vec::new();
                 // Capabilities are the intersection of payload primitives and
                 // this Rust adapter's actual lowerings, never raw advertised bits.
-                if caps.association_statistic_mask & GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON != 0
-                    && caps.primitive_mask & GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON != 0
-                {
-                    statistics.push("pearson");
+                if caps.primitive_mask & GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON != 0 {
+                    for (mask, name) in [
+                        (GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON, "pearson"),
+                        (GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN, "spearman"),
+                        (
+                            GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI,
+                            "fixed_nmi",
+                        ),
+                    ] {
+                        if caps.association_statistic_mask & mask != 0 {
+                            statistics.push(name);
+                        }
+                    }
+                }
+                if !statistics.is_empty() {
                     contexts.extend(["reference", "paired_view"]);
                     if caps.primitive_mask & GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER != 0 {
                         contexts.push("labels");
@@ -164,6 +193,27 @@ impl TabularExecutor {
                 out.set_item("programs", programs)?;
                 out.set_item("statistics", statistics)?;
                 out.set_item("contexts", contexts)?;
+                out.set_item(
+                    "fitted_centered_interactions",
+                    caps.primitive_mask & GAFIME_SEMANTIC_PRIMITIVE_MASK_COLUMN_MEANS != 0
+                        && caps.program_op_mask & GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT
+                            != 0,
+                )?;
+                let bins: Vec<_> = [2, 4, 8, 12, 16, 24, 32, 48, 64, 96]
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(ordinal, bins)| {
+                        (caps.fixed_corrected_nmi_bin_mask & (1 << ordinal) != 0).then_some(bins)
+                    })
+                    .collect();
+                out.set_item("fixed_nmi_bins", bins)?;
+                let limits = PyDict::new(py);
+                limits.set_item("rows", caps.max_rows)?;
+                limits.set_item("association_pairs", caps.max_association_pairs)?;
+                limits.set_item("spearman_rows", caps.max_spearman_rows)?;
+                limits.set_item("fixed_nmi_rows", caps.max_fixed_corrected_nmi_rows)?;
+                limits.set_item("region_terms", caps.max_region_terms)?;
+                out.set_item("native_limits", limits)?;
                 out.set_item("selection_reason", "Explicit backend; each request must fit the negotiated tabular lowering, with no Core substitution")?;
                 out.set_item("source", "runtime")?;
                 out.set_item(
@@ -192,6 +242,8 @@ impl TabularExecutor {
                 out.set_item("output_allocations", executor.output_allocations())?;
                 out.set_item("output_bytes", executor.output_bytes())?;
                 out.set_item("evidence_kernel_calls", executor.evidence_kernel_calls())?;
+                out.set_item("fitted_mean_columns", executor.fitted_mean_columns())?;
+                out.set_item("fitted_mean_rows", executor.fitted_mean_rows())?;
             }
             Self::Gpu(_) => {
                 // Do not substitute estimated counters for observed work. Device

@@ -272,6 +272,7 @@ fn core_session_evaluates_all_channels_accepts_and_reuses_programs_on_new_rows()
 
     let policy = SelectionPolicy {
         primary: labeled.id(),
+        pareto_objectives: Vec::new(),
         direction: Direction::Maximize,
         constraints: vec![EvidenceConstraint {
             channel: redundancy.id(),
@@ -408,6 +409,7 @@ fn selection_thresholds_missingness_and_ties_are_explicit_and_deterministic() {
 
     let ties = SelectionPolicy {
         primary: strength.id(),
+        pareto_objectives: Vec::new(),
         direction: Direction::Maximize,
         constraints: vec![],
         missing: MissingEvidence::RejectCandidate,
@@ -424,6 +426,7 @@ fn selection_thresholds_missingness_and_ties_are_explicit_and_deterministic() {
 
     let threshold_rejects = SelectionPolicy {
         primary: strength.id(),
+        pareto_objectives: Vec::new(),
         direction: Direction::Maximize,
         constraints: vec![EvidenceConstraint {
             channel: strength.id(),
@@ -441,6 +444,7 @@ fn selection_thresholds_missingness_and_ties_are_explicit_and_deterministic() {
 
     let missing_rejects = SelectionPolicy {
         primary: strength.id(),
+        pareto_objectives: Vec::new(),
         direction: Direction::Maximize,
         constraints: vec![EvidenceConstraint {
             channel: absent.id(),
@@ -534,6 +538,7 @@ fn changed_labels_only_change_labeled_evidence_for_the_same_program_and_frame() 
     measured(first.value(difference, first_labels.id()).unwrap(), 1.0, 4);
     let policy = SelectionPolicy {
         primary: redundancy.id(),
+        pareto_objectives: Vec::new(),
         direction: Direction::Minimize,
         constraints: vec![],
         missing: MissingEvidence::RejectCandidate,
@@ -623,6 +628,7 @@ fn frozen_centered_product_uses_declared_means_on_new_inference_rows() {
         .unwrap();
     let policy = SelectionPolicy {
         primary: channel.id(),
+        pareto_objectives: Vec::new(),
         direction: Direction::Maximize,
         constraints: vec![],
         missing: MissingEvidence::RejectCandidate,
@@ -902,6 +908,7 @@ fn backend_context_identity_and_closed_sessions_fail_closed() {
         .unwrap();
     let policy = SelectionPolicy {
         primary: channel.id(),
+        pareto_objectives: Vec::new(),
         direction: Direction::Maximize,
         constraints: vec![],
         missing: MissingEvidence::RejectCandidate,

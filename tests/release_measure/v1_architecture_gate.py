@@ -2796,9 +2796,11 @@ def check_native_kernel_structure() -> None:
         in (metal_beast_workflow)
     )
     assert (
-        "python -m pip install numpy wheelhouse/gafime-*.whl"
+        "python -m pip install numpy pyarrow scikit-learn pytest wheelhouse/gafime-*.whl"
         in native_validation_workflow
     )
+    assert "test_semantic_native_accelerators.py" in native_validation_workflow
+    assert "GAFIME_METAL_BUILD_TESTS=ON" in native_validation_workflow
     assert "GAFIME_CUDA_MI_ACCUMULATION_MODE" not in contract_workflow
     assert "gafime_cuda_precision_abi_smoke" in cuda_cmake
     assert "gafime_rocm_precision_abi_smoke" in rocm_cmake

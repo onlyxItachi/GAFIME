@@ -26,6 +26,8 @@
     gafime_gpu_semantic_bank_upload_v1;
     gafime_gpu_semantic_materialize_v1;
     gafime_gpu_semantic_pairwise_pearson_v1;
+    gafime_gpu_semantic_pairwise_association_v1;
+    gafime_gpu_semantic_column_means_v1;
     gafime_gpu_semantic_ordered_edge_energy_v1;
     gafime_gpu_semantic_sparse_gather_v1;
     gafime_gpu_semantic_forecast_v1;

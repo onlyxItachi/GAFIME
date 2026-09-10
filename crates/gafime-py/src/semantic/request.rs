@@ -3,7 +3,7 @@ use super::input::{PyGraph, PyLabels, PySnapshot};
 use super::{error, PyCandidate};
 use gafime_orchestrator::semantic::{
     AssociationContext, AssociationStatistic, Direction, EvidenceChannel, EvidenceConstraint,
-    EvidenceDefinition, MissingEvidence, SelectionPolicy,
+    EvidenceDefinition, EvidenceObjective, MissingEvidence, SelectionPolicy,
 };
 use pyo3::{exceptions::PyValueError, prelude::*};
 
@@ -22,6 +22,16 @@ fn missing(name: &str, optional: bool) -> PyResult<MissingEvidence> {
         "ignore" if optional => Ok(MissingEvidence::IgnoreConstraint),
         _ => Err(PyValueError::new_err(
             "missing must be reject/error (or ignore for an optional constraint)",
+        )),
+    }
+}
+
+fn direction(name: &str) -> PyResult<Direction> {
+    match name {
+        "maximize" => Ok(Direction::Maximize),
+        "minimize" => Ok(Direction::Minimize),
+        _ => Err(PyValueError::new_err(
+            "direction must be maximize or minimize",
         )),
     }
 }
@@ -223,6 +233,10 @@ impl PyConstraint {
 }
 
 /// Explicit primary-channel order plus constraints, not a weighted quality score.
+/// pareto optionally names two to eight (Evidence, direction) objective pairs.
+/// Only nondominated eligible candidates survive; primary orders/truncates that
+/// frontier. Missing objectives follow missing; optional constraints cannot make
+/// an objective optional. Pairwise comparisons obey the session max_work bound.
 /// direction is maximize/minimize; missing is reject/error. Ties are resolved
 /// by canonical program order. limit may be zero. fp32 thresholds quantize to
 /// the profile's result dtype; nonfinite/overflowed thresholds fail closed.
@@ -233,13 +247,14 @@ pub(crate) struct PySelectionPolicy {
 #[pymethods]
 impl PySelectionPolicy {
     #[new]
-    #[pyo3(signature=(primary, *, direction="maximize", limit=10, missing="reject", constraints=None))]
+    #[pyo3(signature=(primary, *, direction="maximize", limit=10, missing="reject", constraints=None, pareto=None))]
     fn new(
         primary: PyRef<'_, PyEvidence>,
         direction: &str,
         limit: usize,
         missing: &str,
         constraints: Option<&Bound<'_, PyAny>>,
+        pareto: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let constraints = match constraints {
             None => Vec::new(),
@@ -252,22 +267,47 @@ impl PySelectionPolicy {
                 "policy exceeds bounded constraints/result limit",
             ));
         }
-        let direction = match direction {
-            "maximize" => Direction::Maximize,
-            "minimize" => Direction::Minimize,
-            _ => {
-                return Err(PyValueError::new_err(
-                    "direction must be maximize or minimize",
-                ))
-            }
+        let pareto_objectives = match pareto {
+            None => Vec::new(),
+            Some(value) => super::input::bounded_items(value, 8, "Pareto objectives")?
+                .map(|item| {
+                    let item = item?;
+                    let pair = item.cast::<pyo3::types::PyTuple>()?;
+                    if pair.len() != 2 {
+                        return Err(PyValueError::new_err(
+                            "each Pareto objective must be an (Evidence, direction) tuple",
+                        ));
+                    }
+                    Ok(EvidenceObjective {
+                        channel: pair
+                            .get_item(0)?
+                            .extract::<PyRef<'_, PyEvidence>>()?
+                            .channel
+                            .id(),
+                        direction: self::direction(&pair.get_item(1)?.extract::<String>()?)?,
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()?,
         };
+        if pareto_objectives.len() == 1
+            || pareto_objectives.iter().enumerate().any(|(i, objective)| {
+                pareto_objectives[..i]
+                    .iter()
+                    .any(|previous| previous.channel == objective.channel)
+            })
+        {
+            return Err(PyValueError::new_err(
+                "Pareto selection requires two to eight distinct channels",
+            ));
+        }
         Ok(Self {
             policy: SelectionPolicy {
                 primary: primary.channel.id(),
-                direction,
+                direction: self::direction(direction)?,
                 limit,
                 missing: self::missing(missing, false)?,
                 constraints,
+                pareto_objectives,
             },
         })
     }

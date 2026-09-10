@@ -89,6 +89,7 @@ fn run(profile: PrecisionProfile, workers: usize) -> SemanticResult<()> {
             ];
             let policy = SelectionPolicy {
                 primary: redundancy.id(),
+                pareto_objectives: Vec::new(),
                 direction: Direction::Maximize,
                 constraints: vec![],
                 missing: MissingEvidence::Error,

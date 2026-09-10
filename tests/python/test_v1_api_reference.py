@@ -83,11 +83,17 @@ def test_v1_reference_code_cells_compile_and_selected_examples_execute() -> None
         source = "".join(cell["source"])
         compiled = compile(source, f"gafime_v1_api_reference[{index}]", "exec")
         group = cell.get("metadata", {}).get("gafime_test", "syntax")
-        if group in {"core", "semantic", "sklearn", "polars"}:
+        if group in {"core", "semantic", "semantic_discovery", "sklearn", "polars"}:
             exec(compiled, namespace)
             executed_groups.add(group)
 
-    assert executed_groups == {"core", "semantic", "sklearn", "polars"}
+    assert executed_groups == {
+        "core",
+        "semantic",
+        "semantic_discovery",
+        "sklearn",
+        "polars",
+    }
 
 
 def test_reference_inventory_matches_top_level_exports_and_coverage() -> None:
@@ -366,6 +372,7 @@ def test_documentation_hierarchy_and_local_links_are_valid() -> None:
     docs_index = (ROOT / "docs" / "README.md").read_text(encoding="utf-8")
     assert "v1.1-tabular-semantic-product.md" in docs_index
     assert "semantic-primitives-abi.md" in docs_index
+    assert "v1.1-tabular-discovery.md" in docs_index
 
     markdown_sources = {
         ROOT / "README.md": (ROOT / "README.md").read_text(encoding="utf-8"),
@@ -380,6 +387,9 @@ def test_documentation_hierarchy_and_local_links_are_valid() -> None:
             ROOT / "docs" / "releases" / "STATUS.md"
         ).read_text(encoding="utf-8"),
         COVERAGE_PATH: COVERAGE_PATH.read_text(encoding="utf-8"),
+        ROOT / "docs" / "v1.1-tabular-discovery.md": (
+            ROOT / "docs" / "v1.1-tabular-discovery.md"
+        ).read_text(encoding="utf-8"),
         ROOT / "docs" / "v1.1-tabular-semantic-product.md": (
             ROOT / "docs" / "v1.1-tabular-semantic-product.md"
         ).read_text(encoding="utf-8"),
@@ -425,7 +435,9 @@ def test_reference_records_current_non_api_boundaries() -> None:
         "they never silently substitute Core",
         "makes no physical accelerator-execution claim",
         "not a universal quality score",
-        "not a weighted score or Pareto optimizer",
+        "no universal scalar score or full dominance-layer ranking",
+        "inference never refits",
+        "report and acceptance history cannot be changed by later fitting",
         "No Python feature-computation loop",
         "Cross-session/stale handles",
     ):

@@ -27,6 +27,7 @@ add_custom_target(gafime_metal_v1_metallib DEPENDS "${GAFIME_METAL_LIBRARY}")
 
 add_library(gafime_metal_v1 SHARED
     launcher.mm
+    semantic_launcher.mm
     shader.metal
 )
 set_target_properties(gafime_metal_v1 PROPERTIES
@@ -73,6 +74,24 @@ if(GAFIME_METAL_BUILD_TESTS)
         "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/abi_consumers"
         "${CMAKE_CURRENT_BINARY_DIR}/abi_consumers"
     )
+
+    # This is intentionally a direct payload CTest, separate from the
+    # host-only shared ABI validator above.  It allocates resident semantic
+    # banks and executes every advertised Metal fp32 primitive on the selected
+    # Apple device; a macOS gate runs it with the exact built metallib.
+    add_executable(
+        gafime_metal_semantic_native_test
+        "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/metal_semantic_native_test.cpp"
+    )
+    add_dependencies(gafime_metal_semantic_native_test gafime_metal_v1_metallib)
+    target_compile_features(gafime_metal_semantic_native_test PRIVATE cxx_std_23)
+    target_compile_options(gafime_metal_semantic_native_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(gafime_metal_semantic_native_test PRIVATE gafime_metal_v1)
+    add_test(NAME gafime_metal_semantic_native_test COMMAND gafime_metal_semantic_native_test)
+    set_tests_properties(gafime_metal_semantic_native_test PROPERTIES
+        ENVIRONMENT "GAFIME_METAL_V1_METALLIB=${GAFIME_METAL_LIBRARY}"
+    )
+
     unset(GAFIME_ABI_CONSUMER_PAYLOAD_TARGET)
     unset(GAFIME_ABI_CONSUMER_BACKEND_KIND)
     unset(GAFIME_ABI_CONSUMER_EXPECTED_ROUTE_COUNT)

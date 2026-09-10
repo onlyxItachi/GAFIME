@@ -12,8 +12,8 @@ use gafime_types::{
 
 use super::{
     next_identity, CandidateRegistry, EvidenceChannel, EvidenceDefinition, EvidenceRecord,
-    EvidenceTable, EvidenceValue, FeatureFrame, FeatureId, FeatureOp, NumericColumn,
-    SelectionPolicy, SemanticError, SemanticResult,
+    EvidenceTable, EvidenceValue, FeatureFrame, FeatureId, FeatureOp, FrozenMeans, NumericColumn,
+    PredicateComparator, SelectionPolicy, SemanticError, SemanticResult, TrainingBinding,
 };
 
 /// Context-bound values, distinct from durable candidate programs. Only native
@@ -284,6 +284,35 @@ pub trait NativeEvidenceExecutor {
         max_bytes: usize,
     ) -> SemanticResult<Vec<EvidenceValue>>;
 
+    /// Validate backend capabilities and return a conservative additional work
+    /// charge before materialization. The session aggregates unique channels:
+    /// granting each channel the entire call budget would admit unbounded sums.
+    /// Core uses the ordinary structural charge; accelerator sorting/ranking
+    /// may require additional backend-specific admission without substitution.
+    fn validate_evidence_admission(
+        &self,
+        _definition: &EvidenceDefinition,
+        _pair_count: usize,
+        _support_rows: usize,
+    ) -> SemanticResult<usize> {
+        Ok(0)
+    }
+
+    /// Fit one ordered profile-native mean for every requested materialized
+    /// candidate.  The returned typed bit vector is in exactly `candidates`
+    /// order; it is a narrow arithmetic primitive, not a host-download or
+    /// Python fitting fallback.
+    fn fit_means(
+        &mut self,
+        _values: &MaterializedColumns,
+        _candidates: &[FeatureId],
+        _max_bytes: usize,
+    ) -> SemanticResult<FrozenMeans> {
+        Err(SemanticError::Unsupported(
+            "semantic executor does not support fitted centered interaction means",
+        ))
+    }
+
     /// Retain only accepted values, optionally merging a same-context retained
     /// bank.  Backends must validate frame, profile, schema and backend
     /// identity before allocating; `max_live_bytes` covers all old, source,
@@ -329,6 +358,8 @@ pub struct AcceptedFeature {
     policy: SelectionPolicy,
     channels: Vec<EvidenceChannel>,
     evidence: Vec<EvidenceRecord>,
+    training_bindings: Vec<Arc<TrainingBinding>>,
+    contextual_training: Arc<[super::evidence::TrainingLineage]>,
 }
 
 /// Caller-selected resource ceilings, not heuristic unlimited cache growth.
@@ -338,8 +369,9 @@ pub struct AcceptedFeature {
 pub struct SessionLimits {
     pub max_bytes: usize,
     pub max_retained_bytes: usize,
-    /// Structural candidate-row/edge units across dependencies and channels.
-    /// This is admission control, not actual kernel visits, FLOPs or elapsed time.
+    /// Structural candidate-row/edge units across dependencies and channels,
+    /// plus preflighted fitting-lineage metadata construction. This is
+    /// admission control, not actual kernel visits, FLOPs or elapsed time.
     pub max_work: usize,
     pub max_rounds: u64,
 }
@@ -388,6 +420,12 @@ const MAX_PROPOSAL_CANDIDATES: usize = 65_536;
 pub struct DiscoveryRound<'a> {
     registry: &'a mut CandidateRegistry,
     eligible: &'a mut BTreeSet<FeatureId>,
+    // Predicate leaves deliberately have a narrower operand authority than
+    // generic algebraic proposals: only raw sources and explicitly accepted
+    // prior-round programs are atoms. Newly proposed current-round algebraic
+    // nodes may compose through their own operators, but cannot silently turn
+    // into an unfitted decision threshold input.
+    predicate_atoms: &'a BTreeSet<FeatureId>,
 }
 
 impl DiscoveryRound<'_> {
@@ -396,6 +434,15 @@ impl DiscoveryRound<'_> {
         if !self.eligible.contains(&id) {
             return Err(SemanticError::Invalid(
                 "operand is not an eligible atom in this round",
+            ));
+        }
+        Ok(())
+    }
+    fn predicate_atom(&self, id: FeatureId) -> SemanticResult<()> {
+        self.registry.program(id)?;
+        if !self.predicate_atoms.contains(&id) {
+            return Err(SemanticError::Invalid(
+                "hard predicate input is not a raw or accepted atom in this round",
             ));
         }
         Ok(())
@@ -437,6 +484,47 @@ impl DiscoveryRound<'_> {
             self.operand(id)?;
         }
         let id = self.registry.centered_product_f64(operands, means)?;
+        self.eligible.insert(id);
+        Ok(id)
+    }
+
+    /// Declare one exact hard predicate over a raw source or explicitly
+    /// accepted/current-round atom in an f32-storage profile.
+    pub fn hard_predicate(
+        &mut self,
+        input: FeatureId,
+        comparison: PredicateComparator,
+        threshold: f32,
+    ) -> SemanticResult<FeatureId> {
+        self.predicate_atom(input)?;
+        let id = self.registry.hard_predicate(input, comparison, threshold)?;
+        self.eligible.insert(id);
+        Ok(id)
+    }
+
+    /// Declare one exact hard predicate over a raw source or explicitly
+    /// accepted/current-round atom in an fp64 profile.
+    pub fn hard_predicate_f64(
+        &mut self,
+        input: FeatureId,
+        comparison: PredicateComparator,
+        threshold: f64,
+    ) -> SemanticResult<FeatureId> {
+        self.predicate_atom(input)?;
+        let id = self
+            .registry
+            .hard_predicate_f64(input, comparison, threshold)?;
+        self.eligible.insert(id);
+        Ok(id)
+    }
+
+    /// Declare a canonical flattened hard-AND region from eligible hard
+    /// predicates and/or eligible previously accepted regions.
+    pub fn decision_region(&mut self, terms: Vec<FeatureId>) -> SemanticResult<FeatureId> {
+        for &term in &terms {
+            self.operand(term)?;
+        }
+        let id = self.registry.decision_region(terms)?;
         self.eligible.insert(id);
         Ok(id)
     }
@@ -528,6 +616,81 @@ impl DiscoveryRound<'_> {
             }
         }
     }
+
+    /// Internal half of a session-owned fitted interaction proposal.  The
+    /// session obtains profile-native means from the selected executor first;
+    /// this scope then performs only deterministic registry mutation and
+    /// eligibility admission.
+    fn propose_fitted_centered_interactions(
+        &mut self,
+        atoms: &[FeatureId],
+        arities: &[usize],
+        means: &FrozenMeans,
+        binding: Arc<TrainingBinding>,
+        max_candidates: usize,
+    ) -> SemanticResult<Vec<FeatureId>> {
+        if atoms.is_empty()
+            || arities.is_empty()
+            || means.len() != atoms.len()
+            || max_candidates == 0
+            || max_candidates > MAX_PROPOSAL_CANDIDATES
+        {
+            return Err(SemanticError::Invalid(
+                "invalid fitted centered interaction proposal",
+            ));
+        }
+        if atoms.windows(2).any(|pair| pair[0] >= pair[1])
+            || arities.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(SemanticError::Invalid(
+                "fitted interaction atoms and arities must be unique and ordered",
+            ));
+        }
+        for &atom in atoms {
+            self.operand(atom)?;
+        }
+        for &arity in arities {
+            if arity < 2 || arity > self.registry.limits().max_logical_arity {
+                return Err(SemanticError::Invalid(
+                    "fitted centered interaction arity is outside registry bounds",
+                ));
+            }
+        }
+
+        let checkpoint = self.registry.mutation_checkpoint();
+        let result: SemanticResult<Vec<FeatureId>> = (|| {
+            let mut proposed = Vec::new();
+            let mut seen = BTreeSet::new();
+            let mut indices = Vec::new();
+            for &arity in arities {
+                if emit_centered_combinations(
+                    self.registry,
+                    atoms,
+                    means,
+                    arity,
+                    0,
+                    &mut indices,
+                    max_candidates,
+                    &mut proposed,
+                    &mut seen,
+                )? {
+                    break;
+                }
+            }
+            self.registry.attach_training_binding(&proposed, binding)?;
+            Ok(proposed)
+        })();
+        match result {
+            Ok(proposed) => {
+                self.eligible.extend(proposed.iter().copied());
+                Ok(proposed)
+            }
+            Err(error) => {
+                self.registry.rollback_mutations(checkpoint);
+                Err(error)
+            }
+        }
+    }
 }
 
 fn push_proposal(
@@ -539,6 +702,69 @@ fn push_proposal(
     if proposed.len() < limit && seen.insert(candidate) {
         proposed.push(candidate);
     }
+}
+
+/// Enumerate lexicographic combinations without materializing the full
+/// combinatorial catalog.  The selected order is intentional: a bulk proposal
+/// emits one canonical operand order per atom set, while an explicit caller
+/// may still declare a different ordered centered product.
+#[allow(clippy::too_many_arguments)]
+fn emit_centered_combinations(
+    registry: &mut CandidateRegistry,
+    atoms: &[FeatureId],
+    means: &FrozenMeans,
+    arity: usize,
+    start: usize,
+    indices: &mut Vec<usize>,
+    limit: usize,
+    proposed: &mut Vec<FeatureId>,
+    seen: &mut BTreeSet<FeatureId>,
+) -> SemanticResult<bool> {
+    if proposed.len() == limit {
+        return Ok(true);
+    }
+    if indices.len() == arity {
+        let operands = indices.iter().map(|&index| atoms[index]).collect();
+        let frozen = match means {
+            FrozenMeans::F32(values) => {
+                FrozenMeans::F32(indices.iter().map(|&index| values[index]).collect())
+            }
+            FrozenMeans::F64(values) => {
+                FrozenMeans::F64(indices.iter().map(|&index| values[index]).collect())
+            }
+        };
+        let candidate = registry.centered_product_from_frozen(operands, frozen)?;
+        push_proposal(proposed, seen, candidate, limit);
+        return Ok(proposed.len() == limit);
+    }
+    let remaining = arity
+        .checked_sub(indices.len())
+        .ok_or(SemanticError::Invalid("fitted interaction arity underflow"))?;
+    let last_start = atoms
+        .len()
+        .checked_sub(remaining)
+        .ok_or(SemanticError::Invalid(
+            "fitted interaction arity exceeds atom count",
+        ))?;
+    for index in start..=last_start {
+        indices.push(index);
+        if emit_centered_combinations(
+            registry,
+            atoms,
+            means,
+            arity,
+            index + 1,
+            indices,
+            limit,
+            proposed,
+            seen,
+        )? {
+            indices.pop();
+            return Ok(true);
+        }
+        indices.pop();
+    }
+    Ok(false)
 }
 
 impl AcceptedFeature {
@@ -560,6 +786,20 @@ impl AcceptedFeature {
     pub fn evidence(&self) -> &[EvidenceRecord] {
         &self.evidence
     }
+    /// Immutable fitting lineage captured from the evaluated candidate when it
+    /// was accepted.  Future equal-state fits cannot mutate this record.
+    pub fn training_bindings(&self) -> &[Arc<TrainingBinding>] {
+        &self.training_bindings
+    }
+    /// Fitting origins of the evaluated program AND contextual reference
+    /// programs. These audit the complete evidence set, not just policy-used
+    /// channels, and never become fitted state of the accepted program itself.
+    pub fn evaluation_training_bindings(&self) -> Vec<Arc<TrainingBinding>> {
+        super::evidence::evaluation_training_bindings(
+            &self.training_bindings,
+            &self.contextual_training,
+        )
+    }
 }
 
 /// Bounded internal discovery lifecycle. One context of accepted values is
@@ -573,6 +813,7 @@ pub struct SemanticSession {
     limits: SessionLimits,
     round: u64,
     eligible: Option<BTreeSet<FeatureId>>,
+    predicate_atoms: Option<BTreeSet<FeatureId>>,
 }
 
 impl SemanticSession {
@@ -605,6 +846,7 @@ impl SemanticSession {
             limits,
             round: 0,
             eligible: None,
+            predicate_atoms: None,
         })
     }
     pub fn registry(&self) -> SemanticResult<&CandidateRegistry> {
@@ -615,7 +857,9 @@ impl SemanticSession {
         accepted: &[AcceptedFeature],
     ) -> SemanticResult<DiscoveryRound<'_>> {
         let registry = self.registry()?;
-        if self.round >= self.limits.max_rounds || accepted.len() > registry.limits().max_nodes {
+        // Bound declaration input independently of the unique accepted union:
+        // overlapping batches confer the same authority, not extra programs.
+        if self.round >= self.limits.max_rounds || accepted.len() > 65_536 {
             return Err(SemanticError::Invalid(
                 "discovery round resource limit exceeded",
             ));
@@ -631,11 +875,22 @@ impl SemanticSession {
             registry.program(a.feature)?;
             eligible.insert(a.feature);
         }
+        if eligible.len() > registry.limits().max_nodes {
+            return Err(SemanticError::Invalid(
+                "discovery round resource limit exceeded",
+            ));
+        }
+        let predicate_atoms = eligible.clone();
         self.round += 1;
         self.eligible = Some(eligible);
+        self.predicate_atoms = Some(predicate_atoms);
         Ok(DiscoveryRound {
             registry: self.registry.as_mut().ok_or(SemanticError::Closed)?,
             eligible: self.eligible.as_mut().expect("round initialized"),
+            predicate_atoms: self
+                .predicate_atoms
+                .as_ref()
+                .expect("predicate atoms initialized"),
         })
     }
 
@@ -646,7 +901,7 @@ impl SemanticSession {
         if self.registry.is_none() {
             return Err(SemanticError::Closed);
         }
-        if self.eligible.is_none() {
+        if self.eligible.is_none() || self.predicate_atoms.is_none() {
             return Err(SemanticError::Invalid(
                 "no active discovery round is available",
             ));
@@ -654,6 +909,10 @@ impl SemanticSession {
         Ok(DiscoveryRound {
             registry: self.registry.as_mut().expect("open registry checked"),
             eligible: self.eligible.as_mut().expect("active round checked"),
+            predicate_atoms: self
+                .predicate_atoms
+                .as_ref()
+                .expect("active predicate atoms checked"),
         })
     }
 
@@ -683,6 +942,19 @@ impl SemanticSession {
         }
         Ok(())
     }
+    fn declared_atom(&self, id: FeatureId) -> SemanticResult<()> {
+        self.registry()?.program(id)?;
+        if self
+            .predicate_atoms
+            .as_ref()
+            .is_none_or(|set| !set.contains(&id))
+        {
+            return Err(SemanticError::Invalid(
+                "fitted interaction atom is not a raw or accepted atom in this round",
+            ));
+        }
+        Ok(())
+    }
     fn switch_context(&mut self, frame: &FeatureFrame) {
         if self
             .cache
@@ -696,6 +968,7 @@ impl SemanticSession {
         self.cache = None;
         self.registry = None;
         self.eligible = None;
+        self.predicate_atoms = None;
     }
 
     fn validate_executor(&self, executor: &dyn NativeEvidenceExecutor) -> SemanticResult<()> {
@@ -706,6 +979,110 @@ impl SemanticSession {
             ));
         }
         Ok(())
+    }
+
+    /// Fit and declare a bounded bulk of ordered centered interactions from an
+    /// immutable discovery snapshot.  Means come from the selected native
+    /// executor through [`NativeEvidenceExecutor::fit_means`]; this method
+    /// never downloads a resident bank or substitutes Core/Python arithmetic.
+    pub fn propose_centered_interactions(
+        &mut self,
+        executor: &mut dyn NativeEvidenceExecutor,
+        training: &FeatureFrame,
+        atoms: &[FeatureId],
+        arities: &[usize],
+        max_candidates: usize,
+    ) -> SemanticResult<Vec<FeatureId>> {
+        self.validate_executor(executor)?;
+        let registry = self.registry()?;
+        if training.role() != super::EvaluationRole::Discovery
+            || training.schema() != registry.schema()
+            || training.profile() != registry.precision()
+            || atoms.is_empty()
+            || arities.is_empty()
+            || max_candidates == 0
+            || max_candidates > MAX_PROPOSAL_CANDIDATES
+        {
+            return Err(SemanticError::Invalid(
+                "fitted centered interactions require a bounded matching discovery frame",
+            ));
+        }
+        let atoms = atoms.iter().copied().collect::<BTreeSet<_>>();
+        let atoms = atoms.into_iter().collect::<Vec<_>>();
+        let arity_set = arities.iter().copied().collect::<BTreeSet<_>>();
+        if arity_set.len() != arities.len() {
+            return Err(SemanticError::Invalid(
+                "fitted centered interaction arities must be unique",
+            ));
+        }
+        let arities = arity_set.into_iter().collect::<Vec<_>>();
+        if arities.iter().any(|&arity| {
+            arity < 2 || arity > registry.limits().max_logical_arity || arity > atoms.len()
+        }) {
+            return Err(SemanticError::Invalid(
+                "fitted centered interaction arity is outside available atom bounds",
+            ));
+        }
+        for &atom in &atoms {
+            self.declared_atom(atom)?;
+        }
+        let work = dependency_work(registry, training.rows(), &atoms)?
+            .checked_add(
+                training
+                    .rows()
+                    .checked_mul(atoms.len())
+                    .ok_or(SemanticError::Invalid("semantic fitting work overflow"))?,
+            )
+            .and_then(|work| work.checked_add(max_candidates))
+            .ok_or(SemanticError::Invalid("semantic fitting work overflow"))?;
+        if work > self.limits.max_work {
+            return Err(SemanticError::Invalid(
+                "fitted centered interaction work limit exceeded",
+            ));
+        }
+
+        // Do not switch or evict the session cache while merely fitting a
+        // declaration batch.  A failed proposal must leave lifecycle state
+        // exactly as it was; same-frame retention remains reusable here.
+        let retained = self
+            .cache
+            .as_ref()
+            .filter(|cache| cache.frame_id() == training.id());
+        let budget = self
+            .limits
+            .max_bytes
+            .checked_sub(self.retained_bytes())
+            .ok_or(SemanticError::Invalid(
+                "retained semantic values exceed session budget",
+            ))?;
+        let materialized = executor.materialize(registry, training, &atoms, retained, budget)?;
+        validate_output(
+            registry,
+            training,
+            self.backend,
+            &atoms,
+            &materialized,
+            budget,
+        )?;
+        let fit_budget = budget
+            .checked_sub(materialized.bytes())
+            .ok_or(SemanticError::Invalid(
+                "semantic mean fitting exceeds session budget",
+            ))?;
+        let means = executor.fit_means(&materialized, &atoms, fit_budget)?;
+        validate_fitted_means(training.profile(), &means, atoms.len())?;
+        let binding = Arc::new(TrainingBinding::from_discovery_frame(
+            training.id(),
+            Arc::from(training.row_domain()),
+            Arc::from(training.provenance()),
+        ));
+        self.current_round()?.propose_fitted_centered_interactions(
+            &atoms,
+            &arities,
+            &means,
+            binding,
+            max_candidates,
+        )
     }
 
     pub fn evaluate(
@@ -781,6 +1158,19 @@ impl SemanticSession {
             } else {
                 frame.rows()
             };
+            // Missing labels deliberately produce explicit unavailable values
+            // without a native statistic request. Every other unique channel
+            // gives a selected backend one bounded admission opportunity
+            // before materialization or evidence dispatch.
+            if !matches!(definition.labels(), Some(None)) {
+                work = work
+                    .checked_add(executor.validate_evidence_admission(
+                        definition,
+                        candidates.len(),
+                        rows,
+                    )?)
+                    .ok_or(SemanticError::Invalid("semantic work count overflow"))?;
+            }
             work = work
                 .checked_add(
                     rows.checked_mul(candidates.len())
@@ -793,6 +1183,66 @@ impl SemanticSession {
                 "semantic evaluation work limit exceeded",
             ));
         }
+        // Provenance snapshots are not numeric banks and therefore are not
+        // covered by `max_bytes`. Preflight their structurally deduplicated
+        // expansion before allocating an EvidenceTable, charging both passes
+        // against the remaining session work ceiling.
+        let lineage_budget =
+            self.limits
+                .max_work
+                .checked_sub(work)
+                .ok_or(SemanticError::Invalid(
+                    "semantic fitting lineage metadata work limit exceeded",
+                ))?;
+        let lineage_snapshot = registry.snapshot_training_lineages(&roots, lineage_budget)?;
+        work = work
+            .checked_add(lineage_snapshot.metadata_work)
+            .ok_or(SemanticError::Invalid(
+                "semantic fitting lineage metadata work overflow",
+            ))?;
+        // Shared per-root arrays avoid candidate x reference lineage expansion.
+        // Acceptance retains the same immutable contextual snapshot, whereas
+        // later program construction consults only mathematical dependencies.
+        let handle_work = if lineage_snapshot.metadata_work == 0 {
+            0
+        } else {
+            roots.len().saturating_mul(2)
+        };
+        work = work.checked_add(handle_work).ok_or(SemanticError::Invalid(
+            "semantic fitting lineage metadata work overflow",
+        ))?;
+        if work > self.limits.max_work {
+            return Err(SemanticError::Invalid(
+                "semantic fitting lineage metadata work limit exceeded",
+            ));
+        }
+        // Empty lineages share one allocation. The ordinary unfitted path
+        // must not acquire a per-candidate heap object just for provenance.
+        let empty_lineage: super::evidence::TrainingLineage = Arc::from([]);
+        let lineages: Vec<super::evidence::TrainingLineage> = lineage_snapshot
+            .lineages
+            .into_iter()
+            .map(|lineage| {
+                if lineage.is_empty() {
+                    Arc::clone(&empty_lineage)
+                } else {
+                    Arc::from(lineage)
+                }
+            })
+            .collect();
+        let lineage_for = |id: &FeatureId| {
+            Arc::clone(&lineages[roots.binary_search(id).expect("validated evaluation root")])
+        };
+        let training_lineage = candidates.iter().map(lineage_for).collect();
+        let reference_ids: BTreeSet<_> = channels
+            .iter()
+            .filter_map(|channel| channel.definition().reference())
+            .collect();
+        let contextual_training = reference_ids
+            .iter()
+            .map(lineage_for)
+            .collect::<Vec<_>>()
+            .into();
         self.switch_context(&frame);
         let registry = self.registry()?;
         let retained = self.cache.as_ref().filter(|c| c.frame_id == frame.id());
@@ -869,6 +1319,8 @@ impl SemanticSession {
             candidates,
             channels: channels.to_vec(),
             records,
+            training_lineage,
+            contextual_training,
             materialized,
             backend: self.backend,
         })
@@ -969,7 +1421,7 @@ impl SemanticSession {
                 "cannot accept evidence from a previous discovery round",
             ));
         }
-        policy.select(table)
+        policy.select(table, self.limits.max_work)
     }
 
     fn finish_accept(
@@ -1003,6 +1455,8 @@ impl SemanticSession {
                 policy: policy.clone(),
                 channels: table.channels.clone(),
                 evidence: table.records[start..start + table.channels.len()].to_vec(),
+                training_bindings: table.training_bindings(feature)?.to_vec(),
+                contextual_training: Arc::clone(&table.contextual_training),
             });
         }
         self.cache = Some(retained);
@@ -1169,6 +1623,39 @@ fn validate_output(
     Ok(())
 }
 
+fn validate_fitted_means(
+    profile: PrecisionProfile,
+    means: &FrozenMeans,
+    expected: usize,
+) -> SemanticResult<()> {
+    if means.len() != expected {
+        return Err(SemanticError::Invalid(
+            "native mean fitting returned the wrong candidate count",
+        ));
+    }
+    match (profile, means) {
+        (PrecisionProfile::Fp32 | PrecisionProfile::Mixed, FrozenMeans::F32(bits))
+            if bits.iter().all(|bits| f32::from_bits(*bits).is_finite()) =>
+        {
+            Ok(())
+        }
+        (PrecisionProfile::Fp64, FrozenMeans::F64(bits))
+            if bits.iter().all(|bits| f64::from_bits(*bits).is_finite()) =>
+        {
+            Ok(())
+        }
+        (PrecisionProfile::Fp32 | PrecisionProfile::Mixed, FrozenMeans::F64(_)) => Err(
+            SemanticError::Invalid("native mean fitting returned f64 state for f32 storage"),
+        ),
+        (PrecisionProfile::Fp64, FrozenMeans::F32(_)) => Err(SemanticError::Invalid(
+            "native mean fitting returned f32 state for fp64 storage",
+        )),
+        _ => Err(SemanticError::Invalid(
+            "native mean fitting returned nonfinite frozen state",
+        )),
+    }
+}
+
 fn dependency_work(
     registry: &CandidateRegistry,
     rows: usize,
@@ -1188,8 +1675,9 @@ fn dependency_work(
         match program.op() {
             FeatureOp::Source(_) => {}
             FeatureOp::AbsoluteDifference(a, b) => pending.extend([*a, *b]),
-            FeatureOp::Softsign(a) => pending.push(*a),
+            FeatureOp::Softsign(a) | FeatureOp::HardPredicate { input: a, .. } => pending.push(*a),
             FeatureOp::CenteredProduct { operands, .. } => pending.extend(operands),
+            FeatureOp::DecisionRegion { terms } => pending.extend(terms),
         }
     }
     units
@@ -1200,7 +1688,9 @@ fn dependency_work(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic::{EvaluationRole, ProgramLimits};
+    use crate::semantic::{
+        AssociationContext, AssociationStatistic, EvaluationRole, ProgramLimits,
+    };
     use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CUDA};
 
     struct MustNotExecute;
@@ -1228,6 +1718,109 @@ mod tests {
         ) -> SemanticResult<Vec<EvidenceValue>> {
             panic!("unexpected evidence execution")
         }
+    }
+
+    struct ChargedAdmission;
+    impl NativeEvidenceExecutor for ChargedAdmission {
+        fn backend_kind(&self) -> u32 {
+            GAFIME_BACKEND_CPU
+        }
+        fn validate_evidence_admission(
+            &self,
+            _: &EvidenceDefinition,
+            _: usize,
+            _: usize,
+        ) -> SemanticResult<usize> {
+            Ok(60)
+        }
+        fn materialize(
+            &mut self,
+            _: &CandidateRegistry,
+            _: &FeatureFrame,
+            _: &[FeatureId],
+            _: Option<&MaterializedColumns>,
+            _: usize,
+        ) -> SemanticResult<MaterializedColumns> {
+            Err(SemanticError::Invalid("fixture reached materialization"))
+        }
+        fn evaluate_channel(
+            &mut self,
+            _: &EvidenceDefinition,
+            _: &[FeatureId],
+            _: &MaterializedColumns,
+            _: Option<&MaterializedColumns>,
+            _: usize,
+        ) -> SemanticResult<Vec<EvidenceValue>> {
+            panic!("admission fixture must not score")
+        }
+    }
+
+    #[test]
+    fn unique_backend_channel_costs_share_one_call_budget() {
+        let frame = Arc::new(
+            FeatureFrame::new(
+                vec!["a".into()],
+                "rows".into(),
+                vec![0, 1],
+                EvaluationRole::Discovery,
+                "work admission".into(),
+                vec![vec![0.0, 1.0]],
+            )
+            .unwrap(),
+        );
+        let registry = CandidateRegistry::new(
+            frame.schema().to_vec(),
+            PrecisionProfile::Mixed,
+            ProgramLimits::default(),
+        )
+        .unwrap();
+        let mut limits = SessionLimits::for_budget(1024);
+        limits.max_work = 100;
+        let mut session =
+            SemanticSession::with_limits(registry, GAFIME_BACKEND_CPU, limits).unwrap();
+        let source = session.begin_round(&[]).unwrap().source(0).unwrap();
+        let make = |name: &str, statistic| {
+            EvidenceChannel::new(
+                name.into(),
+                EvidenceDefinition::Association {
+                    statistic,
+                    context: AssociationContext::Reference { reference: source },
+                },
+            )
+            .unwrap()
+        };
+        let pearson = make("pearson", AssociationStatistic::Pearson);
+        let duplicate_work = make("another-name", AssociationStatistic::Pearson);
+        let spearman = make("spearman", AssociationStatistic::Spearman);
+        let error = session
+            .evaluate(
+                &mut ChargedAdmission,
+                Arc::clone(&frame),
+                &[source],
+                &[pearson.clone(), spearman],
+            )
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            SemanticError::Invalid("semantic evaluation work limit exceeded")
+        );
+        // Identical mathematics/context is charged once even when exposed under
+        // two channel names; the admitted call reaches the fixture boundary.
+        let error = session
+            .evaluate(
+                &mut ChargedAdmission,
+                frame,
+                &[source],
+                &[pearson, duplicate_work],
+            )
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            SemanticError::Invalid("fixture reached materialization")
+        );
+        assert_eq!(session.retained_bytes(), 0);
     }
 
     #[test]
@@ -1562,5 +2155,103 @@ mod tests {
             .download_materialization(&mut executor, &frame, &downloaded)
             .is_err());
         assert_eq!(executor.calls, 1);
+    }
+
+    #[test]
+    fn lineage_snapshot_admission_rejects_shared_descendants_before_native_execution() {
+        let frame = Arc::new(
+            FeatureFrame::new(
+                vec!["a".into(), "b".into()],
+                "training".into(),
+                vec![0, 1, 2, 3],
+                EvaluationRole::Discovery,
+                "lineage fixture".into(),
+                vec![vec![-2.0, -1.0, 1.0, 2.0], vec![-3.0, -1.0, 1.0, 3.0]],
+            )
+            .unwrap(),
+        );
+        let mut registry = CandidateRegistry::new(
+            frame.schema().to_vec(),
+            PrecisionProfile::Mixed,
+            ProgramLimits::default(),
+        )
+        .unwrap();
+        let a = registry.source(0).unwrap();
+        let b = registry.source(1).unwrap();
+        let fitted = registry
+            .centered_product(vec![a, b], vec![0.0, 0.0])
+            .unwrap();
+        // Model many independently fitted frames reaching this exact frozen
+        // state. The centered branches below are shared descendants, not eight
+        // independent origin ledgers.
+        for index in 0..16 {
+            registry
+                .attach_training_binding(
+                    &[fitted],
+                    Arc::new(TrainingBinding::from_discovery_frame(
+                        10_000 + index,
+                        Arc::from("training"),
+                        Arc::<str>::from(format!("same-state refit {index}")),
+                    )),
+                )
+                .unwrap();
+        }
+        let descendants = (0..8)
+            .map(|index| registry.centered_product(vec![fitted, a], vec![0.0, index as f32 - 4.0]))
+            .collect::<SemanticResult<Vec<_>>>()
+            .unwrap();
+
+        let mut limits = SessionLimits::for_budget(1 << 20);
+        // Numeric dependency/evidence work is 112 here; the remaining 18 is
+        // deliberately insufficient for the preflighted 8 x 16 lineage copy.
+        limits.max_work = 130;
+        let mut session =
+            SemanticSession::with_limits(registry, GAFIME_BACKEND_CPU, limits).unwrap();
+        let declared = {
+            let mut round = session.begin_round(&[]).unwrap();
+            let a = round.source(0).unwrap();
+            let b = round.source(1).unwrap();
+            let fitted = round.centered_product(vec![a, b], vec![0.0, 0.0]).unwrap();
+            (0..8)
+                .map(|index| round.centered_product(vec![fitted, a], vec![0.0, index as f32 - 4.0]))
+                .collect::<SemanticResult<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(declared, descendants);
+        let channel = EvidenceChannel::new(
+            "reference".into(),
+            EvidenceDefinition::Association {
+                statistic: AssociationStatistic::Pearson,
+                context: AssociationContext::Reference {
+                    reference: session.registry().unwrap().source(0).unwrap(),
+                },
+            },
+        )
+        .unwrap();
+
+        let error = match session.evaluate(
+            &mut MustNotExecute,
+            frame,
+            &declared,
+            std::slice::from_ref(&channel),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("lineage admission must reject before native materialization"),
+        };
+        assert_eq!(
+            error,
+            SemanticError::Invalid("semantic fitting lineage metadata work limit exceeded")
+        );
+        assert_eq!(session.retained_bytes(), 0);
+        assert_eq!(session.registry().unwrap().training_binding_count(), 16);
+        assert_eq!(
+            session
+                .registry()
+                .unwrap()
+                .training_lineage(declared[0])
+                .unwrap()
+                .len(),
+            16
+        );
     }
 }

@@ -19,8 +19,12 @@ extern "C" {
 #define GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR 1u
 /* Minor 2 makes program-descriptor forecast inputs exact for immutable,
  * batch-wide descriptor storage.  Minor 1's reusable maximum span cannot
- * bound the resident operand and mean arrays of this lowering. */
-#define GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR 2u
+ * bound the resident operand and mean arrays of this lowering.  Minor 3 adds
+ * generic pairwise association and its exact fixed-NMI capability envelope.
+ * It leaves the frozen matrix ABI untouched, but extends the program-node
+ * element stride; v1.2 semantic consumers must fail negotiation before they
+ * can interpret a v1.3 program array. */
+#define GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR 3u
 #define GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION \
     ((GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR << 16) | \
         GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR)
@@ -33,23 +37,36 @@ typedef enum GafimeSemanticProgramOp {
     GAFIME_SEMANTIC_PROGRAM_SOURCE = 1,
     GAFIME_SEMANTIC_PROGRAM_ABSOLUTE_DIFFERENCE = 2,
     GAFIME_SEMANTIC_PROGRAM_SOFTSIGN = 3,
-    GAFIME_SEMANTIC_PROGRAM_CENTERED_PRODUCT = 4
+    GAFIME_SEMANTIC_PROGRAM_CENTERED_PRODUCT = 4,
+    /* A closed hard-AND over frozen <=/> terms.  The terms remain typed
+       physical arithmetic; candidate identity and fitting provenance stay in
+       Rust. */
+    GAFIME_SEMANTIC_PROGRAM_FROZEN_REGION_CONJUNCTION = 5
 } GafimeSemanticProgramOp;
 
 #define GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOURCE 0x1u
 #define GAFIME_SEMANTIC_PROGRAM_OP_MASK_ABSOLUTE_DIFFERENCE 0x2u
 #define GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOFTSIGN 0x4u
 #define GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT 0x8u
+#define GAFIME_SEMANTIC_PROGRAM_OP_MASK_FROZEN_REGION_CONJUNCTION 0x10u
 
 typedef enum GafimeSemanticPrimitiveKind {
-    GAFIME_SEMANTIC_PRIMITIVE_PAIRWISE_PEARSON = 1,
+    GAFIME_SEMANTIC_PRIMITIVE_PAIRWISE_ASSOCIATION = 1,
+    /* Source-compatible spelling for the v1.2 Pearson-only lowering. */
+    GAFIME_SEMANTIC_PRIMITIVE_PAIRWISE_PEARSON =
+        GAFIME_SEMANTIC_PRIMITIVE_PAIRWISE_ASSOCIATION,
     GAFIME_SEMANTIC_PRIMITIVE_ORDERED_EDGE_ENERGY = 2,
-    GAFIME_SEMANTIC_PRIMITIVE_SPARSE_GATHER = 3
+    GAFIME_SEMANTIC_PRIMITIVE_SPARSE_GATHER = 3,
+    GAFIME_SEMANTIC_PRIMITIVE_COLUMN_MEANS = 4
 } GafimeSemanticPrimitiveKind;
 
-#define GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON 0x1u
+#define GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_ASSOCIATION 0x1u
+/* Source-compatible spelling for the same physical primitive bit. */
+#define GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON \
+    GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_ASSOCIATION
 #define GAFIME_SEMANTIC_PRIMITIVE_MASK_ORDERED_EDGE_ENERGY 0x2u
 #define GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER 0x4u
+#define GAFIME_SEMANTIC_PRIMITIVE_MASK_COLUMN_MEANS 0x8u
 
 /* Association statistics are negotiated independently from generic operand
  * primitives.  A GPU may expose Pearson arithmetic while explicitly declining
@@ -63,6 +80,36 @@ typedef enum GafimeSemanticPearsonMode {
     GAFIME_SEMANTIC_PEARSON_SIGNED = 1,
     GAFIME_SEMANTIC_PEARSON_ABSOLUTE = 2
 } GafimeSemanticPearsonMode;
+
+/* Association arithmetic is generic over resident physical slots.  Rust
+ * chooses the statistic/presentation from its already-declared evidence
+ * channel; native code neither receives nor owns evidence semantics. */
+typedef enum GafimeSemanticAssociationStatistic {
+    GAFIME_SEMANTIC_ASSOCIATION_PEARSON = 1,
+    GAFIME_SEMANTIC_ASSOCIATION_SPEARMAN = 2,
+    GAFIME_SEMANTIC_ASSOCIATION_FIXED_CORRECTED_NMI = 3
+} GafimeSemanticAssociationStatistic;
+
+typedef enum GafimeSemanticAssociationPresentation {
+    GAFIME_SEMANTIC_ASSOCIATION_SIGNED = 1,
+    GAFIME_SEMANTIC_ASSOCIATION_ABSOLUTE = 2,
+    GAFIME_SEMANTIC_ASSOCIATION_NONNEGATIVE = 3
+} GafimeSemanticAssociationPresentation;
+
+/* The bin mask is intentionally a capability bitset rather than an implicit
+ * integer range: backends may decline a costly static histogram specialization
+ * and callers fail closed for that exact requested bin count. */
+#define GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_2 0x001u
+#define GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_4 0x002u
+#define GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_8 0x004u
+#define GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_12 0x008u
+#define GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_16 0x010u
+#define GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_24 0x020u
+#define GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_32 0x040u
+#define GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_48 0x080u
+#define GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_64 0x100u
+#define GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_96 0x200u
+#define GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_MASK_ALL 0x3ffu
 
 /* Native result states describe arithmetic definedness only.  Rust maps these
  * to its evidence vocabulary and applies missingness policy. */
@@ -90,7 +137,17 @@ typedef struct GafimeSemanticCapabilities {
     uint32_t max_slot_count;
     uint64_t max_rows;
     uint64_t max_gather_rows;
+    /* v1.2 reserved prefix: it remains zero and its offsets never move. */
     uint64_t reserved[8];
+    /* v1.3 association/program tail.  Each statistic-specific limit is
+     * explicit rather than hiding nonlinear rank work or histogram-counter
+     * bounds behind generic `max_rows`. */
+    uint32_t fixed_corrected_nmi_bin_mask;
+    uint32_t max_region_terms;
+    uint64_t max_association_pairs;
+    uint64_t max_spearman_rows;
+    uint64_t max_fixed_corrected_nmi_rows;
+    uint64_t reserved_v3[5];
 } GafimeSemanticCapabilities;
 
 /* Columns are stored column-major in a typed resident bank.  `source_slots`
@@ -116,8 +173,34 @@ typedef struct GafimeSemanticProgramNode {
     uint32_t operand_count;
     uint32_t mean_offset;
     uint32_t mean_count;
+    /* v1.2 reserved prefix: it remains zero and its offsets never move. */
     uint64_t reserved[2];
+    /* v1.3 region-term range.  Only FROZEN_REGION_CONJUNCTION consumes it;
+     * every older operation requires both fields to be zero. */
+    uint32_t region_term_offset;
+    uint32_t region_term_count;
+    uint64_t reserved_v3[2];
 } GafimeSemanticProgramNode;
+
+typedef enum GafimeSemanticRegionRelation {
+    GAFIME_SEMANTIC_REGION_LESS_EQUAL = 1,
+    GAFIME_SEMANTIC_REGION_GREATER_THAN = 2
+} GafimeSemanticRegionRelation;
+
+/* Frozen threshold bits follow the program profile: f32 bits are zero-extended
+ * for fp32/mixed, f64 bits are raw for fp64.  Each term names only a physical
+ * initialized input slot; source versus accepted-atom eligibility is Rust
+ * policy and never crosses this boundary. */
+typedef struct GafimeSemanticFrozenRegionTerm {
+    uint32_t input_slot;
+    uint32_t relation;
+    uint64_t threshold_bits;
+} GafimeSemanticFrozenRegionTerm;
+
+typedef struct GafimeSemanticRegionTermSlice {
+    const GafimeSemanticFrozenRegionTerm* ptr;
+    uint64_t len;
+} GafimeSemanticRegionTermSlice;
 
 /* `operand_slots` and `mean_bits` are one contiguous program descriptor.
  * `mean_bits` contains f32 bit patterns zero-extended for fp32/mixed and raw
@@ -131,7 +214,11 @@ typedef struct GafimeSemanticProgramBatch {
     uint32_t reserved32;
     GafimeSliceU32 operand_slots;
     GafimeSliceU64 mean_bits;
+    /* v1.2 reserved prefix: it remains zero and its offsets never move. */
     uint64_t reserved[8];
+    /* v1.3 immutable region descriptor storage. */
+    GafimeSemanticRegionTermSlice region_terms;
+    uint64_t reserved_v3[6];
 } GafimeSemanticProgramBatch;
 
 /* Corresponding entries in left_slots and right_slots form one generic
@@ -147,6 +234,35 @@ typedef struct GafimeSemanticPearsonBatch {
     GafimeSliceU32 right_slots;
     uint64_t reserved[8];
 } GafimeSemanticPearsonBatch;
+
+/* Corresponding left/right slots form one association pair.  `presentation`
+ * is arithmetic post-processing only: Pearson and Spearman allow signed or
+ * absolute values; fixed corrected NMI requires nonnegative presentation.
+ * `fixed_nmi_bins` is zero for Pearson/Spearman and one advertised exact bin
+ * count for fixed corrected NMI. */
+typedef struct GafimeSemanticAssociationBatch {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t statistic;
+    uint32_t presentation;
+    uint32_t fixed_nmi_bins;
+    uint32_t flags;
+    GafimeSliceU32 left_slots;
+    GafimeSliceU32 right_slots;
+    uint64_t reserved[8];
+} GafimeSemanticAssociationBatch;
+
+/* One typed resident column per requested output.  A mean is defined for a
+ * finite constant column; only empty or nonfinite inputs are unavailable.
+ * Values/states/supports use the same route-typed scalar table as reductions. */
+typedef struct GafimeSemanticColumnMeanBatch {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t flags;
+    uint32_t reserved32;
+    GafimeSliceU32 candidate_slots;
+    uint64_t reserved[8];
+} GafimeSemanticColumnMeanBatch;
 
 typedef struct GafimeSemanticEdge {
     uint64_t left_row;
@@ -216,7 +332,12 @@ typedef struct GafimeSemanticForecastRequest {
        intentionally distinct: only centered products contribute means. */
     uint64_t program_operand_count;
     uint64_t program_mean_count;
+    /* v1.2 reserved prefix: it remains zero and its offsets never move. */
     uint64_t reserved[8];
+    /* v1.3 exact counts for independently allocated transient descriptors. */
+    uint64_t mean_slot_count;
+    uint64_t program_region_term_count;
+    uint64_t reserved_v3[6];
 } GafimeSemanticForecastRequest;
 
 typedef struct GafimeSemanticMemoryForecast {
@@ -228,7 +349,7 @@ typedef struct GafimeSemanticMemoryForecast {
     uint64_t reserved[8];
 } GafimeSemanticMemoryForecast;
 
-/* The following eleven symbols form one optional operation table.  A payload
+/* The following thirteen symbols form one optional operation table.  A payload
  * exporting any one must export all of them; consumers reject partial tables
  * and old payloads simply report semantic lowering unavailable. */
 GAFIME_GPU_API int gafime_gpu_semantic_capabilities_v1(
@@ -258,6 +379,21 @@ GAFIME_GPU_API int gafime_gpu_semantic_pairwise_pearson_v1(
     GafimeGpuSemanticBank left_bank,
     GafimeGpuSemanticBank right_bank,
     const GafimeSemanticPearsonBatch* batch,
+    GafimeSemanticScalarResultTable* results_out
+);
+
+/* v1.3 generic association entry.  The v1.2 Pearson entry above remains an
+ * adapter so existing direct consumers retain their exact descriptor/symbol. */
+GAFIME_GPU_API int gafime_gpu_semantic_pairwise_association_v1(
+    GafimeGpuSemanticBank left_bank,
+    GafimeGpuSemanticBank right_bank,
+    const GafimeSemanticAssociationBatch* batch,
+    GafimeSemanticScalarResultTable* results_out
+);
+
+GAFIME_GPU_API int gafime_gpu_semantic_column_means_v1(
+    GafimeGpuSemanticBank bank,
+    const GafimeSemanticColumnMeanBatch* batch,
     GafimeSemanticScalarResultTable* results_out
 );
 

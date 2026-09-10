@@ -1859,6 +1859,78 @@ __global__ void semantic_centered_product_kernel(
 }
 
 template <typename Storage>
+__global__ void semantic_frozen_region_conjunction_kernel(
+    Storage* columns,
+    uint64_t rows,
+    const GafimeSemanticFrozenRegionTerm* terms,
+    uint32_t term_count,
+    uint32_t output_slot
+) {
+    const uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    Storage membership = static_cast<Storage>(1);
+    for (uint32_t term_index = 0; term_index < term_count; ++term_index) {
+        const GafimeSemanticFrozenRegionTerm term = terms[term_index];
+        const Storage value = columns[static_cast<uint64_t>(term.input_slot) * rows + row];
+        if (!device_isfinite(value)) {
+            membership = device_nan<Storage>();
+            break;
+        }
+        const Storage threshold = semantic_mean_from_bits<Storage>(term.threshold_bits);
+        const bool matches = term.relation == GAFIME_SEMANTIC_REGION_LESS_EQUAL
+            ? value <= threshold
+            : value > threshold;
+        if (!matches) {
+            membership = static_cast<Storage>(0);
+            break;
+        }
+    }
+    columns[static_cast<uint64_t>(output_slot) * rows + row] = membership;
+}
+
+// Frozen fitting constants are candidate identity, so each requested column
+// reduces in one declared row order.  Parallelism is across independent
+// columns only; no block regrouping is permitted here.
+template <typename Storage, typename Accumulation, typename Result>
+__global__ void semantic_column_means_kernel(
+    const Storage* columns,
+    uint64_t rows,
+    const uint32_t* candidate_slots,
+    uint64_t candidate_count,
+    Result* values,
+    uint32_t* states,
+    uint64_t* supports
+) {
+    const uint64_t candidate = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (candidate >= candidate_count) return;
+    supports[candidate] = rows;
+    if (rows == 0) {
+        states[candidate] = GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT;
+        values[candidate] = static_cast<Result>(0);
+        return;
+    }
+    const Storage* column = columns + static_cast<uint64_t>(candidate_slots[candidate]) * rows;
+    Accumulation sum = static_cast<Accumulation>(0);
+    for (uint64_t row = 0; row < rows; ++row) {
+        const Storage value = column[row];
+        if (!device_isfinite(value)) {
+            states[candidate] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+            values[candidate] = static_cast<Result>(0);
+            return;
+        }
+        sum += static_cast<Accumulation>(value);
+    }
+    const Accumulation mean = sum / static_cast<Accumulation>(rows);
+    if (!device_isfinite(mean)) {
+        states[candidate] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+        values[candidate] = static_cast<Result>(0);
+        return;
+    }
+    states[candidate] = GAFIME_SEMANTIC_SCALAR_MEASURED;
+    values[candidate] = static_cast<Result>(mean);
+}
+
+template <typename Storage>
 __global__ void semantic_reject_nonfinite_output_kernel(
     const Storage* columns,
     uint64_t rows,
@@ -2008,6 +2080,332 @@ __global__ void semantic_pairwise_pearson_kernel(
         if (mode == GAFIME_SEMANTIC_PEARSON_ABSOLUTE) correlation = device_abs(correlation);
         states[pair] = GAFIME_SEMANTIC_SCALAR_MEASURED;
         values[pair] = correlation;
+    }
+}
+
+// The initial generic Spearman lowering deliberately reuses the existing
+// average-tie rank primitive.  Its O(rows^2) work is surfaced through the
+// semantic capability/session admission boundary; this kernel never treats a
+// rank result as a target-oriented score.
+template <typename Storage, typename Accumulation, typename Result>
+__global__ void semantic_pairwise_spearman_kernel(
+    const Storage* left_columns,
+    const Storage* right_columns,
+    uint64_t rows,
+    const uint32_t* left_slots,
+    const uint32_t* right_slots,
+    uint64_t pair_count,
+    uint32_t presentation,
+    Result* values,
+    uint32_t* states,
+    uint64_t* supports
+) {
+    const uint64_t pair = blockIdx.x;
+    if (pair >= pair_count) return;
+    const Storage* left = left_columns + static_cast<uint64_t>(left_slots[pair]) * rows;
+    const Storage* right = right_columns + static_cast<uint64_t>(right_slots[pair]) * rows;
+    __shared__ uint32_t nonfinite[kThreads];
+    __shared__ uint32_t left_changed[kThreads];
+    __shared__ uint32_t right_changed[kThreads];
+    __shared__ Accumulation sum_x[kThreads];
+    __shared__ Accumulation sum_y[kThreads];
+    __shared__ Accumulation sum_xx[kThreads];
+    __shared__ Accumulation sum_yy[kThreads];
+    __shared__ Accumulation sum_xy[kThreads];
+    __shared__ uint64_t counts[kThreads];
+    __shared__ uint32_t result_state;
+
+    const Storage left_first = rows == 0 ? static_cast<Storage>(0) : left[0];
+    const Storage right_first = rows == 0 ? static_cast<Storage>(0) : right[0];
+    uint32_t local_nonfinite = 0;
+    uint32_t local_left_changed = 0;
+    uint32_t local_right_changed = 0;
+    for (uint64_t row = threadIdx.x; row < rows; row += blockDim.x) {
+        const Storage left_value = left[row];
+        const Storage right_value = right[row];
+        local_nonfinite |= !device_isfinite(left_value) || !device_isfinite(right_value);
+        local_left_changed |= left_value != left_first;
+        local_right_changed |= right_value != right_first;
+    }
+    nonfinite[threadIdx.x] = local_nonfinite;
+    left_changed[threadIdx.x] = local_left_changed;
+    right_changed[threadIdx.x] = local_right_changed;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            nonfinite[threadIdx.x] |= nonfinite[threadIdx.x + stride];
+            left_changed[threadIdx.x] |= left_changed[threadIdx.x + stride];
+            right_changed[threadIdx.x] |= right_changed[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        supports[pair] = rows;
+        result_state = rows < 2 ? GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT :
+            nonfinite[0] != 0 ? GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION :
+            left_changed[0] == 0 || right_changed[0] == 0
+                ? GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND
+                : GAFIME_SEMANTIC_SCALAR_MEASURED;
+    }
+    __syncthreads();
+    if (result_state != GAFIME_SEMANTIC_SCALAR_MEASURED) {
+        if (threadIdx.x == 0) {
+            states[pair] = result_state;
+            values[pair] = static_cast<Result>(0);
+        }
+        return;
+    }
+
+    Accumulation local_sum_x = static_cast<Accumulation>(0);
+    Accumulation local_sum_y = static_cast<Accumulation>(0);
+    Accumulation local_sum_xx = static_cast<Accumulation>(0);
+    Accumulation local_sum_yy = static_cast<Accumulation>(0);
+    Accumulation local_sum_xy = static_cast<Accumulation>(0);
+    uint64_t local_count = 0;
+    for (uint64_t row = threadIdx.x; row < rows; row += blockDim.x) {
+        const Accumulation rank_x = static_cast<Accumulation>(rank_twice_for_value(
+            left[row], left, rows)) * static_cast<Accumulation>(0.5);
+        const Accumulation rank_y = static_cast<Accumulation>(rank_twice_for_value(
+            right[row], right, rows)) * static_cast<Accumulation>(0.5);
+        local_sum_x += rank_x;
+        local_sum_y += rank_y;
+        local_sum_xx += rank_x * rank_x;
+        local_sum_yy += rank_y * rank_y;
+        local_sum_xy += rank_x * rank_y;
+        ++local_count;
+    }
+    sum_x[threadIdx.x] = local_sum_x;
+    sum_y[threadIdx.x] = local_sum_y;
+    sum_xx[threadIdx.x] = local_sum_xx;
+    sum_yy[threadIdx.x] = local_sum_yy;
+    sum_xy[threadIdx.x] = local_sum_xy;
+    counts[threadIdx.x] = local_count;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sum_x[threadIdx.x] += sum_x[threadIdx.x + stride];
+            sum_y[threadIdx.x] += sum_y[threadIdx.x + stride];
+            sum_xx[threadIdx.x] += sum_xx[threadIdx.x + stride];
+            sum_yy[threadIdx.x] += sum_yy[threadIdx.x + stride];
+            sum_xy[threadIdx.x] += sum_xy[threadIdx.x + stride];
+            counts[threadIdx.x] += counts[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const Accumulation count = static_cast<Accumulation>(counts[0]);
+        const Accumulation covariance = count * sum_xy[0] - sum_x[0] * sum_y[0];
+        const Accumulation variance_x = count * sum_xx[0] - sum_x[0] * sum_x[0];
+        const Accumulation variance_y = count * sum_yy[0] - sum_y[0] * sum_y[0];
+        if (variance_x == static_cast<Accumulation>(0) ||
+            variance_y == static_cast<Accumulation>(0) ||
+            (device_isfinite(variance_x) && device_isfinite(variance_y) &&
+                device_isfinite(covariance) && variance_x > static_cast<Accumulation>(0) &&
+                variance_y > static_cast<Accumulation>(0) &&
+                variance_x * variance_y == static_cast<Accumulation>(0))) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_DEGENERATE_REDUCTION;
+            values[pair] = static_cast<Result>(0);
+            return;
+        }
+        Result correlation = finalize_correlation<Accumulation, Result>(
+            variance_x, variance_y, covariance);
+        if (!device_isfinite(correlation)) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+            values[pair] = static_cast<Result>(0);
+            return;
+        }
+        if (presentation == GAFIME_SEMANTIC_ASSOCIATION_ABSOLUTE) {
+            correlation = device_abs(correlation);
+        }
+        states[pair] = GAFIME_SEMANTIC_SCALAR_MEASURED;
+        values[pair] = correlation;
+    }
+}
+
+// This shares the device-side fixed-bin histogram mechanics with the existing
+// continuous MI route, but its operands are generic resident columns and its
+// result state remains arithmetic definedness rather than a target score.
+template <typename Storage, typename Accumulation, typename Result, uint32_t StaticBins>
+__global__ void semantic_fixed_corrected_nmi_kernel(
+    const Storage* left_columns,
+    const Storage* right_columns,
+    uint64_t rows,
+    const uint32_t* left_slots,
+    const uint32_t* right_slots,
+    uint64_t pair_count,
+    Result* values,
+    uint32_t* states,
+    uint64_t* supports
+) {
+    static_assert(StaticBins >= 2 && StaticBins <= kMaxMiBins);
+    const uint64_t pair = blockIdx.x;
+    if (pair >= pair_count) return;
+    const Storage* left = left_columns + static_cast<uint64_t>(left_slots[pair]) * rows;
+    const Storage* right = right_columns + static_cast<uint64_t>(right_slots[pair]) * rows;
+    __shared__ Storage minimum_x;
+    __shared__ Storage maximum_x;
+    __shared__ Storage minimum_y;
+    __shared__ Storage maximum_y;
+    __shared__ Storage warp_min_x[kMiWarpsPerBlock];
+    __shared__ Storage warp_max_x[kMiWarpsPerBlock];
+    __shared__ Storage warp_min_y[kMiWarpsPerBlock];
+    __shared__ Storage warp_max_y[kMiWarpsPerBlock];
+    __shared__ unsigned int warp_nonfinite[kMiWarpsPerBlock];
+    __shared__ unsigned int hist_x[StaticBins];
+    __shared__ unsigned int hist_y[StaticBins];
+    __shared__ unsigned int joint[StaticBins * StaticBins];
+    __shared__ uint32_t result_state;
+
+    Storage local_min_x = static_cast<Storage>(INFINITY);
+    Storage local_max_x = static_cast<Storage>(-INFINITY);
+    Storage local_min_y = static_cast<Storage>(INFINITY);
+    Storage local_max_y = static_cast<Storage>(-INFINITY);
+    unsigned int local_nonfinite = 0;
+    for (uint64_t row = threadIdx.x; row < rows; row += blockDim.x) {
+        const Storage x = left[row];
+        const Storage y = right[row];
+        if (!device_isfinite(x) || !device_isfinite(y)) {
+            local_nonfinite = 1;
+            continue;
+        }
+        if (x < local_min_x) local_min_x = x;
+        if (x > local_max_x) local_max_x = x;
+        if (y < local_min_y) local_min_y = y;
+        if (y > local_max_y) local_max_y = y;
+    }
+    local_min_x = warp_reduce_min(local_min_x);
+    local_max_x = warp_reduce_max(local_max_x);
+    local_min_y = warp_reduce_min(local_min_y);
+    local_max_y = warp_reduce_max(local_max_y);
+    local_nonfinite = warp_reduce_sum(local_nonfinite);
+    const uint32_t lane = threadIdx.x & (kCudaWarpSize - 1);
+    const uint32_t warp = threadIdx.x / kCudaWarpSize;
+    const uint32_t warp_count_total = (blockDim.x + kCudaWarpSize - 1) / kCudaWarpSize;
+    if (lane == 0) {
+        warp_min_x[warp] = local_min_x;
+        warp_max_x[warp] = local_max_x;
+        warp_min_y[warp] = local_min_y;
+        warp_max_y[warp] = local_max_y;
+        warp_nonfinite[warp] = local_nonfinite;
+    }
+    __syncthreads();
+
+    Storage block_min_x = static_cast<Storage>(INFINITY);
+    Storage block_max_x = static_cast<Storage>(-INFINITY);
+    Storage block_min_y = static_cast<Storage>(INFINITY);
+    Storage block_max_y = static_cast<Storage>(-INFINITY);
+    unsigned int block_nonfinite = 0;
+    if (threadIdx.x < warp_count_total) {
+        block_min_x = warp_min_x[threadIdx.x];
+        block_max_x = warp_max_x[threadIdx.x];
+        block_min_y = warp_min_y[threadIdx.x];
+        block_max_y = warp_max_y[threadIdx.x];
+        block_nonfinite = warp_nonfinite[threadIdx.x];
+    }
+    if (warp == 0) {
+        block_min_x = warp_reduce_min(block_min_x);
+        block_max_x = warp_reduce_max(block_max_x);
+        block_min_y = warp_reduce_min(block_min_y);
+        block_max_y = warp_reduce_max(block_max_y);
+        block_nonfinite = warp_reduce_sum(block_nonfinite);
+        if (lane == 0) {
+            minimum_x = block_min_x;
+            maximum_x = block_max_x;
+            minimum_y = block_min_y;
+            maximum_y = block_max_y;
+            supports[pair] = rows;
+            const Storage span_x = maximum_x - minimum_x;
+            const Storage span_y = maximum_y - minimum_y;
+            const uint64_t minimum_support = static_cast<uint64_t>(StaticBins) *
+                static_cast<uint64_t>(StaticBins) * 8u;
+            result_state = rows < 2 ? GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT :
+                block_nonfinite != 0 ? GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION :
+                !device_isfinite(span_x) || !device_isfinite(span_y)
+                    ? GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION
+                    : span_x <= static_cast<Storage>(0) || span_y <= static_cast<Storage>(0)
+                        ? GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND
+                        : rows < minimum_support
+                            ? GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT
+                            : GAFIME_SEMANTIC_SCALAR_MEASURED;
+        }
+    }
+    __syncthreads();
+    if (result_state != GAFIME_SEMANTIC_SCALAR_MEASURED) {
+        if (threadIdx.x == 0) {
+            states[pair] = result_state;
+            values[pair] = static_cast<Result>(0);
+        }
+        return;
+    }
+    for (uint32_t index = threadIdx.x; index < StaticBins; index += blockDim.x) {
+        hist_x[index] = 0;
+        hist_y[index] = 0;
+    }
+    for (uint32_t index = threadIdx.x; index < StaticBins * StaticBins; index += blockDim.x) {
+        joint[index] = 0;
+    }
+    __syncthreads();
+    const Storage inverse_x = static_cast<Storage>(StaticBins) / (maximum_x - minimum_x);
+    const Storage inverse_y = static_cast<Storage>(StaticBins) / (maximum_y - minimum_y);
+    if (!device_isfinite(inverse_x) || !device_isfinite(inverse_y)) {
+        if (threadIdx.x == 0) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+            values[pair] = static_cast<Result>(0);
+        }
+        return;
+    }
+    for (uint64_t row = threadIdx.x; row < rows; row += blockDim.x) {
+        const uint32_t x_bin = fixed_mi_bin(left[row], minimum_x, inverse_x, StaticBins);
+        const uint32_t y_bin = fixed_mi_bin(right[row], minimum_y, inverse_y, StaticBins);
+        atomicAdd(&hist_x[x_bin], 1u);
+        atomicAdd(&hist_y[y_bin], 1u);
+        atomicAdd(&joint[x_bin * StaticBins + y_bin], 1u);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        uint32_t active_x = 0;
+        uint32_t active_y = 0;
+        for (uint32_t bin = 0; bin < StaticBins; ++bin) {
+            active_x += hist_x[bin] != 0;
+            active_y += hist_y[bin] != 0;
+        }
+        if (active_x < 2 || active_y < 2) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_DEGENERATE_REDUCTION;
+            values[pair] = static_cast<Result>(0);
+            return;
+        }
+        const Accumulation total = static_cast<Accumulation>(rows);
+        Accumulation mutual_information = static_cast<Accumulation>(0);
+        for (uint32_t x_bin = 0; x_bin < StaticBins; ++x_bin) {
+            for (uint32_t y_bin = 0; y_bin < StaticBins; ++y_bin) {
+                const unsigned int count = joint[x_bin * StaticBins + y_bin];
+                if (count == 0) continue;
+                const Accumulation pxy = static_cast<Accumulation>(count) / total;
+                const Accumulation px = static_cast<Accumulation>(hist_x[x_bin]) / total;
+                const Accumulation py = static_cast<Accumulation>(hist_y[y_bin]) / total;
+                mutual_information += pxy * device_log(pxy / (px * py));
+            }
+        }
+        const Accumulation correction =
+            (static_cast<Accumulation>(active_x - 1) * static_cast<Accumulation>(active_y - 1)) /
+            (static_cast<Accumulation>(2) * total);
+        const Accumulation corrected = mutual_information > correction
+            ? mutual_information - correction
+            : static_cast<Accumulation>(0);
+        const uint32_t normalizer_bins = active_x < active_y ? active_x : active_y;
+        const Accumulation normalizer = normalizer_bins > 1
+            ? device_log(static_cast<Accumulation>(normalizer_bins))
+            : static_cast<Accumulation>(0);
+        const Result result = normalizer > static_cast<Accumulation>(0)
+            ? static_cast<Result>(corrected / normalizer)
+            : static_cast<Result>(0);
+        if (!device_isfinite(result)) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+            values[pair] = static_cast<Result>(0);
+        } else {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_MEASURED;
+            values[pair] = result;
+        }
     }
 }
 
@@ -2167,6 +2565,127 @@ cudaError_t launch_semantic_pairwise_pearson_erased(
 }
 
 template <GafimePrecisionProfile Profile>
+cudaError_t launch_semantic_frozen_region_conjunction_erased(
+    void* columns, uint64_t rows, const GafimeSemanticFrozenRegionTerm* terms,
+    uint32_t term_count, uint32_t output_slot, const CudaKernelLaunchPolicy& policy,
+    cudaStream_t stream
+) {
+    const uint32_t blocks = semantic_grid_blocks(rows, policy);
+    if (rows != 0 && blocks == 0) return cudaErrorInvalidConfiguration;
+    if (blocks == 0) return cudaSuccess;
+    semantic_frozen_region_conjunction_kernel<StorageFor<Profile>><<<
+        blocks, policy.threads_per_block, 0, stream>>>(
+        static_cast<StorageFor<Profile>*>(columns), rows, terms, term_count, output_slot);
+    return cudaGetLastError();
+}
+
+template <GafimePrecisionProfile Profile>
+cudaError_t launch_semantic_column_means_erased(
+    const void* columns, uint64_t rows, const uint32_t* candidate_slots, uint64_t candidate_count,
+    void* values, uint32_t* states, uint64_t* supports, const CudaKernelLaunchPolicy& policy,
+    cudaStream_t stream
+) {
+    const uint32_t blocks = semantic_grid_blocks(candidate_count, policy);
+    if (candidate_count != 0 && blocks == 0) return cudaErrorInvalidConfiguration;
+    if (blocks == 0) return cudaSuccess;
+    semantic_column_means_kernel<StorageFor<Profile>, AccumulationFor<Profile>, ResultFor<Profile>><<<
+        blocks, policy.threads_per_block, 0, stream>>>(
+        static_cast<const StorageFor<Profile>*>(columns), rows, candidate_slots, candidate_count,
+        static_cast<ResultFor<Profile>*>(values), states, supports);
+    return cudaGetLastError();
+}
+
+template <GafimePrecisionProfile Profile>
+cudaError_t launch_semantic_pairwise_spearman_erased(
+    const void* left_columns, const void* right_columns, uint64_t rows, const uint32_t* left_slots,
+    const uint32_t* right_slots, uint64_t pair_count, uint32_t presentation, void* values,
+    uint32_t* states, uint64_t* supports, const CudaKernelLaunchPolicy& policy, cudaStream_t stream
+) {
+    if (pair_count == 0) return cudaSuccess;
+    if (pair_count > static_cast<uint64_t>(UINT32_MAX)) return cudaErrorInvalidConfiguration;
+    semantic_pairwise_spearman_kernel<StorageFor<Profile>, AccumulationFor<Profile>, ResultFor<Profile>><<<
+        static_cast<uint32_t>(pair_count), policy.threads_per_block, 0, stream>>>(
+        static_cast<const StorageFor<Profile>*>(left_columns),
+        static_cast<const StorageFor<Profile>*>(right_columns), rows, left_slots, right_slots,
+        pair_count, presentation, static_cast<ResultFor<Profile>*>(values), states, supports);
+    return cudaGetLastError();
+}
+
+template <GafimePrecisionProfile Profile, uint32_t StaticBins>
+cudaError_t launch_semantic_fixed_corrected_nmi_static(
+    const void* left_columns, const void* right_columns, uint64_t rows, const uint32_t* left_slots,
+    const uint32_t* right_slots, uint64_t pair_count, void* values, uint32_t* states,
+    uint64_t* supports, cudaStream_t stream
+) {
+    if (pair_count == 0) return cudaSuccess;
+    if (pair_count > static_cast<uint64_t>(UINT32_MAX)) return cudaErrorInvalidConfiguration;
+    semantic_fixed_corrected_nmi_kernel<
+        StorageFor<Profile>, AccumulationFor<Profile>, ResultFor<Profile>, StaticBins><<<
+        static_cast<uint32_t>(pair_count), gafime_cuda_v1::kMiThreadsPerBlock, 0, stream>>>(
+        static_cast<const StorageFor<Profile>*>(left_columns),
+        static_cast<const StorageFor<Profile>*>(right_columns), rows, left_slots, right_slots,
+        pair_count, static_cast<ResultFor<Profile>*>(values), states, supports);
+    return cudaGetLastError();
+}
+
+template <GafimePrecisionProfile Profile>
+cudaError_t launch_semantic_pairwise_association_erased(
+    const void* left_columns, const void* right_columns, uint64_t rows, const uint32_t* left_slots,
+    const uint32_t* right_slots, uint64_t pair_count, uint32_t statistic, uint32_t presentation,
+    uint32_t fixed_nmi_bins, void* values, uint32_t* states, uint64_t* supports,
+    const CudaKernelLaunchPolicy& policy, cudaStream_t stream
+) {
+    switch (statistic) {
+    case GAFIME_SEMANTIC_ASSOCIATION_PEARSON:
+        return launch_semantic_pairwise_pearson_erased<Profile>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count,
+            presentation == GAFIME_SEMANTIC_ASSOCIATION_ABSOLUTE
+                ? GAFIME_SEMANTIC_PEARSON_ABSOLUTE
+                : GAFIME_SEMANTIC_PEARSON_SIGNED,
+            values, states, supports, policy, stream);
+    case GAFIME_SEMANTIC_ASSOCIATION_SPEARMAN:
+        return launch_semantic_pairwise_spearman_erased<Profile>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, presentation,
+            values, states, supports, policy, stream);
+    case GAFIME_SEMANTIC_ASSOCIATION_FIXED_CORRECTED_NMI:
+        switch (fixed_nmi_bins) {
+        case 2: return launch_semantic_fixed_corrected_nmi_static<Profile, 2>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 4: return launch_semantic_fixed_corrected_nmi_static<Profile, 4>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 8: return launch_semantic_fixed_corrected_nmi_static<Profile, 8>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 12: return launch_semantic_fixed_corrected_nmi_static<Profile, 12>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 16: return launch_semantic_fixed_corrected_nmi_static<Profile, 16>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 24: return launch_semantic_fixed_corrected_nmi_static<Profile, 24>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 32: return launch_semantic_fixed_corrected_nmi_static<Profile, 32>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 48: return launch_semantic_fixed_corrected_nmi_static<Profile, 48>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 64: return launch_semantic_fixed_corrected_nmi_static<Profile, 64>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        case 96: return launch_semantic_fixed_corrected_nmi_static<Profile, 96>(
+            left_columns, right_columns, rows, left_slots, right_slots, pair_count, values, states,
+            supports, stream);
+        default: return cudaErrorInvalidValue;
+        }
+    default: return cudaErrorInvalidValue;
+    }
+}
+
+template <GafimePrecisionProfile Profile>
 cudaError_t launch_semantic_ordered_edge_energy_erased(
     const void* columns, uint64_t rows, const uint32_t* candidate_slots, uint64_t candidate_count,
     const GafimeSemanticEdge* edges, const void* weights, uint64_t edge_count, void* values,
@@ -2215,6 +2734,9 @@ CudaSemanticKernelSet make_semantic_kernel_set() {
     set.centered_product = &launch_semantic_centered_product_erased<Profile>;
     set.reject_nonfinite_output = &launch_semantic_reject_nonfinite_output_erased<Profile>;
     set.pairwise_pearson = &launch_semantic_pairwise_pearson_erased<Profile>;
+    set.pairwise_association = &launch_semantic_pairwise_association_erased<Profile>;
+    set.column_means = &launch_semantic_column_means_erased<Profile>;
+    set.frozen_region_conjunction = &launch_semantic_frozen_region_conjunction_erased<Profile>;
     set.ordered_edge_energy = &launch_semantic_ordered_edge_energy_erased<Profile>;
     set.sparse_gather = &launch_semantic_sparse_gather_erased<Profile>;
     return set;

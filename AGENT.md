@@ -180,9 +180,13 @@ The optional typed arithmetic boundary in `docs/semantic-primitives-abi.md`
 may carry physical slots and bounded resource requests, never candidate IDs,
 evidence policy or acceptance authority. It preserves the frozen standard ABI
 tables. Native banks use immutable initialized slots; accepted reuse is lowered
-to retention/gather, not a second native semantic catalog. CUDA/ROCm support is
-operation-specific; unsupported Metal/statistic requests fail closed, and
-semantic `auto` selects Core's complete vocabulary without claiming GPU work.
+to retention/gather, not a second native semantic catalog. CUDA/ROCm/Metal
+support is operation-specific; unsupported profile/statistic/resource requests
+fail closed. Metal remains fp32 only. Semantic `auto` preserves its conservative
+Core policy without claiming GPU work. `docs/v1.1-tabular-discovery.md` defines
+the deeper bounded model: fitted-state provenance is separate from mathematical
+identity; hard regions, multi-objective selection and training-bound proposals
+remain Rust-owned. A future RT lowering must not change those semantics.
 
 Candidate stabilization branches use `release/v<canonical-semver>` and may be
 cut only from an exact `main` commit whose required checks are green. Creating

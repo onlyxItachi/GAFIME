@@ -9,9 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use gafime_orchestrator::semantic::{
     AssociationContext, AssociationStatistic, CandidateRegistry, EvidenceDefinition, EvidenceValue,
-    FeatureFrame, FeatureId, FeatureOp, FrozenMeans, LabelSet, MaterializedColumns,
-    NativeEvidenceExecutor, NeighborGraph, NumericColumn, SemanticError, SemanticResult,
-    UnavailableReason,
+    FeatureFrame, FeatureId, FeatureOp, FrozenMeans, FrozenThreshold, LabelSet,
+    MaterializedColumns, NativeEvidenceExecutor, NeighborGraph, NumericColumn, PredicateComparator,
+    SemanticError, SemanticResult, UnavailableReason,
 };
 use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CPU};
 use rayon::prelude::*;
@@ -34,6 +34,8 @@ pub struct CoreEvidenceExecutor {
     output_allocations: usize,
     output_bytes: usize,
     evidence_kernel_calls: usize,
+    fitted_mean_columns: usize,
+    fitted_mean_rows: usize,
 }
 
 impl CoreEvidenceExecutor {
@@ -74,6 +76,18 @@ impl CoreEvidenceExecutor {
     /// counted as a kernel call.
     pub fn evidence_kernel_calls(&self) -> usize {
         self.evidence_kernel_calls
+    }
+
+    /// Completed profile-native frozen-mean reductions, counted once per
+    /// requested materialized atom after the whole batch succeeds.
+    pub fn fitted_mean_columns(&self) -> usize {
+        self.fitted_mean_columns
+    }
+
+    /// Row visits in completed ordered frozen-mean reductions. This is work
+    /// accounting, not a timing or throughput measurement.
+    pub fn fitted_mean_rows(&self) -> usize {
+        self.fitted_mean_rows
     }
 }
 
@@ -128,8 +142,11 @@ impl NativeEvidenceExecutor for CoreEvidenceExecutor {
             match program.op() {
                 FeatureOp::Source(_) => {}
                 FeatureOp::AbsoluteDifference(left, right) => pending.extend([*left, *right]),
-                FeatureOp::Softsign(input) => pending.push(*input),
+                FeatureOp::Softsign(input) | FeatureOp::HardPredicate { input, .. } => {
+                    pending.push(*input)
+                }
                 FeatureOp::CenteredProduct { operands, .. } => pending.extend(operands),
+                FeatureOp::DecisionRegion { terms } => pending.extend(terms),
             }
         }
 
@@ -179,6 +196,64 @@ impl NativeEvidenceExecutor for CoreEvidenceExecutor {
             requested.insert(id, values.shared_clone());
         }
         MaterializedColumns::from_columns(registry, frame, requested)
+    }
+
+    fn fit_means(
+        &mut self,
+        values: &MaterializedColumns,
+        candidates: &[FeatureId],
+        max_bytes: usize,
+    ) -> SemanticResult<FrozenMeans> {
+        validate_budget(max_bytes)?;
+        if values.backend_kind() != GAFIME_BACKEND_CPU {
+            return Err(SemanticError::Invalid(
+                "Core semantic mean fitting requires Core-host materialization",
+            ));
+        }
+        validate_bank_profile(values, candidates)?;
+        let result_bytes = checked_bytes(candidates.len(), 1, element_bytes(values.profile()))?;
+        if result_bytes > max_bytes {
+            return Err(SemanticError::Invalid(
+                "frozen semantic means exceed execution budget",
+            ));
+        }
+
+        // Frozen mean bits become part of centered-product identity.  Each
+        // column therefore has one declared row-order reduction; Rayon only
+        // distributes independent columns and never regroups a reduction.
+        let rows = candidates
+            .first()
+            .map(|&candidate| values.get_typed(candidate).map(NumericColumn::len))
+            .transpose()?
+            .unwrap_or(0);
+        let means = match values.profile() {
+            PrecisionProfile::Fp32 => {
+                let bits: SemanticResult<Vec<u32>> = candidates
+                    .par_iter()
+                    .map(|&candidate| ordered_mean_f32(values.get_typed(candidate)?))
+                    .collect();
+                FrozenMeans::F32(bits?)
+            }
+            PrecisionProfile::Mixed => {
+                let bits: SemanticResult<Vec<u32>> = candidates
+                    .par_iter()
+                    .map(|&candidate| ordered_mean_mixed(values.get_typed(candidate)?))
+                    .collect();
+                FrozenMeans::F32(bits?)
+            }
+            PrecisionProfile::Fp64 => {
+                let bits: SemanticResult<Vec<u64>> = candidates
+                    .par_iter()
+                    .map(|&candidate| ordered_mean_f64(values.get_typed(candidate)?))
+                    .collect();
+                FrozenMeans::F64(bits?)
+            }
+        };
+        self.fitted_mean_columns = self.fitted_mean_columns.saturating_add(candidates.len());
+        self.fitted_mean_rows = self
+            .fitted_mean_rows
+            .saturating_add(candidates.len().saturating_mul(rows));
+        Ok(means)
     }
 
     fn evaluate_channel(
@@ -384,6 +459,24 @@ fn materialize_node(
             centered_product(frame.profile(), operands, mean_bits, bank, frame.rows())?,
             false,
         ),
+        FeatureOp::HardPredicate {
+            input,
+            comparison,
+            threshold_bits,
+        } => (
+            hard_predicate(
+                frame.profile(),
+                operand(bank, *input)?,
+                *comparison,
+                threshold_bits,
+                frame.rows(),
+            )?,
+            false,
+        ),
+        FeatureOp::DecisionRegion { terms } => (
+            decision_region(frame.profile(), terms, bank, frame.rows())?,
+            false,
+        ),
     };
     if values.len() != frame.rows() || !values.finite() || !values.supports_profile(frame.profile())
     {
@@ -396,6 +489,242 @@ fn materialize_node(
         values,
         source_shared,
     })
+}
+
+/// Serial f32 row-order mean used as frozen candidate state.  This is kept
+/// separate from evidence reductions because changing its association or
+/// block-reduction order would silently manufacture another program identity.
+fn ordered_mean_f32(values: &NumericColumn) -> SemanticResult<u32> {
+    let values = values.as_f32()?;
+    if values.is_empty() {
+        return Err(SemanticError::Invalid(
+            "fitted semantic means require at least one row",
+        ));
+    }
+    let mut sum = 0.0f32;
+    for &value in values {
+        sum += value;
+    }
+    let mean = sum / values.len() as f32;
+    if !mean.is_finite() {
+        return Err(SemanticError::Invalid(
+            "ordered f32 semantic mean is nonfinite",
+        ));
+    }
+    Ok(mean.to_bits())
+}
+
+/// Mixed profile preserves f32 storage but freezes a row-order f64 accumulator
+/// cast back to f32, matching its declared arithmetic lane exactly.
+fn ordered_mean_mixed(values: &NumericColumn) -> SemanticResult<u32> {
+    let values = values.as_f32()?;
+    if values.is_empty() {
+        return Err(SemanticError::Invalid(
+            "fitted semantic means require at least one row",
+        ));
+    }
+    let mut sum = 0.0f64;
+    for &value in values {
+        sum += f64::from(value);
+    }
+    let mean = sum / values.len() as f64;
+    let frozen = mean as f32;
+    if !mean.is_finite() || !frozen.is_finite() {
+        return Err(SemanticError::Invalid(
+            "ordered mixed semantic mean is nonfinite",
+        ));
+    }
+    Ok(frozen.to_bits())
+}
+
+fn ordered_mean_f64(values: &NumericColumn) -> SemanticResult<u64> {
+    let values = values.as_f64()?;
+    if values.is_empty() {
+        return Err(SemanticError::Invalid(
+            "fitted semantic means require at least one row",
+        ));
+    }
+    let mut sum = 0.0f64;
+    for &value in values {
+        sum += value;
+    }
+    let mean = sum / values.len() as f64;
+    if !mean.is_finite() {
+        return Err(SemanticError::Invalid(
+            "ordered f64 semantic mean is nonfinite",
+        ));
+    }
+    Ok(mean.to_bits())
+}
+
+fn hard_predicate(
+    profile: PrecisionProfile,
+    input: &NumericColumn,
+    comparison: PredicateComparator,
+    threshold_bits: &FrozenThreshold,
+    rows: usize,
+) -> SemanticResult<NumericColumn> {
+    match profile {
+        PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+            let input = input.as_f32()?;
+            if input.len() != rows {
+                return Err(SemanticError::Invalid("unaligned pointwise operand"));
+            }
+            let threshold = f32::from_bits(threshold_bits.as_f32_bits()?);
+            if !threshold.is_finite() {
+                return Err(SemanticError::Invalid(
+                    "hard predicate frozen threshold is nonfinite",
+                ));
+            }
+            Ok(NumericColumn::from(
+                input
+                    .iter()
+                    .map(|&value| predicate_value_f32(value, comparison, threshold))
+                    .collect::<Vec<f32>>(),
+            ))
+        }
+        PrecisionProfile::Fp64 => {
+            let input = input.as_f64()?;
+            if input.len() != rows {
+                return Err(SemanticError::Invalid("unaligned pointwise operand"));
+            }
+            let threshold = f64::from_bits(threshold_bits.as_f64_bits()?);
+            if !threshold.is_finite() {
+                return Err(SemanticError::Invalid(
+                    "hard predicate frozen threshold is nonfinite",
+                ));
+            }
+            Ok(NumericColumn::from(
+                input
+                    .iter()
+                    .map(|&value| predicate_value_f64(value, comparison, threshold))
+                    .collect::<Vec<f64>>(),
+            ))
+        }
+    }
+}
+
+fn predicate_value_f32(value: f32, comparison: PredicateComparator, threshold: f32) -> f32 {
+    if value.is_nan() {
+        return f32::NAN;
+    }
+    let matched = match comparison {
+        PredicateComparator::LessEqual => value <= threshold,
+        PredicateComparator::GreaterThan => value > threshold,
+    };
+    if matched {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn predicate_value_f64(value: f64, comparison: PredicateComparator, threshold: f64) -> f64 {
+    if value.is_nan() {
+        return f64::NAN;
+    }
+    let matched = match comparison {
+        PredicateComparator::LessEqual => value <= threshold,
+        PredicateComparator::GreaterThan => value > threshold,
+    };
+    if matched {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// Flattened conjunction semantics: a false predicate wins over a NaN from a
+/// different predicate; otherwise an unresolved predicate yields NaN.  Normal
+/// validated frames are finite, but keeping this definition exact makes native
+/// lowering stable if a future input policy admits missing values.
+fn decision_region(
+    profile: PrecisionProfile,
+    terms: &[FeatureId],
+    bank: &BTreeMap<FeatureId, NumericColumn>,
+    rows: usize,
+) -> SemanticResult<NumericColumn> {
+    if terms.is_empty() {
+        return Err(SemanticError::Invalid(
+            "decision region requires at least one predicate term",
+        ));
+    }
+    match profile {
+        PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+            let inputs = terms
+                .iter()
+                .map(|&term| {
+                    let values = operand(bank, term)?.as_f32()?;
+                    if values.len() != rows {
+                        return Err(SemanticError::Invalid("unaligned region predicate term"));
+                    }
+                    Ok(values)
+                })
+                .collect::<SemanticResult<Vec<_>>>()?;
+            let mut output = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let mut unresolved = false;
+                let mut false_term = false;
+                for values in &inputs {
+                    let value = values[row];
+                    if value.is_nan() {
+                        unresolved = true;
+                    } else if value == 0.0 {
+                        false_term = true;
+                    } else if value != 1.0 {
+                        return Err(SemanticError::Invalid(
+                            "decision region term is not a hard predicate output",
+                        ));
+                    }
+                }
+                output.push(if false_term {
+                    0.0
+                } else if unresolved {
+                    f32::NAN
+                } else {
+                    1.0
+                });
+            }
+            Ok(NumericColumn::from(output))
+        }
+        PrecisionProfile::Fp64 => {
+            let inputs = terms
+                .iter()
+                .map(|&term| {
+                    let values = operand(bank, term)?.as_f64()?;
+                    if values.len() != rows {
+                        return Err(SemanticError::Invalid("unaligned region predicate term"));
+                    }
+                    Ok(values)
+                })
+                .collect::<SemanticResult<Vec<_>>>()?;
+            let mut output = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let mut unresolved = false;
+                let mut false_term = false;
+                for values in &inputs {
+                    let value = values[row];
+                    if value.is_nan() {
+                        unresolved = true;
+                    } else if value == 0.0 {
+                        false_term = true;
+                    } else if value != 1.0 {
+                        return Err(SemanticError::Invalid(
+                            "decision region term is not a hard predicate output",
+                        ));
+                    }
+                }
+                output.push(if false_term {
+                    0.0
+                } else if unresolved {
+                    f64::NAN
+                } else {
+                    1.0
+                });
+            }
+            Ok(NumericColumn::from(output))
+        }
+    }
 }
 
 fn operand(

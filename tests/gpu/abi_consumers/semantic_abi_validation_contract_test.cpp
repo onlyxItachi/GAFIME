@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <limits>
 #include <type_traits>
+#include <vector>
 
 #include "../../../src/common/semantic_primitives_abi_impl.hpp"
 
@@ -34,6 +35,7 @@ int capabilities_and_versions() {
     caps.max_slot_count = 8;
     caps.max_rows = 32;
     caps.max_gather_rows = 32;
+    caps.max_association_pairs = 8;
     const auto check = [&]() {
         return gafime_semantic_abi::validate_capabilities(&caps, GAFIME_BACKEND_CUDA, 0);
     };
@@ -43,18 +45,20 @@ int capabilities_and_versions() {
     caps.flags = 1;
     failed |= expect(check(), GAFIME_STATUS_INVALID_ARGUMENT, "unknown required capability");
     caps.flags = 0;
-    caps.abi_version = GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR << 16;
-    failed |= expect(check(), GAFIME_STATUS_ABI_MISMATCH, "old forecast draft rejected");
-    caps.abi_version |= 1;
-    failed |= expect(check(), GAFIME_STATUS_ABI_MISMATCH, "reusable descriptor forecast rejected");
+    caps.abi_version = (GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR << 16) | 2u;
+    failed |= expect(check(), GAFIME_STATUS_ABI_MISMATCH,
+        "v1.2 consumer capability record rejected");
     caps.abi_version = GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION + 1;
     failed |= expect(check(), GAFIME_STATUS_OK, "future compatible semantic minor");
-    caps.struct_size = gafime_semantic_abi::kCapabilitiesStablePrefixSize - 1;
+    caps.struct_size = gafime_semantic_abi::kCapabilitiesV13StablePrefixSize - 1;
     failed |= expect(check(), GAFIME_STATUS_ABI_MISMATCH, "truncated capability prefix");
     caps.struct_size = sizeof(caps);
     caps.reserved[0] = 1;
     failed |= expect(check(), GAFIME_STATUS_INVALID_ARGUMENT, "reserved capability field");
     caps.reserved[0] = 0;
+    caps.reserved_v3[0] = 1;
+    failed |= expect(check(), GAFIME_STATUS_INVALID_ARGUMENT, "v1.3 reserved capability field");
+    caps.reserved_v3[0] = 0;
     caps.max_program_nodes = 0;
     failed |= expect(check(), GAFIME_STATUS_INVALID_ARGUMENT, "zero program capacity");
     return failed;
@@ -90,12 +94,18 @@ int bank_and_program_shapes() {
     const std::vector<uint8_t> initialized = {1, 1, 0};
     const auto check = [&]() {
         return gafime_semantic_abi::validate_program_batch(
-            &batch, GAFIME_PRECISION_FP32, 2, 3, initialized);
+            &batch, GAFIME_PRECISION_FP32, 2, 3, initialized,
+            gafime_semantic_abi::kSemanticMaxRegionTerms);
     };
     failed |= expect(check(), GAFIME_STATUS_OK, "valid absolute-difference node");
+    batch.abi_version = (GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR << 16) | 2u;
+    failed |= expect(check(), GAFIME_STATUS_ABI_MISMATCH,
+        "v1.2 program descriptor rejected before node stride access");
+    batch.abi_version = GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION;
     const std::vector<uint8_t> previously_written = {1, 1, 1};
     failed |= expect(gafime_semantic_abi::validate_program_batch(
-        &batch, GAFIME_PRECISION_FP32, 2, 3, previously_written),
+        &batch, GAFIME_PRECISION_FP32, 2, 3, previously_written,
+        gafime_semantic_abi::kSemanticMaxRegionTerms),
         GAFIME_STATUS_INVALID_ARGUMENT, "derived slots cannot overwrite a prior valid value");
     const GafimeSemanticProgramNode repeated_nodes[] = {node, node};
     batch.nodes = repeated_nodes;
@@ -132,11 +142,36 @@ int bank_and_program_shapes() {
     batch.operand_slots.len = 1;
     batch.mean_bits = {nullptr, 0};
     failed |= expect(gafime_semantic_abi::validate_program_batch(
-        &batch, GAFIME_PRECISION_FP32, 0, 2, gathered), GAFIME_STATUS_OK,
+        &batch, GAFIME_PRECISION_FP32, 0, 2, gathered,
+        gafime_semantic_abi::kSemanticMaxRegionTerms), GAFIME_STATUS_OK,
         "gathered accepted atom may feed a later program");
     failed |= expect(gafime_semantic_abi::validate_program_batch(
-        &batch, GAFIME_PRECISION_FP32, 0, 2, absent), GAFIME_STATUS_INVALID_ARGUMENT,
+        &batch, GAFIME_PRECISION_FP32, 0, 2, absent,
+        gafime_semantic_abi::kSemanticMaxRegionTerms), GAFIME_STATUS_INVALID_ARGUMENT,
         "ungathered accepted atom is not initialized");
+
+    GafimeSemanticFrozenRegionTerm term{};
+    term.input_slot = 0;
+    term.relation = GAFIME_SEMANTIC_REGION_LESS_EQUAL;
+    term.threshold_bits = UINT32_C(0x3f800000);
+    node = {};
+    node.opcode = GAFIME_SEMANTIC_PROGRAM_FROZEN_REGION_CONJUNCTION;
+    node.output_slot = 1;
+    node.region_term_count = 1;
+    batch.nodes = &node;
+    batch.node_count = 1;
+    batch.operand_slots = {nullptr, 0};
+    batch.mean_bits = {nullptr, 0};
+    batch.region_terms = {&term, 1};
+    failed |= expect(gafime_semantic_abi::validate_program_batch(
+        &batch, GAFIME_PRECISION_FP32, 0, 2, gathered,
+        gafime_semantic_abi::kSemanticMaxRegionTerms), GAFIME_STATUS_OK,
+        "valid frozen region physical term");
+    term.threshold_bits = UINT32_C(0x7fc00000);
+    failed |= expect(gafime_semantic_abi::validate_program_batch(
+        &batch, GAFIME_PRECISION_FP32, 0, 2, gathered,
+        gafime_semantic_abi::kSemanticMaxRegionTerms), GAFIME_STATUS_INVALID_ARGUMENT,
+        "nonfinite frozen region threshold");
     return failed;
 }
 
@@ -145,20 +180,68 @@ int forecast_versions() {
     request.program_max_operand_count = 2;
     request.program_operand_count = 7;
     request.program_mean_count = 4;
+    request.mean_slot_count = 3;
+    request.program_region_term_count = 2;
     const auto check = [&]() {
         return gafime_semantic_abi::validate_forecast_request(&request);
     };
     int failed = expect(check(), GAFIME_STATUS_OK, "immutable batch descriptor forecast");
-    request.abi_version = (GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR << 16) | 1;
-    failed |= expect(check(), GAFIME_STATUS_ABI_MISMATCH, "old max-span forecast rejected");
+    request.abi_version = (GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR << 16) | 2u;
+    failed |= expect(check(), GAFIME_STATUS_ABI_MISMATCH, "v1.2 forecast rejected");
     request.abi_version = GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION;
-    request.struct_size = gafime_semantic_abi::kForecastRequestStablePrefixSize - 1;
+    request.struct_size = gafime_semantic_abi::kForecastRequestV13StablePrefixSize - 1;
     failed |= expect(check(), GAFIME_STATUS_ABI_MISMATCH, "truncated total-count prefix");
-    request.struct_size = gafime_semantic_abi::kForecastRequestStablePrefixSize;
+    request.struct_size = gafime_semantic_abi::kForecastRequestV13StablePrefixSize;
     failed |= expect(check(), GAFIME_STATUS_OK, "complete stable forecast prefix");
     request.struct_size = sizeof(request);
     request.reserved[0] = 1;
     failed |= expect(check(), GAFIME_STATUS_INVALID_ARGUMENT, "reserved forecast field");
+    request.reserved[0] = 0;
+    request.reserved_v3[0] = 1;
+    failed |= expect(check(), GAFIME_STATUS_INVALID_ARGUMENT, "v1.3 reserved forecast field");
+    return failed;
+}
+
+int association_and_mean_shapes() {
+    uint32_t left[] = {0, 1};
+    uint32_t right[] = {1, 0};
+    auto association = descriptor<GafimeSemanticAssociationBatch>();
+    association.statistic = GAFIME_SEMANTIC_ASSOCIATION_PEARSON;
+    association.presentation = GAFIME_SEMANTIC_ASSOCIATION_SIGNED;
+    association.left_slots = {left, 2};
+    association.right_slots = {right, 2};
+    const auto check_association = [&]() {
+        return gafime_semantic_abi::validate_association_batch(
+            &association, 2, 2,
+            GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON |
+                GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN |
+                GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI,
+            GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_2, 2, 8, 8, 4);
+    };
+    int failed = expect(check_association(), GAFIME_STATUS_OK, "valid generic Pearson");
+    association.statistic = GAFIME_SEMANTIC_ASSOCIATION_FIXED_CORRECTED_NMI;
+    association.fixed_nmi_bins = 2;
+    association.presentation = GAFIME_SEMANTIC_ASSOCIATION_SIGNED;
+    failed |= expect(check_association(), GAFIME_STATUS_INVALID_ARGUMENT,
+        "fixed NMI signed presentation rejected before work");
+    association.presentation = GAFIME_SEMANTIC_ASSOCIATION_NONNEGATIVE;
+    association.fixed_nmi_bins = 4;
+    failed |= expect(check_association(), GAFIME_STATUS_UNSUPPORTED_BACKEND,
+        "unsupported fixed NMI bins reject before work");
+    association.fixed_nmi_bins = 2;
+    failed |= expect(check_association(), GAFIME_STATUS_OK, "valid fixed NMI descriptor");
+    association.abi_version = (GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR << 16) | 2u;
+    failed |= expect(check_association(), GAFIME_STATUS_ABI_MISMATCH,
+        "v1.2 association descriptor rejected");
+
+    uint32_t candidates[] = {0, 1};
+    auto means = descriptor<GafimeSemanticColumnMeanBatch>();
+    means.candidate_slots = {candidates, 2};
+    failed |= expect(gafime_semantic_abi::validate_column_mean_batch(&means, 2),
+        GAFIME_STATUS_OK, "valid ordered mean slots");
+    candidates[1] = 0;
+    failed |= expect(gafime_semantic_abi::validate_column_mean_batch(&means, 2),
+        GAFIME_STATUS_INVALID_ARGUMENT, "duplicate ordered mean slot");
     return failed;
 }
 
@@ -226,9 +309,24 @@ static_assert(offsetof(GafimeSemanticForecastRequest, retained_slot_count) == 56
 static_assert(offsetof(GafimeSemanticForecastRequest, program_operand_count) == 64);
 static_assert(offsetof(GafimeSemanticForecastRequest, program_mean_count) == 72);
 static_assert(offsetof(GafimeSemanticForecastRequest, reserved) == 80);
-static_assert(sizeof(GafimeSemanticForecastRequest) == 144);
+static_assert(offsetof(GafimeSemanticForecastRequest, mean_slot_count) == 144);
+static_assert(offsetof(GafimeSemanticForecastRequest, program_region_term_count) == 152);
+static_assert(offsetof(GafimeSemanticForecastRequest, reserved_v3) == 160);
+static_assert(sizeof(GafimeSemanticForecastRequest) == 208);
+static_assert(offsetof(GafimeSemanticProgramNode, region_term_offset) == 40);
+static_assert(offsetof(GafimeSemanticProgramNode, reserved_v3) == 48);
+static_assert(sizeof(GafimeSemanticProgramNode) == 64);
+static_assert(offsetof(GafimeSemanticProgramBatch, region_terms) == 224);
+static_assert(sizeof(GafimeSemanticProgramBatch) == 288);
+static_assert(offsetof(GafimeSemanticCapabilities, fixed_corrected_nmi_bin_mask) == 128);
+static_assert(offsetof(GafimeSemanticCapabilities, max_association_pairs) == 136);
+static_assert(sizeof(GafimeSemanticCapabilities) == 200);
+static_assert(offsetof(GafimeSemanticAssociationBatch, left_slots) == 24);
+static_assert(sizeof(GafimeSemanticAssociationBatch) == 120);
+static_assert(offsetof(GafimeSemanticColumnMeanBatch, candidate_slots) == 16);
+static_assert(sizeof(GafimeSemanticColumnMeanBatch) == 96);
 
 int main() {
     return capabilities_and_versions() | bank_and_program_shapes() |
-        forecast_versions() | gathering_and_outputs();
+        forecast_versions() | association_and_mean_shapes() | gathering_and_outputs();
 }

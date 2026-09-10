@@ -25,9 +25,10 @@ pub use evidence::{
 pub use numeric::NumericColumn;
 pub use ordering::Direction;
 pub use program::{
-    CandidateRegistry, FeatureId, FeatureOp, FeatureProgram, FrozenMeans, ProgramLimits,
+    CandidateRegistry, FeatureId, FeatureOp, FeatureProgram, FrozenMeans, FrozenThreshold,
+    PredicateComparator, ProgramLimits, TrainingBinding, MAX_REGION_TERMS,
 };
-pub use selection::{EvidenceConstraint, MissingEvidence, SelectionPolicy};
+pub use selection::{EvidenceConstraint, EvidenceObjective, MissingEvidence, SelectionPolicy};
 pub use session::{
     AcceptedFeature, DiscoveryRound, MaterializedColumns, NativeEvidenceExecutor, ProposalOperator,
     ResidentMaterializationLease, SemanticSession, SessionLimits,

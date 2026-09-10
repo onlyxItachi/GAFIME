@@ -2142,7 +2142,8 @@ int cuda_semantic_materialize_internal(
     int status = require_semantic_bank(bank);
     if (status != GAFIME_STATUS_OK) return status;
     status = gafime_semantic_abi::validate_program_batch(
-        batch, bank->profile, bank->source_slots, bank->slot_capacity, bank->initialized_slots);
+        batch, bank->profile, bank->source_slots, bank->slot_capacity, bank->initialized_slots,
+        gafime_semantic_abi::kSemanticMaxRegionTerms);
     if (status != GAFIME_STATUS_OK) return status;
     if (batch->node_count > gafime_semantic_abi::kSemanticMaxProgramNodes) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
@@ -2162,6 +2163,7 @@ int cuda_semantic_materialize_internal(
     if (status != GAFIME_STATUS_OK) return status;
     PrecisionCudaTransientBuffer<uint32_t> operand_slots;
     PrecisionCudaTransientBuffer<uint64_t> mean_bits;
+    PrecisionCudaTransientBuffer<GafimeSemanticFrozenRegionTerm> region_terms;
     // Every nonempty program batch reserves this one-word device flag so the
     // forecast has an exact, profile-independent accounting term.  Only
     // derived outputs are scanned; source nodes leave it clear.
@@ -2171,6 +2173,7 @@ int cuda_semantic_materialize_internal(
     // which an earlier asynchronous centered-product kernel still reads.
     status = operand_slots.allocate(batch->operand_slots.len);
     if (status == GAFIME_STATUS_OK) status = mean_bits.allocate(batch->mean_bits.len);
+    if (status == GAFIME_STATUS_OK) status = region_terms.allocate(batch->region_terms.len);
     if (status == GAFIME_STATUS_OK) status = derived_nonfinite.allocate(1);
     if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemset(derived_nonfinite.get(), 0, sizeof(uint32_t)));
     if (status == GAFIME_STATUS_OK && batch->operand_slots.len != 0) {
@@ -2182,6 +2185,12 @@ int cuda_semantic_materialize_internal(
         status = cuda_status(cudaMemcpy(
             mean_bits.get(), batch->mean_bits.ptr,
             static_cast<size_t>(batch->mean_bits.len) * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    }
+    if (status == GAFIME_STATUS_OK && batch->region_terms.len != 0) {
+        status = cuda_status(cudaMemcpy(
+            region_terms.get(), batch->region_terms.ptr,
+            static_cast<size_t>(batch->region_terms.len) * sizeof(GafimeSemanticFrozenRegionTerm),
+            cudaMemcpyHostToDevice));
     }
     if (status != GAFIME_STATUS_OK) return status;
     for (uint32_t index = 0; index < batch->node_count; ++index) {
@@ -2204,6 +2213,11 @@ int cuda_semantic_materialize_internal(
                 bank->columns, bank->rows, operand_slots.get() + node.operand_offset,
                 mean_bits.get() + node.mean_offset, node.operand_count,
                 node.output_slot, bank->launch_policy, nullptr));
+            break;
+        case GAFIME_SEMANTIC_PROGRAM_FROZEN_REGION_CONJUNCTION:
+            status = cuda_status(bank->kernels->frozen_region_conjunction(
+                bank->columns, bank->rows, region_terms.get() + node.region_term_offset,
+                node.region_term_count, node.output_slot, bank->launch_policy, nullptr));
             break;
         default: return GAFIME_STATUS_UNSUPPORTED_BACKEND;
         }
@@ -2285,6 +2299,129 @@ int cuda_semantic_pairwise_pearson_internal(
         results->supports, supports.get(), static_cast<size_t>(batch->left_slots.len) * sizeof(uint64_t),
         cudaMemcpyDeviceToHost));
     if (status == GAFIME_STATUS_OK) results->count = batch->left_slots.len;
+    return status;
+}
+
+int cuda_semantic_pairwise_association_internal(
+    SemanticCudaBank* left,
+    SemanticCudaBank* right,
+    const GafimeSemanticAssociationBatch* batch,
+    GafimeSemanticScalarResultTable* results
+) {
+    int status = require_semantic_bank(left);
+    if (status != GAFIME_STATUS_OK || require_semantic_bank(right) != GAFIME_STATUS_OK) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (left->device_id != right->device_id || left->rows != right->rows ||
+        !gafime_gpu_abi::route_fields_equal(left->route, right->route)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    status = gafime_semantic_abi::validate_association_batch(
+        batch, left->slot_capacity, right->slot_capacity,
+        GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON |
+            GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN |
+            GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI,
+        GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_MASK_ALL,
+        std::numeric_limits<uint32_t>::max(), 8192u,
+        std::numeric_limits<uint32_t>::max(), left->rows);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_scalar_results(
+        results, left->route, batch->left_slots.len);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (!semantic_slots_initialized(left, batch->left_slots.ptr, batch->left_slots.len) ||
+        !semantic_slots_initialized(right, batch->right_slots.ptr, batch->right_slots.len)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch->left_slots.len == 0) return GAFIME_STATUS_OK;
+    uint64_t value_bytes = 0;
+    if (!checked_mul(batch->left_slots.len, left->kernels->result_bytes, &value_bytes) ||
+        !fits_size_t(value_bytes, sizeof(uint8_t))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    ScopedCudaDevice device(left->device_id);
+    status = cuda_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    PrecisionCudaTransientBuffer<uint32_t> left_slots;
+    PrecisionCudaTransientBuffer<uint32_t> right_slots;
+    PrecisionCudaTransientBuffer<uint32_t> states;
+    PrecisionCudaTransientBuffer<uint64_t> supports;
+    PrecisionCudaTransientBuffer<uint8_t> values;
+    status = left_slots.allocate(batch->left_slots.len);
+    if (status == GAFIME_STATUS_OK) status = right_slots.allocate(batch->right_slots.len);
+    if (status == GAFIME_STATUS_OK) status = states.allocate(batch->left_slots.len);
+    if (status == GAFIME_STATUS_OK) status = supports.allocate(batch->left_slots.len);
+    if (status == GAFIME_STATUS_OK) status = values.allocate(value_bytes);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = cuda_status(cudaMemcpy(left_slots.get(), batch->left_slots.ptr,
+        static_cast<size_t>(batch->left_slots.len) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(right_slots.get(),
+        batch->right_slots.ptr, static_cast<size_t>(batch->right_slots.len) * sizeof(uint32_t),
+        cudaMemcpyHostToDevice));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(left->kernels->pairwise_association(
+        left->columns, right->columns, left->rows, left_slots.get(), right_slots.get(),
+        batch->left_slots.len, batch->statistic, batch->presentation, batch->fixed_nmi_bins,
+        values.get(), states.get(), supports.get(), left->launch_policy, nullptr));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaDeviceSynchronize());
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(
+        results->values.data, values.get(), static_cast<size_t>(value_bytes), cudaMemcpyDeviceToHost));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(
+        results->states, states.get(), static_cast<size_t>(batch->left_slots.len) * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(
+        results->supports, supports.get(), static_cast<size_t>(batch->left_slots.len) * sizeof(uint64_t),
+        cudaMemcpyDeviceToHost));
+    if (status == GAFIME_STATUS_OK) results->count = batch->left_slots.len;
+    return status;
+}
+
+int cuda_semantic_column_means_internal(
+    SemanticCudaBank* bank,
+    const GafimeSemanticColumnMeanBatch* batch,
+    GafimeSemanticScalarResultTable* results
+) {
+    int status = require_semantic_bank(bank);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_column_mean_batch(batch, bank->slot_capacity);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_semantic_abi::validate_scalar_results(
+        results, bank->route, batch->candidate_slots.len);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (!semantic_slots_initialized(bank, batch->candidate_slots.ptr, batch->candidate_slots.len)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch->candidate_slots.len == 0) return GAFIME_STATUS_OK;
+    uint64_t value_bytes = 0;
+    if (!checked_mul(batch->candidate_slots.len, bank->kernels->result_bytes, &value_bytes) ||
+        !fits_size_t(value_bytes, sizeof(uint8_t))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    ScopedCudaDevice device(bank->device_id);
+    status = cuda_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    PrecisionCudaTransientBuffer<uint32_t> candidates;
+    PrecisionCudaTransientBuffer<uint32_t> states;
+    PrecisionCudaTransientBuffer<uint64_t> supports;
+    PrecisionCudaTransientBuffer<uint8_t> values;
+    status = candidates.allocate(batch->candidate_slots.len);
+    if (status == GAFIME_STATUS_OK) status = states.allocate(batch->candidate_slots.len);
+    if (status == GAFIME_STATUS_OK) status = supports.allocate(batch->candidate_slots.len);
+    if (status == GAFIME_STATUS_OK) status = values.allocate(value_bytes);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = cuda_status(cudaMemcpy(candidates.get(), batch->candidate_slots.ptr,
+        static_cast<size_t>(batch->candidate_slots.len) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(bank->kernels->column_means(
+        bank->columns, bank->rows, candidates.get(), batch->candidate_slots.len, values.get(),
+        states.get(), supports.get(), bank->launch_policy, nullptr));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaDeviceSynchronize());
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(
+        results->values.data, values.get(), static_cast<size_t>(value_bytes), cudaMemcpyDeviceToHost));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(
+        results->states, states.get(), static_cast<size_t>(batch->candidate_slots.len) * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaMemcpy(
+        results->supports, supports.get(), static_cast<size_t>(batch->candidate_slots.len) * sizeof(uint64_t),
+        cudaMemcpyDeviceToHost));
+    if (status == GAFIME_STATUS_OK) results->count = batch->candidate_slots.len;
     return status;
 }
 
@@ -2426,11 +2563,15 @@ int cuda_semantic_forecast_internal(
     uint64_t retained = 0;
     uint64_t program_operand_bytes = 0;
     uint64_t program_mean_bytes = 0;
+    uint64_t program_region_term_bytes = 0;
     uint64_t program_descriptor_bytes = 0;
     uint64_t program_nonfinite_flag_bytes = 0;
     uint64_t gather_descriptor_bytes = 0;
     uint64_t pair_slot_bytes = 0;
     uint64_t pair_result_bytes = 0;
+    uint64_t mean_slot_bytes = 0;
+    uint64_t mean_result_bytes = 0;
+    uint64_t mean_bytes = 0;
     uint64_t graph_candidate_bytes = 0;
     uint64_t graph_edge_bytes = 0;
     uint64_t gather_slot_bytes = 0;
@@ -2439,12 +2580,20 @@ int cuda_semantic_forecast_internal(
         !checked_mul(resident, bank->kernels->storage_bytes, &resident) ||
         !checked_mul(request->program_operand_count, sizeof(uint32_t), &program_operand_bytes) ||
         !checked_mul(request->program_mean_count, sizeof(uint64_t), &program_mean_bytes) ||
+        !checked_mul(request->program_region_term_count, sizeof(GafimeSemanticFrozenRegionTerm),
+            &program_region_term_bytes) ||
         !checked_add(program_operand_bytes, program_mean_bytes, &program_descriptor_bytes) ||
-        !checked_mul(request->program_operand_count == 0 ? 0 : 1,
+        !checked_add(program_descriptor_bytes, program_region_term_bytes, &program_descriptor_bytes) ||
+        !checked_mul(
+            request->program_operand_count == 0 && request->program_region_term_count == 0 ? 0 : 1,
             sizeof(uint32_t), &program_nonfinite_flag_bytes) ||
         !checked_mul(request->pair_count, 2 * sizeof(uint32_t), &pair_slot_bytes) ||
         !checked_mul(request->pair_count,
             bank->kernels->result_bytes + sizeof(uint32_t) + sizeof(uint64_t), &pair_result_bytes) ||
+        !checked_mul(request->mean_slot_count, sizeof(uint32_t), &mean_slot_bytes) ||
+        !checked_mul(request->mean_slot_count,
+            bank->kernels->result_bytes + sizeof(uint32_t) + sizeof(uint64_t), &mean_result_bytes) ||
+        !checked_add(mean_slot_bytes, mean_result_bytes, &mean_bytes) ||
         !checked_mul(request->graph_candidate_count,
             sizeof(uint32_t) + bank->kernels->result_bytes + sizeof(uint32_t) + sizeof(uint64_t),
             &graph_candidate_bytes) ||
@@ -2469,7 +2618,8 @@ int cuda_semantic_forecast_internal(
         gather_descriptor_bytes = 0;
     }
     const uint64_t transient = std::max(
-        std::max(pair_bytes, graph_bytes), std::max(program_descriptor_bytes, gather_descriptor_bytes));
+        std::max(pair_bytes, graph_bytes),
+        std::max(std::max(program_descriptor_bytes, gather_descriptor_bytes), mean_bytes));
     forecast->resident_bytes = resident;
     forecast->transient_bytes = transient;
     forecast->retained_bytes = retained;
@@ -3351,15 +3501,28 @@ GAFIME_GPU_API int gafime_gpu_semantic_capabilities_v1(
     capabilities_out->program_op_mask = GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOURCE |
         GAFIME_SEMANTIC_PROGRAM_OP_MASK_ABSOLUTE_DIFFERENCE |
         GAFIME_SEMANTIC_PROGRAM_OP_MASK_SOFTSIGN |
-        GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT;
-    capabilities_out->primitive_mask = GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_PEARSON |
+        GAFIME_SEMANTIC_PROGRAM_OP_MASK_CENTERED_PRODUCT |
+        GAFIME_SEMANTIC_PROGRAM_OP_MASK_FROZEN_REGION_CONJUNCTION;
+    capabilities_out->primitive_mask = GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_ASSOCIATION |
         GAFIME_SEMANTIC_PRIMITIVE_MASK_ORDERED_EDGE_ENERGY |
-        GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER;
-    capabilities_out->association_statistic_mask = GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON;
+        GAFIME_SEMANTIC_PRIMITIVE_MASK_SPARSE_GATHER |
+        GAFIME_SEMANTIC_PRIMITIVE_MASK_COLUMN_MEANS;
+    capabilities_out->association_statistic_mask = GAFIME_SEMANTIC_STATISTIC_MASK_PEARSON |
+        GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN |
+        GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI;
     capabilities_out->max_program_nodes = gafime_semantic_abi::kSemanticMaxProgramNodes;
     capabilities_out->max_slot_count = std::numeric_limits<uint32_t>::max();
     capabilities_out->max_rows = std::numeric_limits<uint64_t>::max() / sizeof(double);
     capabilities_out->max_gather_rows = gafime_semantic_abi::kSemanticMaxGatherRows;
+    capabilities_out->fixed_corrected_nmi_bin_mask =
+        GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_MASK_ALL;
+    capabilities_out->max_region_terms = gafime_semantic_abi::kSemanticMaxRegionTerms;
+    capabilities_out->max_association_pairs = std::numeric_limits<uint32_t>::max();
+    // The current CUDA average-tie rank primitive scans every row for each
+    // rank. Rust charges this quadratic path before dispatch rather than
+    // presenting it as a generic linear association capability.
+    capabilities_out->max_spearman_rows = 8192u;
+    capabilities_out->max_fixed_corrected_nmi_rows = std::numeric_limits<uint32_t>::max();
     return GAFIME_STATUS_OK;
 }
 
@@ -3404,6 +3567,34 @@ GAFIME_GPU_API int gafime_gpu_semantic_pairwise_pearson_v1(
     return cuda_semantic_pairwise_pearson_internal(
         semantic_bank_from_handle(left_bank_handle), semantic_bank_from_handle(right_bank_handle),
         batch, results_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_pairwise_association_v1(
+    GafimeGpuSemanticBank left_bank_handle,
+    GafimeGpuSemanticBank right_bank_handle,
+    const GafimeSemanticAssociationBatch* batch,
+    GafimeSemanticScalarResultTable* results_out
+) try {
+    return cuda_semantic_pairwise_association_internal(
+        semantic_bank_from_handle(left_bank_handle), semantic_bank_from_handle(right_bank_handle),
+        batch, results_out);
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_semantic_column_means_v1(
+    GafimeGpuSemanticBank bank_handle,
+    const GafimeSemanticColumnMeanBatch* batch,
+    GafimeSemanticScalarResultTable* results_out
+) try {
+    return cuda_semantic_column_means_internal(
+        semantic_bank_from_handle(bank_handle), batch, results_out);
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 GAFIME_GPU_API int gafime_gpu_semantic_ordered_edge_energy_v1(

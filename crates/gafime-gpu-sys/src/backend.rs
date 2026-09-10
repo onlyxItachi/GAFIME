@@ -22,7 +22,11 @@ use gafime_types::{
     GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL, GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE,
     GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT,
     GAFIME_MATRIX_ROW_MAJOR, GAFIME_PRECISION_ABI_VERSION, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
-    GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION, GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR,
+    GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_MASK_ALL, GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION,
+    GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR,
+    GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_ASSOCIATION,
+    GAFIME_SEMANTIC_PROGRAM_OP_MASK_FROZEN_REGION_CONJUNCTION,
+    GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI, GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN,
     GAFIME_STATUS_OK,
 };
 use libloading::Library;
@@ -396,7 +400,7 @@ impl GpuBackend {
         status_to_gpu_result("gafime_gpu_semantic_capabilities_v1", status)?;
         let major = result.abi_version >> 16;
         let minor = result.abi_version & 0xffff;
-        let stable_prefix = std::mem::offset_of!(GafimeSemanticCapabilities, reserved) as u32;
+        let stable_prefix = std::mem::offset_of!(GafimeSemanticCapabilities, reserved_v3) as u32;
         if major != u32::from(GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR)
             || minor < u32::from(gafime_types::GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MINOR)
             || result.struct_size < stable_prefix
@@ -418,6 +422,15 @@ impl GpuBackend {
                 actual: result.device_id,
             });
         }
+        let has_fixed_nmi = result.association_statistic_mask
+            & GAFIME_SEMANTIC_STATISTIC_MASK_FIXED_CORRECTED_NMI
+            != 0;
+        let has_spearman =
+            result.association_statistic_mask & GAFIME_SEMANTIC_STATISTIC_MASK_SPEARMAN != 0;
+        let has_association =
+            result.primitive_mask & GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_ASSOCIATION != 0;
+        let has_region =
+            result.program_op_mask & GAFIME_SEMANTIC_PROGRAM_OP_MASK_FROZEN_REGION_CONJUNCTION != 0;
         if result.profile_mask == 0
             || result.program_op_mask == 0
             || result.primitive_mask == 0
@@ -427,8 +440,24 @@ impl GpuBackend {
             || result.max_rows == 0
             || result.max_program_nodes == 0
             || result.max_gather_rows == 0
+            || (has_fixed_nmi
+                && (result.fixed_corrected_nmi_bin_mask == 0
+                    || result.fixed_corrected_nmi_bin_mask
+                        & !GAFIME_SEMANTIC_FIXED_CORRECTED_NMI_BIN_MASK_ALL
+                        != 0
+                    || result.max_fixed_corrected_nmi_rows == 0))
+            || (!has_fixed_nmi
+                && (result.fixed_corrected_nmi_bin_mask != 0
+                    || result.max_fixed_corrected_nmi_rows != 0))
+            || (has_spearman && result.max_spearman_rows == 0)
+            || (!has_spearman && result.max_spearman_rows != 0)
+            || (has_association && result.max_association_pairs == 0)
+            || (!has_association && result.max_association_pairs != 0)
+            || (has_region && (result.max_region_terms == 0 || result.max_region_terms > 64))
+            || (!has_region && result.max_region_terms != 0)
+            || result.reserved.iter().any(|value| *value != 0)
             || (result.struct_size >= std::mem::size_of::<GafimeSemanticCapabilities>() as u32
-                && result.reserved.iter().any(|value| *value != 0))
+                && result.reserved_v3.iter().any(|value| *value != 0))
         {
             return Err(GpuSysError::InvalidInput(
                 "GPU payload advertised invalid semantic capabilities",

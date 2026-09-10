@@ -149,12 +149,16 @@ def test_session_copies_input_and_reports_operation_specific_capabilities() -> N
                 "absolute_difference",
                 "softsign",
                 "centered_product",
+                "hard_predicate",
+                "decision_region",
             ],
             "statistics": ["pearson", "spearman", "fixed_nmi", "graph_energy"],
             "contexts": ["reference", "paired_view", "labels", "graph"],
+            "fitted_centered_interactions": True,
+            "fixed_nmi_bins": [2, 4, 8, 12, 16, 24, 32, 48, 64, 96],
             "selection_reason": (
-                "Core supports the complete tabular semantic vocabulary; supervised "
-                "GPU route support alone is insufficient"
+                "Core is the explicit or conservative semantic-auto policy; "
+                "accelerators require explicit operation-capability negotiation"
             ),
             "source": "static",
         }
@@ -165,6 +169,8 @@ def test_session_copies_input_and_reports_operation_specific_capabilities() -> N
             "output_allocations": 0,
             "output_bytes": 0,
             "evidence_kernel_calls": 0,
+            "fitted_mean_columns": 0,
+            "fitted_mean_rows": 0,
             "retained_bytes": 0,
         }
 
@@ -334,11 +340,17 @@ def test_explicit_accelerator_negotiation_never_substitutes_core(
     _ = storage
 
 
-def test_metal_semantic_request_is_explicitly_unsupported_not_core() -> None:
+def test_missing_metal_semantic_payload_fails_instead_of_selecting_core(
+    monkeypatch, tmp_path
+) -> None:
+    import gafime._payloads
+
+    monkeypatch.setenv("GAFIME_METAL_V1_LIB", str(tmp_path / "absent.dylib"))
+    monkeypatch.setattr(gafime._payloads, "discover_payloads", lambda *_: None)
     storage, matrix = _matrix(_ROWS)
     with pytest.raises(
-        NotImplementedError,
-        match="Metal does not implement the tabular semantic primitive lowering",
+        RuntimeError,
+        match="tabular backend initialization failed",
     ):
         semantic.TabularSession(
             matrix,

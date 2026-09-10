@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::plan::combos::MI_TEMPLATE_BIN_LEVELS;
@@ -7,7 +8,7 @@ use gafime_types::{
 
 use super::{
     next_identity, CandidateRegistry, FeatureFrame, FeatureId, LabelSet, MaterializedColumns,
-    NeighborGraph, SemanticError, SemanticResult,
+    NeighborGraph, SemanticError, SemanticResult, TrainingBinding,
 };
 
 /// Distinct evaluation channels do not become candidate identities or metric IDs.
@@ -415,6 +416,23 @@ pub struct EvidenceRecord {
     pub(crate) value: EvidenceValue,
 }
 
+pub(crate) type TrainingLineage = Arc<[Arc<TrainingBinding>]>;
+
+/// The underlying snapshot already admits total origin entries across roots.
+/// A diagnostic union cannot grow beyond that bound and never mutates identity.
+pub(crate) fn evaluation_training_bindings(
+    program: &[Arc<TrainingBinding>],
+    contextual: &[TrainingLineage],
+) -> Vec<Arc<TrainingBinding>> {
+    program
+        .iter()
+        .chain(contextual.iter().flat_map(|lineage| lineage.iter()))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 impl EvidenceRecord {
     pub fn candidate(&self) -> FeatureId {
         self.candidate
@@ -438,6 +456,13 @@ pub struct EvidenceTable {
     pub(crate) candidates: Vec<FeatureId>,
     pub(crate) channels: Vec<EvidenceChannel>,
     pub(crate) records: Vec<EvidenceRecord>,
+    /// Immutable transitive fitting lineage, aligned with `candidates`.  This
+    /// is a snapshot taken at evaluation time so later equivalent fits cannot
+    /// rewrite a historical measurement's derivation record.
+    pub(crate) training_lineage: Vec<TrainingLineage>,
+    /// Shared immutable origins of contextual reference programs. Kept apart
+    /// from candidate fitted state so evidence cannot change program meaning.
+    pub(crate) contextual_training: Arc<[TrainingLineage]>,
     pub(crate) materialized: MaterializedColumns,
     pub(crate) backend: BackendKind,
 }
@@ -457,6 +482,36 @@ impl EvidenceTable {
     }
     pub fn records(&self) -> &[EvidenceRecord] {
         &self.records
+    }
+
+    /// Return the immutable fitting lineage captured for one evaluated
+    /// candidate.  An empty slice means no state in its dependency DAG was
+    /// fitted through the bounded training lifecycle.
+    pub fn training_bindings(
+        &self,
+        candidate: FeatureId,
+    ) -> SemanticResult<&[Arc<TrainingBinding>]> {
+        let row = self
+            .candidates
+            .binary_search(&candidate)
+            .map_err(|_| SemanticError::ForeignIdentity)?;
+        self.training_lineage
+            .get(row)
+            .map(AsRef::as_ref)
+            .ok_or(SemanticError::Invalid(
+                "evidence table fitting lineage is not row-aligned",
+            ))
+    }
+    /// Snapshot of fitting origins affecting this candidate's complete evidence
+    /// set, including contextual reference programs, whether selected or not.
+    pub fn evaluation_training_bindings(
+        &self,
+        candidate: FeatureId,
+    ) -> SemanticResult<Vec<Arc<TrainingBinding>>> {
+        Ok(evaluation_training_bindings(
+            self.training_bindings(candidate)?,
+            &self.contextual_training,
+        ))
     }
     pub fn backend(&self) -> &'static str {
         match self.backend {

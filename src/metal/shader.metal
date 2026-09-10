@@ -8,6 +8,17 @@ constant uint GAFIME_METRIC_MUTUAL_INFO = 3;
 constant uint GAFIME_METRIC_R2 = 4;
 constant uint GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE = 0x1u;
 constant uint GAFIME_PRECISION_FP32 = 1;
+constant uint GAFIME_SEMANTIC_PROGRAM_ABSOLUTE_DIFFERENCE = 2;
+constant uint GAFIME_SEMANTIC_PROGRAM_SOFTSIGN = 3;
+constant uint GAFIME_SEMANTIC_PROGRAM_CENTERED_PRODUCT = 4;
+constant uint GAFIME_SEMANTIC_REGION_LESS_EQUAL = 1;
+constant uint GAFIME_SEMANTIC_REGION_GREATER_THAN = 2;
+constant uint GAFIME_SEMANTIC_ASSOCIATION_ABSOLUTE = 2;
+constant uint GAFIME_SEMANTIC_SCALAR_MEASURED = 1;
+constant uint GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT = 2;
+constant uint GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND = 3;
+constant uint GAFIME_SEMANTIC_SCALAR_DEGENERATE_REDUCTION = 4;
+constant uint GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION = 5;
 
 // Metal has no fp64, so the reductions below accumulate in fp32. Parity
 // tolerances account for backend-specific precision and reduction order. The
@@ -110,6 +121,74 @@ struct MetalInteractionDiagnosticInfo {
     ulong rows;
     uint max_arity;
     uint combo_count;
+};
+
+// These structures are private to the optional semantic arithmetic table.  The
+// public C ABI descriptors are copied into compact immutable Metal buffers by
+// semantic_launcher.mm, so no semantic/program identity crosses this boundary.
+struct MetalSemanticProgramNode {
+    uint opcode;
+    uint output_slot;
+    uint operand_offset;
+    uint operand_count;
+    uint mean_offset;
+    uint mean_count;
+    uint region_term_offset;
+    uint region_term_count;
+};
+
+struct MetalSemanticRegionTerm {
+    uint input_slot;
+    uint relation;
+    ulong threshold_bits;
+};
+
+struct MetalSemanticRowsInfo {
+    ulong rows;
+    uint item_count;
+    uint reserved;
+};
+
+struct MetalSemanticAssociationInfo {
+    ulong rows;
+    ulong pair_count;
+    uint presentation;
+    uint bins;
+    uint padded_rows;
+    uint reserved;
+};
+
+struct MetalSemanticRankInfo {
+    ulong rows;
+    ulong pair_count;
+    uint padded_rows;
+    uint stage;
+    uint stride;
+    uint reserved;
+};
+
+struct MetalSemanticEdgeInfo {
+    ulong rows;
+    ulong edge_count;
+    ulong candidate_count;
+    ulong reserved;
+};
+
+struct MetalSemanticGatherInfo {
+    ulong source_rows;
+    ulong destination_rows;
+    ulong slot_count;
+    ulong reserved;
+};
+
+struct MetalSemanticEdge {
+    ulong left_row;
+    ulong right_row;
+};
+
+struct MetalSemanticRankRecord {
+    float value;
+    uint row;
 };
 
 static inline float centered_feature(
@@ -1127,4 +1206,784 @@ kernel void gafime_copy_selected_metric_rows(
     }
     selected_metric_values[idx] =
         metric_values[static_cast<ulong>(source_row) * rank.metric_count + metric_idx];
+}
+
+// -------------------------------------------------------------------------
+// Optional typed semantic-arithmetic table.  These kernels consume only
+// resident physical slots and frozen numeric descriptors; evidence identity,
+// fitting provenance, and selection policy stay in Rust.
+// -------------------------------------------------------------------------
+
+kernel void gafime_semantic_absolute_difference(
+    device float* columns [[buffer(0)]],
+    constant MetalSemanticProgramNode& node [[buffer(1)]],
+    device const uint* operands [[buffer(2)]],
+    constant MetalSemanticRowsInfo& info [[buffer(3)]],
+    ulong row [[thread_position_in_grid]]
+) {
+    if (row >= info.rows) return;
+    const uint left_slot = operands[node.operand_offset];
+    const uint right_slot = operands[node.operand_offset + 1u];
+    const float left = columns[static_cast<ulong>(left_slot) * info.rows + row];
+    const float right = columns[static_cast<ulong>(right_slot) * info.rows + row];
+    columns[static_cast<ulong>(node.output_slot) * info.rows + row] = abs(left - right);
+}
+
+kernel void gafime_semantic_softsign(
+    device float* columns [[buffer(0)]],
+    constant MetalSemanticProgramNode& node [[buffer(1)]],
+    device const uint* operands [[buffer(2)]],
+    constant MetalSemanticRowsInfo& info [[buffer(3)]],
+    ulong row [[thread_position_in_grid]]
+) {
+    if (row >= info.rows) return;
+    const uint input_slot = operands[node.operand_offset];
+    const float value = columns[static_cast<ulong>(input_slot) * info.rows + row];
+    columns[static_cast<ulong>(node.output_slot) * info.rows + row] =
+        value / (1.0f + abs(value));
+}
+
+kernel void gafime_semantic_centered_product(
+    device float* columns [[buffer(0)]],
+    constant MetalSemanticProgramNode& node [[buffer(1)]],
+    device const uint* operands [[buffer(2)]],
+    device const ulong* mean_bits [[buffer(3)]],
+    constant MetalSemanticRowsInfo& info [[buffer(4)]],
+    ulong row [[thread_position_in_grid]]
+) {
+    if (row >= info.rows) return;
+    float product = 1.0f;
+    for (uint operand = 0; operand < node.operand_count; ++operand) {
+        const uint slot = operands[node.operand_offset + operand];
+        const float mean = as_type<float>(static_cast<uint>(mean_bits[node.mean_offset + operand]));
+        const float value = columns[static_cast<ulong>(slot) * info.rows + row];
+        product *= value - mean;
+    }
+    columns[static_cast<ulong>(node.output_slot) * info.rows + row] = product;
+}
+
+kernel void gafime_semantic_frozen_region_conjunction(
+    device float* columns [[buffer(0)]],
+    constant MetalSemanticProgramNode& node [[buffer(1)]],
+    device const MetalSemanticRegionTerm* terms [[buffer(2)]],
+    constant MetalSemanticRowsInfo& info [[buffer(3)]],
+    ulong row [[thread_position_in_grid]]
+) {
+    if (row >= info.rows) return;
+    bool undetermined = false;
+    for (uint term_index = 0; term_index < node.region_term_count; ++term_index) {
+        const MetalSemanticRegionTerm term = terms[node.region_term_offset + term_index];
+        const float value = columns[static_cast<ulong>(term.input_slot) * info.rows + row];
+        if (isnan(value)) {
+            undetermined = true;
+            continue;
+        }
+        const float threshold = as_type<float>(static_cast<uint>(term.threshold_bits));
+        const bool holds = term.relation == GAFIME_SEMANTIC_REGION_LESS_EQUAL
+            ? value <= threshold
+            : value > threshold;
+        // False dominates a prior NaN exactly as the frozen predicate contract
+        // specifies: only an otherwise-true undetermined conjunction emits NaN.
+        if (!holds) {
+            columns[static_cast<ulong>(node.output_slot) * info.rows + row] = 0.0f;
+            return;
+        }
+    }
+    columns[static_cast<ulong>(node.output_slot) * info.rows + row] = undetermined
+        ? nonfinite_metric()
+        : 1.0f;
+}
+
+kernel void gafime_semantic_reject_nonfinite(
+    device const float* columns [[buffer(0)]],
+    constant MetalSemanticRowsInfo& info [[buffer(1)]],
+    device atomic_uint* nonfinite_out [[buffer(2)]],
+    ulong row [[thread_position_in_grid]]
+) {
+    if (row >= info.rows) return;
+    if (!isfinite(columns[static_cast<ulong>(info.item_count) * info.rows + row])) {
+        atomic_store_explicit(nonfinite_out, 1u, memory_order_relaxed);
+    }
+}
+
+kernel void gafime_semantic_pairwise_pearson(
+    device const float* left_columns [[buffer(0)]],
+    device const float* right_columns [[buffer(1)]],
+    device const uint* left_slots [[buffer(2)]],
+    device const uint* right_slots [[buffer(3)]],
+    device float* values [[buffer(4)]],
+    device uint* states [[buffer(5)]],
+    device ulong* supports [[buffer(6)]],
+    constant MetalSemanticAssociationInfo& info [[buffer(7)]],
+    uint pair [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint lane_count [[threads_per_threadgroup]]
+) {
+    if (static_cast<ulong>(pair) >= info.pair_count) return;
+    device const float* left = left_columns + static_cast<ulong>(left_slots[pair]) * info.rows;
+    device const float* right = right_columns + static_cast<ulong>(right_slots[pair]) * info.rows;
+    const float left_first = info.rows == 0 ? 0.0f : left[0];
+    const float right_first = info.rows == 0 ? 0.0f : right[0];
+
+    float local_left_sum = 0.0f;
+    float local_right_sum = 0.0f;
+    uint local_nonfinite = 0;
+    uint local_left_changed = 0;
+    uint local_right_changed = 0;
+    for (ulong row = lane; row < info.rows; row += lane_count) {
+        const float left_value = left[row];
+        const float right_value = right[row];
+        local_nonfinite |= (!isfinite(left_value) || !isfinite(right_value)) ? 1u : 0u;
+        local_left_changed |= left_value != left_first;
+        local_right_changed |= right_value != right_first;
+        local_left_sum += left_value;
+        local_right_sum += right_value;
+    }
+
+    threadgroup float sums_left[kMetalReduceWidth];
+    threadgroup float sums_right[kMetalReduceWidth];
+    threadgroup float variances_left[kMetalReduceWidth];
+    threadgroup float variances_right[kMetalReduceWidth];
+    threadgroup float covariances[kMetalReduceWidth];
+    threadgroup uint nonfinite[kMetalReduceWidth];
+    threadgroup uint left_changed[kMetalReduceWidth];
+    threadgroup uint right_changed[kMetalReduceWidth];
+    threadgroup float left_mean;
+    threadgroup float right_mean;
+    threadgroup uint result_state;
+
+    sums_left[lane] = local_left_sum;
+    sums_right[lane] = local_right_sum;
+    nonfinite[lane] = local_nonfinite;
+    left_changed[lane] = local_left_changed;
+    right_changed[lane] = local_right_changed;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            sums_left[lane] += sums_left[lane + stride];
+            sums_right[lane] += sums_right[lane + stride];
+            nonfinite[lane] |= nonfinite[lane + stride];
+            left_changed[lane] |= left_changed[lane + stride];
+            right_changed[lane] |= right_changed[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        supports[pair] = info.rows;
+        result_state = info.rows < 2 ? GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT :
+            nonfinite[0] != 0 ? GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION :
+            (left_changed[0] == 0 || right_changed[0] == 0)
+                ? GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND
+                : GAFIME_SEMANTIC_SCALAR_MEASURED;
+        if (result_state == GAFIME_SEMANTIC_SCALAR_MEASURED) {
+            left_mean = sums_left[0] / static_cast<float>(info.rows);
+            right_mean = sums_right[0] / static_cast<float>(info.rows);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (result_state != GAFIME_SEMANTIC_SCALAR_MEASURED) {
+        if (lane == 0) {
+            states[pair] = result_state;
+            values[pair] = 0.0f;
+        }
+        return;
+    }
+
+    float local_left_variance = 0.0f;
+    float local_right_variance = 0.0f;
+    float local_covariance = 0.0f;
+    for (ulong row = lane; row < info.rows; row += lane_count) {
+        const float left_delta = left[row] - left_mean;
+        const float right_delta = right[row] - right_mean;
+        local_left_variance += left_delta * left_delta;
+        local_right_variance += right_delta * right_delta;
+        local_covariance += left_delta * right_delta;
+    }
+    variances_left[lane] = local_left_variance;
+    variances_right[lane] = local_right_variance;
+    covariances[lane] = local_covariance;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            variances_left[lane] += variances_left[lane + stride];
+            variances_right[lane] += variances_right[lane + stride];
+            covariances[lane] += covariances[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        const float variance_left = variances_left[0];
+        const float variance_right = variances_right[0];
+        const float covariance = covariances[0];
+        if (variance_left == 0.0f || variance_right == 0.0f ||
+            (isfinite(variance_left) && isfinite(variance_right) && isfinite(covariance) &&
+                variance_left > 0.0f && variance_right > 0.0f &&
+                variance_left * variance_right == 0.0f)) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_DEGENERATE_REDUCTION;
+            values[pair] = 0.0f;
+            return;
+        }
+        float correlation = finalize_correlation(variance_left, variance_right, covariance);
+        if (!isfinite(correlation)) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+            values[pair] = 0.0f;
+            return;
+        }
+        if (info.presentation == GAFIME_SEMANTIC_ASSOCIATION_ABSOLUTE) correlation = abs(correlation);
+        states[pair] = GAFIME_SEMANTIC_SCALAR_MEASURED;
+        values[pair] = correlation;
+    }
+}
+
+kernel void gafime_semantic_fixed_corrected_nmi(
+    device const float* left_columns [[buffer(0)]],
+    device const float* right_columns [[buffer(1)]],
+    device const uint* left_slots [[buffer(2)]],
+    device const uint* right_slots [[buffer(3)]],
+    device float* values [[buffer(4)]],
+    device uint* states [[buffer(5)]],
+    device ulong* supports [[buffer(6)]],
+    constant MetalSemanticAssociationInfo& info [[buffer(7)]],
+    uint pair [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint lane_count [[threads_per_threadgroup]]
+) {
+    if (static_cast<ulong>(pair) >= info.pair_count) return;
+    const uint bins = info.bins;
+    device const float* left = left_columns + static_cast<ulong>(left_slots[pair]) * info.rows;
+    device const float* right = right_columns + static_cast<ulong>(right_slots[pair]) * info.rows;
+    const float left_first = info.rows == 0 ? 0.0f : left[0];
+    const float right_first = info.rows == 0 ? 0.0f : right[0];
+
+    threadgroup atomic_uint histogram_left[kMetalMaxMiBins];
+    threadgroup atomic_uint histogram_right[kMetalMaxMiBins];
+    threadgroup atomic_uint joint[kMetalMaxMiBins * kMetalMaxMiBins];
+    threadgroup float minimum_left[kMetalReduceWidth];
+    threadgroup float maximum_left[kMetalReduceWidth];
+    threadgroup float minimum_right[kMetalReduceWidth];
+    threadgroup float maximum_right[kMetalReduceWidth];
+    threadgroup uint nonfinite[kMetalReduceWidth];
+    threadgroup uint left_changed[kMetalReduceWidth];
+    threadgroup uint right_changed[kMetalReduceWidth];
+    threadgroup uint result_state;
+
+    for (uint index = lane; index < bins; index += lane_count) {
+        atomic_store_explicit(&histogram_left[index], 0u, memory_order_relaxed);
+        atomic_store_explicit(&histogram_right[index], 0u, memory_order_relaxed);
+    }
+    for (uint index = lane; index < bins * bins; index += lane_count) {
+        atomic_store_explicit(&joint[index], 0u, memory_order_relaxed);
+    }
+
+    float local_minimum_left = INFINITY;
+    float local_maximum_left = -INFINITY;
+    float local_minimum_right = INFINITY;
+    float local_maximum_right = -INFINITY;
+    uint local_nonfinite = 0;
+    uint local_left_changed = 0;
+    uint local_right_changed = 0;
+    for (ulong row = lane; row < info.rows; row += lane_count) {
+        const float left_value = left[row];
+        const float right_value = right[row];
+        const bool finite = isfinite(left_value) && isfinite(right_value);
+        local_nonfinite |= finite ? 0u : 1u;
+        local_left_changed |= left_value != left_first;
+        local_right_changed |= right_value != right_first;
+        if (finite) {
+            local_minimum_left = min(local_minimum_left, left_value);
+            local_maximum_left = max(local_maximum_left, left_value);
+            local_minimum_right = min(local_minimum_right, right_value);
+            local_maximum_right = max(local_maximum_right, right_value);
+        }
+    }
+    minimum_left[lane] = local_minimum_left;
+    maximum_left[lane] = local_maximum_left;
+    minimum_right[lane] = local_minimum_right;
+    maximum_right[lane] = local_maximum_right;
+    nonfinite[lane] = local_nonfinite;
+    left_changed[lane] = local_left_changed;
+    right_changed[lane] = local_right_changed;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            minimum_left[lane] = min(minimum_left[lane], minimum_left[lane + stride]);
+            maximum_left[lane] = max(maximum_left[lane], maximum_left[lane + stride]);
+            minimum_right[lane] = min(minimum_right[lane], minimum_right[lane + stride]);
+            maximum_right[lane] = max(maximum_right[lane], maximum_right[lane + stride]);
+            nonfinite[lane] |= nonfinite[lane + stride];
+            left_changed[lane] |= left_changed[lane + stride];
+            right_changed[lane] |= right_changed[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float min_left = minimum_left[0];
+    const float max_left = maximum_left[0];
+    const float min_right = minimum_right[0];
+    const float max_right = maximum_right[0];
+    if (lane == 0) {
+        supports[pair] = info.rows;
+        const ulong required_support = 8ull * static_cast<ulong>(bins) * static_cast<ulong>(bins);
+        const float left_span = max_left - min_left;
+        const float right_span = max_right - min_right;
+        result_state = info.rows < 2 ? GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT :
+            nonfinite[0] != 0 ? GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION :
+            (left_changed[0] == 0 || right_changed[0] == 0)
+                ? GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND
+                : info.rows < required_support
+                    ? GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT
+                    : (!isfinite(left_span) || !isfinite(right_span))
+                        ? GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION
+                        : (left_span <= 0.0f || right_span <= 0.0f)
+                            ? GAFIME_SEMANTIC_SCALAR_DEGENERATE_REDUCTION
+                            : GAFIME_SEMANTIC_SCALAR_MEASURED;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (result_state != GAFIME_SEMANTIC_SCALAR_MEASURED) {
+        if (lane == 0) {
+            states[pair] = result_state;
+            values[pair] = 0.0f;
+        }
+        return;
+    }
+
+    const float inverse_left = static_cast<float>(bins) / (max_left - min_left);
+    const float inverse_right = static_cast<float>(bins) / (max_right - min_right);
+    if (!isfinite(inverse_left) || !isfinite(inverse_right)) {
+        if (lane == 0) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+            values[pair] = 0.0f;
+        }
+        return;
+    }
+    for (ulong row = lane; row < info.rows; row += lane_count) {
+        const uint left_bin = fixed_mi_bin(left[row], min_left, inverse_left, bins);
+        const uint right_bin = fixed_mi_bin(right[row], min_right, inverse_right, bins);
+        atomic_fetch_add_explicit(&histogram_left[left_bin], 1u, memory_order_relaxed);
+        atomic_fetch_add_explicit(&histogram_right[right_bin], 1u, memory_order_relaxed);
+        atomic_fetch_add_explicit(&joint[left_bin * bins + right_bin], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        const float total = static_cast<float>(info.rows);
+        float mutual_information = 0.0f;
+        uint active_left = 0;
+        uint active_right = 0;
+        for (uint left_bin = 0; left_bin < bins; ++left_bin) {
+            const uint left_count = atomic_load_explicit(&histogram_left[left_bin], memory_order_relaxed);
+            if (left_count == 0) continue;
+            ++active_left;
+            const float probability_left = static_cast<float>(left_count) / total;
+            for (uint right_bin = 0; right_bin < bins; ++right_bin) {
+                const uint joint_count = atomic_load_explicit(
+                    &joint[left_bin * bins + right_bin], memory_order_relaxed);
+                const uint right_count = atomic_load_explicit(
+                    &histogram_right[right_bin], memory_order_relaxed);
+                if (joint_count == 0 || right_count == 0) continue;
+                const float probability_right = static_cast<float>(right_count) / total;
+                const float probability_joint = static_cast<float>(joint_count) / total;
+                mutual_information += probability_joint * log(
+                    probability_joint / (probability_left * probability_right));
+            }
+        }
+        for (uint right_bin = 0; right_bin < bins; ++right_bin) {
+            if (atomic_load_explicit(&histogram_right[right_bin], memory_order_relaxed) != 0) {
+                ++active_right;
+            }
+        }
+        if (active_left < 2 || active_right < 2) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_DEGENERATE_REDUCTION;
+            values[pair] = 0.0f;
+            return;
+        }
+        const float correction = static_cast<float>((active_left - 1u) * (active_right - 1u)) /
+            (2.0f * total);
+        const float corrected = max(0.0f, mutual_information - correction);
+        const float normalizer = log(static_cast<float>(min(active_left, active_right)));
+        const float result = corrected / normalizer;
+        if (!isfinite(mutual_information) || !isfinite(correction) || !isfinite(normalizer) ||
+            normalizer <= 0.0f || !isfinite(result)) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+            values[pair] = 0.0f;
+            return;
+        }
+        states[pair] = GAFIME_SEMANTIC_SCALAR_MEASURED;
+        values[pair] = result;
+    }
+}
+
+kernel void gafime_semantic_rank_prepare(
+    device const float* left_columns [[buffer(0)]],
+    device const float* right_columns [[buffer(1)]],
+    device const uint* left_slots [[buffer(2)]],
+    device const uint* right_slots [[buffer(3)]],
+    device MetalSemanticRankRecord* left_records [[buffer(4)]],
+    device MetalSemanticRankRecord* right_records [[buffer(5)]],
+    constant MetalSemanticRankInfo& info [[buffer(6)]],
+    ulong item [[thread_position_in_grid]]
+) {
+    const ulong total = info.pair_count * static_cast<ulong>(info.padded_rows);
+    if (item >= total) return;
+    const ulong pair = item / static_cast<ulong>(info.padded_rows);
+    const uint row = static_cast<uint>(item - pair * static_cast<ulong>(info.padded_rows));
+    MetalSemanticRankRecord left_record{};
+    MetalSemanticRankRecord right_record{};
+    left_record.row = row;
+    right_record.row = row;
+    if (static_cast<ulong>(row) < info.rows) {
+        const float left_value = left_columns[
+            static_cast<ulong>(left_slots[pair]) * info.rows + static_cast<ulong>(row)];
+        const float right_value = right_columns[
+            static_cast<ulong>(right_slots[pair]) * info.rows + static_cast<ulong>(row)];
+        // A later definedness pass reports a nonfinite input.  The sentinels
+        // keep the bounded sort well-defined without treating nonfinite values
+        // as valid rank observations.
+        left_record.value = isfinite(left_value) && isfinite(right_value) ? left_value : INFINITY;
+        right_record.value = isfinite(left_value) && isfinite(right_value) ? right_value : INFINITY;
+    } else {
+        left_record.value = INFINITY;
+        right_record.value = INFINITY;
+    }
+    left_records[item] = left_record;
+    right_records[item] = right_record;
+}
+
+static inline bool semantic_rank_record_greater(
+    MetalSemanticRankRecord left,
+    MetalSemanticRankRecord right
+) {
+    return left.value > right.value ||
+        (left.value == right.value && left.row > right.row);
+}
+
+static inline bool semantic_rank_record_less(
+    MetalSemanticRankRecord left,
+    MetalSemanticRankRecord right
+) {
+    return left.value < right.value ||
+        (left.value == right.value && left.row < right.row);
+}
+
+kernel void gafime_semantic_rank_bitonic_step(
+    device MetalSemanticRankRecord* left_records [[buffer(0)]],
+    device MetalSemanticRankRecord* right_records [[buffer(1)]],
+    constant MetalSemanticRankInfo& info [[buffer(2)]],
+    ulong item [[thread_position_in_grid]]
+) {
+    const ulong total = info.pair_count * static_cast<ulong>(info.padded_rows);
+    if (item >= total) return;
+    const ulong pair = item / static_cast<ulong>(info.padded_rows);
+    const uint local = static_cast<uint>(item - pair * static_cast<ulong>(info.padded_rows));
+    const uint peer_local = local ^ info.stride;
+    if (peer_local <= local || peer_local >= info.padded_rows) return;
+    const ulong peer = pair * static_cast<ulong>(info.padded_rows) + peer_local;
+    const bool ascending = (local & info.stage) == 0;
+
+    MetalSemanticRankRecord left_a = left_records[item];
+    MetalSemanticRankRecord left_b = left_records[peer];
+    const bool swap_left = ascending
+        ? semantic_rank_record_greater(left_a, left_b)
+        : semantic_rank_record_less(left_a, left_b);
+    if (swap_left) {
+        left_records[item] = left_b;
+        left_records[peer] = left_a;
+    }
+
+    MetalSemanticRankRecord right_a = right_records[item];
+    MetalSemanticRankRecord right_b = right_records[peer];
+    const bool swap_right = ascending
+        ? semantic_rank_record_greater(right_a, right_b)
+        : semantic_rank_record_less(right_a, right_b);
+    if (swap_right) {
+        right_records[item] = right_b;
+        right_records[peer] = right_a;
+    }
+}
+
+static inline uint semantic_rank_lower_bound(
+    device const MetalSemanticRankRecord* records,
+    ulong base,
+    uint count,
+    float value
+) {
+    uint begin = 0;
+    uint end = count;
+    while (begin < end) {
+        const uint middle = begin + (end - begin) / 2u;
+        if (records[base + middle].value < value) {
+            begin = middle + 1u;
+        } else {
+            end = middle;
+        }
+    }
+    return begin;
+}
+
+static inline uint semantic_rank_upper_bound(
+    device const MetalSemanticRankRecord* records,
+    ulong base,
+    uint count,
+    float value
+) {
+    uint begin = 0;
+    uint end = count;
+    while (begin < end) {
+        const uint middle = begin + (end - begin) / 2u;
+        if (!(value < records[base + middle].value)) {
+            begin = middle + 1u;
+        } else {
+            end = middle;
+        }
+    }
+    return begin;
+}
+
+kernel void gafime_semantic_rank_positions(
+    device const MetalSemanticRankRecord* left_records [[buffer(0)]],
+    device const MetalSemanticRankRecord* right_records [[buffer(1)]],
+    device uint* left_ranks_twice [[buffer(2)]],
+    device uint* right_ranks_twice [[buffer(3)]],
+    constant MetalSemanticRankInfo& info [[buffer(4)]],
+    ulong item [[thread_position_in_grid]]
+) {
+    const ulong total = info.pair_count * info.rows;
+    if (item >= total) return;
+    const ulong pair = item / info.rows;
+    const ulong row = item - pair * info.rows;
+    const ulong record_base = pair * static_cast<ulong>(info.padded_rows);
+    const float left_value = left_records[record_base + row].value;
+    const float right_value = right_records[record_base + row].value;
+    if (!isfinite(left_value) || !isfinite(right_value)) return;
+    const uint count = static_cast<uint>(info.rows);
+    const uint left_lower = semantic_rank_lower_bound(left_records, record_base, count, left_value);
+    const uint left_upper = semantic_rank_upper_bound(left_records, record_base, count, left_value);
+    const uint right_lower = semantic_rank_lower_bound(right_records, record_base, count, right_value);
+    const uint right_upper = semantic_rank_upper_bound(right_records, record_base, count, right_value);
+    const MetalSemanticRankRecord left_record = left_records[record_base + row];
+    const MetalSemanticRankRecord right_record = right_records[record_base + row];
+    left_ranks_twice[pair * info.rows + left_record.row] = left_lower + left_upper - 1u;
+    right_ranks_twice[pair * info.rows + right_record.row] = right_lower + right_upper - 1u;
+}
+
+kernel void gafime_semantic_spearman_finalize(
+    device const float* left_columns [[buffer(0)]],
+    device const float* right_columns [[buffer(1)]],
+    device const uint* left_slots [[buffer(2)]],
+    device const uint* right_slots [[buffer(3)]],
+    device const uint* left_ranks_twice [[buffer(4)]],
+    device const uint* right_ranks_twice [[buffer(5)]],
+    device float* values [[buffer(6)]],
+    device uint* states [[buffer(7)]],
+    device ulong* supports [[buffer(8)]],
+    constant MetalSemanticAssociationInfo& info [[buffer(9)]],
+    uint pair [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint lane_count [[threads_per_threadgroup]]
+) {
+    if (static_cast<ulong>(pair) >= info.pair_count) return;
+    device const float* left = left_columns + static_cast<ulong>(left_slots[pair]) * info.rows;
+    device const float* right = right_columns + static_cast<ulong>(right_slots[pair]) * info.rows;
+    const float left_first = info.rows == 0 ? 0.0f : left[0];
+    const float right_first = info.rows == 0 ? 0.0f : right[0];
+
+    uint local_nonfinite = 0;
+    uint local_left_changed = 0;
+    uint local_right_changed = 0;
+    for (ulong row = lane; row < info.rows; row += lane_count) {
+        const float left_value = left[row];
+        const float right_value = right[row];
+        local_nonfinite |= (!isfinite(left_value) || !isfinite(right_value)) ? 1u : 0u;
+        local_left_changed |= left_value != left_first;
+        local_right_changed |= right_value != right_first;
+    }
+    threadgroup uint nonfinite[kMetalReduceWidth];
+    threadgroup uint left_changed[kMetalReduceWidth];
+    threadgroup uint right_changed[kMetalReduceWidth];
+    threadgroup float variances_left[kMetalReduceWidth];
+    threadgroup float variances_right[kMetalReduceWidth];
+    threadgroup float covariances[kMetalReduceWidth];
+    threadgroup uint result_state;
+    nonfinite[lane] = local_nonfinite;
+    left_changed[lane] = local_left_changed;
+    right_changed[lane] = local_right_changed;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            nonfinite[lane] |= nonfinite[lane + stride];
+            left_changed[lane] |= left_changed[lane + stride];
+            right_changed[lane] |= right_changed[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        supports[pair] = info.rows;
+        result_state = info.rows < 2 ? GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT :
+            nonfinite[0] != 0 ? GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION :
+            (left_changed[0] == 0 || right_changed[0] == 0)
+                ? GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND
+                : GAFIME_SEMANTIC_SCALAR_MEASURED;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (result_state != GAFIME_SEMANTIC_SCALAR_MEASURED) {
+        if (lane == 0) {
+            states[pair] = result_state;
+            values[pair] = 0.0f;
+        }
+        return;
+    }
+
+    // Average-tie rank positions are exact integers.  Centering at the exact
+    // common mean and normalizing before reduction avoids a large fp32
+    // cancellation at the advertised 32,768-row bound without changing the
+    // mathematical Pearson correlation of the ranks.
+    const float center = static_cast<float>(info.rows - 1ull);
+    const float scale = 1.0f / max(1.0f, center);
+    float local_left_variance = 0.0f;
+    float local_right_variance = 0.0f;
+    float local_covariance = 0.0f;
+    const ulong rank_base = static_cast<ulong>(pair) * info.rows;
+    for (ulong row = lane; row < info.rows; row += lane_count) {
+        const float left_rank = (static_cast<float>(left_ranks_twice[rank_base + row]) - center) * scale;
+        const float right_rank = (static_cast<float>(right_ranks_twice[rank_base + row]) - center) * scale;
+        local_left_variance += left_rank * left_rank;
+        local_right_variance += right_rank * right_rank;
+        local_covariance += left_rank * right_rank;
+    }
+    variances_left[lane] = local_left_variance;
+    variances_right[lane] = local_right_variance;
+    covariances[lane] = local_covariance;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            variances_left[lane] += variances_left[lane + stride];
+            variances_right[lane] += variances_right[lane + stride];
+            covariances[lane] += covariances[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        if (variances_left[0] == 0.0f || variances_right[0] == 0.0f) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_DEGENERATE_REDUCTION;
+            values[pair] = 0.0f;
+            return;
+        }
+        float correlation = finalize_correlation(variances_left[0], variances_right[0], covariances[0]);
+        if (!isfinite(correlation)) {
+            states[pair] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+            values[pair] = 0.0f;
+            return;
+        }
+        if (info.presentation == GAFIME_SEMANTIC_ASSOCIATION_ABSOLUTE) correlation = abs(correlation);
+        states[pair] = GAFIME_SEMANTIC_SCALAR_MEASURED;
+        values[pair] = correlation;
+    }
+}
+
+kernel void gafime_semantic_column_means(
+    device const float* columns [[buffer(0)]],
+    device const uint* candidate_slots [[buffer(1)]],
+    device float* values [[buffer(2)]],
+    device uint* states [[buffer(3)]],
+    device ulong* supports [[buffer(4)]],
+    constant MetalSemanticRowsInfo& info [[buffer(5)]],
+    ulong candidate [[thread_position_in_grid]]
+) {
+    if (candidate >= static_cast<ulong>(info.item_count)) return;
+    supports[candidate] = info.rows;
+    if (info.rows == 0) {
+        states[candidate] = GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT;
+        values[candidate] = 0.0f;
+        return;
+    }
+    device const float* column = columns + static_cast<ulong>(candidate_slots[candidate]) * info.rows;
+    float sum = 0.0f;
+    bool nonfinite = false;
+    // Means are intentionally one device thread per requested column.  This
+    // preserves the declared row-order fp32 sum used to freeze centered terms;
+    // the host only transfers the resulting typed scalar.
+    for (ulong row = 0; row < info.rows; ++row) {
+        const float value = column[row];
+        nonfinite = nonfinite || !isfinite(value);
+        sum += value;
+    }
+    const float mean = sum / static_cast<float>(info.rows);
+    if (nonfinite || !isfinite(sum) || !isfinite(mean)) {
+        states[candidate] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+        values[candidate] = 0.0f;
+        return;
+    }
+    states[candidate] = GAFIME_SEMANTIC_SCALAR_MEASURED;
+    values[candidate] = mean;
+}
+
+kernel void gafime_semantic_ordered_edge_energy(
+    device const float* columns [[buffer(0)]],
+    device const uint* candidate_slots [[buffer(1)]],
+    device const MetalSemanticEdge* edges [[buffer(2)]],
+    device const float* weights [[buffer(3)]],
+    device float* values [[buffer(4)]],
+    device uint* states [[buffer(5)]],
+    device ulong* supports [[buffer(6)]],
+    constant MetalSemanticEdgeInfo& info [[buffer(7)]],
+    ulong candidate [[thread_position_in_grid]]
+) {
+    if (candidate >= info.candidate_count) return;
+    supports[candidate] = info.edge_count;
+    if (info.rows == 0) {
+        states[candidate] = GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT;
+        values[candidate] = 0.0f;
+        return;
+    }
+    device const float* column = columns + static_cast<ulong>(candidate_slots[candidate]) * info.rows;
+    const float first = column[0];
+    bool constant = true;
+    for (ulong row = 0; row < info.rows; ++row) {
+        constant = constant && column[row] == first;
+    }
+    if (constant) {
+        states[candidate] = GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND;
+        values[candidate] = 0.0f;
+        return;
+    }
+    float numerator = 0.0f;
+    float denominator = 0.0f;
+    // Edge order is the ABI reduction order.  One device thread per candidate
+    // deliberately preserves it rather than silently re-associating weights.
+    for (ulong edge_index = 0; edge_index < info.edge_count; ++edge_index) {
+        const MetalSemanticEdge edge = edges[edge_index];
+        const float left = column[edge.left_row];
+        const float right = column[edge.right_row];
+        const float weight = weights[edge_index];
+        const float difference = left - right;
+        numerator += weight * difference * difference;
+        denominator += weight * (left * left + right * right);
+    }
+    const float ratio = numerator / denominator;
+    if (!isfinite(numerator) || !isfinite(denominator) || !isfinite(ratio)) {
+        states[candidate] = GAFIME_SEMANTIC_SCALAR_NONFINITE_REDUCTION;
+        values[candidate] = 0.0f;
+        return;
+    }
+    states[candidate] = GAFIME_SEMANTIC_SCALAR_MEASURED;
+    values[candidate] = ratio;
+}
+
+kernel void gafime_semantic_sparse_gather(
+    device const float* source_columns [[buffer(0)]],
+    device float* destination_columns [[buffer(1)]],
+    device const uint* source_slots [[buffer(2)]],
+    device const uint* destination_slots [[buffer(3)]],
+    device const ulong* row_indices [[buffer(4)]],
+    constant MetalSemanticGatherInfo& info [[buffer(5)]],
+    ulong item [[thread_position_in_grid]]
+) {
+    const ulong total = info.slot_count * info.destination_rows;
+    if (item >= total) return;
+    const ulong slot_index = item / info.destination_rows;
+    const ulong destination_row = item - slot_index * info.destination_rows;
+    const ulong source_row = row_indices[destination_row];
+    destination_columns[static_cast<ulong>(destination_slots[slot_index]) * info.destination_rows +
+        destination_row] = source_columns[static_cast<ulong>(source_slots[slot_index]) * info.source_rows +
+        source_row];
 }

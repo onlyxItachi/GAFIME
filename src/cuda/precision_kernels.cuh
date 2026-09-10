@@ -253,6 +253,42 @@ struct CudaSemanticKernelSet {
         const CudaKernelLaunchPolicy& launch_policy,
         cudaStream_t stream
     );
+    cudaError_t (*pairwise_association)(
+        const void* left_columns,
+        const void* right_columns,
+        uint64_t rows,
+        const uint32_t* left_slots,
+        const uint32_t* right_slots,
+        uint64_t pair_count,
+        uint32_t statistic,
+        uint32_t presentation,
+        uint32_t fixed_nmi_bins,
+        void* values,
+        uint32_t* states,
+        uint64_t* supports,
+        const CudaKernelLaunchPolicy& launch_policy,
+        cudaStream_t stream
+    );
+    cudaError_t (*column_means)(
+        const void* columns,
+        uint64_t rows,
+        const uint32_t* candidate_slots,
+        uint64_t candidate_count,
+        void* values,
+        uint32_t* states,
+        uint64_t* supports,
+        const CudaKernelLaunchPolicy& launch_policy,
+        cudaStream_t stream
+    );
+    cudaError_t (*frozen_region_conjunction)(
+        void* columns,
+        uint64_t rows,
+        const GafimeSemanticFrozenRegionTerm* terms,
+        uint32_t term_count,
+        uint32_t output_slot,
+        const CudaKernelLaunchPolicy& launch_policy,
+        cudaStream_t stream
+    );
     cudaError_t (*ordered_edge_energy)(
         const void* columns,
         uint64_t rows,

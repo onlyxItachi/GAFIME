@@ -72,6 +72,7 @@ fn independent_acceptance_rounds_retain_both_atoms_for_composition() {
                 &table,
                 &SelectionPolicy {
                     primary: channel.id(),
+                    pareto_objectives: Vec::new(),
                     direction: Direction::Maximize,
                     constraints: vec![],
                     missing: MissingEvidence::Error,
@@ -172,6 +173,7 @@ fn channels(
 fn policy(channels: &[EvidenceChannel]) -> SelectionPolicy {
     SelectionPolicy {
         primary: channels[2].id(),
+        pareto_objectives: Vec::new(),
         direction: Direction::Minimize,
         constraints: vec![
             EvidenceConstraint {
@@ -397,6 +399,7 @@ fn stable_policy_rebinds_partial_labels_and_context_without_changing_program() {
         let absent = EvidenceChannel::new("labeled".into(), pearson_labels(None)).unwrap();
         let policy = SelectionPolicy {
             primary: absent.id(),
+            pareto_objectives: Vec::new(),
             direction: Direction::Maximize,
             constraints: vec![],
             missing: MissingEvidence::RejectCandidate,
@@ -495,6 +498,7 @@ fn round_atom_admission_rejects_unaccepted_foreign_and_exhausted_state() {
         .unwrap();
     let policy = SelectionPolicy {
         primary: ch.id(),
+        pareto_objectives: Vec::new(),
         direction: Direction::Maximize,
         constraints: vec![],
         missing: MissingEvidence::Error,
@@ -581,6 +585,7 @@ fn work_and_retention_admission_are_bounded_without_silent_eviction() {
         .unwrap();
     let mut policy = SelectionPolicy {
         primary: ch.id(),
+        pareto_objectives: Vec::new(),
         direction: Direction::Maximize,
         constraints: vec![],
         missing: MissingEvidence::Error,
@@ -633,6 +638,7 @@ fn accepted_atoms_do_not_hide_transitive_source_limits() {
             &table,
             &SelectionPolicy {
                 primary: channel.id(),
+                pareto_objectives: Vec::new(),
                 direction: Direction::Maximize,
                 constraints: vec![],
                 missing: MissingEvidence::Error,
@@ -685,6 +691,7 @@ fn repeated_discovery_rounds_stop_at_registry_budget_without_losing_accepted_inf
                 &table,
                 &SelectionPolicy {
                     primary: channel.id(),
+                    pareto_objectives: Vec::new(),
                     direction: Direction::Maximize,
                     constraints: vec![],
                     missing: MissingEvidence::Error,

@@ -6,11 +6,11 @@ use gafime_types::{
     GafimeMatrixDesc, GafimeMutableBufferView, GafimeNumericInteractionDiagnosticBatch,
     GafimeNumericLaunchProtocol, GafimeNumericMatrixDesc, GafimeNumericResultTable,
     GafimeNumericRoute, GafimeNumericSignificanceTable, GafimePermutationSignificanceTable,
-    GafimeResultTable, GafimeSemanticBankDesc, GafimeSemanticCapabilities,
-    GafimeSemanticEdgeEnergyBatch, GafimeSemanticForecastRequest, GafimeSemanticMemoryForecast,
-    GafimeSemanticPearsonBatch, GafimeSemanticProgramBatch, GafimeSemanticScalarResultTable,
-    GafimeSemanticSparseGatherBatch, GafimeSliceU32, GafimeStatus, PrecisionProfile,
-    GAFIME_STATUS_OK,
+    GafimeResultTable, GafimeSemanticAssociationBatch, GafimeSemanticBankDesc,
+    GafimeSemanticCapabilities, GafimeSemanticColumnMeanBatch, GafimeSemanticEdgeEnergyBatch,
+    GafimeSemanticForecastRequest, GafimeSemanticMemoryForecast, GafimeSemanticPearsonBatch,
+    GafimeSemanticProgramBatch, GafimeSemanticScalarResultTable, GafimeSemanticSparseGatherBatch,
+    GafimeSliceU32, GafimeStatus, PrecisionProfile, GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
@@ -145,6 +145,17 @@ pub type GafimeGpuSemanticPairwisePearsonV1Fn = unsafe extern "C" fn(
     batch: *const GafimeSemanticPearsonBatch,
     results_out: *mut GafimeSemanticScalarResultTable,
 ) -> GafimeStatus;
+pub type GafimeGpuSemanticPairwiseAssociationV1Fn = unsafe extern "C" fn(
+    left_bank: GafimeGpuSemanticBank,
+    right_bank: GafimeGpuSemanticBank,
+    batch: *const GafimeSemanticAssociationBatch,
+    results_out: *mut GafimeSemanticScalarResultTable,
+) -> GafimeStatus;
+pub type GafimeGpuSemanticColumnMeansV1Fn = unsafe extern "C" fn(
+    bank: GafimeGpuSemanticBank,
+    batch: *const GafimeSemanticColumnMeanBatch,
+    results_out: *mut GafimeSemanticScalarResultTable,
+) -> GafimeStatus;
 pub type GafimeGpuSemanticOrderedEdgeEnergyV1Fn = unsafe extern "C" fn(
     bank: GafimeGpuSemanticBank,
     batch: *const GafimeSemanticEdgeEnergyBatch,
@@ -201,6 +212,8 @@ pub struct GpuFunctionTable {
     pub semantic_bank_upload_v1: Option<GafimeGpuSemanticBankUploadV1Fn>,
     pub semantic_materialize_v1: Option<GafimeGpuSemanticMaterializeV1Fn>,
     pub semantic_pairwise_pearson_v1: Option<GafimeGpuSemanticPairwisePearsonV1Fn>,
+    pub semantic_pairwise_association_v1: Option<GafimeGpuSemanticPairwiseAssociationV1Fn>,
+    pub semantic_column_means_v1: Option<GafimeGpuSemanticColumnMeansV1Fn>,
     pub semantic_ordered_edge_energy_v1: Option<GafimeGpuSemanticOrderedEdgeEnergyV1Fn>,
     pub semantic_sparse_gather_v1: Option<GafimeGpuSemanticSparseGatherV1Fn>,
     pub semantic_forecast_v1: Option<GafimeGpuSemanticForecastV1Fn>,
@@ -258,6 +271,8 @@ impl GpuFunctionTable {
             || self.semantic_bank_upload_v1.is_some()
             || self.semantic_materialize_v1.is_some()
             || self.semantic_pairwise_pearson_v1.is_some()
+            || self.semantic_pairwise_association_v1.is_some()
+            || self.semantic_column_means_v1.is_some()
             || self.semantic_ordered_edge_energy_v1.is_some()
             || self.semantic_sparse_gather_v1.is_some()
             || self.semantic_forecast_v1.is_some()
@@ -297,6 +312,16 @@ impl GpuFunctionTable {
         if self.semantic_pairwise_pearson_v1.is_none() {
             return Err(GpuSysError::MissingFunction(
                 "gafime_gpu_semantic_pairwise_pearson_v1",
+            ));
+        }
+        if self.semantic_pairwise_association_v1.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_semantic_pairwise_association_v1",
+            ));
+        }
+        if self.semantic_column_means_v1.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_semantic_column_means_v1",
             ));
         }
         if self.semantic_ordered_edge_energy_v1.is_none() {
@@ -591,6 +616,16 @@ pub(crate) unsafe fn load_function_table(
                 GafimeGpuSemanticPairwisePearsonV1Fn,
             >(
                 library, "gafime_gpu_semantic_pairwise_pearson_v1"
+            ),
+            semantic_pairwise_association_v1: load_optional_symbol::<
+                GafimeGpuSemanticPairwiseAssociationV1Fn,
+            >(
+                library,
+                "gafime_gpu_semantic_pairwise_association_v1",
+            ),
+            semantic_column_means_v1: load_optional_symbol::<GafimeGpuSemanticColumnMeansV1Fn>(
+                library,
+                "gafime_gpu_semantic_column_means_v1",
             ),
             semantic_ordered_edge_energy_v1: load_optional_symbol::<
                 GafimeGpuSemanticOrderedEdgeEnergyV1Fn,

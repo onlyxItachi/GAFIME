@@ -47,7 +47,7 @@ Coverage classes:
 | `gafime.family_capability` | primary | lookup/failure semantics | family sections | family smoke | exact-name lookup |
 | `gafime.generate_tutorial` | integration | generator contract | documentation hierarchy | deterministic tutorial parity test | generates the compact practice notebook only |
 | `gafime.require_family_supported` | primary | lookup/failure semantics | family sections | family smoke | fail-closed family admission |
-| `gafime.semantic` | explicit namespace | bounded lifecycle and support boundary | semantic lifecycle/API index | semantic boundary, installed-wheel lifecycle, and hardware-conditional accelerator smokes | additive Rust-owned namespace: complete Core vocabulary plus a conditional CUDA/ROCm subset; explicit import only, deliberately omitted from legacy wildcard exports; its handles are not copied to the top level |
+| `gafime.semantic` | explicit namespace | bounded lifecycle and support boundary | semantic lifecycle/API index | semantic boundary, installed-wheel lifecycle, and hardware-conditional accelerator smokes | additive Rust-owned namespace with operation-specific Core/CUDA/ROCm/Metal lowerings; explicit import only, deliberately omitted from legacy wildcard exports; its handles are not copied to the top level |
 | `gafime.subfunctions` | advanced compatibility | proxy and compatibility boundary | compatibility/API-index section | existing compatibility tests | prefer top-level safe APIs for new code |
 
 The table covers every name in `gafime.__all__` plus the public runtime version
@@ -127,11 +127,11 @@ the legacy supervised APIs. The detailed contract is
 
 | Symbol | Classification | Supported purpose | Important boundary |
 |---|---|---|---|
-| `TabularSession` | primary | owns a bounded Core discovery/inference lifecycle and an explicit conditional CUDA/ROCm subset | `capabilities` separates selected operation support from legacy backend availability; GPU support is a runtime intersection, not a Core fallback; `diagnostics` reports completed native work, not timing; `close()` is terminal and idempotent |
+| `TabularSession` | primary | owns bounded discovery/inference with explicit conditional CUDA/ROCm/Metal lowerings | `capabilities` separates selected operation support from legacy backend availability; GPU support is a runtime intersection, not a Core fallback; `diagnostics` reports completed native work, not timing; `close()` is terminal and idempotent |
 | `Snapshot` | result model | immutable Rust-owned frame identity | row keys/domain, profile, role, schema, and provenance are explicit; caller mutation after ingest does not alter it |
 | `Candidate`, `CandidateSet`, `AcceptedSet` | result model | opaque session-local program handles and bounded ordered collections | no integer constructor, serialization, cross-session reuse, or authority from output ordinals |
 | `Evidence` | primary declaration | named reference, paired-view, labels, or graph measurement | a named measurement is not a universal quality score or a fabricated target |
-| `Constraint`, `SelectionPolicy` | primary declaration | explicit primary ordering plus inclusive per-channel bounds | constraints are independent channels, not weighted/Pareto-like score synthesis |
+| `Constraint`, `SelectionPolicy` | primary declaration | explicit primary ordering, inclusive per-channel bounds, optional bounded Pareto frontier | axes keep separate units; two to eight distinct objectives; constraints filter, frontier survives, primary orders/truncates; no scalar score synthesis |
 | `EvidenceReport` | result model | contextual values, immutable context metadata, availability reasons, support, and Arrow long-form export | `context` retains row/channel declarations without certifying leakage safety; use `value(candidate, channel)` or `__arrow_c_array__()`; no Python row materialization API is promised |
 | `Labels`, `Graph` | result model | row-key-bound optional label subset or caller-supplied graph | provenance/split text is caller-supplied context, not leakage or graph-quality proof |
 | `FeatureTable` | result model | Arrow-exportable accepted-program outputs with row keys | column ordinals/names are presentation only; Arrow buffers outlive a closed session |
@@ -140,11 +140,11 @@ The semantic constructor uses `EngineConfig` only for `backend`, `device_id`,
 and `precision`; non-default legacy scoring, family, significance, or budget
 fields are rejected rather than silently becoming semantic policy. `core` and
 `auto` select Core, with `auto` deliberately retaining Core for the complete
-vocabulary. Explicit CUDA/ROCm requests require a complete compatible optional
+vocabulary. Explicit CUDA/ROCm/Metal requests require a complete compatible optional
 semantic primitive payload table and then admit only the runtime intersection
 of payload capabilities and Rust lowering for the selected profile. Native
 normalization maps `cpu`, `rust`, and `v1-rust-cpu` to `core` and `hip` to
-`rocm`. Metal is explicitly unsupported for this semantic product. No request
+`rocm`. Metal admits fp32 only with its explicit per-operation limits. No request
 silently substitutes Core, and none admits an asynchronous or Python data-plane
 semantic execution path.
 
@@ -162,13 +162,15 @@ retains its detailed completed-work diagnostics. `describe(candidate)` returns
 bounded operation/dependency metadata and opaque operand handles for inspection
 only; it does not make a candidate serializable or a public native descriptor.
 
-The current explicit CUDA/ROCm subset can negotiate source, absolute difference,
-softsign, and ordered frozen centered product; Pearson reference/paired context,
-sparse partial labels, and graph energy are admitted only when their individual
-capability bits are available. Spearman and fixed corrected NMI are unsupported
-there and fail rather than falling back to Core. Hardware-conditional public
+Native requests negotiate source, absolute difference, softsign, frozen centered
+product, hard predicates/regions, per-column fitting means, association
+statistics, sparse partial labels, and graph energy through individual
+capability bits. Spearman row/work limits and fixed-NMI bin/row limits are
+explicit; unsupported requests fail rather than falling back to Core.
+Hardware-conditional public
 tests make a missing corresponding payload a clear skip; a configured but
-insufficient payload is a failure. The installed-payload public suite passed
+insufficient payload is a failure. At the predecessor PR #95 checkpoint (not
+qualification of later source changes), the installed-payload public suite passed
 29/29 cases on CUDA device 0 / RTX 4060 Laptop (`sm89`, driver `610.57.04`) and
 29/29 on ROCm device 0 / AMD Radeon Graphics (`gfx1150`, runtime `70253211`,
 system LLVM `21.1.8`); separate frozen legacy C ABI CMake fixtures passed CUDA
@@ -189,6 +191,29 @@ callbacks to construct candidates or ingest unbounded data.
 role, and per-channel kind/semantic binding. It is a durable record of declared
 context—not evidence that a caller-provided split, provenance string, labels,
 or graph is statistically valid or leakage-free.
+
+### Discovery additions and executable coverage
+
+The [discovery milestone](v1.1-tabular-discovery.md) deepens the bounded #72
+semantic subset without exposing a future compiler or a new execution engine.
+All additions have Rust/PyO3 docstrings and long-form reference coverage:
+
+| Public addition | Meaning | Focused executable coverage |
+|---|---|---|
+| `TabularSession.propose_centered_interactions(atoms=None, arities=None, limit=256, frame=None)` | native per-atom training means and deterministic bounded combination proposals; default arity two | `test_semantic_discovery.py`: all profiles, training/inference roles, same identity across equal fitted states, four consumer paradigms |
+| `TabularSession.predicate(operand, relation=..., threshold=...)` | exact `le`/`gt` finite frozen predicate | profile-native interval boundaries, invalid threshold/relation rejection |
+| `TabularSession.decision_region(predicates)` | canonical hard conjunction; repeated bounds on one atom do not inflate logical arity | deterministic identity, contradictions/duplicates, one-atom arity |
+| `TabularSession.fitting_origins(candidate)` | current transitive fitting ledger | separate equal-math/different-training contexts |
+| `EvidenceReport.fitting_origins(candidate)` | immutable fitting ledger snapshot at evaluation | later fitting cannot rewrite old report |
+| `AcceptedSet.fitting_origins(index)` | immutable transitive fitting ledger snapshot at acceptance | later-round reuse and post-close inspection |
+| `EvidenceReport.evaluation_origins(candidate)`, `AcceptedSet.evaluation_origins(index)` | immutable fitting origins affecting the complete evaluated evidence set, including fitted contextual references | raw candidate selected using a fitted reference, later equal-state refit, unchanged program-only lineage, post-close inspection |
+| `SelectionPolicy(..., pareto=[(evidence, direction), ...])` | explicit frontier filter before existing primary ordering/limit | conflicts, opposite directions, ties, missing objectives, budget failure without retention |
+
+Fitting provenance records `snapshot_id`, `row_domain`, and `provenance`.
+The ID is process-local diagnostics, not a serializable authority; manually
+declared constants have no session fitting record. Unlabeled inference does
+not refit state or evaluate evidence. Arrow-to-learner fixtures verify delivery,
+not a general predictive-quality or DL Method efficacy claim.
 
 Evidence evaluation accepts discovery or holdout snapshots only. Inference
 snapshots are transform-only and are rejected before any native evidence work.
