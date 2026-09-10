@@ -2773,6 +2773,73 @@ int inspect_cuda_matrix(
     return GAFIME_STATUS_OK;
 }
 
+int inspect_cuda_semantic_bank(
+    GafimeGpuSemanticBank bank_handle,
+    CudaSemanticBankView* view_out
+) {
+    if (view_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    auto* bank = semantic_bank_from_handle(bank_handle);
+    const int status = require_semantic_bank(bank);
+    if (status != GAFIME_STATUS_OK) return status;
+
+    // The local RT experiment is intentionally narrower than the standard
+    // semantic table.  Mixed f32 storage is not enough: region membership is
+    // a profile-specific fp32 arithmetic path and must not silently narrow a
+    // mixed/fp64 semantic request.
+    if (bank->profile != GAFIME_PRECISION_FP32 ||
+        bank->route.profile != GAFIME_PRECISION_FP32 ||
+        bank->route.storage_dtype != GAFIME_DTYPE_F32 ||
+        bank->kernels->storage_bytes != sizeof(float) ||
+        bank->initialized_slots.size() != bank->slot_capacity) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+
+    *view_out = {
+        static_cast<float*>(bank->columns),
+        bank->rows,
+        bank->source_slots,
+        bank->slot_capacity,
+        bank->device_id,
+        bank->device_flags,
+        bank->architecture_class,
+        bank->route,
+        &bank->initialized_slots,
+    };
+    return GAFIME_STATUS_OK;
+}
+
+int commit_cuda_semantic_bank_outputs(
+    GafimeGpuSemanticBank bank_handle,
+    const uint32_t* output_slots,
+    uint32_t output_count
+) {
+    auto* bank = semantic_bank_from_handle(bank_handle);
+    const int status = require_semantic_bank(bank);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (output_slots == nullptr && output_count != 0u ||
+        bank->initialized_slots.size() != bank->slot_capacity) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+
+    // Validate every state transition before mutating the bank.  The local RT
+    // bound keeps this small O(n^2) duplicate check explicit and allocation
+    // free; a failed call therefore leaves every fresh slot uninitialized.
+    for (uint32_t index = 0; index < output_count; ++index) {
+        const uint32_t slot = output_slots[index];
+        if (slot < bank->source_slots || slot >= bank->slot_capacity ||
+            bank->initialized_slots[slot] != 0u) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        for (uint32_t prior = 0; prior < index; ++prior) {
+            if (output_slots[prior] == slot) return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    for (uint32_t index = 0; index < output_count; ++index) {
+        bank->initialized_slots[output_slots[index]] = 1u;
+    }
+    return GAFIME_STATUS_OK;
+}
+
 }  // namespace gafime_cuda_v1::detail
 
 extern "C" {

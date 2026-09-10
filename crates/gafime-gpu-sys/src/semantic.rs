@@ -556,12 +556,6 @@ impl OwnedSemanticBank {
         if nodes.is_empty() {
             return Ok(());
         }
-        let node_count = u32::try_from(nodes.len()).map_err(|_| GpuSysError::SizeOverflow)?;
-        if node_count > self.max_program_nodes() {
-            return Err(GpuSysError::InvalidInput(
-                "semantic program node count exceeds payload capability",
-            ));
-        }
         let materialize =
             self.inner
                 .functions
@@ -569,6 +563,30 @@ impl OwnedSemanticBank {
                 .ok_or(GpuSysError::MissingFunction(
                     "gafime_gpu_semantic_materialize_v1",
                 ))?;
+        self.with_program_batch(nodes, |raw, batch| {
+            // SAFETY: the shared marshaller keeps the descriptor arrays and
+            // bank alive and exclusively locked through this synchronous call.
+            let status = unsafe { materialize(raw, batch) };
+            status_to_gpu_result("gafime_gpu_semantic_materialize_v1", status)
+        })
+    }
+
+    // One physical marshaller serves the standard executor and feature-gated
+    // local experiments. Neither callback can extend descriptor lifetimes.
+    pub(crate) fn with_program_batch(
+        &self,
+        nodes: &[SemanticProgramNode],
+        call: impl FnOnce(GafimeGpuSemanticBank, &GafimeSemanticProgramBatch) -> Result<(), GpuSysError>,
+    ) -> Result<(), GpuSysError> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let node_count = u32::try_from(nodes.len()).map_err(|_| GpuSysError::SizeOverflow)?;
+        if node_count > self.max_program_nodes() {
+            return Err(GpuSysError::InvalidInput(
+                "semantic program node count exceeds payload capability",
+            ));
+        }
         let operand_capacity = nodes.iter().try_fold(0usize, |total, node| {
             let count = match node {
                 SemanticProgramNode::Source { .. } | SemanticProgramNode::Softsign { .. } => 1,
@@ -776,11 +794,7 @@ impl OwnedSemanticBank {
             ..Default::default()
         };
         let _guard = self.lock();
-        // SAFETY: all descriptor vectors remain live for this synchronous call,
-        // slot bounds were checked locally and native validation repeats the
-        // complete topological/route validation before dispatch.
-        let status = unsafe { materialize(self.inner.raw, &batch) };
-        status_to_gpu_result("gafime_gpu_semantic_materialize_v1", status)
+        call(self.inner.raw, &batch)
     }
 
     fn scalar_results(
@@ -1381,6 +1395,9 @@ fn checked_download_elements(rows: u64, slots: usize) -> Result<usize, GpuSysErr
 pub struct GpuNativeEvidenceExecutor {
     backend: GpuBackend,
     capabilities: gafime_types::GafimeSemanticCapabilities,
+    #[cfg(feature = "local-cmake-experiment")]
+    pub(crate) local_region_execution:
+        Option<crate::local_cmake_experiment::LocalSemanticRegionExecution>,
 }
 
 impl GpuNativeEvidenceExecutor {
@@ -1429,6 +1446,8 @@ impl GpuNativeEvidenceExecutor {
         Ok(Self {
             backend,
             capabilities,
+            #[cfg(feature = "local-cmake-experiment")]
+            local_region_execution: None,
         })
     }
 
@@ -1473,6 +1492,12 @@ impl GpuNativeEvidenceExecutor {
     }
 
     fn require_profile(&self, profile: PrecisionProfile) -> SemanticResult<()> {
+        #[cfg(feature = "local-cmake-experiment")]
+        if self.local_region_execution.is_some() && profile != PrecisionProfile::Fp32 {
+            return Err(SemanticError::Unsupported(
+                "local semantic RT requires the fp32 profile, not just f32 storage",
+            ));
+        }
         if self.capabilities.profile_mask & profile.capability_mask() == 0 {
             return Err(SemanticError::Unsupported(
                 "selected GPU semantic payload does not support this precision profile",
@@ -2622,6 +2647,20 @@ impl NativeEvidenceExecutor for GpuNativeEvidenceExecutor {
                 .map_err(Self::semantic_error)?;
         }
         if !native_nodes.is_empty() {
+            #[cfg(feature = "local-cmake-experiment")]
+            if let Some(execution) = &mut self.local_region_execution {
+                let available = max_bytes
+                    .checked_sub(resident_bytes)
+                    .and_then(|bytes| bytes.checked_sub(host_temporary_bytes))
+                    .ok_or(SemanticError::Invalid(
+                        "local execution temporary budget exhausted",
+                    ))?;
+                execution.materialize(&bank, &native_nodes, available)?;
+            } else {
+                bank.materialize(&native_nodes)
+                    .map_err(Self::semantic_error)?;
+            }
+            #[cfg(not(feature = "local-cmake-experiment"))]
             bank.materialize(&native_nodes)
                 .map_err(Self::semantic_error)?;
         }

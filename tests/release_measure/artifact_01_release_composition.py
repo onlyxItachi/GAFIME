@@ -89,7 +89,8 @@ FORBIDDEN_PRECISION_DISTRIBUTION_IDENTITY = re.compile(
 # ABI names, and archive members are not allowed in a standard distribution.
 FORBIDDEN_RT_ABI_IDENTITIES = re.compile(
     rb"(?<![A-Za-z0-9_])"
-    rb"gafime_gpu_decision_path_(?:membership|score|release_device_state)"
+    rb"(?:gafime_gpu_decision_path_(?:membership|score|release_device_state)|"
+    rb"gafime_gpu_semantic_region_materialize_rt_v1)"
     rb"(?![A-Za-z0-9_])"
 )
 FORBIDDEN_OPTIX_IDENTIFIERS = re.compile(
@@ -671,6 +672,7 @@ def _assert_rt_matchers() -> None:
         b"gafime_gpu_decision_path_membership",
         b"gafime_gpu_decision_path_score",
         b"gafime_gpu_decision_path_release_device_state",
+        b"gafime_gpu_semantic_region_materialize_rt_v1",
         b"DecisionPathRtPolicy",
         b"GafimeDecisionPathScoreBatch",
         b"supports_decision_path_membership",
@@ -685,6 +687,17 @@ def _assert_rt_matchers() -> None:
             bool(_forbidden_rt_content(sample, source_member=True)),
             f"RT artifact matcher missed {sample!r}",
         )
+
+    _require(
+        bool(
+            _forbidden_rt_content(
+                b"gafime_gpu_semantic_region_materialize_rt_v1",
+                source_member=False,
+                native_member=True,
+            )
+        ),
+        "local semantic RT export must be excluded from native release artifacts",
+    )
 
     allowed_samples = (
         b"OptiX RT is disabled in every standard artifact.",
@@ -2672,8 +2685,7 @@ def _assert_publish_workflow(workflow: str) -> None:
         "GitHub Release must publish the verified frozen bundle after public installs",
     )
     _require(
-        "ref: ${{ needs.publication_preflight.outputs.source_sha }}"
-        in github_release
+        "ref: ${{ needs.publication_preflight.outputs.source_sha }}" in github_release
         and 0
         <= github_release.find("verify_release_ref_identity.py")
         < github_release.find("softprops/action-gh-release"),

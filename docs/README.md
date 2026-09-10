@@ -65,6 +65,8 @@ documents that own each subject.
 
 ## Evidence and History
 
+- [Local RT semantic batch experiment](rt-semantic-batch-experiment.md) —
+  explicit source-build research, not a supported release backend.
 - [Evidence index](evidence/README.md)
 - [Historical pre-v1 API notebook](notebooks/gafime_full_api_reference_notebook.ipynb)
 - [Historical release records](releases/README.md#release-history)

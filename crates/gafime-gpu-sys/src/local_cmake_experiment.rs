@@ -3,10 +3,12 @@ use std::{
     sync::{Arc, Mutex, OnceLock, Weak},
 };
 
+use gafime_orchestrator::semantic::{SemanticError, SemanticResult};
 use gafime_orchestrator::MatrixHandle;
 use gafime_types::{
     BackendKind, GafimeDecisionPathBatch, GafimeDecisionPathScoreBatch, GafimeDecisionPathTerm,
-    GafimeGpuMatrix, GafimeResultTable, GafimeStatus, GAFIME_ABI_VERSION, GAFIME_BACKEND_CUDA,
+    GafimeGpuMatrix, GafimeGpuSemanticBank, GafimeResultTable, GafimeSemanticProgramBatch,
+    GafimeStatus, PrecisionProfile, GAFIME_ABI_VERSION, GAFIME_BACKEND_CUDA,
     GAFIME_DECISION_PATH_FLAG_REQUIRE_RT, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT,
     GAFIME_MAX_DECISION_PATH_COUNT, GAFIME_STATUS_UNSUPPORTED_BACKEND,
 };
@@ -16,6 +18,7 @@ use crate::{
     abi::{load_optional_symbol, status_to_gpu_result, GpuFunctionTable, GpuSysError},
     backend::GpuBackend,
     profile::GpuDeviceProfile,
+    semantic::{GpuNativeEvidenceExecutor, OwnedSemanticBank, SemanticProgramNode},
 };
 
 pub type GafimeGpuDecisionPathMembershipFn = unsafe extern "C" fn(
@@ -30,11 +33,19 @@ pub type GafimeGpuDecisionPathScoreFn = unsafe extern "C" fn(
 pub type GafimeGpuDecisionPathReleaseDeviceStateFn =
     unsafe extern "C" fn(device_id: u32) -> GafimeStatus;
 
+pub type GafimeGpuSemanticRegionMaterializeRtFn = unsafe extern "C" fn(
+    bank: GafimeGpuSemanticBank,
+    batch: *const GafimeSemanticProgramBatch,
+    max_temporary_bytes: u64,
+    peak_bytes_out: *mut u64,
+) -> GafimeStatus;
+
 #[derive(Clone, Copy, Default)]
 pub struct LocalCmakeExperimentFunctions {
     pub decision_path_membership: Option<GafimeGpuDecisionPathMembershipFn>,
     pub decision_path_score: Option<GafimeGpuDecisionPathScoreFn>,
     pub decision_path_release_device_state: Option<GafimeGpuDecisionPathReleaseDeviceStateFn>,
+    pub semantic_region_materialize_rt: Option<GafimeGpuSemanticRegionMaterializeRtFn>,
 }
 
 /// # Safety
@@ -54,7 +65,231 @@ pub(crate) unsafe fn load_function_table(library: &Library) -> LocalCmakeExperim
                 library,
                 "gafime_gpu_decision_path_release_device_state",
             ),
+            semantic_region_materialize_rt: load_optional_symbol(
+                library,
+                "gafime_gpu_semantic_region_materialize_rt_v1",
+            ),
         }
+    }
+}
+
+/// Local source-build diagnostics, not a supported Python/backend selection API.
+/// Every counted batch completed the explicit RequireRT entrypoint; no fallback
+/// or ordinary arithmetic batch contributes to this record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LocalSemanticRtDiagnostics {
+    pub completed_region_batches: u64,
+    pub completed_regions: u64,
+    pub peak_explicit_temporary_bytes: u64,
+}
+
+pub(crate) struct LocalSemanticRegionExecution {
+    materialize: GafimeGpuSemanticRegionMaterializeRtFn,
+    diagnostics: LocalSemanticRtDiagnostics,
+}
+
+#[cfg(test)]
+mod semantic_region_group_tests {
+    use super::*;
+    use crate::semantic::{SemanticFrozenRegionTerm, SemanticRegionRelation};
+
+    fn region(slots: &[u32]) -> SemanticProgramNode {
+        SemanticProgramNode::FrozenRegionConjunction {
+            output_slot: 99,
+            terms: slots
+                .iter()
+                .map(|&input_slot| SemanticFrozenRegionTerm {
+                    input_slot,
+                    relation: SemanticRegionRelation::LessEqual,
+                    threshold_bits: u64::from(1.0f32.to_bits()),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn groups_preserve_order_and_split_at_native_axis_limit() {
+        let nodes = [region(&[0, 1]), region(&[1, 2]), region(&[2, 3])];
+        assert_eq!(local_region_run_len(&nodes).unwrap(), 2);
+        assert_eq!(local_region_run_len(&nodes[2..]).unwrap(), 1);
+        assert!(local_region_run_len(&[region(&[0, 1, 2, 3])]).is_err());
+    }
+
+    #[test]
+    fn groups_bound_region_count_and_stop_before_other_arithmetic() {
+        assert_eq!(local_region_run_len(&vec![region(&[0]); 257]).unwrap(), 256);
+        let nodes = [region(&[0]), SemanticProgramNode::Source { output_slot: 1 }];
+        assert_eq!(local_region_run_len(&nodes).unwrap(), 1);
+        assert!(local_region_run_len(&[region(&[])]).is_err());
+        assert!(local_region_run_len(&[region(&[0; 65])]).is_err());
+    }
+
+    #[test]
+    fn dependent_regions_begin_a_later_launch() {
+        let nodes = [region(&[0]), region(&[99])];
+        assert_eq!(local_region_run_len(&nodes).unwrap(), 1);
+    }
+}
+
+fn local_semantic_error(error: GpuSysError) -> SemanticError {
+    match error {
+        GpuSysError::BackendStatus {
+            status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
+            ..
+        }
+        | GpuSysError::MissingFunction(_) => SemanticError::Unsupported(
+            "local semantic RT region execution is unavailable or ineligible; no fallback",
+        ),
+        _ => SemanticError::Invalid(
+            "local semantic RT region execution rejected its descriptors or temporary budget",
+        ),
+    }
+}
+
+// Geometry admission is an execution lowering, not candidate semantics. Keep
+// the canonical order while making the three-coordinate OptiX envelope explicit;
+// never silently route a wider individual region to ordinary CUDA.
+fn local_region_run_len(nodes: &[SemanticProgramNode]) -> SemanticResult<usize> {
+    let mut axes = [0u32; 3];
+    let mut axis_count = 0;
+    let mut count = 0;
+    for node in nodes.iter().take(256) {
+        let SemanticProgramNode::FrozenRegionConjunction { terms, .. } = node else {
+            break;
+        };
+        if terms.is_empty() || terms.len() > 64 {
+            return Err(SemanticError::Unsupported(
+                "local RT requires 1..=64 terms per region",
+            ));
+        }
+        let mut next_axes = axes;
+        let mut next_count = axis_count;
+        for term in terms {
+            if nodes[..count].iter().any(|previous| {
+                matches!(previous, SemanticProgramNode::FrozenRegionConjunction {
+                    output_slot, ..
+                } if *output_slot == term.input_slot)
+            }) {
+                // An accepted region may itself be a later logical atom.
+                // Its values must be initialized by a preceding launch.
+                return Ok(count);
+            }
+            if !next_axes[..next_count].contains(&term.input_slot) {
+                if next_count == next_axes.len() {
+                    if count == 0 {
+                        return Err(SemanticError::Unsupported(
+                            "local RT requires at most three physical axes per region",
+                        ));
+                    }
+                    return Ok(count);
+                }
+                next_axes[next_count] = term.input_slot;
+                next_count += 1;
+            }
+        }
+        axes = next_axes;
+        axis_count = next_count;
+        count += 1;
+    }
+    Ok(count)
+}
+
+impl LocalSemanticRegionExecution {
+    pub(crate) fn materialize(
+        &mut self,
+        bank: &OwnedSemanticBank,
+        nodes: &[SemanticProgramNode],
+        available_bytes: usize,
+    ) -> SemanticResult<()> {
+        if bank.backend_kind() != GAFIME_BACKEND_CUDA || bank.profile() != PrecisionProfile::Fp32 {
+            return Err(SemanticError::Unsupported(
+                "local semantic RT requires CUDA fp32",
+            ));
+        }
+        let budget = u64::try_from(available_bytes)
+            .map_err(|_| SemanticError::Invalid("local RT temporary budget exceeds u64"))?;
+        let is_region = |node: &SemanticProgramNode| {
+            matches!(node, SemanticProgramNode::FrozenRegionConjunction { .. })
+        };
+        let mut first = 0;
+        while first < nodes.len() {
+            let region = is_region(&nodes[first]);
+            let end = if region {
+                first + local_region_run_len(&nodes[first..])?
+            } else {
+                nodes[first..]
+                    .iter()
+                    .position(is_region)
+                    .map_or(nodes.len(), |offset| first + offset)
+            };
+            let run = &nodes[first..end];
+            if region {
+                // Canonical predicates only consume raw/previously accepted
+                // atoms, but direct physical callers may supply dependent
+                // regions. The native boundary must validate that a parallel
+                // RT batch reads initialized inputs, never another output.
+                let mut peak = 0u64;
+                bank.with_program_batch(run, |raw, batch| {
+                    // SAFETY: same marshaller/lock/lifetime as ordinary CUDA;
+                    // this pointer came from this executor's retained payload.
+                    // Native repeats route, slot, capability and budget checks.
+                    let status = unsafe { (self.materialize)(raw, batch, budget, &mut peak) };
+                    status_to_gpu_result("gafime_gpu_semantic_region_materialize_rt_v1", status)
+                })
+                .map_err(local_semantic_error)?;
+                if peak > budget {
+                    return Err(SemanticError::Invalid(
+                        "local RT reported an inadmissible temporary peak",
+                    ));
+                }
+                self.diagnostics.completed_region_batches += 1;
+                self.diagnostics.completed_regions += run.len() as u64;
+                self.diagnostics.peak_explicit_temporary_bytes =
+                    self.diagnostics.peak_explicit_temporary_bytes.max(peak);
+            } else {
+                bank.materialize(run).map_err(local_semantic_error)?;
+            }
+            first = end;
+        }
+        Ok(())
+    }
+}
+
+impl GpuBackend {
+    /// Explicit local-only RT region lowering. Normal algebra still executes
+    /// through the standard semantic table. Mixed/fp64 and ineligible regions
+    /// fail closed; this never changes semantic auto or Python EngineConfig.
+    pub fn local_rt_semantic_executor(&self) -> Result<GpuNativeEvidenceExecutor, GpuSysError> {
+        if self.kind != GAFIME_BACKEND_CUDA
+            || !self.device_profile()?.local_cmake_experiment_available()
+        {
+            return Err(GpuSysError::InvalidInput(
+                "local semantic RT requires an actual RT-capable CUDA payload/device",
+            ));
+        }
+        let materialize = self
+            .functions
+            .local_cmake_experiment
+            .semantic_region_materialize_rt
+            .ok_or(GpuSysError::MissingFunction(
+                "gafime_gpu_semantic_region_materialize_rt_v1",
+            ))?;
+        let mut executor = self.semantic_executor()?;
+        executor.local_region_execution = Some(LocalSemanticRegionExecution {
+            materialize,
+            diagnostics: LocalSemanticRtDiagnostics::default(),
+        });
+        Ok(executor)
+    }
+}
+
+impl GpuNativeEvidenceExecutor {
+    /// None for the ordinary executor, even when its payload happens to support
+    /// local RT. Driver/context overhead is outside the explicit-buffer peak.
+    pub fn local_rt_diagnostics(&self) -> Option<LocalSemanticRtDiagnostics> {
+        self.local_region_execution
+            .as_ref()
+            .map(|value| value.diagnostics)
     }
 }
 

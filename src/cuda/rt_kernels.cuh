@@ -42,6 +42,28 @@ __global__ void validate_rt_feature_domain_kernel(
     uint32_t* invalid_out
 );
 
+/* The local semantic RT entry scans only its resolved physical input slots.
+ * It rejects non-finite and subnormal fp32 values before OptiX traversal so
+ * the exact predicate path never turns an unavailable value into membership. */
+__global__ void validate_semantic_region_input_domain_kernel(
+    const float* columns,
+    uint64_t rows,
+    const uint32_t* input_slots,
+    uint32_t input_slot_count,
+    uint32_t* invalid_out
+);
+
+/* Maps path-major OptiX membership into fresh semantic-bank output slots.  A
+ * bad temporary membership value leaves slots uncommitted at the host layer. */
+__global__ void scatter_semantic_region_membership_kernel(
+    const float* membership,
+    uint64_t rows,
+    uint32_t region_count,
+    const uint32_t* output_slots,
+    float* columns,
+    uint32_t* invalid_out
+);
+
 __host__ __device__ inline uint32_t rt_canonical_float_bits(float value) {
 #if defined(__CUDA_ARCH__)
     uint32_t bits = __float_as_uint(value);

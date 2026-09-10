@@ -13,11 +13,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <memory>
 #include <new>
 #include <utility>
 #include <vector>
 
 #include "rt_kernels.cuh"
+#include "../common/semantic_primitives_abi_impl.hpp"
 
 #if defined(GAFIME_CUDA_ENABLE_OPTIX_RT)
 #include <cuda.h>
@@ -30,7 +33,9 @@
 namespace {
 
 int cuda_status(cudaError_t status) {
-    return status == cudaSuccess ? GAFIME_STATUS_OK : GAFIME_STATUS_DEVICE_ERROR;
+    if (status == cudaSuccess) return GAFIME_STATUS_OK;
+    if (status == cudaErrorMemoryAllocation) return GAFIME_STATUS_OUT_OF_MEMORY;
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 class ScopedCudaDevice {
@@ -72,6 +77,33 @@ bool checked_mul_u64(uint64_t left, uint64_t right, uint64_t* out) {
         return false;
     }
     *out = left * right;
+    return true;
+}
+
+bool checked_add_u64(uint64_t left, uint64_t right, uint64_t* out) {
+    if (left > UINT64_MAX - right) {
+        return false;
+    }
+    *out = left + right;
+    return true;
+}
+
+bool checked_element_bytes(uint64_t count, size_t element_size, uint64_t* out) {
+    if (out == nullptr) return false;
+    uint64_t element_bytes = 0;
+    if (element_size == 0 ||
+        !checked_mul_u64(count, static_cast<uint64_t>(element_size), &element_bytes) ||
+        count > static_cast<uint64_t>(SIZE_MAX / element_size)) {
+        return false;
+    }
+    *out = element_bytes;
+    return true;
+}
+
+bool checked_plan_add(uint64_t* total, uint64_t value) {
+    uint64_t next = 0;
+    if (total == nullptr || !checked_add_u64(*total, value, &next)) return false;
+    *total = next;
     return true;
 }
 
@@ -1695,6 +1727,588 @@ int ensure_optix_program(RtDeviceState& state, RtGeometryMode geometry_mode) {
     program.device_id = device_id;
     program.geometry_mode = geometry_mode;
     return GAFIME_STATUS_OK;
+}
+
+/* The local semantic experiment does not extend the normative semantic ABI
+ * table.  It translates only already-validated physical frozen-region terms
+ * into the existing exact custom-AABB machinery, then scatters membership
+ * directly into fresh slots of the same bank. */
+struct SemanticRtBatchShape {
+    uint32_t region_count = 0u;
+    uint64_t term_count = 0u;
+    std::array<uint32_t, GAFIME_CUDA_RT_SEMANTIC_MAX_AXES> axes{0u, 0u, 0u};
+    uint32_t axis_count = 0u;
+};
+
+struct SemanticRtRegionPlan {
+    std::vector<GafimeDecisionPathTerm> terms;
+    std::vector<uint32_t> offsets;
+    std::vector<uint32_t> output_slots;
+    RtBoxPlan boxes;
+    std::vector<OptixAabb> aabbs;
+};
+
+class ScopedRtDeviceAllocation {
+public:
+    ScopedRtDeviceAllocation() = default;
+    ScopedRtDeviceAllocation(const ScopedRtDeviceAllocation&) = delete;
+    ScopedRtDeviceAllocation& operator=(const ScopedRtDeviceAllocation&) = delete;
+
+    ~ScopedRtDeviceAllocation() {
+        if (ptr_ != nullptr) static_cast<void>(cudaFree(ptr_));
+    }
+
+    int allocate(uint64_t bytes) {
+        if (bytes == 0u) return GAFIME_STATUS_OK;
+        if (bytes > static_cast<uint64_t>(SIZE_MAX)) return GAFIME_STATUS_OUT_OF_MEMORY;
+        void* next = nullptr;
+        const int status = cuda_status(cudaMalloc(&next, static_cast<size_t>(bytes)));
+        if (status != GAFIME_STATUS_OK) return status;
+        if (ptr_ != nullptr) static_cast<void>(cudaFree(ptr_));
+        ptr_ = next;
+        return GAFIME_STATUS_OK;
+    }
+
+    template <typename T>
+    T* as() const {
+        return static_cast<T*>(ptr_);
+    }
+
+private:
+    void* ptr_ = nullptr;
+};
+
+int inspect_semantic_rt_batch_shape(
+    const gafime_cuda_v1::detail::CudaSemanticBankView& bank,
+    const GafimeSemanticProgramBatch* batch,
+    SemanticRtBatchShape* shape_out
+) {
+    if (batch == nullptr || shape_out == nullptr || bank.initialized_slots == nullptr ||
+        bank.rows == 0u || bank.rows > GAFIME_CUDA_RT_SEMANTIC_MAX_ROWS ||
+        batch->node_count == 0u || batch->node_count > GAFIME_CUDA_RT_SEMANTIC_MAX_REGIONS) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+
+    SemanticRtBatchShape shape{};
+    shape.region_count = batch->node_count;
+    std::array<uint32_t, GAFIME_CUDA_RT_SEMANTIC_MAX_REGIONS> output_slots{};
+    for (uint32_t node_index = 0; node_index < batch->node_count; ++node_index) {
+        output_slots[node_index] = batch->nodes[node_index].output_slot;
+    }
+    for (uint32_t node_index = 0; node_index < batch->node_count; ++node_index) {
+        const GafimeSemanticProgramNode& node = batch->nodes[node_index];
+        if (node.opcode != GAFIME_SEMANTIC_PROGRAM_FROZEN_REGION_CONJUNCTION ||
+            node.region_term_count == 0u ||
+            node.region_term_count > gafime_semantic_abi::kSemanticMaxRegionTerms) {
+            return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
+        uint64_t next_term_count = 0;
+        if (!checked_add_u64(shape.term_count, node.region_term_count, &next_term_count)) {
+            return GAFIME_STATUS_OUT_OF_MEMORY;
+        }
+        shape.term_count = next_term_count;
+        for (uint32_t term_offset = 0; term_offset < node.region_term_count; ++term_offset) {
+            const GafimeSemanticFrozenRegionTerm& source =
+                batch->region_terms.ptr[node.region_term_offset + term_offset];
+            const uint32_t threshold_bits = static_cast<uint32_t>(source.threshold_bits);
+            float threshold = 0.0f;
+            std::memcpy(&threshold, &threshold_bits, sizeof(threshold));
+            if (!std::isfinite(threshold) || std::fpclassify(threshold) == FP_SUBNORMAL) {
+                return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+            }
+            // Generic materialization permits a topological later node to
+            // consume an earlier output.  This local entry deliberately
+            // launches every region in parallel, so it accepts only an
+            // input-closed region run; Rust splits dependencies into ordered
+            // calls before reaching this narrow lowering.
+            for (uint32_t output_index = 0; output_index < batch->node_count; ++output_index) {
+                if (source.input_slot == output_slots[output_index]) {
+                    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+                }
+            }
+            bool seen = false;
+            for (uint32_t axis_index = 0; axis_index < shape.axis_count; ++axis_index) {
+                seen = seen || shape.axes[axis_index] == source.input_slot;
+            }
+            if (!seen) {
+                if (shape.axis_count == GAFIME_CUDA_RT_SEMANTIC_MAX_AXES) {
+                    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+                }
+                shape.axes[shape.axis_count++] = source.input_slot;
+            }
+        }
+    }
+    if (shape.axis_count == 0u) return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    *shape_out = shape;
+    return GAFIME_STATUS_OK;
+}
+
+bool semantic_rt_host_plan_bytes(
+    const gafime_cuda_v1::detail::CudaSemanticBankView& bank,
+    const SemanticRtBatchShape& shape,
+    uint64_t* host_peak_out
+) {
+    if (host_peak_out == nullptr) return false;
+    uint64_t term_bytes = 0;
+    uint64_t offset_bytes = 0;
+    uint64_t output_slot_bytes = 0;
+    uint64_t box_bytes = 0;
+    uint64_t aabb_bytes = 0;
+    uint64_t axis_bytes = 0;
+    if (!checked_element_bytes(shape.term_count, sizeof(GafimeDecisionPathTerm), &term_bytes) ||
+        !checked_element_bytes(static_cast<uint64_t>(shape.region_count) + 1u, sizeof(uint32_t), &offset_bytes) ||
+        !checked_element_bytes(shape.region_count, sizeof(uint32_t), &output_slot_bytes) ||
+        !checked_element_bytes(shape.region_count, sizeof(gafime_cuda_v1::rt_kernel::GafimeRtBox), &box_bytes) ||
+        !checked_element_bytes(shape.region_count, sizeof(OptixAabb), &aabb_bytes) ||
+        !checked_element_bytes(shape.axis_count, sizeof(uint32_t), &axis_bytes)) {
+        return false;
+    }
+    uint64_t plan_bytes = 0;
+    if (!checked_plan_add(&plan_bytes, term_bytes) ||
+        !checked_plan_add(&plan_bytes, offset_bytes) ||
+        !checked_plan_add(&plan_bytes, output_slot_bytes) ||
+        !checked_plan_add(&plan_bytes, box_bytes) ||
+        !checked_plan_add(&plan_bytes, aabb_bytes) ||
+        !checked_plan_add(&plan_bytes, axis_bytes)) {
+        return false;
+    }
+    // The common physical validator makes this one initialized-slot copy
+    // before this plan is allocated, so peaks do not overlap.  Charge the
+    // larger exact element payload rather than hiding that check's allocation.
+    *host_peak_out = std::max(plan_bytes, static_cast<uint64_t>(bank.slot_capacity));
+    return true;
+}
+
+bool semantic_rt_device_plan_bytes(
+    const gafime_cuda_v1::detail::CudaSemanticBankView& bank,
+    const SemanticRtBatchShape& shape,
+    const OptixAccelBufferSizes& gas_sizes,
+    uint64_t* device_peak_out
+) {
+    if (device_peak_out == nullptr) return false;
+    const uint64_t gas_temp_bytes = static_cast<uint64_t>(gas_sizes.tempSizeInBytes);
+    const uint64_t gas_output_bytes = static_cast<uint64_t>(gas_sizes.outputSizeInBytes);
+    if (static_cast<size_t>(gas_temp_bytes) != gas_sizes.tempSizeInBytes ||
+        static_cast<size_t>(gas_output_bytes) != gas_sizes.outputSizeInBytes) {
+        return false;
+    }
+    uint64_t point_count = 0;
+    uint64_t membership_count = 0;
+    uint64_t point_bytes = 0;
+    uint64_t box_bytes = 0;
+    uint64_t membership_bytes = 0;
+    uint64_t aabb_bytes = 0;
+    uint64_t params_bytes = 0;
+    uint64_t sbt_bytes = 0;
+    uint64_t axis_bytes = 0;
+    uint64_t output_slot_bytes = 0;
+    uint64_t invalid_bytes = 0;
+    if (!checked_mul_u64(bank.rows, 3u, &point_count) ||
+        !checked_mul_u64(bank.rows, shape.region_count, &membership_count) ||
+        !checked_element_bytes(point_count, sizeof(float), &point_bytes) ||
+        !checked_element_bytes(shape.region_count, sizeof(gafime_cuda_v1::rt_kernel::GafimeRtBox), &box_bytes) ||
+        !checked_element_bytes(membership_count, sizeof(float), &membership_bytes) ||
+        !checked_element_bytes(shape.region_count, sizeof(OptixAabb), &aabb_bytes) ||
+        !checked_element_bytes(1u, sizeof(GafimeRtParams), &params_bytes) ||
+        !checked_element_bytes(3u, sizeof(EmptyRecord), &sbt_bytes) ||
+        !checked_element_bytes(shape.axis_count, sizeof(uint32_t), &axis_bytes) ||
+        !checked_element_bytes(shape.region_count, sizeof(uint32_t), &output_slot_bytes) ||
+        !checked_element_bytes(1u, sizeof(uint32_t), &invalid_bytes)) {
+        return false;
+    }
+    uint64_t total = 0;
+    if (!checked_plan_add(&total, point_bytes) ||
+        !checked_plan_add(&total, box_bytes) ||
+        !checked_plan_add(&total, membership_bytes) ||
+        !checked_plan_add(&total, aabb_bytes) ||
+        !checked_plan_add(&total, params_bytes) ||
+        !checked_plan_add(&total, sbt_bytes) ||
+        !checked_plan_add(&total, axis_bytes) ||
+        !checked_plan_add(&total, output_slot_bytes) ||
+        !checked_plan_add(&total, invalid_bytes) ||
+        !checked_plan_add(&total, gas_temp_bytes) ||
+        !checked_plan_add(&total, gas_output_bytes)) {
+        return false;
+    }
+    *device_peak_out = total;
+    return true;
+}
+
+int build_semantic_rt_region_plan(
+    const GafimeSemanticProgramBatch* batch,
+    const SemanticRtBatchShape& shape,
+    SemanticRtRegionPlan* plan_out
+) {
+    if (batch == nullptr || plan_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    SemanticRtRegionPlan plan{};
+    if (shape.term_count > static_cast<uint64_t>(SIZE_MAX) ||
+        shape.region_count == 0u) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    plan.terms.reserve(static_cast<size_t>(shape.term_count));
+    plan.offsets.reserve(static_cast<size_t>(shape.region_count) + 1u);
+    plan.output_slots.reserve(shape.region_count);
+    plan.offsets.push_back(0u);
+    for (uint32_t node_index = 0; node_index < shape.region_count; ++node_index) {
+        const GafimeSemanticProgramNode& node = batch->nodes[node_index];
+        for (uint32_t term_offset = 0; term_offset < node.region_term_count; ++term_offset) {
+            const GafimeSemanticFrozenRegionTerm& source =
+                batch->region_terms.ptr[node.region_term_offset + term_offset];
+            float threshold = 0.0f;
+            const uint32_t threshold_bits = static_cast<uint32_t>(source.threshold_bits);
+            std::memcpy(&threshold, &threshold_bits, sizeof(threshold));
+            plan.terms.push_back({
+                source.input_slot,
+                source.relation == GAFIME_SEMANTIC_REGION_LESS_EQUAL
+                    ? GAFIME_DECISION_PATH_SIGN_LE
+                    : GAFIME_DECISION_PATH_SIGN_GT,
+                threshold,
+                0u,
+                {0u, 0u},
+            });
+        }
+        if (plan.terms.size() > static_cast<size_t>(UINT32_MAX)) {
+            return GAFIME_STATUS_OUT_OF_MEMORY;
+        }
+        plan.offsets.push_back(static_cast<uint32_t>(plan.terms.size()));
+        plan.output_slots.push_back(node.output_slot);
+    }
+    const int status = build_rt_box_plan(
+        shape.region_count,
+        static_cast<uint32_t>(plan.terms.size()),
+        plan.terms.data(),
+        plan.offsets.data(),
+        plan.boxes
+    );
+    if (status != GAFIME_STATUS_OK) return status;
+    build_rt_aabbs(plan.boxes, plan.aabbs);
+    if (plan.aabbs.size() != shape.region_count || plan.boxes.dims != shape.axis_count) {
+        return GAFIME_STATUS_DEVICE_ERROR;
+    }
+    *plan_out = std::move(plan);
+    return GAFIME_STATUS_OK;
+}
+
+int execute_semantic_region_materialize_rt_optix(
+    GafimeGpuSemanticBank bank_handle,
+    const GafimeSemanticProgramBatch* batch,
+    uint64_t max_temporary_bytes,
+    uint64_t* peak_bytes_out
+) {
+    if (peak_bytes_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    *peak_bytes_out = 0u;
+    if (batch == nullptr || !gafime_gpu_abi::naturally_aligned(batch) ||
+        !gafime_semantic_abi::abi_compatible(
+            batch->abi_version,
+            batch->struct_size,
+            gafime_semantic_abi::kProgramBatchV13StablePrefixSize)) {
+        return batch != nullptr && gafime_gpu_abi::naturally_aligned(batch)
+            ? GAFIME_STATUS_ABI_MISMATCH
+            : GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+
+    gafime_cuda_v1::detail::CudaSemanticBankView bank{};
+    int status = gafime_cuda_v1::detail::inspect_cuda_semantic_bank(bank_handle, &bank);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (!gafime_gpu_abi::route_fields_equal(batch->route, bank.route)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // The shared validator deliberately copies the initialized-slot mask to
+    // validate generic intra-batch dependencies.  `ensure_optix_program`
+    // then allocates three fixed-size SBT records before the variable-size AS
+    // query.  Admit the larger non-overlapping prequery requirement before
+    // either allocation; an early rejection reports that minimum rather than
+    // pretending it is the later full OptiX plan peak.
+    uint64_t fixed_sbt_bytes = 0u;
+    if (!checked_element_bytes(3u, sizeof(EmptyRecord), &fixed_sbt_bytes)) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    const uint64_t prequery_minimum = std::max(
+        static_cast<uint64_t>(bank.slot_capacity), fixed_sbt_bytes);
+    if (prequery_minimum > max_temporary_bytes) {
+        *peak_bytes_out = prequery_minimum;
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+
+    // Use the shared physical validator before touching any v1.3 descriptor
+    // array.  It preserves the standard slot/topology/fresh-output invariant
+    // and rejects old semantic-minor consumers before descriptor-stride use.
+    status = gafime_semantic_abi::validate_program_batch(
+        batch,
+        GAFIME_PRECISION_FP32,
+        bank.source_slots,
+        bank.slot_capacity,
+        *bank.initialized_slots,
+        gafime_semantic_abi::kSemanticMaxRegionTerms
+    );
+    if (status != GAFIME_STATUS_OK) return status;
+
+    SemanticRtBatchShape shape{};
+    status = inspect_semantic_rt_batch_shape(bank, batch, &shape);
+    if (status != GAFIME_STATUS_OK) return status;
+
+    uint64_t host_peak = 0u;
+    if (!semantic_rt_host_plan_bytes(bank, shape, &host_peak)) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+
+    ScopedCudaDevice device(bank.device_id);
+    status = cuda_status(device.status());
+    if (status != GAFIME_STATUS_OK) return status;
+    // A stack-owned state deliberately avoids the legacy per-device cache:
+    // this first proof measures only cold, call-local resources and cannot
+    // retain bank-derived geometry beyond this synchronous entrypoint.
+    RtDeviceState state(bank.device_id);
+    // This helper creates exactly three fixed-size SBT records.  Those explicit
+    // CUDA buffers are included in `semantic_rt_device_plan_bytes`; only the
+    // opaque driver/context/pipeline allocations remain outside the local
+    // explicit-buffer budget.  No variable-size AS/workspace allocation occurs
+    // until after the exact query and max_temporary_bytes admission below.
+    status = ensure_optix_program(state, RtGeometryMode::CustomAabb);
+    if (status != GAFIME_STATUS_OK) return status;
+    RtOptixProgram& program = state.program(RtGeometryMode::CustomAabb);
+
+    // Memory-size discovery consumes only build metadata, never AABB contents.
+    // The zero CUdeviceptr is therefore valid for this query and lets an
+    // over-budget request fail before any variable-size device allocation.
+    CUdeviceptr aabb_buffer = 0;
+    uint32_t geometry_flags[1] = {OPTIX_GEOMETRY_FLAG_REQUIRE_SINGLE_ANYHIT_CALL};
+    OptixBuildInput build_input = {};
+    build_input.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
+    build_input.customPrimitiveArray.aabbBuffers = &aabb_buffer;
+    build_input.customPrimitiveArray.numPrimitives = shape.region_count;
+    build_input.customPrimitiveArray.flags = geometry_flags;
+    build_input.customPrimitiveArray.numSbtRecords = 1u;
+    OptixAccelBuildOptions accel_options = {};
+    accel_options.buildFlags = OPTIX_BUILD_FLAG_NONE;
+    accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
+    OptixAccelBufferSizes gas_sizes = {};
+    status = optix_status(optixAccelComputeMemoryUsage(
+        program.context,
+        &accel_options,
+        &build_input,
+        1u,
+        &gas_sizes
+    ));
+    if (status != GAFIME_STATUS_OK) return status;
+
+    uint64_t device_peak = 0u;
+    uint64_t peak = 0u;
+    if (!semantic_rt_device_plan_bytes(bank, shape, gas_sizes, &device_peak) ||
+        !checked_add_u64(host_peak, device_peak, &peak)) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    *peak_bytes_out = peak;
+    if (peak > max_temporary_bytes) return GAFIME_STATUS_OUT_OF_MEMORY;
+
+    SemanticRtRegionPlan plan{};
+    status = build_semantic_rt_region_plan(batch, shape, &plan);
+    if (status != GAFIME_STATUS_OK) {
+        *peak_bytes_out = 0u;
+        return status;
+    }
+
+    uint64_t point_count = 0u;
+    uint64_t membership_count = 0u;
+    if (!checked_mul_u64(bank.rows, 3u, &point_count) ||
+        !checked_mul_u64(bank.rows, shape.region_count, &membership_count) ||
+        point_count > static_cast<uint64_t>(SIZE_MAX) ||
+        membership_count > static_cast<uint64_t>(SIZE_MAX)) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    status = ensure_device_capacity(
+        &program.points_device, program.points_capacity, static_cast<size_t>(point_count));
+    if (status == GAFIME_STATUS_OK) {
+        status = ensure_device_capacity(
+            &program.boxes_device, program.box_capacity, static_cast<size_t>(shape.region_count));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = ensure_device_capacity(
+            &program.membership_device, program.membership_capacity,
+            static_cast<size_t>(membership_count));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = ensure_device_capacity(&program.aabbs_device, program.aabb_capacity, plan.aabbs.size());
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = ensure_device_capacity(&program.params_device, program.params_capacity, size_t{1u});
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = ensure_device_bytes(
+            &program.gas_temp_device, program.gas_temp_capacity, gas_sizes.tempSizeInBytes);
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = ensure_device_bytes(
+            &program.gas_output_device, program.gas_output_capacity, gas_sizes.outputSizeInBytes);
+    }
+    if (status == GAFIME_STATUS_OK && program.stream == nullptr) {
+        status = cuda_status(cudaStreamCreate(&program.stream));
+    }
+    if (status != GAFIME_STATUS_OK) return status;
+
+    ScopedRtDeviceAllocation axes_device;
+    ScopedRtDeviceAllocation output_slots_device;
+    ScopedRtDeviceAllocation invalid_device;
+    uint64_t axis_bytes = 0u;
+    uint64_t output_slot_bytes = 0u;
+    if (!checked_element_bytes(shape.axis_count, sizeof(uint32_t), &axis_bytes) ||
+        !checked_element_bytes(shape.region_count, sizeof(uint32_t), &output_slot_bytes)) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    status = axes_device.allocate(axis_bytes);
+    if (status == GAFIME_STATUS_OK) status = output_slots_device.allocate(output_slot_bytes);
+    if (status == GAFIME_STATUS_OK) status = invalid_device.allocate(sizeof(uint32_t));
+    if (status != GAFIME_STATUS_OK) return status;
+
+    status = cuda_status(cudaMemcpyAsync(
+        axes_device.as<uint32_t>(), plan.boxes.axes.data(), static_cast<size_t>(axis_bytes),
+        cudaMemcpyHostToDevice, program.stream));
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpyAsync(
+            output_slots_device.as<uint32_t>(), plan.output_slots.data(),
+            static_cast<size_t>(output_slot_bytes), cudaMemcpyHostToDevice, program.stream));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemsetAsync(
+            invalid_device.as<uint32_t>(), 0, sizeof(uint32_t), program.stream));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        constexpr uint32_t kThreads = 256u;
+        const uint64_t value_count = bank.rows * static_cast<uint64_t>(shape.axis_count);
+        const uint32_t blocks = static_cast<uint32_t>((value_count + kThreads - 1u) / kThreads);
+        gafime_cuda_v1::rt_kernel::validate_semantic_region_input_domain_kernel<<<
+            blocks, kThreads, 0, program.stream
+        >>>(
+            bank.columns,
+            bank.rows,
+            axes_device.as<uint32_t>(),
+            shape.axis_count,
+            invalid_device.as<uint32_t>()
+        );
+        status = cuda_status(cudaGetLastError());
+    }
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaStreamSynchronize(program.stream));
+    uint32_t invalid = 0u;
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpy(
+            &invalid, invalid_device.as<uint32_t>(), sizeof(invalid), cudaMemcpyDeviceToHost));
+    }
+    if (status != GAFIME_STATUS_OK) return status;
+    if (invalid != 0u) {
+        *peak_bytes_out = 0u;
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+
+    status = cuda_status(cudaMemcpyAsync(
+        program.boxes_device,
+        plan.boxes.boxes.data(),
+        plan.boxes.boxes.size() * sizeof(gafime_cuda_v1::rt_kernel::GafimeRtBox),
+        cudaMemcpyHostToDevice,
+        program.stream));
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpyAsync(
+            program.aabbs_device,
+            plan.aabbs.data(),
+            plan.aabbs.size() * sizeof(OptixAabb),
+            cudaMemcpyHostToDevice,
+            program.stream));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemsetAsync(
+            program.membership_device,
+            0,
+            static_cast<size_t>(membership_count) * sizeof(float),
+            program.stream));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        constexpr uint32_t kThreads = 256u;
+        const uint32_t blocks = static_cast<uint32_t>((bank.rows + kThreads - 1u) / kThreads);
+        gafime_cuda_v1::rt_kernel::pack_decision_path_points_kernel<<<
+            blocks, kThreads, 0, program.stream
+        >>>(
+            bank.columns,
+            bank.rows,
+            plan.boxes.axes[0],
+            plan.boxes.axes[1],
+            plan.boxes.axes[2],
+            plan.boxes.dims,
+            program.points_device
+        );
+        status = cuda_status(cudaGetLastError());
+    }
+    if (status != GAFIME_STATUS_OK) return status;
+
+    aabb_buffer = reinterpret_cast<CUdeviceptr>(program.aabbs_device);
+    status = optix_status(optixAccelBuild(
+        program.context,
+        program.stream,
+        &accel_options,
+        &build_input,
+        1u,
+        reinterpret_cast<CUdeviceptr>(program.gas_temp_device),
+        gas_sizes.tempSizeInBytes,
+        reinterpret_cast<CUdeviceptr>(program.gas_output_device),
+        gas_sizes.outputSizeInBytes,
+        &program.gas_handle,
+        nullptr,
+        0u));
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaStreamSynchronize(program.stream));
+    if (status != GAFIME_STATUS_OK) return status;
+
+    GafimeRtParams params = {};
+    params.handle = program.gas_handle;
+    params.points_xyz = program.points_device;
+    params.boxes = program.boxes_device;
+    params.membership = program.membership_device;
+    params.rows = static_cast<uint32_t>(bank.rows);
+    params.path_count = shape.region_count;
+    params.geometry_mode = static_cast<uint32_t>(RtGeometryMode::CustomAabb);
+    params.group_count = 1u;
+    params.point_stride = 3u;
+    params.direct_first_hit = 0u;
+    status = cuda_status(cudaMemcpyAsync(
+        program.params_device, &params, sizeof(params), cudaMemcpyHostToDevice, program.stream));
+    if (status == GAFIME_STATUS_OK) {
+        status = optix_status(optixLaunch(
+            program.pipeline,
+            program.stream,
+            reinterpret_cast<CUdeviceptr>(program.params_device),
+            sizeof(GafimeRtParams),
+            &program.sbt,
+            static_cast<uint32_t>(bank.rows),
+            1u,
+            1u));
+    }
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaStreamSynchronize(program.stream));
+    if (status != GAFIME_STATUS_OK) return status;
+
+    status = cuda_status(cudaMemsetAsync(
+        invalid_device.as<uint32_t>(), 0, sizeof(uint32_t), program.stream));
+    if (status == GAFIME_STATUS_OK) {
+        constexpr uint32_t kThreads = 256u;
+        const uint32_t blocks = static_cast<uint32_t>((membership_count + kThreads - 1u) / kThreads);
+        gafime_cuda_v1::rt_kernel::scatter_semantic_region_membership_kernel<<<
+            blocks, kThreads, 0, program.stream
+        >>>(
+            program.membership_device,
+            bank.rows,
+            shape.region_count,
+            output_slots_device.as<uint32_t>(),
+            bank.columns,
+            invalid_device.as<uint32_t>()
+        );
+        status = cuda_status(cudaGetLastError());
+    }
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaStreamSynchronize(program.stream));
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpy(
+            &invalid, invalid_device.as<uint32_t>(), sizeof(invalid), cudaMemcpyDeviceToHost));
+    }
+    if (status != GAFIME_STATUS_OK) return status;
+    if (invalid != 0u) return GAFIME_STATUS_DEVICE_ERROR;
+
+    return gafime_cuda_v1::detail::commit_cuda_semantic_bank_outputs(
+        bank_handle, plan.output_slots.data(), shape.region_count);
 }
 
 int execute_decision_path_membership_optix(
@@ -3456,4 +4070,28 @@ extern "C" GAFIME_GPU_API int gafime_gpu_decision_path_release_device_state(uint
     } catch (...) {
         return GAFIME_STATUS_DEVICE_ERROR;
     }
+}
+
+extern "C" GAFIME_GPU_API int gafime_gpu_semantic_region_materialize_rt_v1(
+    GafimeGpuSemanticBank bank,
+    const GafimeSemanticProgramBatch* batch,
+    uint64_t max_temporary_bytes,
+    uint64_t* peak_bytes_out
+) try {
+#if defined(GAFIME_CUDA_ENABLE_OPTIX_RT)
+    return execute_semantic_region_materialize_rt_optix(
+        bank, batch, max_temporary_bytes, peak_bytes_out);
+#else
+    static_cast<void>(bank);
+    static_cast<void>(batch);
+    static_cast<void>(max_temporary_bytes);
+    if (peak_bytes_out != nullptr) *peak_bytes_out = 0u;
+    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+#endif
+} catch (const std::bad_alloc&) {
+    if (peak_bytes_out != nullptr) *peak_bytes_out = 0u;
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    if (peak_bytes_out != nullptr) *peak_bytes_out = 0u;
+    return GAFIME_STATUS_DEVICE_ERROR;
 }

@@ -37,6 +37,7 @@
     gafime_gpu_decision_path_membership;
     gafime_gpu_decision_path_score;
     gafime_gpu_decision_path_release_device_state;
+    gafime_gpu_semantic_region_materialize_rt_v1;
   local:
     *;
 };

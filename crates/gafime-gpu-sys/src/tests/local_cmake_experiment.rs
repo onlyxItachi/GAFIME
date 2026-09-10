@@ -29,15 +29,16 @@ fn raw_local_experiment_result_routes_remain_unsafe_function_items() {
         };
     }
 
-    let _: unsafe fn(
+    type ScoreSignature = unsafe fn(
         &mut GpuBackend,
         &MatrixHandle,
         &[GafimeDecisionPathTerm],
         &[u32],
         &[u32],
         &mut GafimeResultTable,
-    ) -> Result<bool, GpuSysError> = GpuBackend::decision_path_score;
-    let _: unsafe fn(
+    ) -> Result<bool, GpuSysError>;
+    let _: ScoreSignature = GpuBackend::decision_path_score;
+    type PolicyScoreSignature = unsafe fn(
         &mut GpuBackend,
         &MatrixHandle,
         &[GafimeDecisionPathTerm],
@@ -45,7 +46,8 @@ fn raw_local_experiment_result_routes_remain_unsafe_function_items() {
         &[u32],
         &mut GafimeResultTable,
         DecisionPathRtPolicy,
-    ) -> Result<bool, GpuSysError> = GpuBackend::decision_path_score_with_policy;
+    ) -> Result<bool, GpuSysError>;
+    let _: PolicyScoreSignature = GpuBackend::decision_path_score_with_policy;
 }
 
 pub(crate) static TEST_DECISION_PATH_FLAGS: AtomicU32 = AtomicU32::new(0);
@@ -281,9 +283,9 @@ fn require_rt_policy_rejects_an_unsupported_payload_in_rust() {
     assert_eq!(TEST_DECISION_PATH_FLAGS.load(Ordering::SeqCst), u32::MAX);
 
     let mut result = GafimeResultTable::default();
-    // SAFETY: term/offset/metric slices are live; the instrumented payload
-    // rejects the RT policy before touching the zero-capacity result table.
     assert!(matches!(
+        // SAFETY: term/offset/metric slices are live; the instrumented payload
+        // rejects the RT policy before touching the zero-capacity result table.
         unsafe {
             sm_only_backend.decision_path_score_with_policy(
                 sm_only_matrix.handle(),
@@ -1243,7 +1245,7 @@ fn cuda_decision_path_direct_score_instanced_custom_aabbs_count_once() {
     let matrix = backend.alloc_matrix(rows, cols).unwrap();
     matrix.upload(&features, &target).unwrap();
 
-    let terms = vec![
+    let terms = [
         GafimeDecisionPathTerm {
             feature: 0,
             sign: GAFIME_DECISION_PATH_SIGN_GT,
@@ -1822,7 +1824,7 @@ fn cuda_decision_path_firsthit_score_rejects_overlap_without_sm_fallback() {
     let matrix = backend.alloc_matrix(rows, cols).unwrap();
     matrix.upload(&features, &target).unwrap();
 
-    let terms = vec![
+    let terms = [
         GafimeDecisionPathTerm {
             feature: 0,
             sign: GAFIME_DECISION_PATH_SIGN_GT,

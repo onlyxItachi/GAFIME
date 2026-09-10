@@ -264,6 +264,32 @@ if(GAFIME_CUDA_BUILD_TESTS)
             gafime_cuda_rt_same_device_concurrency
             PROPERTIES SKIP_RETURN_CODE 77
         )
+
+        # Local-only semantic RT proof: it exercises the same resident bank
+        # that ordinary semantic lowering owns, with a strict OptiX path and
+        # no benchmark/timing claim.  Unsupported RT hardware skips instead
+        # of substituting an SM or host implementation.
+        add_executable(
+            gafime_cuda_rt_semantic_region_smoke
+            "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_rt_semantic_region_smoke.cpp"
+        )
+        target_compile_features(gafime_cuda_rt_semantic_region_smoke PRIVATE cxx_std_20)
+        target_include_directories(
+            gafime_cuda_rt_semantic_region_smoke
+            PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${CMAKE_CURRENT_LIST_DIR}/../common
+        )
+        target_link_libraries(
+            gafime_cuda_rt_semantic_region_smoke
+            PRIVATE ${gafime_cuda_rt_test_target} CUDA::cudart
+        )
+        add_test(
+            NAME gafime_cuda_rt_semantic_region_smoke
+            COMMAND gafime_cuda_rt_semantic_region_smoke
+        )
+        set_tests_properties(
+            gafime_cuda_rt_semantic_region_smoke
+            PROPERTIES SKIP_RETURN_CODE 77
+        )
     endif()
 
     set(GAFIME_ABI_CONSUMER_PAYLOAD_TARGET gafime_cuda_v1)

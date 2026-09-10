@@ -205,6 +205,58 @@ __global__ void validate_rt_feature_domain_kernel(
     }
 }
 
+__global__ void validate_semantic_region_input_domain_kernel(
+    const float* columns,
+    uint64_t rows,
+    const uint32_t* input_slots,
+    uint32_t input_slot_count,
+    uint32_t* invalid_out
+) {
+    const uint64_t value_count = rows * static_cast<uint64_t>(input_slot_count);
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < value_count;
+         index += stride) {
+        const uint32_t slot_index = static_cast<uint32_t>(index / rows);
+        const uint64_t row = index - static_cast<uint64_t>(slot_index) * rows;
+        const float value = columns[static_cast<uint64_t>(input_slots[slot_index]) * rows + row];
+        const uint32_t magnitude_bits = __float_as_uint(value) & 0x7fffffffu;
+        const bool nonfinite = (magnitude_bits & 0x7f800000u) == 0x7f800000u;
+        const bool subnormal =
+            (magnitude_bits & 0x7f800000u) == 0u &&
+            (magnitude_bits & 0x007fffffu) != 0u;
+        if (nonfinite || subnormal) {
+            atomicExch(invalid_out, 1u);
+            return;
+        }
+    }
+}
+
+__global__ void scatter_semantic_region_membership_kernel(
+    const float* membership,
+    uint64_t rows,
+    uint32_t region_count,
+    const uint32_t* output_slots,
+    float* columns,
+    uint32_t* invalid_out
+) {
+    const uint64_t value_count = rows * static_cast<uint64_t>(region_count);
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < value_count;
+         index += stride) {
+        const uint32_t region = static_cast<uint32_t>(index / rows);
+        const uint64_t row = index - static_cast<uint64_t>(region) * rows;
+        const float value = membership[index];
+        const uint32_t bits = __float_as_uint(value);
+        if (bits != 0u && bits != 0x3f800000u) {
+            atomicExch(invalid_out, 1u);
+            continue;
+        }
+        columns[static_cast<uint64_t>(output_slots[region]) * rows + row] = value;
+    }
+}
+
 __global__ void pack_decision_path_points_kernel(
     const float* features,
     uint64_t n_samples,
