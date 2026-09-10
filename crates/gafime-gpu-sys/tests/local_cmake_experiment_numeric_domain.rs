@@ -128,6 +128,10 @@ fn semantic_region_timing(
     );
     let mut first_output = None;
     for sample in 0..3 {
+        // Same-frame inference intentionally caches accepted outputs. Clear
+        // that state outside timing: otherwise later samples measure retrieval
+        // and could falsely be described as warm RT traversal.
+        session.clear_materializations().unwrap();
         let start = Instant::now();
         let materialized = session
             .materialize_accepted(executor, &inference, &accepted)
@@ -208,6 +212,13 @@ fn local_semantic_region_same_workload_diagnostic() {
                 semantic_region_timing(&mut rt, GAFIME_BACKEND_CUDA, "rt", rows, regions, derived);
             assert_eq!(expected, ordinary);
             assert_eq!(expected, accelerated);
+            let counters = rt.local_rt_diagnostics().unwrap();
+            assert_eq!(counters.completed_region_batches, 4);
+            assert_eq!(
+                counters.completed_regions,
+                4 * regions as u64,
+                "one discovery plus three fresh inference executions must use RT"
+            );
             println!("RT_SEMANTIC_PARITY rows={rows} regions={regions} derived_atom={derived} exact=true diagnostics={:?}", rt.local_rt_diagnostics().unwrap());
         }
     }

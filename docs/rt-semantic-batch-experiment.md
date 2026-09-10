@@ -108,6 +108,9 @@ programs, output cardinality and membership bytes for Core's default Rayon
 execution, ordinary CUDA and explicit RT. It uses bounded synthetic
 1,024-row/32-region and 8,192-row/128-region cases, with source and accepted
 softsign atoms. It reports three raw materialization/delivery samples per case.
+Before each sample it explicitly clears cached materializations outside timing
+and checks the completed RT-node count. Same-frame cache retrieval is therefore
+not mislabeled as a repeated traversal or warm RT execution.
 Materialization includes source upload and call-local geometry; delivery is
   reported separately. It does not isolate fixed-function traversal time.
 
