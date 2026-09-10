@@ -58,6 +58,15 @@ This prevents a changed source or failed overwrite from leaving apparently
 valid derived values. Rebinding a frame uses a new bank, while retention creates
 an independently owned bank for the selected columns.
 
+At the direct native boundary, uploaded numeric values may include nonfinite
+values; this does not relax the public semantic frame's finite-input validation.
+Frozen region predicates compare ordered infinities normally. A false term
+dominates an undefined (NaN) term regardless of term order; an otherwise-true
+conjunction with an undefined term remains NaN. Materialization rejects that
+nonfinite final output and does not initialize its slot. Every derived node is
+checked before later use, so finite-input arithmetic overflow cannot silently
+become a successful predicate through an intermediate bank slot.
+
 Materialization uploads operand/centering descriptors once per batch and keeps
 them immutable until queued kernels finish. In particular, host writes into
 managed memory must not race a preceding HIP kernel's descriptor reads. This

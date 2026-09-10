@@ -200,6 +200,7 @@ jobs:
           cargo test -p gafime-gpu-sys metal_fp32_precision_metrics_match_core_fp32_on_high_dynamic_and_nonfinite_inputs_when_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_nonfinite_correlation_is_not_laundered_when_library_is_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_scaled_covariance_matches_cpu_across_dynamic_range_when_available -- --nocapture
+          cargo test -p gafime-gpu-sys --test semantic_predicate_native metal_semantic_predicate_definedness_when_configured -- --nocapture
 
   release_artifact_composition:
     name: Release source and sdist composition

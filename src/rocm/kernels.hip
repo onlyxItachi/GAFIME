@@ -2122,12 +2122,13 @@ __global__ void semantic_frozen_region_conjunction_kernel(
     const uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (row >= rows) return;
     StorageT membership = static_cast<StorageT>(1);
+    bool undetermined = false;
     for (uint32_t term_index = 0; term_index < term_count; ++term_index) {
         const GafimeSemanticFrozenRegionTerm term = terms[term_index];
         const StorageT value = columns[static_cast<uint64_t>(term.input_slot) * rows + row];
-        if (!precision_isfinite(value)) {
-            membership = static_cast<StorageT>(NAN);
-            break;
+        if (isnan(value)) {
+            undetermined = true;
+            continue;
         }
         const StorageT threshold = semantic_mean_from_bits<StorageT>(term.threshold_bits);
         const bool matches = term.relation == GAFIME_SEMANTIC_REGION_LESS_EQUAL
@@ -2138,7 +2139,12 @@ __global__ void semantic_frozen_region_conjunction_kernel(
             break;
         }
     }
-    columns[static_cast<uint64_t>(output_slot) * rows + row] = membership;
+    // Match Core/Metal: ordered infinities compare normally; a false term
+    // dominates NaN regardless of term order. The launcher still rejects an
+    // unresolved final output instead of marking its slot initialized.
+    columns[static_cast<uint64_t>(output_slot) * rows + row] =
+        membership != static_cast<StorageT>(0) && undetermined
+        ? static_cast<StorageT>(NAN) : membership;
 }
 
 // Frozen fitting values participate in semantic identity.  One thread owns
