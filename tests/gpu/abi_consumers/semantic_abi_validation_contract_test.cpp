@@ -2,7 +2,10 @@
 // CUDA/HIP; passing them is not evidence of physical device execution.
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <memory>
 #include <type_traits>
 #include <vector>
 
@@ -98,6 +101,29 @@ int bank_and_program_shapes() {
             gafime_semantic_abi::kSemanticMaxRegionTerms);
     };
     failed |= expect(check(), GAFIME_STATUS_OK, "valid absolute-difference node");
+    batch.struct_size = gafime_semantic_abi::kProgramBatchV13StablePrefixSize;
+    batch.reserved_v3[0] = 1;
+    failed |= expect(check(), GAFIME_STATUS_OK,
+        "program stable prefix does not expose its absent reserved tail");
+    // Allocate only the promised prefix. ASan catches a validator that reads
+    // the physically absent tail even if ordinary fixtures happen to have it.
+    std::unique_ptr<void, decltype(&std::free)> prefix(
+        std::malloc(batch.struct_size), &std::free);
+    if (!prefix) return failed | 1;
+    std::memcpy(prefix.get(), &batch, batch.struct_size);
+    failed |= expect(gafime_semantic_abi::validate_program_batch(
+        static_cast<const GafimeSemanticProgramBatch*>(prefix.get()),
+        GAFIME_PRECISION_FP32, 2, 3, initialized,
+        gafime_semantic_abi::kSemanticMaxRegionTerms), GAFIME_STATUS_OK,
+        "allocated exact program prefix is readable without a tail");
+    batch.struct_size = sizeof(batch);
+    failed |= expect(check(), GAFIME_STATUS_INVALID_ARGUMENT,
+        "present program reserved tail still must be zero");
+    batch.reserved_v3[0] = 0;
+    batch.struct_size = gafime_semantic_abi::kProgramBatchV13StablePrefixSize - 1;
+    failed |= expect(check(), GAFIME_STATUS_ABI_MISMATCH,
+        "truncated program stable prefix fails closed");
+    batch.struct_size = sizeof(batch);
     batch.abi_version = (GAFIME_SEMANTIC_PRIMITIVES_ABI_VERSION_MAJOR << 16) | 2u;
     failed |= expect(check(), GAFIME_STATUS_ABI_MISMATCH,
         "v1.2 program descriptor rejected before node stride access");

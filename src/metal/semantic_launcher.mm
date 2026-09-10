@@ -29,6 +29,13 @@ constexpr uint64_t kMetalSemanticMaxRows = 32'768ull;
 constexpr uint32_t kMetalSemanticMaxSlots = 65'536u;
 constexpr uint64_t kMetalSemanticMaxAssociationPairs = 65'536ull;
 constexpr uint32_t kMetalSemanticReduceWidth = 64u;
+// MSL exposes thread_position_in_grid as uint.  Keep every scheduled semantic
+// invocation representable before the shader promotes it to ulong for offset
+// arithmetic.  The round-down also accounts for the final partial group.
+constexpr uint64_t kMetalSemanticMaxIndexedDispatchItems =
+    (static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) /
+        static_cast<uint64_t>(kMetalSemanticReduceWidth)) *
+    static_cast<uint64_t>(kMetalSemanticReduceWidth);
 
 bool semantic_checked_add(uint64_t left, uint64_t right, uint64_t* out) {
     if (right > std::numeric_limits<uint64_t>::max() - left) return false;
@@ -348,10 +355,17 @@ int semantic_finish_command(
 }
 
 bool semantic_dispatch_width(uint64_t items, MTLSize* grid_out) {
-    if (grid_out == nullptr || !semantic_metal_size_supported(items)) return false;
+    if (grid_out == nullptr || !semantic_metal_size_supported(items) ||
+        items > kMetalSemanticMaxIndexedDispatchItems) {
+        return false;
+    }
     const uint64_t groups = items == 0 ? 0 :
         1 + (items - 1) / static_cast<uint64_t>(kMetalSemanticReduceWidth);
-    if (!semantic_metal_size_supported(groups)) return false;
+    if (!semantic_metal_size_supported(groups) ||
+        groups > kMetalSemanticMaxIndexedDispatchItems /
+            static_cast<uint64_t>(kMetalSemanticReduceWidth)) {
+        return false;
+    }
     *grid_out = MTLSizeMake(static_cast<NSUInteger>(groups), 1, 1);
     return true;
 }

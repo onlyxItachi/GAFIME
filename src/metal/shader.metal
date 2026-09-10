@@ -1212,6 +1212,9 @@ kernel void gafime_copy_selected_metric_rows(
 // Optional typed semantic-arithmetic table.  These kernels consume only
 // resident physical slots and frozen numeric descriptors; evidence identity,
 // fitting provenance, and selection policy stay in Rust.
+// Metal exposes thread_position_in_grid as uint.  The launcher bounds every
+// dispatched semantic grid to that coordinate range; kernels promote it before
+// all offset arithmetic so bank and product calculations remain 64-bit.
 // -------------------------------------------------------------------------
 
 kernel void gafime_semantic_absolute_difference(
@@ -1219,8 +1222,9 @@ kernel void gafime_semantic_absolute_difference(
     constant MetalSemanticProgramNode& node [[buffer(1)]],
     device const uint* operands [[buffer(2)]],
     constant MetalSemanticRowsInfo& info [[buffer(3)]],
-    ulong row [[thread_position_in_grid]]
+    uint row_index [[thread_position_in_grid]]
 ) {
+    const ulong row = static_cast<ulong>(row_index);
     if (row >= info.rows) return;
     const uint left_slot = operands[node.operand_offset];
     const uint right_slot = operands[node.operand_offset + 1u];
@@ -1234,8 +1238,9 @@ kernel void gafime_semantic_softsign(
     constant MetalSemanticProgramNode& node [[buffer(1)]],
     device const uint* operands [[buffer(2)]],
     constant MetalSemanticRowsInfo& info [[buffer(3)]],
-    ulong row [[thread_position_in_grid]]
+    uint row_index [[thread_position_in_grid]]
 ) {
+    const ulong row = static_cast<ulong>(row_index);
     if (row >= info.rows) return;
     const uint input_slot = operands[node.operand_offset];
     const float value = columns[static_cast<ulong>(input_slot) * info.rows + row];
@@ -1249,8 +1254,9 @@ kernel void gafime_semantic_centered_product(
     device const uint* operands [[buffer(2)]],
     device const ulong* mean_bits [[buffer(3)]],
     constant MetalSemanticRowsInfo& info [[buffer(4)]],
-    ulong row [[thread_position_in_grid]]
+    uint row_index [[thread_position_in_grid]]
 ) {
+    const ulong row = static_cast<ulong>(row_index);
     if (row >= info.rows) return;
     float product = 1.0f;
     for (uint operand = 0; operand < node.operand_count; ++operand) {
@@ -1267,8 +1273,9 @@ kernel void gafime_semantic_frozen_region_conjunction(
     constant MetalSemanticProgramNode& node [[buffer(1)]],
     device const MetalSemanticRegionTerm* terms [[buffer(2)]],
     constant MetalSemanticRowsInfo& info [[buffer(3)]],
-    ulong row [[thread_position_in_grid]]
+    uint row_index [[thread_position_in_grid]]
 ) {
+    const ulong row = static_cast<ulong>(row_index);
     if (row >= info.rows) return;
     bool undetermined = false;
     for (uint term_index = 0; term_index < node.region_term_count; ++term_index) {
@@ -1298,8 +1305,9 @@ kernel void gafime_semantic_reject_nonfinite(
     device const float* columns [[buffer(0)]],
     constant MetalSemanticRowsInfo& info [[buffer(1)]],
     device atomic_uint* nonfinite_out [[buffer(2)]],
-    ulong row [[thread_position_in_grid]]
+    uint row_index [[thread_position_in_grid]]
 ) {
+    const ulong row = static_cast<ulong>(row_index);
     if (row >= info.rows) return;
     if (!isfinite(columns[static_cast<ulong>(info.item_count) * info.rows + row])) {
         atomic_store_explicit(nonfinite_out, 1u, memory_order_relaxed);
@@ -1621,8 +1629,9 @@ kernel void gafime_semantic_rank_prepare(
     device MetalSemanticRankRecord* left_records [[buffer(4)]],
     device MetalSemanticRankRecord* right_records [[buffer(5)]],
     constant MetalSemanticRankInfo& info [[buffer(6)]],
-    ulong item [[thread_position_in_grid]]
+    uint item_index [[thread_position_in_grid]]
 ) {
+    const ulong item = static_cast<ulong>(item_index);
     const ulong total = info.pair_count * static_cast<ulong>(info.padded_rows);
     if (item >= total) return;
     const ulong pair = item / static_cast<ulong>(info.padded_rows);
@@ -1669,8 +1678,9 @@ kernel void gafime_semantic_rank_bitonic_step(
     device MetalSemanticRankRecord* left_records [[buffer(0)]],
     device MetalSemanticRankRecord* right_records [[buffer(1)]],
     constant MetalSemanticRankInfo& info [[buffer(2)]],
-    ulong item [[thread_position_in_grid]]
+    uint item_index [[thread_position_in_grid]]
 ) {
+    const ulong item = static_cast<ulong>(item_index);
     const ulong total = info.pair_count * static_cast<ulong>(info.padded_rows);
     if (item >= total) return;
     const ulong pair = item / static_cast<ulong>(info.padded_rows);
@@ -1745,8 +1755,9 @@ kernel void gafime_semantic_rank_positions(
     device uint* left_ranks_twice [[buffer(2)]],
     device uint* right_ranks_twice [[buffer(3)]],
     constant MetalSemanticRankInfo& info [[buffer(4)]],
-    ulong item [[thread_position_in_grid]]
+    uint item_index [[thread_position_in_grid]]
 ) {
+    const ulong item = static_cast<ulong>(item_index);
     const ulong total = info.pair_count * info.rows;
     if (item >= total) return;
     const ulong pair = item / info.rows;
@@ -1887,8 +1898,9 @@ kernel void gafime_semantic_column_means(
     device uint* states [[buffer(3)]],
     device ulong* supports [[buffer(4)]],
     constant MetalSemanticRowsInfo& info [[buffer(5)]],
-    ulong candidate [[thread_position_in_grid]]
+    uint candidate_index [[thread_position_in_grid]]
 ) {
+    const ulong candidate = static_cast<ulong>(candidate_index);
     if (candidate >= static_cast<ulong>(info.item_count)) return;
     supports[candidate] = info.rows;
     if (info.rows == 0) {
@@ -1926,8 +1938,9 @@ kernel void gafime_semantic_ordered_edge_energy(
     device uint* states [[buffer(5)]],
     device ulong* supports [[buffer(6)]],
     constant MetalSemanticEdgeInfo& info [[buffer(7)]],
-    ulong candidate [[thread_position_in_grid]]
+    uint candidate_index [[thread_position_in_grid]]
 ) {
+    const ulong candidate = static_cast<ulong>(candidate_index);
     if (candidate >= info.candidate_count) return;
     supports[candidate] = info.edge_count;
     if (info.rows == 0) {
@@ -1937,11 +1950,11 @@ kernel void gafime_semantic_ordered_edge_energy(
     }
     device const float* column = columns + static_cast<ulong>(candidate_slots[candidate]) * info.rows;
     const float first = column[0];
-    bool constant = true;
+    bool is_constant = true;
     for (ulong row = 0; row < info.rows; ++row) {
-        constant = constant && column[row] == first;
+        is_constant = is_constant && column[row] == first;
     }
-    if (constant) {
+    if (is_constant) {
         states[candidate] = GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND;
         values[candidate] = 0.0f;
         return;
@@ -1976,8 +1989,9 @@ kernel void gafime_semantic_sparse_gather(
     device const uint* destination_slots [[buffer(3)]],
     device const ulong* row_indices [[buffer(4)]],
     constant MetalSemanticGatherInfo& info [[buffer(5)]],
-    ulong item [[thread_position_in_grid]]
+    uint item_index [[thread_position_in_grid]]
 ) {
+    const ulong item = static_cast<ulong>(item_index);
     const ulong total = info.slot_count * info.destination_rows;
     if (item >= total) return;
     const ulong slot_index = item / info.destination_rows;

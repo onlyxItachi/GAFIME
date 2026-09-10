@@ -254,7 +254,10 @@ inline int validate_program_batch(
         !aligned_or_empty(batch->nodes, batch->node_count) ||
         !fits_host_elements(batch->node_count, sizeof(GafimeSemanticProgramNode)) ||
         !gafime_gpu_abi::all_zero(batch->reserved) ||
-        !gafime_gpu_abi::all_zero(batch->reserved_v3)) {
+        // The accepted v1.3 prefix ends before this optional reserved tail.
+        // A caller may allocate only that prefix, not sizeof(*batch).
+        (batch->struct_size >= sizeof(GafimeSemanticProgramBatch) &&
+            !gafime_gpu_abi::all_zero(batch->reserved_v3))) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     status = validate_slot_slice(batch->operand_slots, slot_capacity);
