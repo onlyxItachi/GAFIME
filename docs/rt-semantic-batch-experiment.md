@@ -40,8 +40,10 @@ There is no RT-specific target/metric or candidate/evidence representation.
   does not change the canonical predicate semantics.
 - Overlapping regions are legal. All matching regions materialize membership;
   no first-hit/one-leaf assumption is applied to general feature candidates.
-- Empty collapsed intervals are outside this RT geometry envelope and fail
-  explicitly rather than pretending that a constant result used traversal.
+- The canonical registry rejects contradictory intervals before lowering. A
+  direct physical-ABI caller can supply an empty interval: the shared geometry
+  builder represents it as an impossible box, and the exact guard produces
+  all-zero membership rather than reporting unsupported execution.
 - Geometry, explicit scratch and intermediate membership are call-local. No
   geometry-cache or warm-residency acceleration claim is made.
 - The caller supplies a temporary-buffer budget. Checked host/device planning
@@ -139,3 +141,32 @@ evergreen assertion that later edits remain qualified. Compilation, physical
 correctness and timing must be reported separately. No result from this draft
 changes release packaging, semantic `auto`, the normal CUDA capability table,
 or the status of #75.
+
+## Next experiment: generic program reuse, not geometry reuse
+
+The measured cold baseline remains available unchanged. A possible follow-up is
+to retain only the generic OptiX context/module/pipeline and fixed SBT records,
+while rebuilding every bank-derived box, point buffer, acceleration structure
+and transient workspace. This is a proposal, not an implemented mode or a
+profiler-proven speedup.
+
+The existing native device-state lease and execution mutex can provide lifetime
+and concurrency ownership. Its legacy custom-AABB program must not be reused
+wholesale: that object also owns feature/target-dependent execution caches.
+A dedicated generic-program member and the existing explicit device-state
+release mechanism would keep those responsibilities separate. The Rust local
+executor would need to retain the existing payload/device state owner, not just
+the bank or loaded library.
+
+Persistent SBT records remain explicit device bytes. A reused mode must report
+and reserve their footprint across subsequent bank allocation and non-RT
+operations, not merely charge them during the next RT call or relabel them
+opaque driver overhead. That is the resource-accounting decision to settle
+before implementation; no new semantic catalog, persistent geometry engine or
+standard ABI change is justified by this experiment.
+
+The next test should distinguish one-time generic initialization from per-call
+GAS construction, use changed inputs in different banks, exercise simultaneous
+same-device owners and final-owner teardown, reject under-budget requests
+before allocation, and preserve exact Core/CUDA membership. Fresh execution
+and cached materialization must remain separate measurement categories.
