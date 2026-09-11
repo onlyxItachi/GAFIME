@@ -41,6 +41,7 @@
     gafime_gpu_semantic_region_query_create_rt_v1;
     gafime_gpu_semantic_region_query_execute_rt_v1;
     gafime_gpu_semantic_region_query_materialize_coverage_rt_v1;
+    gafime_gpu_semantic_region_query_materialize_weighted_sum_rt_v1;
     gafime_gpu_semantic_region_query_free_rt_v1;
   local:
     *;

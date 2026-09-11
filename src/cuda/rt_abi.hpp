@@ -272,6 +272,30 @@ GAFIME_GPU_API int gafime_gpu_semantic_region_query_materialize_coverage_rt_v1(
     uint64_t* temporary_peak_out
 );
 
+/* Materializes exactly one fresh fp32 primary-bank slot from the successful
+ * most-recent query membership using one finite f32 weight per submitted
+ * region.  The weighted endpoint admits exactly two through sixty-four
+ * regions; `region_weights` has exactly `region_weight_count` entries and is
+ * copied synchronously before launch; entries remain aligned with the query's
+ * submitted canonical region order.  Native rejects a null/misaligned array,
+ * an out-of-range or mismatched count, and every NaN or infinity.
+ *
+ * Every row starts from +0 and conditionally adds matching weights in that
+ * same ordinal order.  This is a distinct local physical operation from
+ * integer coverage, including all-one weights.  Its explicit temporary peak
+ * contains the copied device weight vector plus its finite-output validation
+ * flag.  A finite weight vector whose fp32 row accumulation overflows returns
+ * INVALID_ARGUMENT without committing the output slot; finite subnormal
+ * outputs remain valid. */
+GAFIME_GPU_API int gafime_gpu_semantic_region_query_materialize_weighted_sum_rt_v1(
+    GafimeGpuSemanticRegionQuery query,
+    uint32_t output_slot,
+    const float* region_weights,
+    uint64_t region_weight_count,
+    uint64_t max_temporary_bytes,
+    uint64_t* temporary_peak_out
+);
+
 /* If teardown cannot select the owning CUDA device, this returns an error and
  * retains caller ownership of the query so release can be retried. */
 GAFIME_GPU_API int gafime_gpu_semantic_region_query_free_rt_v1(

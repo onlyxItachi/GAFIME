@@ -10,8 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use gafime_orchestrator::semantic::{
     AssociationContext, AssociationStatistic, BinaryPairedStatistic, CandidateRegistry,
     EvidenceDefinition, EvidenceValue, FeatureFrame, FeatureId, FeatureOp, FrozenMeans,
-    FrozenThreshold, LabelSet, MaterializedColumns, NativeEvidenceExecutor, NeighborGraph,
-    NumericColumn, PredicateComparator, SemanticError, SemanticResult, UnavailableReason,
+    FrozenRegionWeights, FrozenThreshold, LabelSet, MaterializedColumns, NativeEvidenceExecutor,
+    NeighborGraph, NumericColumn, PredicateComparator, SemanticError, SemanticResult,
+    UnavailableReason,
 };
 use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CPU};
 use rayon::prelude::*;
@@ -148,6 +149,7 @@ impl NativeEvidenceExecutor for CoreEvidenceExecutor {
                 FeatureOp::CenteredProduct { operands, .. } => pending.extend(operands),
                 FeatureOp::DecisionRegion { terms } => pending.extend(terms),
                 FeatureOp::RegionCount { regions } => pending.extend(regions),
+                FeatureOp::RegionWeightedSum { regions, .. } => pending.extend(regions),
             }
         }
 
@@ -512,6 +514,13 @@ fn materialize_node(
             region_count(frame.profile(), regions, bank, frame.rows())?,
             false,
         ),
+        FeatureOp::RegionWeightedSum {
+            regions,
+            weight_bits,
+        } => (
+            region_weighted_sum(frame.profile(), regions, weight_bits, bank, frame.rows())?,
+            false,
+        ),
     };
     if values.len() != frame.rows() || !values.finite() || !values.supports_profile(frame.profile())
     {
@@ -837,6 +846,92 @@ fn region_count(
                     }
                 }
                 output.push(count as f64);
+            }
+            Ok(NumericColumn::from(output))
+        }
+    }
+}
+
+/// Target-free weighted regional materialization.  Each row starts at +0 in
+/// its profile-native pointwise lane and conditionally adds the corresponding
+/// frozen weight in canonical region identity order.  Unlike `RegionCount`,
+/// this is deliberately a floating arithmetic operation: all-one weights do
+/// not normalize into an integer count candidate, and an overflowing finite
+/// input sum is rejected by the caller's normal post-node finite-value gate.
+fn region_weighted_sum(
+    profile: PrecisionProfile,
+    regions: &[FeatureId],
+    weight_bits: &FrozenRegionWeights,
+    bank: &BTreeMap<FeatureId, NumericColumn>,
+    rows: usize,
+) -> SemanticResult<NumericColumn> {
+    if regions.len() < 2 || weight_bits.len() != regions.len() {
+        return Err(SemanticError::Invalid(
+            "region weighted sum requires aligned distinct decision-region memberships and weights",
+        ));
+    }
+    match profile {
+        PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+            let weights = weight_bits.as_f32_bits()?;
+            let inputs = regions
+                .iter()
+                .map(|&region| {
+                    let values = operand(bank, region)?.as_f32()?;
+                    if values.len() != rows {
+                        return Err(SemanticError::Invalid(
+                            "unaligned region weighted-sum membership",
+                        ));
+                    }
+                    Ok(values)
+                })
+                .collect::<SemanticResult<Vec<_>>>()?;
+            let mut output = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let mut sum = 0.0f32;
+                for (values, bits) in inputs.iter().zip(weights) {
+                    match values[row] {
+                        0.0 => {}
+                        1.0 => sum += f32::from_bits(*bits),
+                        _ => {
+                            return Err(SemanticError::Invalid(
+                                "region weighted sum input is not an exact finite membership",
+                            ))
+                        }
+                    }
+                }
+                output.push(sum);
+            }
+            Ok(NumericColumn::from(output))
+        }
+        PrecisionProfile::Fp64 => {
+            let weights = weight_bits.as_f64_bits()?;
+            let inputs = regions
+                .iter()
+                .map(|&region| {
+                    let values = operand(bank, region)?.as_f64()?;
+                    if values.len() != rows {
+                        return Err(SemanticError::Invalid(
+                            "unaligned region weighted-sum membership",
+                        ));
+                    }
+                    Ok(values)
+                })
+                .collect::<SemanticResult<Vec<_>>>()?;
+            let mut output = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let mut sum = 0.0f64;
+                for (values, bits) in inputs.iter().zip(weights) {
+                    match values[row] {
+                        0.0 => {}
+                        1.0 => sum += f64::from_bits(*bits),
+                        _ => {
+                            return Err(SemanticError::Invalid(
+                                "region weighted sum input is not an exact finite membership",
+                            ))
+                        }
+                    }
+                }
+                output.push(sum);
             }
             Ok(NumericColumn::from(output))
         }

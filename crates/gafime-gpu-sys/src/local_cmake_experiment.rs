@@ -53,6 +53,8 @@ pub struct LocalCmakeExperimentFunctions {
     pub semantic_region_query_free_rt: Option<crate::semantic::local_compact::FreeFn>,
     pub semantic_region_query_materialize_coverage_rt:
         Option<crate::semantic::local_compact::CoverageFn>,
+    pub semantic_region_query_materialize_weighted_sum_rt:
+        Option<crate::semantic::local_compact::WeightedSumFn>,
 }
 
 impl LocalCmakeExperimentFunctions {
@@ -61,6 +63,13 @@ impl LocalCmakeExperimentFunctions {
             && self.semantic_region_query_execute_rt.is_some()
             && self.semantic_region_query_free_rt.is_some()
             && self.semantic_region_query_materialize_coverage_rt.is_some()
+    }
+
+    pub(crate) fn has_region_weighted_sum(&self) -> bool {
+        self.has_region_coverage()
+            && self
+                .semantic_region_query_materialize_weighted_sum_rt
+                .is_some()
     }
 }
 
@@ -101,6 +110,10 @@ pub(crate) unsafe fn load_function_table(library: &Library) -> LocalCmakeExperim
                 library,
                 "gafime_gpu_semantic_region_query_materialize_coverage_rt_v1",
             ),
+            semantic_region_query_materialize_weighted_sum_rt: load_optional_symbol(
+                library,
+                "gafime_gpu_semantic_region_query_materialize_weighted_sum_rt_v1",
+            ),
         }
     }
 }
@@ -113,6 +126,7 @@ pub struct LocalSemanticRtDiagnostics {
     pub completed_region_batches: u64,
     pub completed_regions: u64,
     pub completed_coverage_features: u64,
+    pub completed_weighted_features: u64,
     pub peak_explicit_temporary_bytes: u64,
 }
 
@@ -245,10 +259,35 @@ impl LocalSemanticRegionExecution {
             matches!(node, SemanticProgramNode::FrozenRegionConjunction { .. })
         };
         let is_special = |node: &SemanticProgramNode| {
-            is_region(node) || matches!(node, SemanticProgramNode::RegionCount { .. })
+            is_region(node)
+                || matches!(
+                    node,
+                    SemanticProgramNode::RegionCount { .. }
+                        | SemanticProgramNode::RegionWeightedSum { .. }
+                )
         };
         let mut first = 0;
         while first < nodes.len() {
+            if let SemanticProgramNode::RegionWeightedSum {
+                output_slot,
+                regions,
+                weight_bits,
+            } = &nodes[first]
+            {
+                let peak = bank.materialize_local_region_weighted_sum(
+                    *output_slot,
+                    regions,
+                    weight_bits,
+                    available_bytes,
+                )?;
+                self.diagnostics.completed_weighted_features += 1;
+                self.diagnostics.peak_explicit_temporary_bytes = self
+                    .diagnostics
+                    .peak_explicit_temporary_bytes
+                    .max(peak as u64);
+                first += 1;
+                continue;
+            }
             if let SemanticProgramNode::RegionCount {
                 output_slot,
                 regions,

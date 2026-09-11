@@ -318,6 +318,55 @@ impl CompactEvidenceBatch {
     }
 }
 
+/// Arithmetic-only coordinates for an optional Pareto-frontier lowering.
+///
+/// Coordinates are physical, column-major fp32 values: axis `d` and candidate
+/// row `r` is stored at `d * candidate_count + r`.  Rust has already oriented
+/// every axis so smaller is no worse, but does not expose the original evidence
+/// channel, candidate identity, policy, or acceptance authority to the
+/// executor.  `None` deliberately carries no f64/mixed substitute; an explicit
+/// local route can use it to reject an unsupported profile before any numeric
+/// narrowing or coordinate allocation.
+#[derive(Clone, Copy, Debug)]
+pub struct ParetoFrontierRequest<'a> {
+    profile: PrecisionProfile,
+    objective_count: usize,
+    candidate_count: usize,
+    fp32_coordinates: Option<&'a [f32]>,
+}
+
+impl<'a> ParetoFrontierRequest<'a> {
+    pub(crate) const fn new(
+        profile: PrecisionProfile,
+        objective_count: usize,
+        candidate_count: usize,
+        fp32_coordinates: Option<&'a [f32]>,
+    ) -> Self {
+        Self {
+            profile,
+            objective_count,
+            candidate_count,
+            fp32_coordinates,
+        }
+    }
+
+    pub const fn profile(&self) -> PrecisionProfile {
+        self.profile
+    }
+
+    pub const fn objective_count(&self) -> usize {
+        self.objective_count
+    }
+
+    pub const fn candidate_count(&self) -> usize {
+        self.candidate_count
+    }
+
+    pub const fn fp32_coordinates(&self) -> Option<&'a [f32]> {
+        self.fp32_coordinates
+    }
+}
+
 /// Native kernels own arithmetic and candidate-level parallelism. The
 /// orchestrator owns validation, dependency/context planning and selection.
 /// Session validation precedes these lowering calls. This Rust interface is
@@ -356,6 +405,31 @@ pub trait NativeEvidenceExecutor {
         _retained: Option<&MaterializedColumns>,
         _max_bytes: usize,
     ) -> SemanticResult<Option<CompactEvidenceBatch>> {
+        Ok(None)
+    }
+
+    /// True only for an explicitly selected local arithmetic route that can
+    /// answer a bounded Pareto frontier.  Keeping the default false means the
+    /// ordinary Core and GPU paths do not construct a coordinate buffer merely
+    /// to discover that no local RT query exists.
+    fn wants_pareto_frontier(&self) -> bool {
+        false
+    }
+
+    /// Optionally count weak dominators for physical Pareto coordinates.
+    ///
+    /// Returned count `i` includes candidate `i` and every exact-equal
+    /// coordinate vector.  Rust alone subtracts that equal-vector cardinality,
+    /// determines strict dominance, ranks the frontier, and accepts features.
+    /// The request deliberately has no evidence IDs, feature IDs, directions,
+    /// or selection policy.  A local executor that negotiated this route must
+    /// return `Some` or a fail-closed error; `None` is the default seam for
+    /// ordinary executors.
+    fn pareto_weak_dominator_counts(
+        &mut self,
+        _request: ParetoFrontierRequest<'_>,
+        _max_bytes: usize,
+    ) -> SemanticResult<Option<Vec<u64>>> {
         Ok(None)
     }
 
@@ -612,6 +686,38 @@ impl DiscoveryRound<'_> {
             self.operand(region)?;
         }
         let id = self.registry.region_count(regions)?;
+        self.eligible.insert(id);
+        Ok(id)
+    }
+
+    /// Declare one profile-native weighted sum of distinct canonical decision
+    /// regions.  The registry owns canonicalization and exact frozen bits;
+    /// this round only enforces the same current-round operand authority as
+    /// [`Self::region_count`].
+    pub fn region_weighted_sum(
+        &mut self,
+        regions: Vec<FeatureId>,
+        weights: Vec<f32>,
+    ) -> SemanticResult<FeatureId> {
+        for &region in &regions {
+            self.operand(region)?;
+        }
+        let id = self.registry.region_weighted_sum(regions, weights)?;
+        self.eligible.insert(id);
+        Ok(id)
+    }
+
+    /// fp64 counterpart of [`Self::region_weighted_sum`].  It remains a
+    /// declaration forwarder and does not introduce an fp32 intermediate.
+    pub fn region_weighted_sum_f64(
+        &mut self,
+        regions: Vec<FeatureId>,
+        weights: Vec<f64>,
+    ) -> SemanticResult<FeatureId> {
+        for &region in &regions {
+            self.operand(region)?;
+        }
+        let id = self.registry.region_weighted_sum_f64(regions, weights)?;
         self.eligible.insert(id);
         Ok(id)
     }
@@ -1444,7 +1550,29 @@ impl SemanticSession {
         policy: &SelectionPolicy,
     ) -> SemanticResult<Vec<AcceptedFeature>> {
         self.validate_executor(executor)?;
-        let selected = self.select_for_accept(table, policy)?;
+        let selected = if !policy.pareto_objectives.is_empty() && executor.wants_pareto_frontier() {
+            // The evidence dependency bank and same-frame retained bank remain
+            // live throughout the optional local frontier query. Reserve both
+            // before arithmetic allocates coordinates, query state, or counts.
+            let frontier_budget = self
+                .limits
+                .max_bytes
+                .checked_sub(table.materialized.bytes())
+                .and_then(|remaining| {
+                    remaining.checked_sub(
+                        self.cache
+                            .as_ref()
+                            .filter(|cache| cache.frame_id == table.frame.id())
+                            .map_or(0, MaterializedColumns::bytes),
+                    )
+                })
+                .ok_or(SemanticError::Invalid(
+                    "local RT Pareto dependencies and retained values exceed session budget",
+                ))?;
+            self.select_for_accept_with_executor(executor, table, policy, frontier_budget)?
+        } else {
+            self.select_for_accept(table, policy)?
+        };
         if selected.is_empty() {
             return Ok(Vec::new());
         }
@@ -1595,6 +1723,30 @@ impl SemanticSession {
             ));
         }
         policy.select(table, self.limits.max_work)
+    }
+
+    fn select_for_accept_with_executor(
+        &self,
+        executor: &mut dyn NativeEvidenceExecutor,
+        table: &EvidenceTable,
+        policy: &SelectionPolicy,
+        max_bytes: usize,
+    ) -> SemanticResult<Vec<FeatureId>> {
+        self.registry()?;
+        if table.owner != self.id {
+            return Err(SemanticError::ForeignIdentity);
+        }
+        if table.backend != self.backend || table.materialized.backend_kind() != self.backend {
+            return Err(SemanticError::Invalid(
+                "evidence table backend does not match the selected session backend",
+            ));
+        }
+        if table.round != self.round {
+            return Err(SemanticError::Invalid(
+                "cannot accept evidence from a previous discovery round",
+            ));
+        }
+        policy.select_with_executor(executor, table, self.limits.max_work, max_bytes)
     }
 
     fn finish_accept(
@@ -1903,7 +2055,9 @@ fn dependency_ids(
             }
             FeatureOp::CenteredProduct { operands, .. } => pending.extend(operands),
             FeatureOp::DecisionRegion { terms } => pending.extend(terms),
-            FeatureOp::RegionCount { regions } => pending.extend(regions),
+            FeatureOp::RegionCount { regions } | FeatureOp::RegionWeightedSum { regions, .. } => {
+                pending.extend(regions)
+            }
         }
     }
     Ok(ids)
@@ -1964,7 +2118,9 @@ fn dependency_work(
             FeatureOp::Softsign(a) | FeatureOp::HardPredicate { input: a, .. } => pending.push(*a),
             FeatureOp::CenteredProduct { operands, .. } => pending.extend(operands),
             FeatureOp::DecisionRegion { terms } => pending.extend(terms),
-            FeatureOp::RegionCount { regions } => pending.extend(regions),
+            FeatureOp::RegionCount { regions } | FeatureOp::RegionWeightedSum { regions, .. } => {
+                pending.extend(regions)
+            }
         }
     }
     units

@@ -121,6 +121,17 @@ pub enum FrozenMeans {
     F64(Vec<u64>),
 }
 
+/// Exact finite weights for a canonical weighted sum of decision regions.
+///
+/// The raw IEEE bit pattern is part of candidate identity.  In particular,
+/// signed zero and adjacent finite values must not be silently quantized,
+/// coalesced, or converted through another precision profile.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum FrozenRegionWeights {
+    F32(Vec<u32>),
+    F64(Vec<u64>),
+}
+
 /// Exact threshold storage for a hard predicate.  Like frozen means, the raw
 /// IEEE bits are part of the mathematical candidate identity; fitting history
 /// is deliberately kept outside [`FeatureOp`] so later context cannot fork or
@@ -224,6 +235,37 @@ impl FrozenMeans {
     }
 }
 
+impl FrozenRegionWeights {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::F32(bits) => bits.len(),
+            Self::F64(bits) => bits.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_f32_bits(&self) -> SemanticResult<&[u32]> {
+        match self {
+            Self::F32(bits) => Ok(bits),
+            Self::F64(_) => Err(SemanticError::Invalid(
+                "frozen region weights are not f32 bits",
+            )),
+        }
+    }
+
+    pub fn as_f64_bits(&self) -> SemanticResult<&[u64]> {
+        match self {
+            Self::F32(_) => Err(SemanticError::Invalid(
+                "frozen region weights are not f64 bits",
+            )),
+            Self::F64(bits) => Ok(bits),
+        }
+    }
+}
+
 /// A target-free, precision-bound candidate operation.
 ///
 /// `CenteredProduct` preserves operand order because sequential multiplication
@@ -258,6 +300,15 @@ pub enum FeatureOp {
     /// predicate language.
     RegionCount {
         regions: Vec<FeatureId>,
+    },
+    /// A profile-native, target-free weighted sum across distinct canonical
+    /// decision-region memberships.  Regions and weights are stored together
+    /// in canonical region-identity order, so each row accumulates from +0
+    /// in one declared deterministic order.  This remains distinct from
+    /// [`FeatureOp::RegionCount`], including when every weight is one.
+    RegionWeightedSum {
+        regions: Vec<FeatureId>,
+        weight_bits: FrozenRegionWeights,
     },
 }
 
@@ -319,6 +370,19 @@ impl FeatureProgram {
     pub fn region_count_regions(&self) -> Option<&[FeatureId]> {
         match &self.op {
             FeatureOp::RegionCount { regions } => Some(regions),
+            _ => None,
+        }
+    }
+
+    /// Return the canonical region memberships and exact profile-native
+    /// weights used by a weighted regional sum.  The aligned slices are
+    /// ordered by canonical region identity rather than declaration order.
+    pub fn region_weighted_sum(&self) -> Option<(&[FeatureId], &FrozenRegionWeights)> {
+        match &self.op {
+            FeatureOp::RegionWeightedSum {
+                regions,
+                weight_bits,
+            } => Some((regions, weight_bits)),
             _ => None,
         }
     }
@@ -620,6 +684,45 @@ impl CandidateRegistry {
         self.insert_derived(FeatureOp::RegionCount { regions }, metadata)
     }
 
+    /// Add or resolve a canonical weighted sum of distinct frozen decision
+    /// regions for an fp32-storage profile.  Weights are finite f32 values,
+    /// including signed zero, and remain exact frozen candidate state rather
+    /// than a later scoring or selection policy.
+    pub fn region_weighted_sum(
+        &mut self,
+        regions: Vec<FeatureId>,
+        weights: Vec<f32>,
+    ) -> SemanticResult<FeatureId> {
+        if self.precision == PrecisionProfile::Fp64 {
+            return Err(SemanticError::Invalid(
+                "f32 region weights do not match an fp64 candidate registry",
+            ));
+        }
+        self.region_weighted_sum_from_frozen(
+            regions,
+            FrozenRegionWeights::F32(weights.into_iter().map(f32::to_bits).collect()),
+        )
+    }
+
+    /// Add or resolve a canonical weighted sum of distinct frozen decision
+    /// regions for an fp64 profile.  No f32 intermediate is introduced into
+    /// either the candidate identity or the Core pointwise arithmetic lane.
+    pub fn region_weighted_sum_f64(
+        &mut self,
+        regions: Vec<FeatureId>,
+        weights: Vec<f64>,
+    ) -> SemanticResult<FeatureId> {
+        if self.precision != PrecisionProfile::Fp64 {
+            return Err(SemanticError::Invalid(
+                "f64 region weights require an fp64 candidate registry",
+            ));
+        }
+        self.region_weighted_sum_from_frozen(
+            regions,
+            FrozenRegionWeights::F64(weights.into_iter().map(f64::to_bits).collect()),
+        )
+    }
+
     /// Resolve one registry-owned identity to its immutable semantic program.
     pub fn program(&self, id: FeatureId) -> SemanticResult<&FeatureProgram> {
         if id.registry != self.token {
@@ -786,6 +889,10 @@ impl CandidateRegistry {
                     pending.extend(terms);
                 }
                 FeatureOp::RegionCount { regions } => {
+                    charge_training_lineage_work(work, regions.len(), max_work)?;
+                    pending.extend(regions);
+                }
+                FeatureOp::RegionWeightedSum { regions, .. } => {
                     charge_training_lineage_work(work, regions.len(), max_work)?;
                     pending.extend(regions);
                 }
@@ -1060,6 +1167,114 @@ impl CandidateRegistry {
         }
         self.validate_derived_inputs(&regions)?;
         Ok(regions)
+    }
+
+    fn region_weighted_sum_from_frozen(
+        &mut self,
+        regions: Vec<FeatureId>,
+        weights: FrozenRegionWeights,
+    ) -> SemanticResult<FeatureId> {
+        let canonical_regions = self.canonical_region_count_regions(&regions)?;
+        self.validate_region_weights(&weights, regions.len())?;
+        let weight_bits = self.canonical_region_weights(&regions, &canonical_regions, weights)?;
+        let metadata = self.derived_metadata_from_valid_inputs(&canonical_regions)?;
+        self.insert_derived(
+            FeatureOp::RegionWeightedSum {
+                regions: canonical_regions,
+                weight_bits,
+            },
+            metadata,
+        )
+    }
+
+    fn validate_region_weights(
+        &self,
+        weights: &FrozenRegionWeights,
+        expected: usize,
+    ) -> SemanticResult<()> {
+        if weights.len() != expected {
+            return Err(SemanticError::Invalid(
+                "region weighted sum regions and weights must have equal lengths",
+            ));
+        }
+        match (self.precision, weights) {
+            (PrecisionProfile::Fp32 | PrecisionProfile::Mixed, FrozenRegionWeights::F32(bits))
+                if bits.iter().all(|bits| f32::from_bits(*bits).is_finite()) =>
+            {
+                Ok(())
+            }
+            (PrecisionProfile::Fp64, FrozenRegionWeights::F64(bits))
+                if bits.iter().all(|bits| f64::from_bits(*bits).is_finite()) =>
+            {
+                Ok(())
+            }
+            (PrecisionProfile::Fp32 | PrecisionProfile::Mixed, FrozenRegionWeights::F64(_)) => {
+                Err(SemanticError::Invalid(
+                    "f64 region weights do not match the selected candidate profile",
+                ))
+            }
+            (PrecisionProfile::Fp64, FrozenRegionWeights::F32(_)) => Err(SemanticError::Invalid(
+                "f32 region weights do not match an fp64 candidate registry",
+            )),
+            _ => Err(SemanticError::Invalid(
+                "region weighted sum weights must be finite",
+            )),
+        }
+    }
+
+    fn canonical_region_weights(
+        &self,
+        submitted_regions: &[FeatureId],
+        canonical_regions: &[FeatureId],
+        weights: FrozenRegionWeights,
+    ) -> SemanticResult<FrozenRegionWeights> {
+        // `canonical_region_count_regions` has already proved the submitted
+        // regions distinct and sorted.  The raw weight bits travel with their
+        // matching region while we establish that one canonical order; unlike
+        // a multiset reduction, duplicate terms are rejected rather than
+        // merged or summed.
+        match weights {
+            FrozenRegionWeights::F32(bits) => {
+                let mut by_region = BTreeMap::new();
+                for (&region, bits) in submitted_regions.iter().zip(bits) {
+                    if by_region.insert(region, bits).is_some() {
+                        return Err(SemanticError::Invalid(
+                            "region weighted sum repeats a decision region",
+                        ));
+                    }
+                }
+                Ok(FrozenRegionWeights::F32(
+                    canonical_regions
+                        .iter()
+                        .map(|region| {
+                            by_region.get(region).copied().ok_or(SemanticError::Invalid(
+                                "region weighted sum lost a canonical region weight",
+                            ))
+                        })
+                        .collect::<SemanticResult<Vec<_>>>()?,
+                ))
+            }
+            FrozenRegionWeights::F64(bits) => {
+                let mut by_region = BTreeMap::new();
+                for (&region, bits) in submitted_regions.iter().zip(bits) {
+                    if by_region.insert(region, bits).is_some() {
+                        return Err(SemanticError::Invalid(
+                            "region weighted sum repeats a decision region",
+                        ));
+                    }
+                }
+                Ok(FrozenRegionWeights::F64(
+                    canonical_regions
+                        .iter()
+                        .map(|region| {
+                            by_region.get(region).copied().ok_or(SemanticError::Invalid(
+                                "region weighted sum lost a canonical region weight",
+                            ))
+                        })
+                        .collect::<SemanticResult<Vec<_>>>()?,
+                ))
+            }
+        }
     }
 
     fn compare_thresholds(

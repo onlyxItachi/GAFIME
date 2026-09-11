@@ -1143,7 +1143,7 @@ struct GafimeRtParams {
     const uint32_t* semantic_label_zero_words;
     const uint32_t* semantic_label_one_words;
     GafimeSemanticRtRegionExactStats* semantic_stats;
-    uint32_t* semantic_coverage;
+    uint32_t* semantic_direct_region_ordinals;
     uint32_t semantic_statistic_mask;
     uint32_t semantic_direct_stats;
     uint32_t semantic_view;
@@ -4493,7 +4493,11 @@ struct CompactSemanticRtRegionQuery {
     uint32_t* paired_membership_words_device = nullptr;
     uint32_t* label_zero_words_device = nullptr;
     uint32_t* label_one_words_device = nullptr;
-    uint32_t* coverage_device = nullptr;
+    /* In the proof-gated direct-first-hit route this stores one canonical
+     * result-region ordinal plus one per row.  The ordinary coverage endpoint
+     * maps it back to 0/1, while weighted materialization uses the ordinal to
+     * select the matching frozen weight without reconstructing an R by N mask. */
+    uint32_t* direct_region_ordinals_device = nullptr;
     GafimeSemanticRtRegionExactStats* stats_device = nullptr;
 
 #if defined(GAFIME_CUDA_ENABLE_OPTIX_RT)
@@ -4518,7 +4522,7 @@ struct CompactSemanticRtRegionQuery {
             if (status == GAFIME_STATUS_OK && candidate != GAFIME_STATUS_OK) status = candidate;
         };
         release(stats_device);
-        release(coverage_device);
+        release(direct_region_ordinals_device);
         release(label_one_words_device);
         release(label_zero_words_device);
         release(paired_membership_words_device);
@@ -4540,7 +4544,7 @@ struct CompactSemanticRtRegionQuery {
         release(source_paired_terms_device);
         release(source_primary_terms_device);
         stats_device = nullptr;
-        coverage_device = nullptr;
+        direct_region_ordinals_device = nullptr;
         label_one_words_device = nullptr;
         label_zero_words_device = nullptr;
         paired_membership_words_device = nullptr;
@@ -5746,7 +5750,8 @@ int create_compact_semantic_rt_region_query(
         &query->label_zero_words_device, words_per_region);
     if (status == GAFIME_STATUS_OK) status = allocate(
         &query->label_one_words_device, words_per_region);
-    if (status == GAFIME_STATUS_OK) status = allocate(&query->coverage_device, primary.rows);
+    if (status == GAFIME_STATUS_OK) status = allocate(
+        &query->direct_region_ordinals_device, primary.rows);
     if (status == GAFIME_STATUS_OK) status = allocate(&query->stats_device, desc->region_count);
 
     if (status == GAFIME_STATUS_OK) status = copy_compact_semantic_rt_persistent(
@@ -6115,7 +6120,10 @@ int run_compact_semantic_rt_optix(
     ));
     if (status == GAFIME_STATUS_OK && query.direct_first_hit) {
         status = cuda_status(cudaMemsetAsync(
-            query.coverage_device, 0, static_cast<size_t>(query.rows) * sizeof(uint32_t), program.stream));
+            query.direct_region_ordinals_device,
+            0,
+            static_cast<size_t>(query.rows) * sizeof(uint32_t),
+            program.stream));
     }
     if (status == GAFIME_STATUS_OK && !query.direct_first_hit) {
         status = cuda_status(cudaMemsetAsync(
@@ -6148,7 +6156,9 @@ int run_compact_semantic_rt_optix(
     params.semantic_label_zero_words = query.label_zero_words_device;
     params.semantic_label_one_words = query.label_one_words_device;
     params.semantic_stats = query.stats_device;
-    params.semantic_coverage = query.direct_first_hit ? query.coverage_device : nullptr;
+    params.semantic_direct_region_ordinals = query.direct_first_hit
+        ? query.direct_region_ordinals_device
+        : nullptr;
     params.semantic_statistic_mask = statistic_mask;
     params.semantic_direct_stats = query.direct_first_hit ? 1u : 0u;
     params.semantic_view = 0u;
@@ -6171,7 +6181,7 @@ int run_compact_semantic_rt_optix(
         params.points_xyz = query.paired_points_device;
         params.semantic_counterpart_points_xyz = query.primary_points_device;
         params.membership_words = query.direct_first_hit ? nullptr : query.paired_membership_words_device;
-        params.semantic_coverage = nullptr;
+        params.semantic_direct_region_ordinals = nullptr;
         params.semantic_view = 1u;
         status = cuda_status(cudaMemcpyAsync(
             program.params_device, &params, sizeof(params), cudaMemcpyHostToDevice, program.stream));
@@ -6327,7 +6337,7 @@ int materialize_compact_semantic_rt_coverage(
         (query->rows + threads - 1u) / threads, 65'535u));
     if (query->direct_first_hit) {
         gafime_cuda_v1::rt_kernel::scatter_semantic_region_coverage_counts_kernel<<<blocks, threads>>>(
-            query->coverage_device, query->rows, output);
+            query->direct_region_ordinals_device, query->rows, output);
     } else {
         gafime_cuda_v1::rt_kernel::materialize_semantic_region_coverage_kernel<<<blocks, threads>>>(
             query->primary_membership_words_device,
@@ -6340,6 +6350,124 @@ int materialize_compact_semantic_rt_coverage(
     status = cuda_status(cudaGetLastError());
     if (status == GAFIME_STATUS_OK) status = cuda_status(cudaDeviceSynchronize());
     if (status != GAFIME_STATUS_OK) return status;
+    return gafime_cuda_v1::detail::commit_cuda_semantic_bank_outputs(
+        query->primary_bank, &output_slot, 1u);
+}
+
+int materialize_compact_semantic_rt_weighted_sum(
+    GafimeGpuSemanticRegionQuery handle,
+    uint32_t output_slot,
+    const float* region_weights,
+    uint64_t region_weight_count,
+    uint64_t max_temporary_bytes,
+    uint64_t* temporary_peak_out
+) {
+    if (temporary_peak_out == nullptr || !gafime_gpu_abi::naturally_aligned(temporary_peak_out)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    *temporary_peak_out = 0u;
+    CompactSemanticRtRegionQuery* query = compact_semantic_rt_query_from_handle(handle);
+    if (query == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(query->mutex);
+    /* This optional endpoint has a narrower public domain than the general
+     * compact query ABI: Core only constructs weighted candidates for two
+     * through sixty-four distinct canonical regions.  Check every count
+     * before dereferencing caller memory. */
+    if (!query->membership_valid || query->region_count < 2u ||
+        query->region_count > 64u || region_weight_count < 2u ||
+        region_weight_count > 64u || region_weights == nullptr ||
+        !gafime_gpu_abi::naturally_aligned(region_weights) ||
+        region_weight_count != static_cast<uint64_t>(query->region_count) ||
+        !gafime_gpu_abi::fits_host_bytes(region_weight_count, sizeof(float))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    /* Validate before a CUDA allocation or output write.  The caller retains
+     * the host array through this synchronous call; the device never caches
+     * its address or makes it part of query identity. */
+    for (uint64_t index = 0u; index < region_weight_count; ++index) {
+        if (!std::isfinite(region_weights[index])) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    uint64_t weight_bytes = 0u;
+    uint64_t temporary_bytes = 0u;
+    if (!checked_element_bytes(region_weight_count, sizeof(float), &weight_bytes) ||
+        !checked_add_u64(weight_bytes, sizeof(uint32_t), &temporary_bytes)) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    *temporary_peak_out = temporary_bytes;
+    if (temporary_bytes > max_temporary_bytes) return GAFIME_STATUS_OUT_OF_MEMORY;
+
+    ScopedCudaDevice device(query->device_id);
+    if (device.status() != cudaSuccess) return cuda_status(device.status());
+    gafime_cuda_v1::detail::CudaSemanticBankView primary{};
+    int status = gafime_cuda_v1::detail::inspect_cuda_semantic_bank(query->primary_bank, &primary);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (primary.columns != query->primary_columns || primary.rows != query->rows ||
+        output_slot < primary.source_slots || output_slot >= primary.slot_capacity ||
+        primary.initialized_slots == nullptr || (*primary.initialized_slots)[output_slot] != 0u) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+
+    CompactSemanticRtTemporaryAllocation temporary;
+    status = temporary.allocate(temporary_bytes);
+    if (status != GAFIME_STATUS_OK) return status;
+    float* weights_device = temporary.as<float>();
+    uint32_t* nonfinite_device = temporary.as<uint32_t>(weight_bytes);
+    status = cuda_status(cudaMemcpy(
+        weights_device,
+        region_weights,
+        static_cast<size_t>(weight_bytes),
+        cudaMemcpyHostToDevice
+    ));
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemset(nonfinite_device, 0, sizeof(uint32_t)));
+    }
+    if (status != GAFIME_STATUS_OK) return status;
+
+    float* output = primary.columns + static_cast<uint64_t>(output_slot) * query->rows;
+    constexpr uint32_t threads = 256u;
+    const uint32_t blocks = static_cast<uint32_t>(std::min<uint64_t>(
+        (query->rows + threads - 1u) / threads, 65'535u));
+    if (query->direct_first_hit) {
+        if (query->direct_region_ordinals_device == nullptr) return GAFIME_STATUS_DEVICE_ERROR;
+        gafime_cuda_v1::rt_kernel::materialize_semantic_region_weighted_sum_ordinals_kernel<<<
+            blocks, threads
+        >>>(
+            query->direct_region_ordinals_device,
+            query->rows,
+            query->region_count,
+            weights_device,
+            output,
+            nonfinite_device
+        );
+    } else {
+        if (query->primary_membership_words_device == nullptr) return GAFIME_STATUS_DEVICE_ERROR;
+        gafime_cuda_v1::rt_kernel::materialize_semantic_region_weighted_sum_kernel<<<
+            blocks, threads
+        >>>(
+            query->primary_membership_words_device,
+            query->rows,
+            query->region_count,
+            query->words_per_region,
+            weights_device,
+            output,
+            nonfinite_device
+        );
+    }
+    status = cuda_status(cudaGetLastError());
+    if (status == GAFIME_STATUS_OK) status = cuda_status(cudaDeviceSynchronize());
+    uint32_t has_nonfinite = 0u;
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpy(
+            &has_nonfinite, nonfinite_device, sizeof(has_nonfinite), cudaMemcpyDeviceToHost));
+    }
+    if (status != GAFIME_STATUS_OK) return status;
+    /* The temporary flag distinguishes legal finite subnormal results from
+     * overflow/invalid arithmetic.  On failure the bank slot stays logically
+     * uninitialized even though an implementation may have written other
+     * finite rows into its private backing storage. */
+    if (has_nonfinite != 0u) return GAFIME_STATUS_INVALID_ARGUMENT;
     return gafime_cuda_v1::detail::commit_cuda_semantic_bank_outputs(
         query->primary_bank, &output_slot, 1u);
 }
@@ -6703,6 +6831,34 @@ extern "C" GAFIME_GPU_API int gafime_gpu_semantic_region_query_materialize_cover
 ) try {
     return materialize_compact_semantic_rt_coverage(
         query, output_slot, max_temporary_bytes, temporary_peak_out);
+} catch (const std::bad_alloc&) {
+    if (temporary_peak_out != nullptr && gafime_gpu_abi::naturally_aligned(temporary_peak_out)) {
+        *temporary_peak_out = 0u;
+    }
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    if (temporary_peak_out != nullptr && gafime_gpu_abi::naturally_aligned(temporary_peak_out)) {
+        *temporary_peak_out = 0u;
+    }
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+extern "C" GAFIME_GPU_API int gafime_gpu_semantic_region_query_materialize_weighted_sum_rt_v1(
+    GafimeGpuSemanticRegionQuery query,
+    uint32_t output_slot,
+    const float* region_weights,
+    uint64_t region_weight_count,
+    uint64_t max_temporary_bytes,
+    uint64_t* temporary_peak_out
+) try {
+    return materialize_compact_semantic_rt_weighted_sum(
+        query,
+        output_slot,
+        region_weights,
+        region_weight_count,
+        max_temporary_bytes,
+        temporary_peak_out
+    );
 } catch (const std::bad_alloc&) {
     if (temporary_peak_out != nullptr && gafime_gpu_abi::naturally_aligned(temporary_peak_out)) {
         *temporary_peak_out = 0u;

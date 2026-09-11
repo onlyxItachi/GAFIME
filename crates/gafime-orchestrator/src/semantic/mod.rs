@@ -25,14 +25,14 @@ pub use evidence::{
 pub use numeric::NumericColumn;
 pub use ordering::Direction;
 pub use program::{
-    CandidateRegistry, FeatureId, FeatureOp, FeatureProgram, FrozenMeans, FrozenThreshold,
-    PredicateComparator, ProgramLimits, TrainingBinding, MAX_REGION_TERMS,
+    CandidateRegistry, FeatureId, FeatureOp, FeatureProgram, FrozenMeans, FrozenRegionWeights,
+    FrozenThreshold, PredicateComparator, ProgramLimits, TrainingBinding, MAX_REGION_TERMS,
 };
 pub use selection::{EvidenceConstraint, EvidenceObjective, MissingEvidence, SelectionPolicy};
 pub use session::{
     AcceptedFeature, CompactEvidenceBatch, DiscoveryRound, MaterializedColumns,
-    NativeEvidenceExecutor, ProposalOperator, ResidentMaterializationLease, SemanticSession,
-    SessionLimits,
+    NativeEvidenceExecutor, ParetoFrontierRequest, ProposalOperator, ResidentMaterializationLease,
+    SemanticSession, SessionLimits,
 };
 
 use std::sync::atomic::{AtomicU64, Ordering};

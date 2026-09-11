@@ -22,6 +22,17 @@ fn compact_binary_lifecycle(
     Vec<gafime_orchestrator::semantic::EvidenceValue>,
     Vec<Vec<u32>>,
 ) {
+    compact_binary_lifecycle_with_objectives(executor, backend, 0)
+}
+
+fn compact_binary_lifecycle_with_objectives(
+    executor: &mut dyn gafime_orchestrator::semantic::NativeEvidenceExecutor,
+    backend: u32,
+    objective_count: usize,
+) -> (
+    Vec<gafime_orchestrator::semantic::EvidenceValue>,
+    Vec<Vec<u32>>,
+) {
     use gafime_orchestrator::semantic::*;
     use gafime_types::PrecisionProfile;
     use std::sync::Arc;
@@ -208,7 +219,25 @@ fn compact_binary_lifecycle(
         ],
         missing: MissingEvidence::Error,
         limit: 2,
-        pareto_objectives: vec![],
+        pareto_objectives: if objective_count == 0 {
+            vec![]
+        } else {
+            [
+                EvidenceObjective {
+                    channel: coverage.id(),
+                    direction: Direction::Maximize,
+                },
+                EvidenceObjective {
+                    channel: agreement.id(),
+                    direction: Direction::Minimize,
+                },
+                EvidenceObjective {
+                    channel: gini.id(),
+                    direction: Direction::Maximize,
+                },
+            ][..objective_count]
+                .to_vec()
+        },
     };
     let accepted = session.accept_with(executor, &second, &policy).unwrap();
     assert_eq!(accepted.len(), 2);
@@ -320,6 +349,14 @@ fn region_count_lifecycle(
     executor: &mut dyn gafime_orchestrator::semantic::NativeEvidenceExecutor,
     backend: u32,
 ) -> Vec<u32> {
+    region_aggregate_lifecycle(executor, backend, false)
+}
+
+fn region_aggregate_lifecycle(
+    executor: &mut dyn gafime_orchestrator::semantic::NativeEvidenceExecutor,
+    backend: u32,
+    weighted: bool,
+) -> Vec<u32> {
     use gafime_orchestrator::semantic::*;
     use gafime_types::PrecisionProfile;
     use std::sync::Arc;
@@ -358,7 +395,14 @@ fn region_count_lifecycle(
             .unwrap();
         let r0 = round.decision_region(vec![p0]).unwrap();
         let r1 = round.decision_region(vec![p1]).unwrap();
-        (source, round.region_count(vec![r0, r1]).unwrap())
+        let aggregate = if weighted {
+            round
+                .region_weighted_sum(vec![r0, r1], vec![2.0, -3.0])
+                .unwrap()
+        } else {
+            round.region_count(vec![r0, r1]).unwrap()
+        };
+        (source, aggregate)
     };
     let reference = EvidenceChannel::new(
         "ordinary-statistic".into(),
@@ -377,7 +421,12 @@ fn region_count_lifecycle(
         pareto_objectives: vec![],
     };
     let table = session
-        .evaluate(executor, Arc::clone(&frame), &[count], &[reference])
+        .evaluate(
+            executor,
+            Arc::clone(&frame),
+            &[count],
+            std::slice::from_ref(&reference),
+        )
         .unwrap();
     let accepted = session.accept_with(executor, &table, &policy).unwrap();
     assert_eq!(accepted.len(), 1);
@@ -399,11 +448,43 @@ fn region_count_lifecycle(
         .collect::<Vec<_>>();
     assert_eq!(
         result,
-        vec![1.0f32, 1.0, 1.0, 2.0, 2.0, 1.0]
-            .into_iter()
-            .map(f32::to_bits)
-            .collect::<Vec<_>>()
+        (if weighted {
+            vec![2.0f32, 2.0, 2.0, -1.0, -1.0, -3.0]
+        } else {
+            vec![1.0f32, 1.0, 1.0, 2.0, 2.0, 1.0]
+        })
+        .into_iter()
+        .map(f32::to_bits)
+        .collect::<Vec<_>>()
     );
+    if weighted {
+        // The weighted program becomes a later-round logical atom, not a
+        // discovery-only score; new row identities require fresh execution.
+        let composite = {
+            let mut round = session.begin_round(&accepted).unwrap();
+            round
+                .hard_predicate(count, PredicateComparator::GreaterThan, 0.0)
+                .unwrap()
+        };
+        let table = session
+            .evaluate(executor, Arc::clone(&frame), &[composite], &[reference])
+            .unwrap();
+        let selected = session.accept_with(executor, &table, &policy).unwrap();
+        let values = session
+            .materialize_accepted(executor, &inference, &selected)
+            .unwrap();
+        let host = if values.is_resident() {
+            executor
+                .download(session.registry().unwrap(), &inference, &values, 64 << 20)
+                .unwrap()
+        } else {
+            values
+        };
+        assert_eq!(
+            host.get(composite).unwrap(),
+            &[1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+        );
+    }
     session.close();
     result
 }
@@ -431,6 +512,96 @@ fn local_compact_region_count_is_a_target_free_feature_not_an_evidence_alias() {
             .completed_coverage_features,
         2
     );
+}
+
+#[test]
+fn local_weighted_regions_select_compose_and_infer_bit_exactly() {
+    use gafime_cpu::semantic::CoreEvidenceExecutor;
+    use gafime_types::{GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA};
+    let _guard = RT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(backend) = configured_cuda_backend("weighted region lifecycle") else {
+        return;
+    };
+    let expected = region_aggregate_lifecycle(
+        &mut CoreEvidenceExecutor::default(),
+        GAFIME_BACKEND_CPU,
+        true,
+    );
+    let mut rt = backend.local_compact_rt_semantic_executor().unwrap();
+    assert_eq!(
+        region_aggregate_lifecycle(&mut rt, GAFIME_BACKEND_CUDA, true),
+        expected
+    );
+    assert!(
+        rt.local_rt_diagnostics()
+            .unwrap()
+            .completed_weighted_features
+            >= 2
+    );
+    use gafime_orchestrator::semantic::*;
+    use gafime_types::PrecisionProfile;
+    let frame = FeatureFrame::with_profile(
+        PrecisionProfile::Fp32,
+        vec!["x".into()],
+        "ordinary-cuda".into(),
+        vec![0, 1],
+        EvaluationRole::Discovery,
+        "fail-closed weighted route".into(),
+        vec![NumericColumn::from(vec![0.0f32, 1.0])],
+    )
+    .unwrap();
+    let mut registry = CandidateRegistry::new(
+        frame.schema().to_vec(),
+        PrecisionProfile::Fp32,
+        ProgramLimits::default(),
+    )
+    .unwrap();
+    let x = registry.source(0).unwrap();
+    let p0 = registry
+        .hard_predicate(x, PredicateComparator::LessEqual, 0.5)
+        .unwrap();
+    let p1 = registry
+        .hard_predicate(x, PredicateComparator::GreaterThan, 0.5)
+        .unwrap();
+    let r0 = registry.decision_region(vec![p0]).unwrap();
+    let r1 = registry.decision_region(vec![p1]).unwrap();
+    let weighted = registry
+        .region_weighted_sum(vec![r0, r1], vec![1.0, -1.0])
+        .unwrap();
+    let mut ordinary = backend.semantic_executor().unwrap();
+    assert!(
+        matches!(
+            ordinary.materialize(&registry, &frame, &[weighted], None, 1 << 20),
+            Err(SemanticError::Unsupported(_))
+        ),
+        "ordinary CUDA must not silently opt into the experimental RT route"
+    );
+}
+
+#[test]
+fn local_pareto_selection_matches_core_with_conflicts_ties_and_inference() {
+    use gafime_cpu::semantic::CoreEvidenceExecutor;
+    use gafime_types::{GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA};
+    let _guard = RT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(backend) = configured_cuda_backend("local Pareto lifecycle") else {
+        return;
+    };
+    for dimensions in [2, 3] {
+        let expected = compact_binary_lifecycle_with_objectives(
+            &mut CoreEvidenceExecutor::default(),
+            GAFIME_BACKEND_CPU,
+            dimensions,
+        );
+        let mut rt = backend.local_compact_rt_semantic_executor().unwrap();
+        assert_eq!(
+            compact_binary_lifecycle_with_objectives(&mut rt, GAFIME_BACKEND_CUDA, dimensions),
+            expected
+        );
+    }
 }
 
 // This opt-in diagnostic times the same frozen programs through each executor,

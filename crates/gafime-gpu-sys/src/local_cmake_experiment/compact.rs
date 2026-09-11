@@ -11,7 +11,7 @@ use gafime_orchestrator::semantic::{
 };
 
 const QUERY_ABI: u32 = 0x0001_0000;
-const OCCUPANCY: u32 = 1;
+pub(super) const OCCUPANCY: u32 = 1;
 const PAIRED: u32 = 2;
 const LABELED: u32 = 4;
 const OCCUPANCY_SCORE: u32 = 1;
@@ -62,9 +62,9 @@ pub struct ExecuteDesc {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExactStats {
-    row_count: u64,
+    pub(super) row_count: u64,
     label_support: u64,
-    occupancy_inside: u64,
+    pub(super) occupancy_inside: u64,
     paired_n00: u64,
     paired_n01: u64,
     paired_n10: u64,
@@ -101,21 +101,23 @@ pub type ExecuteFn =
     unsafe extern "C" fn(*mut c_void, *const ExecuteDesc, *mut StatsTable, *mut u64) -> i32;
 pub type FreeFn = unsafe extern "C" fn(*mut c_void) -> i32;
 pub type CoverageFn = unsafe extern "C" fn(*mut c_void, u32, u64, *mut u64) -> i32;
+pub type WeightedSumFn =
+    unsafe extern "C" fn(*mut c_void, u32, *const f32, u64, u64, *mut u64) -> i32;
 
 #[derive(Clone, Copy)]
-struct Functions {
-    create: CreateFn,
-    execute: ExecuteFn,
-    free: FreeFn,
-    coverage: CoverageFn,
+pub(super) struct Functions {
+    pub(super) create: CreateFn,
+    pub(super) execute: ExecuteFn,
+    pub(super) free: FreeFn,
+    pub(super) coverage: CoverageFn,
 }
 
-struct Query {
+pub(super) struct Query {
     raw: *mut c_void,
     functions: Functions,
     primary: OwnedSemanticBank,
     _paired: Option<OwnedSemanticBank>,
-    persistent_bytes: usize,
+    pub(super) persistent_bytes: usize,
     regions: usize,
 }
 
@@ -123,6 +125,12 @@ struct Query {
 // Both banks retain their DSO and synchronize accesses. Native calls serialize
 // query state, synchronize before returning, and restore the caller device.
 unsafe impl Send for Query {}
+// SAFETY: shared references expose no native operation or raw handle. Execute
+// requires exclusive access; teardown requires ownership. Bank leases are
+// synchronized and immutable through this wrapper. Keeping the local optional
+// state Sync also preserves the enclosing PyO3 type's free-threaded contract
+// when Cargo features are unified in a workspace build.
+unsafe impl Sync for Query {}
 
 impl Drop for Query {
     fn drop(&mut self) {
@@ -137,19 +145,19 @@ impl Drop for Query {
     }
 }
 
-fn checked_add(a: usize, b: usize) -> SemanticResult<usize> {
+pub(super) fn checked_add(a: usize, b: usize) -> SemanticResult<usize> {
     a.checked_add(b)
         .ok_or(SemanticError::Invalid("compact native byte count overflow"))
 }
 
-fn remaining(budget: usize, used: usize) -> SemanticResult<usize> {
+pub(super) fn remaining(budget: usize, used: usize) -> SemanticResult<usize> {
     budget.checked_sub(used).ok_or(SemanticError::Invalid(
         "compact native query exceeds execution budget",
     ))
 }
 
 impl Query {
-    fn create(
+    pub(super) fn create(
         functions: Functions,
         primary: OwnedSemanticBank,
         paired: Option<OwnedSemanticBank>,
@@ -222,7 +230,7 @@ impl Query {
         Ok(query)
     }
 
-    fn execute(
+    pub(super) fn execute(
         &mut self,
         mask: u32,
         finalizers: u32,
@@ -886,6 +894,26 @@ impl OwnedSemanticBank {
         regions: &[Vec<SemanticFrozenRegionTerm>],
         max_bytes: usize,
     ) -> SemanticResult<usize> {
+        self.materialize_local_region_aggregate(output_slot, regions, None, max_bytes)
+    }
+
+    pub(crate) fn materialize_local_region_weighted_sum(
+        &self,
+        output_slot: u32,
+        regions: &[Vec<SemanticFrozenRegionTerm>],
+        weight_bits: &[u32],
+        max_bytes: usize,
+    ) -> SemanticResult<usize> {
+        self.materialize_local_region_aggregate(output_slot, regions, Some(weight_bits), max_bytes)
+    }
+
+    fn materialize_local_region_aggregate(
+        &self,
+        output_slot: u32,
+        regions: &[Vec<SemanticFrozenRegionTerm>],
+        weight_bits: Option<&[u32]>,
+        max_bytes: usize,
+    ) -> SemanticResult<usize> {
         if self.profile() != PrecisionProfile::Fp32 || regions.len() < 2 || regions.len() > 64 {
             return Err(SemanticError::Unsupported(
                 "local region-count requires fp32 and two to sixty-four regions",
@@ -894,6 +922,22 @@ impl OwnedSemanticBank {
         let local = self.inner.functions.local_cmake_experiment;
         let missing =
             || SemanticError::Unsupported("local conditional-query function table is incomplete");
+        let weighted = if let Some(bits) = weight_bits {
+            if bits.len() != regions.len()
+                || bits.iter().any(|bits| !f32::from_bits(*bits).is_finite())
+            {
+                return Err(SemanticError::Invalid(
+                    "weighted-region coefficients must match regions and be finite fp32",
+                ));
+            }
+            Some(
+                local
+                    .semantic_region_query_materialize_weighted_sum_rt
+                    .ok_or_else(missing)?,
+            )
+        } else {
+            None
+        };
         let functions = Functions {
             create: local.semantic_region_query_create_rt.ok_or_else(missing)?,
             execute: local.semantic_region_query_execute_rt.ok_or_else(missing)?,
@@ -913,7 +957,16 @@ impl OwnedSemanticBank {
                 ))?,
             (regions.len() + 1) * 4,
         )?;
+        let host_bytes = checked_add(
+            host_bytes,
+            weight_bits.map_or(0, |bits| bits.len() * std::mem::size_of::<f32>()),
+        )?;
         let budget = remaining(max_bytes, host_bytes)?;
+        let weights = weight_bits.map(|bits| {
+            bits.iter()
+                .map(|bits| f32::from_bits(*bits))
+                .collect::<Vec<_>>()
+        });
         let mut terms = Vec::with_capacity(term_count);
         let mut offsets = Vec::with_capacity(regions.len() + 1);
         offsets.push(0);
@@ -945,10 +998,25 @@ impl OwnedSemanticBank {
         // SAFETY: query and bank/DSO are retained, the native bank lock is held,
         // and output commits only after a complete synchronous successful call.
         let status = unsafe {
-            (query.functions.coverage)(query.raw, output_slot, available as u64, &mut peak)
+            if let (Some(weighted), Some(weights)) = (weighted, &weights) {
+                weighted(
+                    query.raw,
+                    output_slot,
+                    weights.as_ptr(),
+                    weights.len() as u64,
+                    available as u64,
+                    &mut peak,
+                )
+            } else {
+                (query.functions.coverage)(query.raw, output_slot, available as u64, &mut peak)
+            }
         };
         status_to_gpu_result(
-            "gafime_gpu_semantic_region_query_materialize_coverage_rt_v1",
+            if weighted.is_some() {
+                "gafime_gpu_semantic_region_query_materialize_weighted_sum_rt_v1"
+            } else {
+                "gafime_gpu_semantic_region_query_materialize_coverage_rt_v1"
+            },
             status,
         )
         .map_err(GpuNativeEvidenceExecutor::semantic_error)?;
@@ -978,6 +1046,9 @@ mod layout_tests {
 
     #[test]
     fn local_compact_layout_matches_native_header() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Query>();
+        assert_send_sync::<GpuNativeEvidenceExecutor>();
         assert_eq!(std::mem::size_of::<QueryDesc>(), 144);
         assert_eq!(std::mem::size_of::<BinaryLabels>(), 80);
         assert_eq!(std::mem::size_of::<ExecuteDesc>(), 160);

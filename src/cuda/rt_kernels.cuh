@@ -146,11 +146,36 @@ __global__ void materialize_semantic_region_coverage_kernel(
     float* output_column
 );
 
+/* Sequential fp32 accumulation from +0 over the exact canonical submitted
+ * region order.  `nonfinite_out` reports only invalid ordinal state or a
+ * nonfinite final sum; finite subnormal outputs are deliberately accepted. */
+__global__ void materialize_semantic_region_weighted_sum_kernel(
+    const uint32_t* primary_membership_words,
+    uint64_t rows,
+    uint32_t region_count,
+    uint32_t words_per_region,
+    const float* region_weights,
+    float* output_column,
+    uint32_t* nonfinite_out
+);
+
+/* The proof-gated direct-first-hit query retains one canonical region ordinal
+ * plus one per row instead of an R by N membership mask. */
+__global__ void materialize_semantic_region_weighted_sum_ordinals_kernel(
+    const uint32_t* direct_region_ordinals,
+    uint64_t rows,
+    uint32_t region_count,
+    const float* region_weights,
+    float* output_column,
+    uint32_t* nonfinite_out
+);
+
 /* The proof-gated first-hit RT path keeps a per-row exact membership count
- * rather than an R by N bitset.  This final scatter is intentionally tiny
- * and shares the same fresh-slot commit gate as the bitset path. */
+ * rather than an R by N bitset.  Its retained encoding is an ordinal plus one
+ * (zero means no membership), and this final scatter returns its 0/1 coverage
+ * count while preserving the fresh-slot commit gate. */
 __global__ void scatter_semantic_region_coverage_counts_kernel(
-    const uint32_t* coverage_counts,
+    const uint32_t* direct_region_ordinals,
     uint64_t rows,
     float* output_column
 );

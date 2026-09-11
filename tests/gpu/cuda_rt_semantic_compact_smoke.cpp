@@ -1146,7 +1146,7 @@ int exercise_exact_three_lane_case(
             column_major(primary),
             rows,
             static_cast<uint32_t>(primary.size()),
-            static_cast<uint32_t>(primary.size()),
+            static_cast<uint32_t>(primary.size() + kBenchmarkRoutes.size()),
             &primary_bank) ||
         !allocate_uploaded_f32_bank(
             column_major(paired),
@@ -1158,6 +1158,7 @@ int exercise_exact_three_lane_case(
     }
 
     std::vector<GafimeSemanticRtRegionExactStats> baseline_records;
+    uint32_t weighted_slot = static_cast<uint32_t>(primary.size());
     for (const BenchmarkRoute route : kBenchmarkRoutes) {
         const GafimeSemanticRtRegionQueryDesc desc = query_desc(
             primary_bank.raw, paired_bank.raw, spec, route.flags, kUnlimited);
@@ -1189,6 +1190,32 @@ int exercise_exact_three_lane_case(
         } else if (!same_native_record_vectors(baseline_records, execution.records)) {
             return fail("final compact geometry lanes disagreed in exact records/finalizers");
         }
+        std::vector<float> weights(region_count);
+        for (uint32_t r = 0; r < region_count; ++r) {
+            weights[r] = (r % 2u == 0u ? 1.0f : -1.0f) * static_cast<float>(r + 1u);
+        }
+        uint64_t weighted_peak = 0u;
+        status = gafime_gpu_semantic_region_query_materialize_weighted_sum_rt_v1(
+            query.raw, weighted_slot, weights.data(), region_count, kUnlimited, &weighted_peak);
+        std::vector<float> actual;
+        if (status != GAFIME_STATUS_OK ||
+            !download_f32_slot(primary_bank.raw, rows, weighted_slot, &actual)) {
+            return fail("geometry weighted materialization failed", status);
+        }
+        for (uint64_t row = 0u; row < rows; ++row) {
+            float expected_weighted = 0.0f;
+            for (uint32_t r = 0u; r < region_count; ++r) {
+                bool inside = true;
+                for (uint32_t t = spec.region_offsets[r]; t < spec.region_offsets[r + 1u]; ++t) {
+                    inside = inside && holds(primary[spec.terms[t].input_slot][row], spec.terms[t]);
+                }
+                if (inside) expected_weighted += weights[r];
+            }
+            if (f32_bits(actual[row]) != f32_bits(expected_weighted)) {
+                return fail("geometry weighted ordinal/canonical sum disagrees with oracle");
+            }
+        }
+        ++weighted_slot;
         status = query.close();
         if (status != GAFIME_STATUS_OK || !caller_device_is(caller_device, context)) {
             return fail("final compact geometry query free failed", status);
@@ -1201,6 +1228,89 @@ int exercise_exact_three_lane_case(
             "final compact geometry semantic-bank free failed",
             paired_free != GAFIME_STATUS_OK ? paired_free : primary_free
         );
+    }
+    return 0;
+}
+
+int exercise_weighted_regions(int caller_device) {
+    const Columns primary = {
+        {-1.0f, -0.0f, 0.0f, 0.5f, 1.0f, 2.0f, -2.0f, 3.0f},
+        {0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 2.0f},
+    };
+    const RegionSpec spec = tiny_region_spec();
+    for (const uint32_t flags : {
+             GAFIME_SEMANTIC_RT_REGION_QUERY_FLAG_REQUIRE_RT,
+             GAFIME_SEMANTIC_RT_REGION_QUERY_FLAG_FORCE_SM}) {
+        Bank bank;
+        if (!allocate_uploaded_f32_bank(column_major(primary), 8u, 2u, 5u, &bank)) {
+            return fail("weighted region bank allocation failed");
+        }
+        const auto desc = query_desc(bank.raw, nullptr, spec, flags, kUnlimited);
+        Query query;
+        uint64_t persistent = 0u;
+        int status = gafime_gpu_semantic_region_query_create_rt_v1(
+            &desc, &query.raw, &persistent);
+        if (status != GAFIME_STATUS_OK) return fail("weighted region query failed", status);
+        const std::vector<float> weights{2.0f, -3.0f, 5.0f};
+        uint64_t peak = 0u;
+        auto materialize = [&](uint32_t slot, const float* values, uint64_t count, uint64_t budget) {
+            return gafime_gpu_semantic_region_query_materialize_weighted_sum_rt_v1(
+                query.raw, slot, values, count, budget, &peak);
+        };
+        if (materialize(2u, weights.data(), 3u, kUnlimited) == GAFIME_STATUS_OK ||
+            !f32_slot_is_uninitialized(bank.raw, 8u, 2u)) {
+            return fail("weighted region accepted materialization before execute");
+        }
+        Execution execution;
+        status = execute_query(query.raw, 3u, GAFIME_SEMANTIC_RT_REGION_STAT_BINARY_OCCUPANCY,
+                               0u, {}, kUnlimited, &execution);
+        if (status != GAFIME_STATUS_OK) return fail("weighted region execute failed", status);
+        const std::vector<float> invalid{2.0f, std::numeric_limits<float>::infinity(), 5.0f};
+        if (materialize(2u, weights.data(), 1u, kUnlimited) != GAFIME_STATUS_INVALID_ARGUMENT ||
+            peak != 0u ||
+            materialize(2u, weights.data(), 65u, kUnlimited) != GAFIME_STATUS_INVALID_ARGUMENT ||
+            peak != 0u) {
+            return fail("weighted count envelope did not reject before reading weights");
+        }
+        if (materialize(2u, nullptr, 3u, kUnlimited) == GAFIME_STATUS_OK ||
+            materialize(2u, weights.data(), 2u, kUnlimited) == GAFIME_STATUS_OK ||
+            materialize(2u, invalid.data(), 3u, kUnlimited) == GAFIME_STATUS_OK ||
+            materialize(2u, weights.data(), 3u, 1u) == GAFIME_STATUS_OK ||
+            !f32_slot_is_uninitialized(bank.raw, 8u, 2u)) {
+            return fail("weighted region validation/budget failure committed output");
+        }
+        status = materialize(2u, weights.data(), 3u, kUnlimited);
+        if (status != GAFIME_STATUS_OK || peak != 4u * sizeof(float)) {
+            return fail("weighted region materialization/budget accounting failed", status);
+        }
+        std::vector<float> result;
+        if (!download_f32_slot(bank.raw, 8u, 2u, &result)) return fail("weighted download failed");
+        const std::vector<float> expected{5.0f, 2.0f, 2.0f, 4.0f, 4.0f, -1.0f, 0.0f, 2.0f};
+        for (size_t row = 0; row < expected.size(); ++row) {
+            if (f32_bits(result[row]) != f32_bits(expected[row])) {
+                return fail("weighted region sum differs bit-for-bit from hand oracle");
+            }
+        }
+        if (materialize(2u, weights.data(), 3u, kUnlimited) == GAFIME_STATUS_OK) {
+            return fail("weighted region overwrote a committed slot");
+        }
+        const std::vector<float> overflow(3u, std::numeric_limits<float>::max());
+        if (materialize(3u, overflow.data(), 3u, kUnlimited) == GAFIME_STATUS_OK ||
+            !f32_slot_is_uninitialized(bank.raw, 8u, 3u) ||
+            materialize(3u, weights.data(), 3u, kUnlimited) != GAFIME_STATUS_OK) {
+            return fail("weighted overflow did not fail closed/retry cleanly");
+        }
+        const float tiny = std::numeric_limits<float>::denorm_min();
+        const std::vector<float> subnormal{tiny, tiny, tiny};
+        if (materialize(4u, subnormal.data(), 3u, kUnlimited) != GAFIME_STATUS_OK ||
+            !download_f32_slot(bank.raw, 8u, 4u, &result) ||
+            f32_bits(result[3]) != f32_bits(tiny + tiny + tiny)) {
+            return fail("weighted finite subnormal arithmetic was narrowed/flushed");
+        }
+        int current_device = -1;
+        if (cudaGetDevice(&current_device) != cudaSuccess || current_device != caller_device) {
+            return fail("weighted materialization changed caller device");
+        }
     }
     return 0;
 }
@@ -1830,6 +1940,8 @@ int run_correctness(int* caller_device_out) {
     if (tiny != 0) return tiny;
     std::puts("RT_COMPACT_CASE PASS case=overlap_exact_oracle");
     std::puts("RT_COMPACT_CASE PASS case=empty_labels_insufficient_support");
+    if (exercise_weighted_regions(caller_device) != 0) return 1;
+    std::puts("RT_COMPACT_CASE PASS case=weighted_regions_exact_and_fail_closed");
     // There is intentionally no caller first-hit selector. This 1D partition
     // is a semantic parity case, not a request for the internal 2D first-hit
     // proof; exact records must match both RequireRT and FORCE_SM regardless

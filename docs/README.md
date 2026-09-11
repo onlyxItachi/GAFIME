@@ -69,6 +69,8 @@ documents that own each subject.
   explicit source-build research, not a supported release backend.
 - [Local compact conditional experiment](rt-semantic-compact-experiment.md) —
   target-free region-count features and compact paired/labeled evidence.
+- [Weighted regions and frontier experiment](rt-semantic-weighted-selection-experiment.md) —
+  canonical weighted features and bounded exact RT selection lowering.
 - [Evidence index](evidence/README.md)
 - [Historical pre-v1 API notebook](notebooks/gafime_full_api_reference_notebook.ipynb)
 - [Historical release records](releases/README.md#release-history)

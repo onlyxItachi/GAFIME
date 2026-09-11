@@ -31,7 +31,7 @@ struct GafimeRtParams {
     const uint32_t* semantic_label_zero_words;
     const uint32_t* semantic_label_one_words;
     GafimeSemanticRtRegionExactStats* semantic_stats;
-    uint32_t* semantic_coverage;
+    uint32_t* semantic_direct_region_ordinals;
     uint32_t semantic_statistic_mask;
     uint32_t semantic_direct_stats;
     uint32_t semantic_view;
@@ -236,8 +236,13 @@ extern "C" __global__ void __anyhit__gafime_dp_mark()
                             atomicAdd(reinterpret_cast<unsigned long long*>(&record.paired_n10), one);
                         }
                     }
-                    if (params.semantic_coverage != nullptr) {
-                        atomicAdd(&params.semantic_coverage[row], 1u);
+                    if (params.semantic_direct_region_ordinals != nullptr) {
+                        /* Direct first-hit is admitted only for one finite,
+                         * bounded, pairwise non-overlapping 2D group.  Its
+                         * terminating accepted callback therefore carries one
+                         * exact canonical result-region ordinal for this row.
+                         * Store ordinal+1 so zero remains no membership. */
+                        params.semantic_direct_region_ordinals[row] = result_region + 1u;
                     }
                 } else if (paired_requested && params.semantic_counterpart_points_xyz != nullptr &&
                            !inside_semantic_region(counterpart, path_idx)) {
@@ -770,8 +775,70 @@ __global__ void materialize_semantic_region_coverage_kernel(
     }
 }
 
+__global__ void materialize_semantic_region_weighted_sum_kernel(
+    const uint32_t* primary_membership_words,
+    uint64_t rows,
+    uint32_t region_count,
+    uint32_t words_per_region,
+    const float* region_weights,
+    float* output_column,
+    uint32_t* nonfinite_out
+) {
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         row < rows;
+         row += stride) {
+        const uint32_t word = static_cast<uint32_t>(row >> 5u);
+        const uint32_t bit = 1u << (row & 31u);
+        float sum = 0.0f;
+        for (uint32_t region = 0u; region < region_count; ++region) {
+            const uint64_t word_offset = static_cast<uint64_t>(region) * words_per_region + word;
+            if ((primary_membership_words[word_offset] & bit) != 0u) {
+                /* This is one explicit round-to-nearest addition, not a
+                 * multiply/accumulate expression.  Canonical region order
+                 * supplies the only permitted accumulation order. */
+                sum = __fadd_rn(sum, region_weights[region]);
+            }
+        }
+        if (!isfinite(sum)) {
+            atomicExch(nonfinite_out, 1u);
+            continue;
+        }
+        output_column[row] = sum;
+    }
+}
+
+__global__ void materialize_semantic_region_weighted_sum_ordinals_kernel(
+    const uint32_t* direct_region_ordinals,
+    uint64_t rows,
+    uint32_t region_count,
+    const float* region_weights,
+    float* output_column,
+    uint32_t* nonfinite_out
+) {
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         row < rows;
+         row += stride) {
+        const uint32_t ordinal_plus_one = direct_region_ordinals[row];
+        if (ordinal_plus_one > region_count) {
+            atomicExch(nonfinite_out, 1u);
+            continue;
+        }
+        float sum = 0.0f;
+        if (ordinal_plus_one != 0u) {
+            sum = __fadd_rn(sum, region_weights[ordinal_plus_one - 1u]);
+        }
+        if (!isfinite(sum)) {
+            atomicExch(nonfinite_out, 1u);
+            continue;
+        }
+        output_column[row] = sum;
+    }
+}
+
 __global__ void scatter_semantic_region_coverage_counts_kernel(
-    const uint32_t* coverage_counts,
+    const uint32_t* direct_region_ordinals,
     uint64_t rows,
     float* output_column
 ) {
@@ -779,7 +846,7 @@ __global__ void scatter_semantic_region_coverage_counts_kernel(
     for (uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          row < rows;
          row += stride) {
-        output_column[row] = static_cast<float>(coverage_counts[row]);
+        output_column[row] = direct_region_ordinals[row] == 0u ? 0.0f : 1.0f;
     }
 }
 

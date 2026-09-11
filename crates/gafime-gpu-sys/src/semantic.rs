@@ -10,6 +10,10 @@
 #[path = "local_cmake_experiment/compact.rs"]
 pub(crate) mod local_compact;
 
+#[cfg(feature = "local-cmake-experiment")]
+#[path = "local_cmake_experiment/selection.rs"]
+mod local_selection;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -18,9 +22,9 @@ use std::{
 
 use gafime_orchestrator::semantic::{
     AssociationContext, AssociationStatistic, CandidateRegistry, EvidenceDefinition, EvidenceValue,
-    FeatureFrame, FeatureId, FeatureOp, FrozenMeans, FrozenThreshold, MaterializedColumns,
-    NativeEvidenceExecutor, NumericColumn, PredicateComparator, SemanticError, SemanticResult,
-    UnavailableReason,
+    FeatureFrame, FeatureId, FeatureOp, FrozenMeans, FrozenRegionWeights, FrozenThreshold,
+    MaterializedColumns, NativeEvidenceExecutor, NumericColumn, PredicateComparator, SemanticError,
+    SemanticResult, UnavailableReason,
 };
 use gafime_types::{
     BackendKind, GafimeConstBufferView, GafimeGpuSemanticBank, GafimeMutableBufferView,
@@ -91,6 +95,13 @@ pub enum SemanticProgramNode {
     RegionCount {
         output_slot: u32,
         regions: Vec<Vec<SemanticFrozenRegionTerm>>,
+    },
+    /// Local-only deterministic weighted coverage; coefficients are fp32 bits
+    /// in canonical submitted region order, never semantic evidence scores.
+    RegionWeightedSum {
+        output_slot: u32,
+        regions: Vec<Vec<SemanticFrozenRegionTerm>>,
+        weight_bits: Vec<u32>,
     },
 }
 
@@ -591,10 +602,13 @@ impl OwnedSemanticBank {
         if nodes.is_empty() {
             return Ok(());
         }
-        if nodes
-            .iter()
-            .any(|node| matches!(node, SemanticProgramNode::RegionCount { .. }))
-        {
+        if nodes.iter().any(|node| {
+            matches!(
+                node,
+                SemanticProgramNode::RegionCount { .. }
+                    | SemanticProgramNode::RegionWeightedSum { .. }
+            )
+        }) {
             return Err(GpuSysError::InvalidInput(
                 "region-count primitive is not part of the standard semantic ABI",
             ));
@@ -611,7 +625,8 @@ impl OwnedSemanticBank {
                 SemanticProgramNode::AbsoluteDifference { .. } => 2,
                 SemanticProgramNode::CenteredProduct { operand_slots, .. } => operand_slots.len(),
                 SemanticProgramNode::FrozenRegionConjunction { .. }
-                | SemanticProgramNode::RegionCount { .. } => 0,
+                | SemanticProgramNode::RegionCount { .. }
+                | SemanticProgramNode::RegionWeightedSum { .. } => 0,
             };
             total.checked_add(count).ok_or(GpuSysError::SizeOverflow)
         })?;
@@ -625,7 +640,8 @@ impl OwnedSemanticBank {
         let region_capacity = nodes.iter().try_fold(0usize, |total, node| {
             let count = match node {
                 SemanticProgramNode::FrozenRegionConjunction { terms, .. } => terms.len(),
-                SemanticProgramNode::RegionCount { .. } => 0,
+                SemanticProgramNode::RegionCount { .. }
+                | SemanticProgramNode::RegionWeightedSum { .. } => 0,
                 SemanticProgramNode::Source { .. }
                 | SemanticProgramNode::AbsoluteDifference { .. }
                 | SemanticProgramNode::Softsign { .. }
@@ -641,7 +657,8 @@ impl OwnedSemanticBank {
         let mut region_terms = Vec::with_capacity(region_capacity);
         for node in nodes {
             match node {
-                SemanticProgramNode::RegionCount { .. } => {
+                SemanticProgramNode::RegionCount { .. }
+                | SemanticProgramNode::RegionWeightedSum { .. } => {
                     unreachable!("local primitive was rejected before standard marshalling")
                 }
                 SemanticProgramNode::Source { output_slot } => {
@@ -1556,6 +1573,20 @@ impl GpuNativeEvidenceExecutor {
         Err(SemanticError::Unsupported("region-count execution is supported only by Core or the explicit local conditional-query executor"))
     }
 
+    fn require_region_weighted_sum(&self) -> SemanticResult<()> {
+        #[cfg(feature = "local-cmake-experiment")]
+        if self.local_region_execution.is_some()
+            && self
+                .backend
+                .functions
+                .local_cmake_experiment
+                .has_region_weighted_sum()
+        {
+            return Ok(());
+        }
+        Err(SemanticError::Unsupported("weighted-region execution requires Core or the explicit local RT weighted-query symbol"))
+    }
+
     fn require_association(&self, statistic: AssociationStatistic) -> SemanticResult<()> {
         if self.capabilities.primitive_mask & GAFIME_SEMANTIC_PRIMITIVE_MASK_PAIRWISE_ASSOCIATION
             == 0
@@ -1796,7 +1827,8 @@ impl GpuNativeEvidenceExecutor {
                         }
                     }
                 }
-                FeatureOp::RegionCount { regions } => {
+                FeatureOp::RegionCount { regions }
+                | FeatureOp::RegionWeightedSum { regions, .. } => {
                     for region in regions {
                         let FeatureOp::DecisionRegion { terms } = registry.program(*region)?.op()
                         else {
@@ -1857,7 +1889,8 @@ impl GpuNativeEvidenceExecutor {
                 SemanticProgramNode::AbsoluteDifference { .. } => 2,
                 SemanticProgramNode::CenteredProduct { operand_slots, .. } => operand_slots.len(),
                 SemanticProgramNode::FrozenRegionConjunction { .. }
-                | SemanticProgramNode::RegionCount { .. } => 0,
+                | SemanticProgramNode::RegionCount { .. }
+                | SemanticProgramNode::RegionWeightedSum { .. } => 0,
             })
             .max()
             .map(|count| {
@@ -1880,7 +1913,7 @@ impl GpuNativeEvidenceExecutor {
                     SemanticProgramNode::Source { .. } | SemanticProgramNode::Softsign { .. } => 1,
                     SemanticProgramNode::AbsoluteDifference { .. } => 2,
                     SemanticProgramNode::CenteredProduct { operand_slots, .. } => operand_slots.len(),
-                    SemanticProgramNode::FrozenRegionConjunction { .. } | SemanticProgramNode::RegionCount { .. } => 0,
+                    SemanticProgramNode::FrozenRegionConjunction { .. } | SemanticProgramNode::RegionCount { .. } | SemanticProgramNode::RegionWeightedSum { .. } => 0,
                 };
                 let mean_count = match node {
                     SemanticProgramNode::CenteredProduct { mean_bits, .. } => mean_bits.len(),
@@ -1888,7 +1921,7 @@ impl GpuNativeEvidenceExecutor {
                 };
                 let region_term_count = match node {
                     SemanticProgramNode::FrozenRegionConjunction { terms, .. } => terms.len(),
-                    SemanticProgramNode::RegionCount { regions, .. } => regions.iter().map(Vec::len).sum(),
+                    SemanticProgramNode::RegionCount { regions, .. } | SemanticProgramNode::RegionWeightedSum { regions, .. } => regions.iter().map(Vec::len).sum(),
                     _ => 0,
                 };
                 Ok::<_, SemanticError>((
@@ -1959,18 +1992,26 @@ impl GpuNativeEvidenceExecutor {
                 SemanticProgramNode::FrozenRegionConjunction { terms, .. } => {
                     (0, 0, terms.capacity())
                 }
-                SemanticProgramNode::RegionCount { regions, .. } => {
+                SemanticProgramNode::RegionCount { regions, .. }
+                | SemanticProgramNode::RegionWeightedSum { regions, .. } => {
                     let terms = regions.iter().try_fold(0usize, |sum, region| {
                         sum.checked_add(region.capacity())
                             .ok_or(SemanticError::Invalid(
                                 "semantic region-count term capacity overflows address space",
                             ))
                     })?;
-                    (0, 0, terms)
+                    let weights = match node {
+                        SemanticProgramNode::RegionWeightedSum { weight_bits, .. } => {
+                            weight_bits.capacity()
+                        }
+                        _ => 0,
+                    };
+                    (weights, 0, terms)
                 }
             };
             let nested_headers = match node {
-                SemanticProgramNode::RegionCount { regions, .. } => regions
+                SemanticProgramNode::RegionCount { regions, .. }
+                | SemanticProgramNode::RegionWeightedSum { regions, .. } => regions
                     .capacity()
                     .checked_mul(std::mem::size_of::<Vec<SemanticFrozenRegionTerm>>())
                     .ok_or(SemanticError::Invalid(
@@ -1998,7 +2039,8 @@ impl GpuNativeEvidenceExecutor {
                 SemanticProgramNode::AbsoluteDifference { .. } => 2,
                 SemanticProgramNode::CenteredProduct { operand_slots, .. } => operand_slots.len(),
                 SemanticProgramNode::FrozenRegionConjunction { .. }
-                | SemanticProgramNode::RegionCount { .. } => 0,
+                | SemanticProgramNode::RegionCount { .. }
+                | SemanticProgramNode::RegionWeightedSum { .. } => 0,
             }
             .checked_mul(std::mem::size_of::<u32>())
             .ok_or(SemanticError::Invalid(
@@ -2230,6 +2272,32 @@ impl GpuNativeEvidenceExecutor {
 impl NativeEvidenceExecutor for GpuNativeEvidenceExecutor {
     fn backend_kind(&self) -> u32 {
         self.backend.kind
+    }
+
+    fn wants_pareto_frontier(&self) -> bool {
+        #[cfg(feature = "local-cmake-experiment")]
+        {
+            self.local_compact_execution.is_some()
+        }
+        #[cfg(not(feature = "local-cmake-experiment"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(feature = "local-cmake-experiment")]
+    fn pareto_weak_dominator_counts(
+        &mut self,
+        request: gafime_orchestrator::semantic::ParetoFrontierRequest<'_>,
+        max_bytes: usize,
+    ) -> SemanticResult<Option<Vec<u64>>> {
+        let Some(state) = &mut self.local_compact_execution else {
+            return Ok(None);
+        };
+        // Selection's temporary query does not share the evidence query's
+        // physical frame. Release the latter before admitting another peak.
+        state.clear();
+        local_selection::pareto_weak_dominator_counts(self, request, max_bytes).map(Some)
     }
 
     #[cfg(feature = "local-cmake-experiment")]
@@ -2539,8 +2607,13 @@ impl NativeEvidenceExecutor for GpuNativeEvidenceExecutor {
                 .ok_or(SemanticError::Invalid("missing semantic output slot"))?;
             match program.op() {
                 FeatureOp::Source(_) => unreachable!("source nodes were filtered above"),
-                FeatureOp::RegionCount { regions } => {
-                    self.require_region_count()?;
+                FeatureOp::RegionCount { regions }
+                | FeatureOp::RegionWeightedSum { regions, .. } => {
+                    if matches!(program.op(), FeatureOp::RegionWeightedSum { .. }) {
+                        self.require_region_weighted_sum()?;
+                    } else {
+                        self.require_region_count()?;
+                    }
                     let regions = regions
                         .iter()
                         .map(|region| {
@@ -2575,9 +2648,24 @@ impl NativeEvidenceExecutor for GpuNativeEvidenceExecutor {
                                 .collect::<SemanticResult<Vec<_>>>()
                         })
                         .collect::<SemanticResult<Vec<_>>>()?;
-                    native_nodes.push(SemanticProgramNode::RegionCount {
-                        output_slot,
-                        regions,
+                    native_nodes.push(match program.op() {
+                        FeatureOp::RegionWeightedSum {
+                            weight_bits: FrozenRegionWeights::F32(bits),
+                            ..
+                        } => SemanticProgramNode::RegionWeightedSum {
+                            output_slot,
+                            regions,
+                            weight_bits: bits.clone(),
+                        },
+                        FeatureOp::RegionWeightedSum { .. } => {
+                            return Err(SemanticError::Unsupported(
+                                "local weighted-region query requires fp32 coefficients",
+                            ))
+                        }
+                        _ => SemanticProgramNode::RegionCount {
+                            output_slot,
+                            regions,
+                        },
                     });
                 }
                 FeatureOp::AbsoluteDifference(left, right) => {

@@ -197,6 +197,16 @@ semantic IDs or policy. This adds no Python constructor, standard payload
 capability, or release surface. Keep local query sources and symbols excluded
 from all standard artifacts and fail closed on unsupported execution paths.
 
+`docs/rt-semantic-weighted-selection-experiment.md` extends that local experiment
+with canonical weighted region sums and an exact fp32 two-/three-objective
+frontier lowering. Coefficients remain paired with canonical region identity;
+sum order must not depend on traversal callbacks. Rust still owns constraints,
+objective direction, strict dominance, equal-vector handling and final ranking.
+The native query receives only physical coordinates and returns weak-dominator
+counts. No rank-to-float encoding, fp64 narrowing, or implicit RT fallback is
+allowed. These additions remain absent from supported Python constructors and
+standard payload/release capabilities.
+
 Candidate stabilization branches use `release/v<canonical-semver>` and may be
 cut only from an exact `main` commit whose required checks are green. Creating
 one is source-control coordination only: it does not change version identity,

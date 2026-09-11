@@ -50,6 +50,14 @@ descriptors and exact count/device-finalization primitives, never semantic
 IDs or policy. This experiment adds no Python constructor, standard payload
 capability, or release surface; unsupported paths fail closed.
 
+The [weighted-region/frontier continuation](rt-semantic-weighted-selection-experiment.md)
+adds finite canonical-order weighted region sums (Core reference in all three
+profiles, local RT fp32 only) and an optional exact fp32 two-/three-objective
+selection lowering. Rust owns eligibility, directions, equality multiplicity,
+strict dominance and final order; native queries count physical weak-dominator
+regions only. No score quantization or rank-position-to-float conversion is
+permitted. The same local-only ABI and release-exclusion boundaries apply.
+
 ## Repository Layout
 
 Tracked project source, runtime, test, and documentation content must converge into:
