@@ -9,7 +9,7 @@ use super::{
 
 // Mirrors the explicit compact-query region envelope. This is an admission
 // check only; the local executor repeats it before any native allocation.
-const MAX_LOCAL_RT_PARETO_CANDIDATES: usize = 8_192;
+const MAX_LOCAL_PARETO_CANDIDATES: usize = 8_192;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MissingEvidence {
@@ -107,7 +107,7 @@ impl SelectionPolicy {
         // conversion, rank-position surrogate, or allocation on this branch.
         if prepared.profile != PrecisionProfile::Fp32
             || !(2..=3).contains(&prepared.objectives.len())
-            || prepared.ranked.len() > MAX_LOCAL_RT_PARETO_CANDIDATES
+            || prepared.ranked.len() > MAX_LOCAL_PARETO_CANDIDATES
         {
             let request = ParetoFrontierRequest::new(
                 prepared.profile,
