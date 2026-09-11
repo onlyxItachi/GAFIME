@@ -18,20 +18,21 @@ pub use context::{
     EvaluationRole, FeatureFrame, GraphEdge, GraphEndpoints, LabelSet, NeighborGraph,
 };
 pub use evidence::{
-    AssociationContext, AssociationContextKind, AssociationStatistic, EvidenceChannel,
-    EvidenceDefinition, EvidenceId, EvidenceRecord, EvidenceSemanticKey, EvidenceSpec,
-    EvidenceTable, EvidenceValue, UnavailableReason,
+    AssociationContext, AssociationContextKind, AssociationStatistic, BinaryPairedStatistic,
+    EvidenceChannel, EvidenceDefinition, EvidenceId, EvidenceRecord, EvidenceSemanticKey,
+    EvidenceSpec, EvidenceTable, EvidenceValue, UnavailableReason,
 };
 pub use numeric::NumericColumn;
 pub use ordering::Direction;
 pub use program::{
-    CandidateRegistry, FeatureId, FeatureOp, FeatureProgram, FrozenMeans, FrozenThreshold,
-    PredicateComparator, ProgramLimits, TrainingBinding, MAX_REGION_TERMS,
+    CandidateRegistry, FeatureId, FeatureOp, FeatureProgram, FrozenMeans, FrozenRegionWeights,
+    FrozenThreshold, PredicateComparator, ProgramLimits, TrainingBinding, MAX_REGION_TERMS,
 };
 pub use selection::{EvidenceConstraint, EvidenceObjective, MissingEvidence, SelectionPolicy};
 pub use session::{
-    AcceptedFeature, DiscoveryRound, MaterializedColumns, NativeEvidenceExecutor, ProposalOperator,
-    ResidentMaterializationLease, SemanticSession, SessionLimits,
+    AcceptedFeature, CompactEvidenceBatch, DiscoveryRound, MaterializedColumns,
+    NativeEvidenceExecutor, ParetoFrontierRequest, ProposalOperator, ResidentMaterializationLease,
+    SemanticSession, SessionLimits,
 };
 
 use std::sync::atomic::{AtomicU64, Ordering};

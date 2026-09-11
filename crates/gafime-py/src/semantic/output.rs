@@ -183,6 +183,15 @@ impl PyEvidenceReport {
                     entry.set_item("kind", "graph")?;
                     entry.set_item("provenance", graph.provenance())?;
                 }
+                gafime_orchestrator::semantic::EvidenceDefinition::BinaryOccupancy
+                | gafime_orchestrator::semantic::EvidenceDefinition::BinaryPaired { .. }
+                | gafime_orchestrator::semantic::EvidenceDefinition::BinaryLabeledGiniGain {
+                    ..
+                } => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "experimental binary evidence is not exposed by the Python product API",
+                    ));
+                }
             }
             channels.append(entry)?;
         }

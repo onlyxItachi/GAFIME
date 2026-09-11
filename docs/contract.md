@@ -40,6 +40,24 @@ Hard predicates/regions, bounded fitted proposals and multi-objective policy
 belong to that same Rust owner, not a second target/metric protocol or future
 compiler frontend. No local RT experiment may change their mathematical meaning.
 
+The [local compact conditional experiment](rt-semantic-compact-experiment.md)
+adds Rust-owned binary occupancy, paired agreement/IoU, binary labeled Gini
+evidence, and a region-count candidate, with Core as the numerical reference.
+Its optional compact executor may evaluate evidence before dense candidate
+materialization; selection and accepted-feature identity remain in Rust, and
+only selected outputs need materialization. The local RT query holds physical
+descriptors and exact count/device-finalization primitives, never semantic
+IDs or policy. This experiment adds no Python constructor, standard payload
+capability, or release surface; unsupported paths fail closed.
+
+The [weighted-region/frontier continuation](rt-semantic-weighted-selection-experiment.md)
+adds finite canonical-order weighted region sums (Core reference in all three
+profiles, local RT fp32 only) and an optional exact fp32 two-/three-objective
+selection lowering. Rust owns eligibility, directions, equality multiplicity,
+strict dominance and final order; native queries count physical weak-dominator
+regions only. No score quantization or rank-position-to-float conversion is
+permitted. The same local-only ABI and release-exclusion boundaries apply.
+
 ## Repository Layout
 
 Tracked project source, runtime, test, and documentation content must converge into:

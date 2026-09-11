@@ -25,6 +25,19 @@ pub enum AssociationStatistic {
     FixedCorrectedNmi { bins: u32 },
 }
 
+/// Closed comparison vocabulary for two exact binary region-membership
+/// columns.  The paired frame is contextual; the statistic remains part of
+/// the immutable measurement identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BinaryPairedStatistic {
+    /// Fraction of aligned rows whose membership bits agree.
+    Agreement,
+    /// Intersection divided by union of positive memberships.  An empty
+    /// union is explicitly unavailable rather than a fabricated perfect
+    /// overlap.
+    IntersectionOverUnion,
+}
+
 impl AssociationStatistic {
     pub fn fixed_nmi_bins(self) -> Option<u32> {
         match self {
@@ -118,6 +131,11 @@ pub enum EvidenceSemanticKey {
         context: AssociationContextKind,
     },
     GraphEnergy,
+    BinaryOccupancy,
+    BinaryPaired {
+        statistic: BinaryPairedStatistic,
+    },
+    BinaryLabeledGiniGain,
 }
 
 /// Versioned measurements with explicit operands, not fabricated targets.
@@ -130,6 +148,28 @@ pub enum EvidenceDefinition {
     GraphEnergy {
         graph: Arc<NeighborGraph>,
     },
+    /// Positive membership fraction of canonical hard-predicate or region
+    /// candidates.  It is target-free and does not manufacture a quality
+    /// score.  A singleton row domain has a well-defined fraction; only an
+    /// empty domain is insufficient support.
+    BinaryOccupancy,
+    /// Exact binary membership comparison against the same program evaluated
+    /// on an aligned paired frame.  Agreement is defined for one aligned row;
+    /// IoU is also defined for one row when its union is nonempty.  An empty
+    /// domain is insufficient support, while an empty union is a constant
+    /// operand rather than fabricated perfect overlap.
+    BinaryPaired {
+        statistic: BinaryPairedStatistic,
+        view: Arc<FeatureFrame>,
+    },
+    /// Count-based impurity decrease from splitting actual supplied labels by
+    /// a canonical binary membership candidate.  This evaluates a frozen
+    /// split; it neither discovers a threshold nor builds a tree.  Fewer than
+    /// two actual labels are insufficient support; an empty child or globally
+    /// constant label set is an explicit constant-operand state.
+    BinaryLabeledGiniGain {
+        labels: Option<Arc<LabelSet>>,
+    },
 }
 
 impl EvidenceDefinition {
@@ -140,6 +180,11 @@ impl EvidenceDefinition {
                 context: context.kind(),
             },
             Self::GraphEnergy { .. } => EvidenceSemanticKey::GraphEnergy,
+            Self::BinaryOccupancy => EvidenceSemanticKey::BinaryOccupancy,
+            Self::BinaryPaired { statistic, .. } => EvidenceSemanticKey::BinaryPaired {
+                statistic: *statistic,
+            },
+            Self::BinaryLabeledGiniGain { .. } => EvidenceSemanticKey::BinaryLabeledGiniGain,
         }
     }
 
@@ -150,14 +195,20 @@ impl EvidenceDefinition {
     pub fn statistic(&self) -> Option<AssociationStatistic> {
         match self {
             Self::Association { statistic, .. } => Some(*statistic),
-            Self::GraphEnergy { .. } => None,
+            Self::GraphEnergy { .. }
+            | Self::BinaryOccupancy
+            | Self::BinaryPaired { .. }
+            | Self::BinaryLabeledGiniGain { .. } => None,
         }
     }
 
     pub fn association_context(&self) -> Option<&AssociationContext> {
         match self {
             Self::Association { context, .. } => Some(context),
-            Self::GraphEnergy { .. } => None,
+            Self::GraphEnergy { .. }
+            | Self::BinaryOccupancy
+            | Self::BinaryPaired { .. }
+            | Self::BinaryLabeledGiniGain { .. } => None,
         }
     }
 
@@ -166,17 +217,30 @@ impl EvidenceDefinition {
     }
 
     pub fn paired_view(&self) -> Option<&Arc<FeatureFrame>> {
-        self.association_context()?.paired_view()
+        match self {
+            Self::Association { context, .. } => context.paired_view(),
+            Self::BinaryPaired { view, .. } => Some(view),
+            Self::GraphEnergy { .. }
+            | Self::BinaryOccupancy
+            | Self::BinaryLabeledGiniGain { .. } => None,
+        }
     }
 
     pub fn labels(&self) -> Option<&Option<Arc<LabelSet>>> {
-        self.association_context()?.labels()
+        match self {
+            Self::Association { context, .. } => context.labels(),
+            Self::BinaryLabeledGiniGain { labels } => Some(labels),
+            Self::GraphEnergy { .. } | Self::BinaryOccupancy | Self::BinaryPaired { .. } => None,
+        }
     }
 
     pub fn graph(&self) -> Option<&Arc<NeighborGraph>> {
         match self {
             Self::GraphEnergy { graph } => Some(graph),
-            Self::Association { .. } => None,
+            Self::Association { .. }
+            | Self::BinaryOccupancy
+            | Self::BinaryPaired { .. }
+            | Self::BinaryLabeledGiniGain { .. } => None,
         }
     }
 
@@ -224,9 +288,71 @@ impl EvidenceDefinition {
                     "graph belongs to another input context",
                 ));
             }
-            Self::Association { .. } | Self::GraphEnergy { .. } => {}
+            Self::BinaryPaired { view, .. } if !frame.aligned_with(view) => {
+                return Err(SemanticError::Invalid(
+                    "paired binary evidence schema, row keys, domain and role must align",
+                ));
+            }
+            Self::BinaryLabeledGiniGain {
+                labels: Some(labels),
+            } if labels.frame_id() != frame.id() => {
+                return Err(SemanticError::Invalid(
+                    "binary Gini labels belong to another input context",
+                ));
+            }
+            Self::BinaryLabeledGiniGain {
+                labels: Some(labels),
+            } if !binary_labels(labels) => {
+                return Err(SemanticError::Unsupported(
+                    "binary Gini evidence requires actual labels encoded exactly as 0 or 1",
+                ));
+            }
+            Self::Association { .. }
+            | Self::GraphEnergy { .. }
+            | Self::BinaryOccupancy
+            | Self::BinaryPaired { .. }
+            | Self::BinaryLabeledGiniGain { .. } => {}
         }
         Ok(())
+    }
+
+    /// Binary evidence deliberately applies only to the canonical frozen
+    /// membership forms.  Treating an arbitrary finite real-valued candidate
+    /// as a Boolean would create an unstated thresholding semantics and a
+    /// second candidate language.
+    pub(crate) fn validate_candidates(
+        &self,
+        registry: &CandidateRegistry,
+        candidates: &[FeatureId],
+    ) -> SemanticResult<()> {
+        if !matches!(
+            self,
+            Self::BinaryOccupancy | Self::BinaryPaired { .. } | Self::BinaryLabeledGiniGain { .. }
+        ) {
+            return Ok(());
+        }
+        for &candidate in candidates {
+            match registry.program(candidate)?.op() {
+                super::FeatureOp::HardPredicate { .. } | super::FeatureOp::DecisionRegion { .. } => {}
+                _ => {
+                    return Err(SemanticError::Unsupported(
+                        "binary evidence requires canonical hard-predicate or decision-region candidates",
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn binary_labels(labels: &LabelSet) -> bool {
+    match labels.values_typed() {
+        super::NumericColumn::F32(values) => values
+            .iter()
+            .all(|&value| value == 0.0_f32 || value == 1.0_f32),
+        super::NumericColumn::F64(values) => values
+            .iter()
+            .all(|&value| value == 0.0_f64 || value == 1.0_f64),
     }
 }
 
@@ -323,6 +449,25 @@ impl EvidenceChannel {
                 EvidenceDefinition::GraphEnergy { graph: a },
                 EvidenceDefinition::GraphEnergy { graph: b },
             ) => Arc::ptr_eq(a, b),
+            (EvidenceDefinition::BinaryOccupancy, EvidenceDefinition::BinaryOccupancy) => true,
+            (
+                EvidenceDefinition::BinaryPaired {
+                    statistic: a_statistic,
+                    view: a_view,
+                },
+                EvidenceDefinition::BinaryPaired {
+                    statistic: b_statistic,
+                    view: b_view,
+                },
+            ) => a_statistic == b_statistic && Arc::ptr_eq(a_view, b_view),
+            (
+                EvidenceDefinition::BinaryLabeledGiniGain { labels: a },
+                EvidenceDefinition::BinaryLabeledGiniGain { labels: b },
+            ) => match (a, b) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, Some(_)) | (Some(_), None) => false,
+            },
             _ => false,
         }
     }
@@ -367,6 +512,14 @@ fn semantic_name(key: EvidenceSemanticKey) -> &'static str {
             context: AssociationContextKind::Labels,
         } => "normalized-fixed-corrected-mi/labeled-subset/v1",
         EvidenceSemanticKey::GraphEnergy => "uncentered-edge-energy-ratio/v1",
+        EvidenceSemanticKey::BinaryOccupancy => "binary-occupancy/region-membership/v1",
+        EvidenceSemanticKey::BinaryPaired {
+            statistic: BinaryPairedStatistic::Agreement,
+        } => "binary-agreement/aligned-view/v1",
+        EvidenceSemanticKey::BinaryPaired {
+            statistic: BinaryPairedStatistic::IntersectionOverUnion,
+        } => "binary-intersection-over-union/aligned-view/v1",
+        EvidenceSemanticKey::BinaryLabeledGiniGain => "binary-gini-split-gain/labeled-subset/v1",
     }
 }
 

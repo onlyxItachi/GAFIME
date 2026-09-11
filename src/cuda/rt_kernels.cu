@@ -24,6 +24,17 @@ struct GafimeRtParams {
     uint32_t point_group_stride;
     uint32_t point_stride;
     uint32_t direct_first_hit;
+    const GafimeDecisionPathTerm* semantic_exact_terms;
+    const uint32_t* semantic_exact_offsets;
+    const uint32_t* semantic_region_ids;
+    const float* semantic_counterpart_points_xyz;
+    const uint32_t* semantic_label_zero_words;
+    const uint32_t* semantic_label_one_words;
+    GafimeSemanticRtRegionExactStats* semantic_stats;
+    uint32_t* semantic_direct_region_ordinals;
+    uint32_t semantic_statistic_mask;
+    uint32_t semantic_direct_stats;
+    uint32_t semantic_view;
 };
 
 extern "C" {
@@ -64,6 +75,27 @@ static __forceinline__ __device__ bool inside_box(float3 point, uint32_t path_id
         inside = inside && inside_dim(point.z, box.lo_z, box.hi_z, (box.open_lo_mask & 4u) != 0u);
     }
     return inside;
+}
+
+static __forceinline__ __device__ bool inside_semantic_region(float3 point, uint32_t path_idx)
+{
+    if (params.semantic_exact_terms == nullptr || params.semantic_exact_offsets == nullptr) {
+        return inside_box(point, path_idx);
+    }
+    const uint32_t begin = params.semantic_exact_offsets[path_idx];
+    const uint32_t end = params.semantic_exact_offsets[path_idx + 1u];
+    for (uint32_t term_index = begin; term_index < end; ++term_index) {
+        const GafimeDecisionPathTerm term = params.semantic_exact_terms[term_index];
+        if (term.feature >= 3u) return false;
+        const float value = term.feature == 0u
+            ? point.x
+            : term.feature == 1u ? point.y : point.z;
+        const bool holds = term.sign == GAFIME_DECISION_PATH_SIGN_LE
+            ? value <= term.threshold
+            : value > term.threshold;
+        if (!holds) return false;
+    }
+    return true;
 }
 
 extern "C" __global__ void __raygen__gafime_dp()
@@ -128,7 +160,7 @@ extern "C" __global__ void __intersection__gafime_dp_box()
         params.points_xyz[point_offset + 1u],
         params.points_xyz[point_offset + 2u]
     );
-    if (inside_box(point, path_idx)) {
+    if (inside_semantic_region(point, path_idx)) {
         optixReportIntersection(2.0f, 0, path_idx);
     }
 }
@@ -143,9 +175,89 @@ extern "C" __global__ void __anyhit__gafime_dp_mark()
         ? path_base + (optixGetPrimitiveIndex() >> 1u)
         : optixGetAttribute_0();
     if (path_idx < params.path_count) {
-        if (triangle_2d_instanced && !inside_box(optixGetWorldRayOrigin(), path_idx)) {
+        /* Preserve the mature legacy triangle guard verbatim.  Compact
+         * queries install an exact-term pointer and deliberately take the
+         * second branch, so their conservative triangles are still guarded
+         * by the original conjunction rather than an AABB approximation. */
+        if (triangle_2d_instanced && !inside_box(optixGetWorldRayOrigin(), path_idx) &&
+            params.semantic_exact_terms == nullptr) {
             optixIgnoreIntersection();
             return;
+        }
+        if (triangle_2d_instanced && params.semantic_exact_terms != nullptr &&
+            !inside_semantic_region(optixGetWorldRayOrigin(), path_idx)) {
+            optixIgnoreIntersection();
+            return;
+        }
+        if (params.semantic_exact_terms != nullptr && params.semantic_region_ids != nullptr) {
+            const uint32_t result_region = params.semantic_region_ids[path_idx];
+            if (result_region >= params.path_count) {
+                optixIgnoreIntersection();
+                return;
+            }
+            if (params.semantic_direct_stats != 0u) {
+                GafimeSemanticRtRegionExactStats& record = params.semantic_stats[result_region];
+                const uint64_t point_offset = semantic_point_offset(row, group_idx);
+                const float3 counterpart = make_float3(
+                    params.semantic_counterpart_points_xyz != nullptr
+                        ? params.semantic_counterpart_points_xyz[point_offset + 0u] : 0.0f,
+                    params.semantic_counterpart_points_xyz != nullptr
+                        ? params.semantic_counterpart_points_xyz[point_offset + 1u] : 0.0f,
+                    params.semantic_counterpart_points_xyz != nullptr
+                        ? params.semantic_counterpart_points_xyz[point_offset + 2u] : 0.0f
+                );
+                const bool paired_requested =
+                    (params.semantic_statistic_mask &
+                     GAFIME_SEMANTIC_RT_REGION_STAT_BINARY_PAIRED) != 0u;
+                const bool labeled_requested =
+                    (params.semantic_statistic_mask &
+                     GAFIME_SEMANTIC_RT_REGION_STAT_BINARY_LABELED) != 0u;
+                const bool occupancy_requested =
+                    (params.semantic_statistic_mask &
+                     GAFIME_SEMANTIC_RT_REGION_STAT_BINARY_OCCUPANCY) != 0u;
+                const unsigned long long one = 1ull;
+                if (params.semantic_view == 0u) {
+                    if (occupancy_requested) {
+                        atomicAdd(reinterpret_cast<unsigned long long*>(&record.occupancy_inside), one);
+                    }
+                    if (labeled_requested) {
+                        const uint32_t word = row >> 5u;
+                        const uint32_t bit = 1u << (row & 31u);
+                        if ((params.semantic_label_zero_words[word] & bit) != 0u) {
+                            atomicAdd(reinterpret_cast<unsigned long long*>(&record.label_inside_0), one);
+                        } else if ((params.semantic_label_one_words[word] & bit) != 0u) {
+                            atomicAdd(reinterpret_cast<unsigned long long*>(&record.label_inside_1), one);
+                        }
+                    }
+                    if (paired_requested && params.semantic_counterpart_points_xyz != nullptr) {
+                        if (inside_semantic_region(counterpart, path_idx)) {
+                            atomicAdd(reinterpret_cast<unsigned long long*>(&record.paired_n11), one);
+                        } else {
+                            atomicAdd(reinterpret_cast<unsigned long long*>(&record.paired_n10), one);
+                        }
+                    }
+                    if (params.semantic_direct_region_ordinals != nullptr) {
+                        /* Direct first-hit is admitted only for one finite,
+                         * bounded, pairwise non-overlapping 2D group.  Its
+                         * terminating accepted callback therefore carries one
+                         * exact canonical result-region ordinal for this row.
+                         * Store ordinal+1 so zero remains no membership. */
+                        params.semantic_direct_region_ordinals[row] = result_region + 1u;
+                    }
+                } else if (paired_requested && params.semantic_counterpart_points_xyz != nullptr &&
+                           !inside_semantic_region(counterpart, path_idx)) {
+                    atomicAdd(reinterpret_cast<unsigned long long*>(&record.paired_n01), one);
+                }
+                optixTerminateRay();
+                return;
+            }
+            if (params.membership_words != nullptr) {
+                const uint64_t word_idx = static_cast<uint64_t>(result_region) *
+                    params.words_per_path + (row >> 5u);
+                atomicOr(&params.membership_words[word_idx], 1u << (row & 31u));
+                optixIgnoreIntersection();
+                return;
+            }
         }
         if (params.direct_inside_counts != nullptr) {
             bool first_callback = true;
@@ -202,6 +314,539 @@ __global__ void validate_rt_feature_domain_kernel(
             atomicExch(invalid_out, 1u);
             return;
         }
+    }
+}
+
+__global__ void validate_semantic_region_input_domain_kernel(
+    const float* columns,
+    uint64_t rows,
+    const uint32_t* input_slots,
+    uint32_t input_slot_count,
+    uint32_t* invalid_out
+) {
+    const uint64_t value_count = rows * static_cast<uint64_t>(input_slot_count);
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < value_count;
+         index += stride) {
+        const uint32_t slot_index = static_cast<uint32_t>(index / rows);
+        const uint64_t row = index - static_cast<uint64_t>(slot_index) * rows;
+        const float value = columns[static_cast<uint64_t>(input_slots[slot_index]) * rows + row];
+        const uint32_t magnitude_bits = __float_as_uint(value) & 0x7fffffffu;
+        const bool nonfinite = (magnitude_bits & 0x7f800000u) == 0x7f800000u;
+        const bool subnormal =
+            (magnitude_bits & 0x7f800000u) == 0u &&
+            (magnitude_bits & 0x007fffffu) != 0u;
+        if (nonfinite || subnormal) {
+            atomicExch(invalid_out, 1u);
+            return;
+        }
+    }
+}
+
+__global__ void scatter_semantic_region_membership_kernel(
+    const float* membership,
+    uint64_t rows,
+    uint32_t region_count,
+    const uint32_t* output_slots,
+    float* columns,
+    uint32_t* invalid_out
+) {
+    const uint64_t value_count = rows * static_cast<uint64_t>(region_count);
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < value_count;
+         index += stride) {
+        const uint32_t region = static_cast<uint32_t>(index / rows);
+        const uint64_t row = index - static_cast<uint64_t>(region) * rows;
+        const float value = membership[index];
+        const uint32_t bits = __float_as_uint(value);
+        if (bits != 0u && bits != 0x3f800000u) {
+            atomicExch(invalid_out, 1u);
+            continue;
+        }
+        columns[static_cast<uint64_t>(output_slots[region]) * rows + row] = value;
+    }
+}
+
+__device__ inline bool semantic_region_terms_hold(
+    const float* columns,
+    uint64_t rows,
+    const GafimeDecisionPathTerm* terms,
+    uint32_t begin,
+    uint32_t end,
+    uint64_t row
+) {
+    for (uint32_t term_index = begin; term_index < end; ++term_index) {
+        const GafimeDecisionPathTerm term = terms[term_index];
+        const float value = columns[static_cast<uint64_t>(term.feature) * rows + row];
+        const bool holds = term.sign == GAFIME_DECISION_PATH_SIGN_LE
+            ? value <= term.threshold
+            : value > term.threshold;
+        if (!holds) return false;
+    }
+    return true;
+}
+
+__global__ void semantic_region_binary_label_masks_kernel(
+    const uint64_t* row_indices,
+    const uint8_t* values,
+    uint64_t label_count,
+    uint32_t* label_zero_words,
+    uint32_t* label_one_words
+) {
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < label_count;
+         index += stride) {
+        const uint64_t row = row_indices[index];
+        const uint32_t word = static_cast<uint32_t>(row >> 5u);
+        const uint32_t bit = 1u << (row & 31u);
+        if (values[index] == 0u) {
+            atomicOr(&label_zero_words[word], bit);
+        } else {
+            atomicOr(&label_one_words[word], bit);
+        }
+    }
+}
+
+__global__ void semantic_region_membership_masks_sm_kernel(
+    const float* primary_columns,
+    const float* paired_columns,
+    uint64_t rows,
+    const GafimeDecisionPathTerm* primary_terms,
+    const GafimeDecisionPathTerm* paired_terms,
+    const uint32_t* region_offsets,
+    uint32_t region_count,
+    uint32_t words_per_region,
+    uint32_t* primary_membership_words,
+    uint32_t* paired_membership_words
+) {
+    const uint32_t region = blockIdx.x;
+    const uint64_t row = static_cast<uint64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+    if (region >= region_count || row >= rows) return;
+
+    const uint32_t begin = region_offsets[region];
+    const uint32_t end = region_offsets[region + 1u];
+    const uint64_t word_offset =
+        static_cast<uint64_t>(region) * words_per_region + (row >> 5u);
+    const uint32_t bit = 1u << (row & 31u);
+    if (semantic_region_terms_hold(primary_columns, rows, primary_terms, begin, end, row)) {
+        atomicOr(&primary_membership_words[word_offset], bit);
+    }
+    if (paired_columns != nullptr && paired_membership_words != nullptr &&
+        semantic_region_terms_hold(paired_columns, rows, paired_terms, begin, end, row)) {
+        atomicOr(&paired_membership_words[word_offset], bit);
+    }
+}
+
+constexpr uint32_t kSemanticRegionSmBinCount = 256u;
+
+__device__ inline uint32_t semantic_region_sm_bin(
+    float value,
+    float lo,
+    float inv_span
+) {
+    if (isfinite(lo) && inv_span > 0.0f && isfinite(inv_span)) {
+        const float scaled = (value - lo) * inv_span *
+            static_cast<float>(kSemanticRegionSmBinCount);
+        if (scaled <= 0.0f) return 0u;
+        if (scaled >= static_cast<float>(kSemanticRegionSmBinCount)) {
+            return kSemanticRegionSmBinCount - 1u;
+        }
+        return static_cast<uint32_t>(scaled);
+    }
+    const uint64_t bucket = static_cast<uint64_t>(rt_float_bucket(value));
+    const uint32_t bin = static_cast<uint32_t>(
+        (bucket * kSemanticRegionSmBinCount) >> 23u
+    );
+    return bin < kSemanticRegionSmBinCount ? bin : kSemanticRegionSmBinCount - 1u;
+}
+
+__device__ inline bool semantic_region_point_terms_hold(
+    const float* point,
+    const GafimeDecisionPathTerm* terms,
+    uint32_t begin,
+    uint32_t end
+) {
+    for (uint32_t term_index = begin; term_index < end; ++term_index) {
+        const GafimeDecisionPathTerm term = terms[term_index];
+        if (term.feature >= 3u) return false;
+        const float value = point[term.feature];
+        const bool holds = term.sign == GAFIME_DECISION_PATH_SIGN_LE
+            ? value <= term.threshold
+            : value > term.threshold;
+        if (!holds) return false;
+    }
+    return true;
+}
+
+__global__ void semantic_region_membership_masks_binned_sm_kernel(
+    const float* primary_points_xyz,
+    const float* paired_points_xyz,
+    uint64_t rows,
+    const GafimeDecisionPathTerm* exact_terms,
+    const uint32_t* exact_region_offsets,
+    const uint32_t* group_path_offsets,
+    const uint32_t* group_region_ids,
+    const uint32_t* bin_offsets,
+    const uint32_t* bin_candidates,
+    const float* bin_lo,
+    const float* bin_inv_span,
+    uint32_t group_count,
+    uint32_t point_stride,
+    uint32_t point_group_stride,
+    uint32_t words_per_region,
+    uint32_t* primary_membership_words,
+    uint32_t* paired_membership_words
+) {
+    const uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint32_t group = blockIdx.y;
+    if (row >= rows || group >= group_count) return;
+
+    const uint64_t point_offset =
+        static_cast<uint64_t>(group) * point_group_stride + row * point_stride;
+    const float* primary_point = primary_points_xyz + point_offset;
+    const float* paired_point = paired_points_xyz == nullptr
+        ? nullptr
+        : paired_points_xyz + point_offset;
+    const uint64_t bin_base = static_cast<uint64_t>(group) *
+        (kSemanticRegionSmBinCount + 1u);
+    const uint32_t group_begin = group_path_offsets[group];
+    const uint32_t group_end = group_path_offsets[group + 1u];
+    const uint32_t bit = 1u << (row & 31u);
+    const uint32_t view_count = paired_point != nullptr && paired_membership_words != nullptr ? 2u : 1u;
+    for (uint32_t view = 0u; view < view_count; ++view) {
+        const float* point = view == 0u ? primary_point : paired_point;
+        uint32_t* membership_words = view == 0u
+            ? primary_membership_words
+            : paired_membership_words;
+        /* The paired point gets its own query-bound bin lookup.  Reusing the
+         * primary candidate bin would silently lose paired-only membership
+         * when paired slots cross a bin boundary. */
+        const uint32_t bin = semantic_region_sm_bin(
+            point[0], bin_lo[group], bin_inv_span[group]);
+        const uint32_t begin_candidate = bin_offsets[bin_base + bin];
+        const uint32_t end_candidate = bin_offsets[bin_base + bin + 1u];
+        for (uint32_t candidate_index = begin_candidate;
+             candidate_index < end_candidate;
+             ++candidate_index) {
+            const uint32_t physical_region = bin_candidates[candidate_index];
+            if (physical_region < group_begin || physical_region >= group_end) continue;
+            const uint32_t result_region = group_region_ids[physical_region];
+            const uint64_t word_offset =
+                static_cast<uint64_t>(result_region) * words_per_region + (row >> 5u);
+            const uint32_t begin = exact_region_offsets[physical_region];
+            const uint32_t end = exact_region_offsets[physical_region + 1u];
+            if (semantic_region_point_terms_hold(point, exact_terms, begin, end)) {
+                atomicOr(&membership_words[word_offset], bit);
+            }
+        }
+    }
+}
+
+__global__ void reduce_semantic_region_membership_masks_kernel(
+    const uint32_t* primary_membership_words,
+    const uint32_t* paired_membership_words,
+    const uint32_t* label_zero_words,
+    const uint32_t* label_one_words,
+    uint64_t rows,
+    uint32_t region_count,
+    uint32_t words_per_region,
+    uint32_t statistic_mask,
+    uint64_t label_zero_count,
+    uint64_t label_one_count,
+    GafimeSemanticRtRegionExactStats* stats
+) {
+    const uint32_t region = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    if (region >= region_count) return;
+
+    uint64_t occupancy = 0u;
+    uint64_t paired_n01 = 0u;
+    uint64_t paired_n10 = 0u;
+    uint64_t paired_n11 = 0u;
+    uint64_t label_inside_0 = 0u;
+    uint64_t label_inside_1 = 0u;
+    const uint64_t base = static_cast<uint64_t>(region) * words_per_region;
+    const bool want_paired =
+        (statistic_mask & GAFIME_SEMANTIC_RT_REGION_STAT_BINARY_PAIRED) != 0u;
+    const bool want_labels =
+        (statistic_mask & GAFIME_SEMANTIC_RT_REGION_STAT_BINARY_LABELED) != 0u;
+    for (uint32_t word = lane; word < words_per_region; word += blockDim.x) {
+        const uint32_t primary = primary_membership_words[base + word];
+        occupancy += static_cast<uint64_t>(__popc(primary));
+        if (want_paired) {
+            const uint32_t paired = paired_membership_words[base + word];
+            paired_n11 += static_cast<uint64_t>(__popc(primary & paired));
+            paired_n10 += static_cast<uint64_t>(__popc(primary & ~paired));
+            paired_n01 += static_cast<uint64_t>(__popc(~primary & paired));
+        }
+        if (want_labels) {
+            label_inside_0 += static_cast<uint64_t>(
+                __popc(primary & label_zero_words[word])
+            );
+            label_inside_1 += static_cast<uint64_t>(
+                __popc(primary & label_one_words[word])
+            );
+        }
+    }
+
+    __shared__ uint64_t occupancy_sum[256];
+    __shared__ uint64_t paired_n01_sum[256];
+    __shared__ uint64_t paired_n10_sum[256];
+    __shared__ uint64_t paired_n11_sum[256];
+    __shared__ uint64_t label_inside_0_sum[256];
+    __shared__ uint64_t label_inside_1_sum[256];
+    occupancy_sum[lane] = occupancy;
+    paired_n01_sum[lane] = paired_n01;
+    paired_n10_sum[lane] = paired_n10;
+    paired_n11_sum[lane] = paired_n11;
+    label_inside_0_sum[lane] = label_inside_0;
+    label_inside_1_sum[lane] = label_inside_1;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) {
+            occupancy_sum[lane] += occupancy_sum[lane + stride];
+            paired_n01_sum[lane] += paired_n01_sum[lane + stride];
+            paired_n10_sum[lane] += paired_n10_sum[lane + stride];
+            paired_n11_sum[lane] += paired_n11_sum[lane + stride];
+            label_inside_0_sum[lane] += label_inside_0_sum[lane + stride];
+            label_inside_1_sum[lane] += label_inside_1_sum[lane + stride];
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0u) {
+        GafimeSemanticRtRegionExactStats record = {};
+        record.row_count = rows;
+        if ((statistic_mask & GAFIME_SEMANTIC_RT_REGION_STAT_BINARY_OCCUPANCY) != 0u) {
+            record.occupancy_inside = occupancy_sum[0];
+        }
+        if (want_paired) {
+            const uint64_t used = paired_n01_sum[0] + paired_n10_sum[0] + paired_n11_sum[0];
+            record.paired_n00 = used <= rows ? rows - used : 0u;
+            record.paired_n01 = paired_n01_sum[0];
+            record.paired_n10 = paired_n10_sum[0];
+            record.paired_n11 = paired_n11_sum[0];
+        }
+        if (want_labels) {
+            record.label_support = label_zero_count + label_one_count;
+            record.label_inside_0 = label_inside_0_sum[0];
+            record.label_inside_1 = label_inside_1_sum[0];
+            record.label_outside_0 = label_inside_0_sum[0] <= label_zero_count
+                ? label_zero_count - label_inside_0_sum[0]
+                : 0u;
+            record.label_outside_1 = label_inside_1_sum[0] <= label_one_count
+                ? label_one_count - label_inside_1_sum[0]
+                : 0u;
+        }
+        stats[region] = record;
+    }
+}
+
+__device__ inline float semantic_region_divide_f32(uint64_t numerator, uint64_t denominator) {
+    return __fdiv_rn(static_cast<float>(numerator), static_cast<float>(denominator));
+}
+
+__device__ inline float semantic_region_gini_f32(uint64_t zero_count, uint64_t one_count) {
+    const uint64_t total = zero_count + one_count;
+    const float p0 = semantic_region_divide_f32(zero_count, total);
+    const float p1 = semantic_region_divide_f32(one_count, total);
+    const float p0_sq = __fmul_rn(p0, p0);
+    const float p1_sq = __fmul_rn(p1, p1);
+    return __fsub_rn(__fsub_rn(1.0f, p0_sq), p1_sq);
+}
+
+__global__ void finalize_semantic_region_stats_kernel(
+    uint32_t region_count,
+    uint32_t statistic_mask,
+    uint32_t finalizer_mask,
+    uint64_t rows,
+    uint64_t label_zero_count,
+    uint64_t label_one_count,
+    GafimeSemanticRtRegionExactStats* stats
+) {
+    const uint32_t region = static_cast<uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (region >= region_count) return;
+    GafimeSemanticRtRegionExactStats& record = stats[region];
+
+    record.row_count = rows;
+    if ((statistic_mask & GAFIME_SEMANTIC_RT_REGION_STAT_BINARY_PAIRED) != 0u) {
+        const uint64_t used = record.paired_n01 + record.paired_n10 + record.paired_n11;
+        record.paired_n00 = used <= rows ? rows - used : 0u;
+    }
+    if ((statistic_mask & GAFIME_SEMANTIC_RT_REGION_STAT_BINARY_LABELED) != 0u) {
+        record.label_support = label_zero_count + label_one_count;
+        record.label_outside_0 = record.label_inside_0 <= label_zero_count
+            ? label_zero_count - record.label_inside_0
+            : 0u;
+        record.label_outside_1 = record.label_inside_1 <= label_one_count
+            ? label_one_count - record.label_inside_1
+            : 0u;
+    }
+
+    if ((finalizer_mask & GAFIME_SEMANTIC_RT_REGION_FINALIZE_OCCUPANCY) != 0u &&
+        (statistic_mask & GAFIME_SEMANTIC_RT_REGION_STAT_BINARY_OCCUPANCY) != 0u) {
+        if (record.row_count == 0u) {
+            record.occupancy_state = GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT;
+        } else {
+            record.occupancy = semantic_region_divide_f32(record.occupancy_inside, record.row_count);
+            record.occupancy_state = GAFIME_SEMANTIC_SCALAR_MEASURED;
+        }
+    }
+
+    if ((finalizer_mask & GAFIME_SEMANTIC_RT_REGION_FINALIZE_PAIRED_AGREEMENT) != 0u &&
+        (statistic_mask & GAFIME_SEMANTIC_RT_REGION_STAT_BINARY_PAIRED) != 0u) {
+        if (record.row_count == 0u) {
+            record.paired_agreement_state = GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT;
+        } else {
+            record.paired_agreement = semantic_region_divide_f32(
+                record.paired_n00 + record.paired_n11,
+                record.row_count
+            );
+            record.paired_agreement_state = GAFIME_SEMANTIC_SCALAR_MEASURED;
+        }
+    }
+
+    if ((finalizer_mask & GAFIME_SEMANTIC_RT_REGION_FINALIZE_PAIRED_IOU) != 0u &&
+        (statistic_mask & GAFIME_SEMANTIC_RT_REGION_STAT_BINARY_PAIRED) != 0u) {
+        const uint64_t union_count =
+            record.paired_n01 + record.paired_n10 + record.paired_n11;
+        if (union_count == 0u) {
+            record.paired_iou_state = GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND;
+        } else {
+            record.paired_iou = semantic_region_divide_f32(record.paired_n11, union_count);
+            record.paired_iou_state = GAFIME_SEMANTIC_SCALAR_MEASURED;
+        }
+    }
+
+    if ((finalizer_mask & GAFIME_SEMANTIC_RT_REGION_FINALIZE_LABELED_GINI_GAIN) != 0u &&
+        (statistic_mask & GAFIME_SEMANTIC_RT_REGION_STAT_BINARY_LABELED) != 0u) {
+        const uint64_t support = record.label_support;
+        const uint64_t global_zero = record.label_outside_0 + record.label_inside_0;
+        const uint64_t global_one = record.label_outside_1 + record.label_inside_1;
+        const uint64_t outside = record.label_outside_0 + record.label_outside_1;
+        const uint64_t inside = record.label_inside_0 + record.label_inside_1;
+        if (support < 2u) {
+            record.labeled_gini_gain_state = GAFIME_SEMANTIC_SCALAR_INSUFFICIENT_SUPPORT;
+        } else if (global_zero == 0u || global_one == 0u || outside == 0u || inside == 0u) {
+            record.labeled_gini_gain_state = GAFIME_SEMANTIC_SCALAR_CONSTANT_OPERAND;
+        } else {
+            const float parent = semantic_region_gini_f32(global_zero, global_one);
+            const float outside_weight = semantic_region_divide_f32(outside, support);
+            const float inside_weight = semantic_region_divide_f32(inside, support);
+            const float outside_term = __fmul_rn(
+                outside_weight,
+                semantic_region_gini_f32(record.label_outside_0, record.label_outside_1)
+            );
+            const float inside_term = __fmul_rn(
+                inside_weight,
+                semantic_region_gini_f32(record.label_inside_0, record.label_inside_1)
+            );
+            record.labeled_gini_gain = __fsub_rn(
+                __fsub_rn(parent, outside_term),
+                inside_term
+            );
+            record.labeled_gini_gain_state = GAFIME_SEMANTIC_SCALAR_MEASURED;
+        }
+    }
+}
+
+__global__ void materialize_semantic_region_coverage_kernel(
+    const uint32_t* primary_membership_words,
+    uint64_t rows,
+    uint32_t region_count,
+    uint32_t words_per_region,
+    float* output_column
+) {
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         row < rows;
+         row += stride) {
+        const uint32_t word = static_cast<uint32_t>(row >> 5u);
+        const uint32_t bit = 1u << (row & 31u);
+        uint32_t count = 0u;
+        for (uint32_t region = 0u; region < region_count; ++region) {
+            const uint64_t word_offset = static_cast<uint64_t>(region) * words_per_region + word;
+            count += (primary_membership_words[word_offset] & bit) != 0u ? 1u : 0u;
+        }
+        output_column[row] = static_cast<float>(count);
+    }
+}
+
+__global__ void materialize_semantic_region_weighted_sum_kernel(
+    const uint32_t* primary_membership_words,
+    uint64_t rows,
+    uint32_t region_count,
+    uint32_t words_per_region,
+    const float* region_weights,
+    float* output_column,
+    uint32_t* nonfinite_out
+) {
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         row < rows;
+         row += stride) {
+        const uint32_t word = static_cast<uint32_t>(row >> 5u);
+        const uint32_t bit = 1u << (row & 31u);
+        float sum = 0.0f;
+        for (uint32_t region = 0u; region < region_count; ++region) {
+            const uint64_t word_offset = static_cast<uint64_t>(region) * words_per_region + word;
+            if ((primary_membership_words[word_offset] & bit) != 0u) {
+                /* This is one explicit round-to-nearest addition, not a
+                 * multiply/accumulate expression.  Canonical region order
+                 * supplies the only permitted accumulation order. */
+                sum = __fadd_rn(sum, region_weights[region]);
+            }
+        }
+        if (!isfinite(sum)) {
+            atomicExch(nonfinite_out, 1u);
+            continue;
+        }
+        output_column[row] = sum;
+    }
+}
+
+__global__ void materialize_semantic_region_weighted_sum_ordinals_kernel(
+    const uint32_t* direct_region_ordinals,
+    uint64_t rows,
+    uint32_t region_count,
+    const float* region_weights,
+    float* output_column,
+    uint32_t* nonfinite_out
+) {
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         row < rows;
+         row += stride) {
+        const uint32_t ordinal_plus_one = direct_region_ordinals[row];
+        if (ordinal_plus_one > region_count) {
+            atomicExch(nonfinite_out, 1u);
+            continue;
+        }
+        float sum = 0.0f;
+        if (ordinal_plus_one != 0u) {
+            sum = __fadd_rn(sum, region_weights[ordinal_plus_one - 1u]);
+        }
+        if (!isfinite(sum)) {
+            atomicExch(nonfinite_out, 1u);
+            continue;
+        }
+        output_column[row] = sum;
+    }
+}
+
+__global__ void scatter_semantic_region_coverage_counts_kernel(
+    const uint32_t* direct_region_ordinals,
+    uint64_t rows,
+    float* output_column
+) {
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         row < rows;
+         row += stride) {
+        output_column[row] = direct_region_ordinals[row] == 0u ? 0.0f : 1.0f;
     }
 }
 

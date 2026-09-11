@@ -15,6 +15,1028 @@ use gafime_types::{
 const FIRSTHIT_TOLERANCE: f32 = 1.0e-4;
 const SCORE_SENTINEL: f32 = 12_345.5;
 
+fn compact_binary_lifecycle(
+    executor: &mut dyn gafime_orchestrator::semantic::NativeEvidenceExecutor,
+    backend: u32,
+) -> (
+    Vec<gafime_orchestrator::semantic::EvidenceValue>,
+    Vec<Vec<u32>>,
+) {
+    compact_binary_lifecycle_with_objectives(executor, backend, 0)
+}
+
+fn compact_binary_lifecycle_with_objectives(
+    executor: &mut dyn gafime_orchestrator::semantic::NativeEvidenceExecutor,
+    backend: u32,
+    objective_count: usize,
+) -> (
+    Vec<gafime_orchestrator::semantic::EvidenceValue>,
+    Vec<Vec<u32>>,
+) {
+    use gafime_orchestrator::semantic::*;
+    use gafime_types::PrecisionProfile;
+    use std::sync::Arc;
+
+    let frame = |paired: bool, role, offset: u64| {
+        Arc::new(
+            FeatureFrame::with_profile(
+                PrecisionProfile::Fp32,
+                vec!["x".into(), "y".into(), "unused".into()],
+                "compact-hybrid-fixture".into(),
+                (offset..offset + 256).collect(),
+                role,
+                if paired {
+                    "aligned perturbed view"
+                } else {
+                    "deterministic source rows"
+                }
+                .into(),
+                vec![
+                    NumericColumn::from(
+                        (0..256)
+                            .map(|row| ((row + usize::from(paired)) % 16) as f32 / 4.0)
+                            .collect::<Vec<_>>(),
+                    ),
+                    NumericColumn::from(
+                        (0..256)
+                            .map(|row| (row / 16) as f32 / 4.0)
+                            .collect::<Vec<_>>(),
+                    ),
+                    NumericColumn::from(vec![7.0f32; 256]),
+                ],
+            )
+            .unwrap(),
+        )
+    };
+    let train = frame(false, EvaluationRole::Discovery, 0);
+    let paired = frame(true, EvaluationRole::Discovery, 0);
+    let inference = frame(false, EvaluationRole::Inference, 1000);
+    let registry = CandidateRegistry::new(
+        train.schema().to_vec(),
+        PrecisionProfile::Fp32,
+        ProgramLimits::default(),
+    )
+    .unwrap();
+    let mut session = SemanticSession::new(registry, backend, 128 << 20).unwrap();
+    let regions = {
+        let mut round = session.begin_round(&[]).unwrap();
+        let x = round.source(0).unwrap();
+        let y = round.source(1).unwrap();
+        (0..4)
+            .flat_map(|ix| (0..4).map(move |iy| (ix, iy)))
+            .map(|(ix, iy)| {
+                let terms = vec![
+                    round
+                        .hard_predicate(x, PredicateComparator::GreaterThan, ix as f32 - 0.125)
+                        .unwrap(),
+                    round
+                        .hard_predicate(x, PredicateComparator::LessEqual, ix as f32 + 0.875)
+                        .unwrap(),
+                    round
+                        .hard_predicate(y, PredicateComparator::GreaterThan, iy as f32 - 0.125)
+                        .unwrap(),
+                    round
+                        .hard_predicate(y, PredicateComparator::LessEqual, iy as f32 + 0.875)
+                        .unwrap(),
+                ];
+                round.decision_region(terms).unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let labels = |flip: bool| {
+        Arc::new(
+            LabelSet::new(
+                &train,
+                (0..256)
+                    .filter(|row| row % 3 != 0)
+                    .map(|row| (row, f32::from(((row % 16 >= 8) ^ flip) as u8)))
+                    .collect(),
+                format!("partial binary labels flip={flip}"),
+            )
+            .unwrap(),
+        )
+    };
+    let coverage =
+        EvidenceChannel::new("coverage".into(), EvidenceDefinition::BinaryOccupancy).unwrap();
+    let agreement = EvidenceChannel::new(
+        "agreement".into(),
+        EvidenceDefinition::BinaryPaired {
+            statistic: BinaryPairedStatistic::Agreement,
+            view: Arc::clone(&paired),
+        },
+    )
+    .unwrap();
+    let iou = EvidenceChannel::new(
+        "iou".into(),
+        EvidenceDefinition::BinaryPaired {
+            statistic: BinaryPairedStatistic::IntersectionOverUnion,
+            view: Arc::clone(&paired),
+        },
+    )
+    .unwrap();
+    let gini = EvidenceChannel::new(
+        "gini".into(),
+        EvidenceDefinition::BinaryLabeledGiniGain {
+            labels: Some(labels(false)),
+        },
+    )
+    .unwrap();
+    let absent = EvidenceChannel::new(
+        "optional-labels".into(),
+        EvidenceDefinition::BinaryLabeledGiniGain { labels: None },
+    )
+    .unwrap();
+    let channels = vec![
+        coverage.clone(),
+        agreement.clone(),
+        iou,
+        gini.clone(),
+        absent.clone(),
+    ];
+    let first = session
+        .evaluate(executor, Arc::clone(&train), &regions, &channels)
+        .unwrap();
+    let mut evidence = first
+        .records()
+        .iter()
+        .map(EvidenceRecord::value)
+        .collect::<Vec<_>>();
+    let mut rebound = channels.clone();
+    rebound[3] = gini
+        .rebind(EvidenceDefinition::BinaryLabeledGiniGain {
+            labels: Some(labels(true)),
+        })
+        .unwrap();
+    let second = session
+        .evaluate(executor, Arc::clone(&train), &regions, &rebound)
+        .unwrap();
+    assert_eq!(first.candidates(), second.candidates());
+    assert_ne!(first.id(), second.id());
+    evidence.extend(second.records().iter().map(EvidenceRecord::value));
+    // A bound empty label subset is not an absent context: it retains the
+    // candidate/query identity but produces InsufficientSupport rather than
+    // MissingLabels. It must also clear the previous execute's label masks.
+    let mut empty_labels = channels.clone();
+    empty_labels[3] = gini
+        .rebind(EvidenceDefinition::BinaryLabeledGiniGain {
+            labels: Some(Arc::new(
+                LabelSet::new(&train, vec![], "present empty label subset".into()).unwrap(),
+            )),
+        })
+        .unwrap();
+    let empty = session
+        .evaluate(executor, Arc::clone(&train), &regions, &empty_labels)
+        .unwrap();
+    assert_eq!(empty.candidates(), second.candidates());
+    for record in empty.records() {
+        if record.channel() == gini.id() {
+            assert_eq!(
+                record.value(),
+                EvidenceValue::Unavailable {
+                    reason: UnavailableReason::InsufficientSupport,
+                    support: 0,
+                }
+            );
+        }
+    }
+    evidence.extend(empty.records().iter().map(EvidenceRecord::value));
+    let policy = SelectionPolicy {
+        primary: coverage.id(),
+        direction: Direction::Maximize,
+        constraints: vec![
+            EvidenceConstraint {
+                channel: agreement.id(),
+                minimum: Some(0.5),
+                maximum: None,
+                missing: None,
+            },
+            EvidenceConstraint {
+                channel: absent.id(),
+                minimum: Some(0.0),
+                maximum: None,
+                missing: Some(MissingEvidence::IgnoreConstraint),
+            },
+        ],
+        missing: MissingEvidence::Error,
+        limit: 2,
+        pareto_objectives: if objective_count == 0 {
+            vec![]
+        } else {
+            [
+                EvidenceObjective {
+                    channel: coverage.id(),
+                    direction: Direction::Maximize,
+                },
+                EvidenceObjective {
+                    channel: agreement.id(),
+                    direction: Direction::Minimize,
+                },
+                EvidenceObjective {
+                    channel: gini.id(),
+                    direction: Direction::Maximize,
+                },
+            ][..objective_count]
+                .to_vec()
+        },
+    };
+    let accepted = session.accept_with(executor, &second, &policy).unwrap();
+    assert_eq!(accepted.len(), 2);
+    let composite = {
+        let mut round = session.begin_round(&accepted).unwrap();
+        round
+            .hard_predicate(accepted[0].feature(), PredicateComparator::GreaterThan, 0.5)
+            .unwrap()
+    };
+    let third = session
+        .evaluate(
+            executor,
+            Arc::clone(&train),
+            &[composite],
+            &[coverage.clone(), agreement],
+        )
+        .unwrap();
+    evidence.extend(third.records().iter().map(EvidenceRecord::value));
+    let final_policy = SelectionPolicy {
+        primary: coverage.id(),
+        direction: Direction::Maximize,
+        constraints: vec![],
+        missing: MissingEvidence::Error,
+        limit: 1,
+        pareto_objectives: vec![],
+    };
+    let selected = session
+        .accept_with(executor, &third, &final_policy)
+        .unwrap();
+    let values = session
+        .materialize_accepted(executor, &inference, &selected)
+        .unwrap();
+    let host = if values.is_resident() {
+        executor
+            .download(session.registry().unwrap(), &inference, &values, 128 << 20)
+            .unwrap()
+    } else {
+        values
+    };
+    let output = selected
+        .iter()
+        .map(|feature| {
+            host.get(feature.feature())
+                .unwrap()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect()
+        })
+        .collect();
+    session.close();
+    (evidence, output)
+}
+
+#[test]
+fn local_compact_binary_evidence_selects_reuses_and_infers_without_dense_discovery() {
+    use gafime_cpu::semantic::CoreEvidenceExecutor;
+    use gafime_types::{GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA};
+    let _guard = RT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(backend) = configured_cuda_backend("local compact semantic evidence") else {
+        return;
+    };
+    let mut core = CoreEvidenceExecutor::default();
+    let expected = compact_binary_lifecycle(&mut core, GAFIME_BACKEND_CPU);
+    let mut rt = backend
+        .local_compact_rt_semantic_executor()
+        .expect("configured payload must expose compact RT query, not skip");
+    let actual = compact_binary_lifecycle(&mut rt, GAFIME_BACKEND_CUDA);
+    assert_eq!(
+        actual, expected,
+        "count-finalized evidence and inference must be bit identical"
+    );
+    for (actual, expected) in actual.0.iter().zip(&expected.0) {
+        if let (
+            gafime_orchestrator::semantic::EvidenceValue::Measured { value: actual, .. },
+            gafime_orchestrator::semantic::EvidenceValue::Measured {
+                value: expected, ..
+            },
+        ) = (actual, expected)
+        {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "including signed zero"
+            );
+        }
+    }
+    let counters = rt.local_compact_diagnostics().unwrap();
+    assert_eq!(counters.queries_created, 2);
+    assert_eq!(
+        counters.queries_reused, 2,
+        "changed labels must reuse geometry but execute fresh statistics"
+    );
+    assert_eq!(counters.executions, 4);
+    assert_eq!(counters.evaluated_regions, 49);
+    assert_eq!(
+        counters.last_live_bytes, 0,
+        "ordinary inference/download must release hidden query ownership"
+    );
+    let dense = rt.local_rt_diagnostics().unwrap();
+    assert!(
+        dense.completed_regions < 16,
+        "dense outputs are selected atoms only, not the full discovery bank"
+    );
+}
+
+fn region_count_lifecycle(
+    executor: &mut dyn gafime_orchestrator::semantic::NativeEvidenceExecutor,
+    backend: u32,
+) -> Vec<u32> {
+    region_aggregate_lifecycle(executor, backend, false)
+}
+
+fn region_aggregate_lifecycle(
+    executor: &mut dyn gafime_orchestrator::semantic::NativeEvidenceExecutor,
+    backend: u32,
+    weighted: bool,
+) -> Vec<u32> {
+    use gafime_orchestrator::semantic::*;
+    use gafime_types::PrecisionProfile;
+    use std::sync::Arc;
+
+    let make_frame = |role, keys: std::ops::Range<u64>| {
+        Arc::new(
+            FeatureFrame::with_profile(
+                PrecisionProfile::Fp32,
+                vec!["x".into()],
+                "coverage-count".into(),
+                keys.collect(),
+                role,
+                "overlapping frozen rules".into(),
+                vec![NumericColumn::from(vec![-1.0f32, 0.0, 1.0, 2.0, 3.0, 4.0])],
+            )
+            .unwrap(),
+        )
+    };
+    let frame = make_frame(EvaluationRole::Discovery, 0..6);
+    let inference = make_frame(EvaluationRole::Inference, 10..16);
+    let registry = CandidateRegistry::new(
+        frame.schema().to_vec(),
+        PrecisionProfile::Fp32,
+        ProgramLimits::default(),
+    )
+    .unwrap();
+    let mut session = SemanticSession::new(registry, backend, 64 << 20).unwrap();
+    let (source, count) = {
+        let mut round = session.begin_round(&[]).unwrap();
+        let source = round.source(0).unwrap();
+        let p0 = round
+            .hard_predicate(source, PredicateComparator::LessEqual, 3.0)
+            .unwrap();
+        let p1 = round
+            .hard_predicate(source, PredicateComparator::GreaterThan, 1.0)
+            .unwrap();
+        let r0 = round.decision_region(vec![p0]).unwrap();
+        let r1 = round.decision_region(vec![p1]).unwrap();
+        let aggregate = if weighted {
+            round
+                .region_weighted_sum(vec![r0, r1], vec![2.0, -3.0])
+                .unwrap()
+        } else {
+            round.region_count(vec![r0, r1]).unwrap()
+        };
+        (source, aggregate)
+    };
+    let reference = EvidenceChannel::new(
+        "ordinary-statistic".into(),
+        EvidenceDefinition::Association {
+            statistic: AssociationStatistic::Pearson,
+            context: AssociationContext::Reference { reference: source },
+        },
+    )
+    .unwrap();
+    let policy = SelectionPolicy {
+        primary: reference.id(),
+        direction: Direction::Maximize,
+        constraints: vec![],
+        missing: MissingEvidence::Error,
+        limit: 1,
+        pareto_objectives: vec![],
+    };
+    let table = session
+        .evaluate(
+            executor,
+            Arc::clone(&frame),
+            &[count],
+            std::slice::from_ref(&reference),
+        )
+        .unwrap();
+    let accepted = session.accept_with(executor, &table, &policy).unwrap();
+    assert_eq!(accepted.len(), 1);
+    let result = session
+        .materialize_accepted(executor, &inference, &accepted)
+        .unwrap();
+    let host = if result.is_resident() {
+        executor
+            .download(session.registry().unwrap(), &inference, &result, 64 << 20)
+            .unwrap()
+    } else {
+        result
+    };
+    let result = host
+        .get(count)
+        .unwrap()
+        .iter()
+        .map(|value| value.to_bits())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        result,
+        (if weighted {
+            vec![2.0f32, 2.0, 2.0, -1.0, -1.0, -3.0]
+        } else {
+            vec![1.0f32, 1.0, 1.0, 2.0, 2.0, 1.0]
+        })
+        .into_iter()
+        .map(f32::to_bits)
+        .collect::<Vec<_>>()
+    );
+    if weighted {
+        // The weighted program becomes a later-round logical atom, not a
+        // discovery-only score; new row identities require fresh execution.
+        let composite = {
+            let mut round = session.begin_round(&accepted).unwrap();
+            round
+                .hard_predicate(count, PredicateComparator::GreaterThan, 0.0)
+                .unwrap()
+        };
+        let table = session
+            .evaluate(executor, Arc::clone(&frame), &[composite], &[reference])
+            .unwrap();
+        let selected = session.accept_with(executor, &table, &policy).unwrap();
+        let values = session
+            .materialize_accepted(executor, &inference, &selected)
+            .unwrap();
+        let host = if values.is_resident() {
+            executor
+                .download(session.registry().unwrap(), &inference, &values, 64 << 20)
+                .unwrap()
+        } else {
+            values
+        };
+        assert_eq!(
+            host.get(composite).unwrap(),
+            &[1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+        );
+    }
+    session.close();
+    result
+}
+
+#[test]
+fn local_compact_region_count_is_a_target_free_feature_not_an_evidence_alias() {
+    use gafime_cpu::semantic::CoreEvidenceExecutor;
+    use gafime_types::{GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA};
+    let _guard = RT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(backend) = configured_cuda_backend("local compact region-count feature") else {
+        return;
+    };
+    let expected = region_count_lifecycle(&mut CoreEvidenceExecutor::default(), GAFIME_BACKEND_CPU);
+    let mut executor = backend.local_compact_rt_semantic_executor().unwrap();
+    assert_eq!(
+        region_count_lifecycle(&mut executor, GAFIME_BACKEND_CUDA),
+        expected
+    );
+    assert_eq!(
+        executor
+            .local_rt_diagnostics()
+            .unwrap()
+            .completed_coverage_features,
+        2
+    );
+}
+
+#[test]
+fn local_weighted_regions_select_compose_and_infer_bit_exactly() {
+    use gafime_cpu::semantic::CoreEvidenceExecutor;
+    use gafime_types::{GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA};
+    let _guard = RT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(backend) = configured_cuda_backend("weighted region lifecycle") else {
+        return;
+    };
+    let expected = region_aggregate_lifecycle(
+        &mut CoreEvidenceExecutor::default(),
+        GAFIME_BACKEND_CPU,
+        true,
+    );
+    let mut rt = backend.local_compact_rt_semantic_executor().unwrap();
+    assert_eq!(
+        region_aggregate_lifecycle(&mut rt, GAFIME_BACKEND_CUDA, true),
+        expected
+    );
+    assert!(
+        rt.local_rt_diagnostics()
+            .unwrap()
+            .completed_weighted_features
+            >= 2
+    );
+    use gafime_orchestrator::semantic::*;
+    use gafime_types::PrecisionProfile;
+    let frame = FeatureFrame::with_profile(
+        PrecisionProfile::Fp32,
+        vec!["x".into()],
+        "ordinary-cuda".into(),
+        vec![0, 1],
+        EvaluationRole::Discovery,
+        "fail-closed weighted route".into(),
+        vec![NumericColumn::from(vec![0.0f32, 1.0])],
+    )
+    .unwrap();
+    let mut registry = CandidateRegistry::new(
+        frame.schema().to_vec(),
+        PrecisionProfile::Fp32,
+        ProgramLimits::default(),
+    )
+    .unwrap();
+    let x = registry.source(0).unwrap();
+    let p0 = registry
+        .hard_predicate(x, PredicateComparator::LessEqual, 0.5)
+        .unwrap();
+    let p1 = registry
+        .hard_predicate(x, PredicateComparator::GreaterThan, 0.5)
+        .unwrap();
+    let r0 = registry.decision_region(vec![p0]).unwrap();
+    let r1 = registry.decision_region(vec![p1]).unwrap();
+    let weighted = registry
+        .region_weighted_sum(vec![r0, r1], vec![1.0, -1.0])
+        .unwrap();
+    let mut ordinary = backend.semantic_executor().unwrap();
+    assert!(
+        matches!(
+            ordinary.materialize(&registry, &frame, &[weighted], None, 1 << 20),
+            Err(SemanticError::Unsupported(_))
+        ),
+        "ordinary CUDA must not silently opt into the experimental RT route"
+    );
+}
+
+#[test]
+fn local_pareto_selection_matches_core_with_conflicts_ties_and_inference() {
+    use gafime_cpu::semantic::CoreEvidenceExecutor;
+    use gafime_types::{GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA};
+    let _guard = RT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(backend) = configured_cuda_backend("local Pareto lifecycle") else {
+        return;
+    };
+    for dimensions in [2, 3] {
+        let expected = compact_binary_lifecycle_with_objectives(
+            &mut CoreEvidenceExecutor::default(),
+            GAFIME_BACKEND_CPU,
+            dimensions,
+        );
+        let mut rt = backend.local_compact_rt_semantic_executor().unwrap();
+        assert_eq!(
+            compact_binary_lifecycle_with_objectives(&mut rt, GAFIME_BACKEND_CUDA, dimensions),
+            expected
+        );
+    }
+}
+
+// This opt-in diagnostic times the same frozen programs through each executor,
+// not an all-pairs-equivalent traversal denominator. It deliberately includes
+// input-bank upload and fresh call-local geometry in materialization time, and
+// reports final delivery separately. No hidden resident-geometry warm claim.
+fn semantic_region_timing(
+    executor: &mut dyn gafime_orchestrator::semantic::NativeEvidenceExecutor,
+    backend: u32,
+    name: &str,
+    rows: usize,
+    region_count: usize,
+    derived_atom: bool,
+) -> Vec<u32> {
+    use gafime_orchestrator::semantic::*;
+    use gafime_types::PrecisionProfile;
+    use std::{sync::Arc, time::Instant};
+
+    let frame = |size: usize, role, offset: usize| {
+        Arc::new(
+            FeatureFrame::with_profile(
+                PrecisionProfile::Fp32,
+                vec!["x".into(), "y".into()],
+                "local-region-diagnostic".into(),
+                (offset as u64..(offset + size) as u64).collect(),
+                role,
+                "fixed synthetic rows; no universal throughput claim".into(),
+                vec![
+                    NumericColumn::from(
+                        (0..size)
+                            .map(|i| ((i + offset) % 1021) as f32 / 256.0 - 2.0)
+                            .collect::<Vec<_>>(),
+                    ),
+                    NumericColumn::from(
+                        (0..size)
+                            .map(|i| ((i * 37 + offset) % 1031) as f32 / 256.0 - 2.0)
+                            .collect::<Vec<_>>(),
+                    ),
+                ],
+            )
+            .unwrap(),
+        )
+    };
+    let train = frame(1024, EvaluationRole::Discovery, 0);
+    let inference = frame(rows, EvaluationRole::Inference, 100_000);
+    let registry = CandidateRegistry::new(
+        train.schema().to_vec(),
+        PrecisionProfile::Fp32,
+        ProgramLimits::default(),
+    )
+    .unwrap();
+    let mut session = SemanticSession::new(registry, backend, 128 << 20).unwrap();
+    let (source, atom, other) = {
+        let mut round = session.begin_round(&[]).unwrap();
+        let source = round.source(0).unwrap();
+        let atom = if derived_atom {
+            round.softsign(source).unwrap()
+        } else {
+            source
+        };
+        (source, atom, round.source(1).unwrap())
+    };
+    let channel = EvidenceChannel::new(
+        "association".into(),
+        EvidenceDefinition::Association {
+            statistic: AssociationStatistic::Pearson,
+            context: AssociationContext::Reference { reference: source },
+        },
+    )
+    .unwrap();
+    let policy = SelectionPolicy {
+        primary: channel.id(),
+        direction: Direction::Maximize,
+        constraints: vec![],
+        missing: MissingEvidence::RejectCandidate,
+        limit: region_count,
+        pareto_objectives: vec![],
+    };
+    let first = session
+        .evaluate(
+            executor,
+            Arc::clone(&train),
+            &[atom],
+            std::slice::from_ref(&channel),
+        )
+        .unwrap();
+    let accepted_atom = session.accept_with(executor, &first, &policy).unwrap();
+    assert_eq!(accepted_atom.len(), 1);
+    let regions = {
+        let mut round = session.begin_round(&accepted_atom).unwrap();
+        let high = round
+            .hard_predicate(other, PredicateComparator::LessEqual, 1.5)
+            .unwrap();
+        (0..region_count)
+            .map(|index| {
+                let span = if derived_atom { 1.2 } else { 3.6 };
+                let threshold = -span / 2.0 + span * index as f32 / region_count as f32;
+                let low = round
+                    .hard_predicate(atom, PredicateComparator::LessEqual, threshold)
+                    .unwrap();
+                round.decision_region(vec![low, high]).unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let table = session
+        .evaluate(executor, Arc::clone(&train), &regions, &[channel])
+        .unwrap();
+    let accepted = session.accept_with(executor, &table, &policy).unwrap();
+    assert_eq!(
+        accepted.len(),
+        region_count,
+        "diagnostic must not time a pruned workload"
+    );
+    let mut first_output = None;
+    for sample in 0..3 {
+        // Same-frame inference intentionally caches accepted outputs. Clear
+        // that state outside timing: otherwise later samples measure retrieval
+        // and could falsely be described as warm RT traversal.
+        session.clear_materializations().unwrap();
+        let start = Instant::now();
+        let materialized = session
+            .materialize_accepted(executor, &inference, &accepted)
+            .unwrap();
+        let materialize_ns = start.elapsed().as_nanos();
+        let start = Instant::now();
+        let delivered = if materialized.is_resident() {
+            session
+                .download_materialization(executor, &inference, &materialized)
+                .unwrap()
+        } else {
+            materialized
+        };
+        let delivery_ns = start.elapsed().as_nanos();
+        let output = regions
+            .iter()
+            .flat_map(|&id| {
+                delivered
+                    .get(id)
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.to_bits())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output.len(), rows * region_count);
+        if let Some(expected) = &first_output {
+            assert_eq!(&output, expected);
+        } else {
+            first_output = Some(output);
+        }
+        println!("RT_SEMANTIC_SAMPLE backend={name} rows={rows} regions={region_count} derived_atom={derived_atom} sample={sample} materialize_ns={materialize_ns} delivery_ns={delivery_ns} output_bytes={}", rows * region_count * 4);
+    }
+    session.close();
+    first_output.unwrap()
+}
+
+#[test]
+#[ignore = "explicit local physical diagnostic; never an automatic release/performance gate"]
+fn local_semantic_region_same_workload_diagnostic() {
+    use gafime_cpu::semantic::CoreEvidenceExecutor;
+    use gafime_types::{GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA};
+    let _guard = RT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let backend = configured_cuda_backend("same-workload local diagnostic")
+        .expect("set an explicit current local CUDA payload");
+    assert!(
+        env::var_os("RAYON_NUM_THREADS").is_none(),
+        "production Core uses the normal default worker policy in this diagnostic"
+    );
+    println!(
+        "RT_SEMANTIC_ENV core_worker_policy=default available_parallelism={} cuda={:?}",
+        std::thread::available_parallelism().unwrap(),
+        backend.device_info().unwrap()
+    );
+    for (rows, regions) in [(1024, 32), (8192, 128)] {
+        for derived in [false, true] {
+            let mut core = CoreEvidenceExecutor::default();
+            let mut cuda = backend.semantic_executor().unwrap();
+            let mut rt = backend.local_rt_semantic_executor().unwrap();
+            let expected = semantic_region_timing(
+                &mut core,
+                GAFIME_BACKEND_CPU,
+                "core",
+                rows,
+                regions,
+                derived,
+            );
+            let ordinary = semantic_region_timing(
+                &mut cuda,
+                GAFIME_BACKEND_CUDA,
+                "cuda",
+                rows,
+                regions,
+                derived,
+            );
+            let accelerated =
+                semantic_region_timing(&mut rt, GAFIME_BACKEND_CUDA, "rt", rows, regions, derived);
+            assert_eq!(expected, ordinary);
+            assert_eq!(expected, accelerated);
+            let counters = rt.local_rt_diagnostics().unwrap();
+            assert_eq!(counters.completed_region_batches, 4);
+            assert_eq!(
+                counters.completed_regions,
+                4 * regions as u64,
+                "one discovery plus three fresh inference executions must use RT"
+            );
+            println!("RT_SEMANTIC_PARITY rows={rows} regions={regions} derived_atom={derived} exact=true diagnostics={:?}", rt.local_rt_diagnostics().unwrap());
+        }
+    }
+}
+
+// The new local experiment consumes the canonical session; it must not invent
+// an RT target protocol or copy accepted columns through host memory for reuse.
+fn semantic_region_lifecycle(
+    executor: &mut dyn gafime_orchestrator::semantic::NativeEvidenceExecutor,
+    backend: u32,
+) -> (
+    Vec<gafime_orchestrator::semantic::EvidenceValue>,
+    Vec<(usize, Vec<u32>)>,
+) {
+    use gafime_orchestrator::semantic::*;
+    use gafime_types::PrecisionProfile;
+    use std::sync::Arc;
+
+    let make_frame = |rows: usize, offset: usize, role| {
+        Arc::new(
+            FeatureFrame::with_profile(
+                PrecisionProfile::Fp32,
+                vec!["x".into(), "y".into()],
+                "local-rt-parity".into(),
+                (offset as u64..(offset + rows) as u64).collect(),
+                role,
+                "fixed synthetic tabular fixture; no performance claim".into(),
+                vec![
+                    NumericColumn::from(
+                        (0..rows)
+                            .map(|i| ((i + offset) % 31) as f32 / 8.0 - 2.0)
+                            .collect::<Vec<_>>(),
+                    ),
+                    NumericColumn::from(
+                        (0..rows)
+                            .map(|i| ((i * 7 + offset) % 37) as f32 / 8.0 - 2.0)
+                            .collect::<Vec<_>>(),
+                    ),
+                ],
+            )
+            .unwrap(),
+        )
+    };
+    let training = make_frame(1024, 0, EvaluationRole::Discovery);
+    let registry = CandidateRegistry::new(
+        training.schema().to_vec(),
+        PrecisionProfile::Fp32,
+        ProgramLimits::default(),
+    )
+    .unwrap();
+    let mut session = SemanticSession::new(registry, backend, 128 << 20).unwrap();
+    let (atom, reference) = {
+        let mut round = session.begin_round(&[]).unwrap();
+        (
+            round.softsign(round.source(0).unwrap()).unwrap(),
+            round.source(1).unwrap(),
+        )
+    };
+    let channel = EvidenceChannel::new(
+        "reference".into(),
+        EvidenceDefinition::Association {
+            statistic: AssociationStatistic::Pearson,
+            context: AssociationContext::Reference { reference },
+        },
+    )
+    .unwrap();
+    let policy = SelectionPolicy {
+        primary: channel.id(),
+        pareto_objectives: vec![],
+        direction: Direction::Maximize,
+        constraints: vec![],
+        missing: MissingEvidence::RejectCandidate,
+        limit: 8,
+    };
+    let first = session
+        .evaluate(
+            executor,
+            Arc::clone(&training),
+            &[atom],
+            std::slice::from_ref(&channel),
+        )
+        .unwrap();
+    let accepted_atom = session.accept_with(executor, &first, &policy).unwrap();
+    assert_eq!(accepted_atom.len(), 1);
+    let regions = {
+        let mut round = session.begin_round(&accepted_atom).unwrap();
+        let mut regions = Vec::new();
+        for i in 0..4 {
+            let lo = -0.75 + i as f32 * 0.25;
+            let a = round
+                .hard_predicate(atom, PredicateComparator::GreaterThan, lo)
+                .unwrap();
+            let b = round
+                .hard_predicate(atom, PredicateComparator::LessEqual, lo + 0.5)
+                .unwrap();
+            let c = round
+                .hard_predicate(reference, PredicateComparator::LessEqual, 1.0)
+                .unwrap();
+            regions.push(round.decision_region(vec![a, b, c]).unwrap());
+        }
+        regions
+    };
+    let rank = EvidenceChannel::new(
+        "rank".into(),
+        EvidenceDefinition::Association {
+            statistic: AssociationStatistic::Spearman,
+            context: AssociationContext::Reference { reference },
+        },
+    )
+    .unwrap();
+    let table = session
+        .evaluate(executor, Arc::clone(&training), &regions, &[channel, rank])
+        .unwrap();
+    let evidence = table.records().iter().map(EvidenceRecord::value).collect();
+    let accepted_regions = session.accept_with(executor, &table, &policy).unwrap();
+    assert_eq!(accepted_regions.len(), regions.len());
+    // An accepted region is itself a legal later-round atom. On fresh inference
+    // rows this forces the local lowering to separate dependent region launches,
+    // not merely batch algebraic-input predicates that happen to be independent.
+    let regions = {
+        let mut round = session.begin_round(&accepted_regions).unwrap();
+        regions
+            .iter()
+            .map(|&region| {
+                round
+                    .hard_predicate(region, PredicateComparator::GreaterThan, 0.5)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let channel = EvidenceChannel::new(
+        "reference".into(),
+        EvidenceDefinition::Association {
+            statistic: AssociationStatistic::Pearson,
+            context: AssociationContext::Reference { reference },
+        },
+    )
+    .unwrap();
+    let policy = SelectionPolicy {
+        primary: channel.id(),
+        ..policy.clone()
+    };
+    let third = session
+        .evaluate(executor, Arc::clone(&training), &regions, &[channel])
+        .unwrap();
+    let accepted_regions = session.accept_with(executor, &third, &policy).unwrap();
+    assert_eq!(accepted_regions.len(), regions.len());
+    let inference = make_frame(173, 10_000, EvaluationRole::Inference);
+    let materialized = session
+        .materialize_accepted(executor, &inference, &accepted_regions)
+        .unwrap();
+    let delivered = if materialized.is_resident() {
+        session
+            .download_materialization(executor, &inference, &materialized)
+            .unwrap()
+    } else {
+        materialized
+    };
+    let mut output = accepted_regions
+        .iter()
+        .map(|accepted| {
+            let index = regions
+                .iter()
+                .position(|id| *id == accepted.feature())
+                .unwrap();
+            let bits = delivered
+                .get(accepted.feature())
+                .unwrap()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect();
+            (index, bits)
+        })
+        .collect::<Vec<_>>();
+    output.sort_by_key(|item| item.0);
+    session.close();
+    (evidence, output)
+}
+
+#[test]
+fn local_semantic_regions_reuse_accepted_atoms_and_execute_unlabeled_rows() {
+    use gafime_cpu::semantic::CoreEvidenceExecutor;
+    use gafime_orchestrator::semantic::EvidenceValue;
+    use gafime_types::{GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA};
+    let _guard = RT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(backend) = configured_cuda_backend("local semantic regions") else {
+        return;
+    };
+    // A configured non-RT/old payload is a failed explicit experiment, not a
+    // passing skip and never a request to silently substitute ordinary CUDA.
+    let mut rt = backend
+        .local_rt_semantic_executor()
+        .expect("explicit RT-capable current local payload required");
+    let mut cuda = backend.semantic_executor().unwrap();
+    let mut core = CoreEvidenceExecutor::default();
+    let expected = semantic_region_lifecycle(&mut core, GAFIME_BACKEND_CPU);
+    let standard = semantic_region_lifecycle(&mut cuda, GAFIME_BACKEND_CUDA);
+    let actual = semantic_region_lifecycle(&mut rt, GAFIME_BACKEND_CUDA);
+    assert_eq!(actual.1, expected.1, "RT memberships differ from Core");
+    assert_eq!(
+        actual.1, standard.1,
+        "RT memberships differ from ordinary CUDA"
+    );
+    assert_eq!(
+        actual.0, standard.0,
+        "RT changed the existing CUDA evidence arithmetic"
+    );
+    for (left, right) in actual.0.iter().zip(&expected.0) {
+        match (left, right) {
+            (
+                EvidenceValue::Measured { value: a, .. },
+                EvidenceValue::Measured { value: b, .. },
+            ) => assert!(
+                (a - b).abs() <= 5e-5,
+                "profile-native cross-backend evidence mismatch"
+            ),
+            _ => assert_eq!(left, right),
+        }
+    }
+    let diagnostics = rt.local_rt_diagnostics().unwrap();
+    assert!(diagnostics.completed_region_batches >= 2);
+    assert!(diagnostics.completed_regions >= 8);
+    assert!(diagnostics.peak_explicit_temporary_bytes > 0);
+    eprintln!("local semantic RT physical lifecycle: {diagnostics:?}");
+    assert!(cuda.local_rt_diagnostics().is_none());
+}
+
 static RT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvOverride {

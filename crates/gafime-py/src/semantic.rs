@@ -412,6 +412,24 @@ impl PyTabularSession {
                 ("hard_predicate", vec![*input])
             }
             FeatureOp::DecisionRegion { terms } => ("decision_region", terms.clone()),
+            FeatureOp::RegionCount { regions } => ("region_count", regions.clone()),
+            FeatureOp::RegionWeightedSum {
+                regions,
+                weight_bits,
+            } => {
+                // No Python constructor is exposed by the local experiment;
+                // introspection still describes any Rust-origin program truthfully.
+                let weights: Vec<f64> = match weight_bits {
+                    gafime_orchestrator::semantic::FrozenRegionWeights::F32(bits) => {
+                        bits.iter().map(|b| f64::from(f32::from_bits(*b))).collect()
+                    }
+                    gafime_orchestrator::semantic::FrozenRegionWeights::F64(bits) => {
+                        bits.iter().map(|b| f64::from_bits(*b)).collect()
+                    }
+                };
+                out.set_item("weights", weights)?;
+                ("region_weighted_sum", regions.clone())
+            }
         };
         out.set_item("operation", operation)?;
         out.set_item("operands", PyCandidateSet { ids: operands })?;
