@@ -402,6 +402,12 @@ def test_documentation_hierarchy_and_local_links_are_valid() -> None:
         ROOT / "docs" / "capabilities.md": (
             ROOT / "docs" / "capabilities.md"
         ).read_text(encoding="utf-8"),
+        ROOT / "docs" / "rt-semantic-batch-experiment.md": (
+            ROOT / "docs" / "rt-semantic-batch-experiment.md"
+        ).read_text(encoding="utf-8"),
+        ROOT / "docs" / "rt-semantic-compact-experiment.md": (
+            ROOT / "docs" / "rt-semantic-compact-experiment.md"
+        ).read_text(encoding="utf-8"),
     }
     notebook_markdown = "\n".join(
         "".join(cell["source"])
