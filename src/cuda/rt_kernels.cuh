@@ -64,6 +64,97 @@ __global__ void scatter_semantic_region_membership_kernel(
     uint32_t* invalid_out
 );
 
+/* Compact binary regional-statistics helpers.  They never materialize a
+ * path-major float matrix: overlap-safe paths retain one bit per
+ * (region,row), then reduce exact integer counts. */
+__global__ void semantic_region_binary_label_masks_kernel(
+    const uint64_t* row_indices,
+    const uint8_t* values,
+    uint64_t label_count,
+    uint32_t* label_zero_words,
+    uint32_t* label_one_words
+);
+
+__global__ void semantic_region_membership_masks_sm_kernel(
+    const float* primary_columns,
+    const float* paired_columns,
+    uint64_t rows,
+    const GafimeDecisionPathTerm* primary_terms,
+    const GafimeDecisionPathTerm* paired_terms,
+    const uint32_t* region_offsets,
+    uint32_t region_count,
+    uint32_t words_per_region,
+    uint32_t* primary_membership_words,
+    uint32_t* paired_membership_words
+);
+
+/* Exact SM baseline for grouped regions.  A conservative query-bound x-bin
+ * (ordered-float only for unbounded fallback groups) narrows candidates, then
+ * the same original predicate terms guard every candidate before its
+ * overlap-safe membership bit is set. */
+__global__ void semantic_region_membership_masks_binned_sm_kernel(
+    const float* primary_points_xyz,
+    const float* paired_points_xyz,
+    uint64_t rows,
+    const GafimeDecisionPathTerm* exact_terms,
+    const uint32_t* exact_region_offsets,
+    const uint32_t* group_path_offsets,
+    const uint32_t* group_region_ids,
+    const uint32_t* bin_offsets,
+    const uint32_t* bin_candidates,
+    const float* bin_lo,
+    const float* bin_inv_span,
+    uint32_t group_count,
+    uint32_t point_stride,
+    uint32_t point_group_stride,
+    uint32_t words_per_region,
+    uint32_t* primary_membership_words,
+    uint32_t* paired_membership_words
+);
+
+__global__ void reduce_semantic_region_membership_masks_kernel(
+    const uint32_t* primary_membership_words,
+    const uint32_t* paired_membership_words,
+    const uint32_t* label_zero_words,
+    const uint32_t* label_one_words,
+    uint64_t rows,
+    uint32_t region_count,
+    uint32_t words_per_region,
+    uint32_t statistic_mask,
+    uint64_t label_zero_count,
+    uint64_t label_one_count,
+    GafimeSemanticRtRegionExactStats* stats
+);
+
+__global__ void finalize_semantic_region_stats_kernel(
+    uint32_t region_count,
+    uint32_t statistic_mask,
+    uint32_t finalizer_mask,
+    uint64_t rows,
+    uint64_t label_zero_count,
+    uint64_t label_one_count,
+    GafimeSemanticRtRegionExactStats* stats
+);
+
+/* One exact target-free pointwise feature: the number of submitted regions
+ * whose retained binary membership contains each row. */
+__global__ void materialize_semantic_region_coverage_kernel(
+    const uint32_t* primary_membership_words,
+    uint64_t rows,
+    uint32_t region_count,
+    uint32_t words_per_region,
+    float* output_column
+);
+
+/* The proof-gated first-hit RT path keeps a per-row exact membership count
+ * rather than an R by N bitset.  This final scatter is intentionally tiny
+ * and shares the same fresh-slot commit gate as the bitset path. */
+__global__ void scatter_semantic_region_coverage_counts_kernel(
+    const uint32_t* coverage_counts,
+    uint64_t rows,
+    float* output_column
+);
+
 __host__ __device__ inline uint32_t rt_canonical_float_bits(float value) {
 #if defined(__CUDA_ARCH__)
     uint32_t bits = __float_as_uint(value);

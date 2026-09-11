@@ -188,6 +188,15 @@ the deeper bounded model: fitted-state provenance is separate from mathematical
 identity; hard regions, multi-objective selection and training-bound proposals
 remain Rust-owned. A future RT lowering must not change those semantics.
 
+The local compact conditional experiment is specified in
+`docs/rt-semantic-compact-experiment.md`. Binary evidence and region-count
+candidate semantics stay Rust-owned, with Core as the numerical reference.
+Compact execution may defer candidate columns until selection; native RT
+queries own only physical descriptors, counts, and numeric finalization, never
+semantic IDs or policy. This adds no Python constructor, standard payload
+capability, or release surface. Keep local query sources and symbols excluded
+from all standard artifacts and fail closed on unsupported execution paths.
+
 Candidate stabilization branches use `release/v<canonical-semver>` and may be
 cut only from an exact `main` commit whose required checks are green. Creating
 one is source-control coordination only: it does not change version identity,

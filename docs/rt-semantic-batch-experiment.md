@@ -77,6 +77,12 @@ the number of primitive tests performed by this experiment. General predicates,
 tree induction, Gini scoring and promotion into normal packages remain separate
 decisions under #75.
 
+The planned [compact conditional-evidence follow-up](rt-semantic-compact-experiment.md)
+asks a distinct pre-materialization question with exact occupancy, paired, and
+optional partial-binary-label counts. It preserves this document's cold
+dense-column baseline and does not transfer the historical compact-score
+measurements into that new workload.
+
 ## Local reproduction
 
 Use the active source checkout and a locally installed OptiX SDK. These commands

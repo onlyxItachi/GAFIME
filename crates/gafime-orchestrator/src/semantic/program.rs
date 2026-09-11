@@ -251,6 +251,14 @@ pub enum FeatureOp {
     DecisionRegion {
         terms: Vec<FeatureId>,
     },
+    /// Target-free per-row coverage count across distinct canonical decision
+    /// regions.  The operand order is canonicalized because integer addition
+    /// is commutative before its one profile-native pointwise conversion.
+    /// This is a bounded candidate form, not a tree, rule learner, or another
+    /// predicate language.
+    RegionCount {
+        regions: Vec<FeatureId>,
+    },
 }
 
 /// One immutable semantic program in a [`CandidateRegistry`].
@@ -301,6 +309,16 @@ impl FeatureProgram {
     pub fn decision_region_terms(&self) -> Option<&[FeatureId]> {
         match &self.op {
             FeatureOp::DecisionRegion { terms } => Some(terms),
+            _ => None,
+        }
+    }
+
+    /// Return the canonical region memberships summed by a coverage-count
+    /// program.  This remains a program dependency list rather than a second
+    /// native semantic descriptor.
+    pub fn region_count_regions(&self) -> Option<&[FeatureId]> {
+        match &self.op {
+            FeatureOp::RegionCount { regions } => Some(regions),
             _ => None,
         }
     }
@@ -592,6 +610,16 @@ impl CandidateRegistry {
         self.insert_derived(FeatureOp::DecisionRegion { terms }, metadata)
     }
 
+    /// Add or resolve a canonical target-free coverage count across frozen
+    /// decision-region memberships.  One region is intentionally rejected:
+    /// it would duplicate an existing binary region under a second candidate
+    /// identity rather than establish a new mathematical form.
+    pub fn region_count(&mut self, regions: Vec<FeatureId>) -> SemanticResult<FeatureId> {
+        let regions = self.canonical_region_count_regions(&regions)?;
+        let metadata = self.derived_metadata_from_valid_inputs(&regions)?;
+        self.insert_derived(FeatureOp::RegionCount { regions }, metadata)
+    }
+
     /// Resolve one registry-owned identity to its immutable semantic program.
     pub fn program(&self, id: FeatureId) -> SemanticResult<&FeatureProgram> {
         if id.registry != self.token {
@@ -756,6 +784,10 @@ impl CandidateRegistry {
                 FeatureOp::DecisionRegion { terms } => {
                     charge_training_lineage_work(work, terms.len(), max_work)?;
                     pending.extend(terms);
+                }
+                FeatureOp::RegionCount { regions } => {
+                    charge_training_lineage_work(work, regions.len(), max_work)?;
+                    pending.extend(regions);
                 }
             }
         }
@@ -993,6 +1025,41 @@ impl CandidateRegistry {
             region_term_count: terms.len(),
             depth,
         })
+    }
+
+    fn canonical_region_count_regions(
+        &self,
+        regions: &[FeatureId],
+    ) -> SemanticResult<Vec<FeatureId>> {
+        if regions.len() < 2 {
+            return Err(SemanticError::Invalid(
+                "region coverage requires at least two distinct decision regions",
+            ));
+        }
+        if regions.len() > self.limits.max_logical_arity {
+            return Err(SemanticError::Unsupported(
+                "region coverage exceeds logical arity limit",
+            ));
+        }
+        let mut regions = regions.to_vec();
+        regions.sort();
+        if regions.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(SemanticError::Invalid(
+                "region coverage repeats a decision region",
+            ));
+        }
+        for &region in &regions {
+            match self.program(region)?.op() {
+                FeatureOp::DecisionRegion { .. } => {}
+                _ => {
+                    return Err(SemanticError::Invalid(
+                        "region coverage inputs must be canonical decision regions",
+                    ))
+                }
+            }
+        }
+        self.validate_derived_inputs(&regions)?;
+        Ok(regions)
     }
 
     fn compare_thresholds(

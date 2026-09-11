@@ -40,12 +40,28 @@ pub type GafimeGpuSemanticRegionMaterializeRtFn = unsafe extern "C" fn(
     peak_bytes_out: *mut u64,
 ) -> GafimeStatus;
 
+pub use crate::semantic::local_compact::LocalCompactDiagnostics;
+
 #[derive(Clone, Copy, Default)]
 pub struct LocalCmakeExperimentFunctions {
     pub decision_path_membership: Option<GafimeGpuDecisionPathMembershipFn>,
     pub decision_path_score: Option<GafimeGpuDecisionPathScoreFn>,
     pub decision_path_release_device_state: Option<GafimeGpuDecisionPathReleaseDeviceStateFn>,
     pub semantic_region_materialize_rt: Option<GafimeGpuSemanticRegionMaterializeRtFn>,
+    pub semantic_region_query_create_rt: Option<crate::semantic::local_compact::CreateFn>,
+    pub semantic_region_query_execute_rt: Option<crate::semantic::local_compact::ExecuteFn>,
+    pub semantic_region_query_free_rt: Option<crate::semantic::local_compact::FreeFn>,
+    pub semantic_region_query_materialize_coverage_rt:
+        Option<crate::semantic::local_compact::CoverageFn>,
+}
+
+impl LocalCmakeExperimentFunctions {
+    pub(crate) fn has_region_coverage(&self) -> bool {
+        self.semantic_region_query_create_rt.is_some()
+            && self.semantic_region_query_execute_rt.is_some()
+            && self.semantic_region_query_free_rt.is_some()
+            && self.semantic_region_query_materialize_coverage_rt.is_some()
+    }
 }
 
 /// # Safety
@@ -69,6 +85,22 @@ pub(crate) unsafe fn load_function_table(library: &Library) -> LocalCmakeExperim
                 library,
                 "gafime_gpu_semantic_region_materialize_rt_v1",
             ),
+            semantic_region_query_create_rt: load_optional_symbol(
+                library,
+                "gafime_gpu_semantic_region_query_create_rt_v1",
+            ),
+            semantic_region_query_execute_rt: load_optional_symbol(
+                library,
+                "gafime_gpu_semantic_region_query_execute_rt_v1",
+            ),
+            semantic_region_query_free_rt: load_optional_symbol(
+                library,
+                "gafime_gpu_semantic_region_query_free_rt_v1",
+            ),
+            semantic_region_query_materialize_coverage_rt: load_optional_symbol(
+                library,
+                "gafime_gpu_semantic_region_query_materialize_coverage_rt_v1",
+            ),
         }
     }
 }
@@ -80,6 +112,7 @@ pub(crate) unsafe fn load_function_table(library: &Library) -> LocalCmakeExperim
 pub struct LocalSemanticRtDiagnostics {
     pub completed_region_batches: u64,
     pub completed_regions: u64,
+    pub completed_coverage_features: u64,
     pub peak_explicit_temporary_bytes: u64,
 }
 
@@ -211,15 +244,33 @@ impl LocalSemanticRegionExecution {
         let is_region = |node: &SemanticProgramNode| {
             matches!(node, SemanticProgramNode::FrozenRegionConjunction { .. })
         };
+        let is_special = |node: &SemanticProgramNode| {
+            is_region(node) || matches!(node, SemanticProgramNode::RegionCount { .. })
+        };
         let mut first = 0;
         while first < nodes.len() {
+            if let SemanticProgramNode::RegionCount {
+                output_slot,
+                regions,
+            } = &nodes[first]
+            {
+                let peak =
+                    bank.materialize_local_region_count(*output_slot, regions, available_bytes)?;
+                self.diagnostics.completed_coverage_features += 1;
+                self.diagnostics.peak_explicit_temporary_bytes = self
+                    .diagnostics
+                    .peak_explicit_temporary_bytes
+                    .max(peak as u64);
+                first += 1;
+                continue;
+            }
             let region = is_region(&nodes[first]);
             let end = if region {
                 first + local_region_run_len(&nodes[first..])?
             } else {
                 nodes[first..]
                     .iter()
-                    .position(is_region)
+                    .position(is_special)
                     .map_or(nodes.len(), |offset| first + offset)
             };
             let run = &nodes[first..end];

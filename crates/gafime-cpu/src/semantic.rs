@@ -8,10 +8,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use gafime_orchestrator::semantic::{
-    AssociationContext, AssociationStatistic, CandidateRegistry, EvidenceDefinition, EvidenceValue,
-    FeatureFrame, FeatureId, FeatureOp, FrozenMeans, FrozenThreshold, LabelSet,
-    MaterializedColumns, NativeEvidenceExecutor, NeighborGraph, NumericColumn, PredicateComparator,
-    SemanticError, SemanticResult, UnavailableReason,
+    AssociationContext, AssociationStatistic, BinaryPairedStatistic, CandidateRegistry,
+    EvidenceDefinition, EvidenceValue, FeatureFrame, FeatureId, FeatureOp, FrozenMeans,
+    FrozenThreshold, LabelSet, MaterializedColumns, NativeEvidenceExecutor, NeighborGraph,
+    NumericColumn, PredicateComparator, SemanticError, SemanticResult, UnavailableReason,
 };
 use gafime_types::{PrecisionProfile, GAFIME_BACKEND_CPU};
 use rayon::prelude::*;
@@ -147,6 +147,7 @@ impl NativeEvidenceExecutor for CoreEvidenceExecutor {
                 }
                 FeatureOp::CenteredProduct { operands, .. } => pending.extend(operands),
                 FeatureOp::DecisionRegion { terms } => pending.extend(terms),
+                FeatureOp::RegionCount { regions } => pending.extend(regions),
             }
         }
 
@@ -322,6 +323,36 @@ impl NativeEvidenceExecutor for CoreEvidenceExecutor {
                 }
                 parallel_graph_energy(candidates, values, graph)?
             }
+            EvidenceDefinition::BinaryOccupancy => binary_occupancy(candidates, values)?,
+            EvidenceDefinition::BinaryPaired { statistic, view } => {
+                let paired = paired.ok_or(SemanticError::Invalid(
+                    "paired binary evidence requires materialized view",
+                ))?;
+                if paired.frame_id() != view.id()
+                    || paired.profile() != view.profile()
+                    || paired.profile() != values.profile()
+                {
+                    return Err(SemanticError::Invalid(
+                        "paired binary materialization context or precision mismatch",
+                    ));
+                }
+                validate_bank_profile(paired, candidates)?;
+                binary_paired(candidates, values, paired, *statistic)?
+            }
+            EvidenceDefinition::BinaryLabeledGiniGain { labels: None } => (
+                vec![unavailable(UnavailableReason::MissingLabels, 0); candidates.len()],
+                0,
+            ),
+            EvidenceDefinition::BinaryLabeledGiniGain {
+                labels: Some(labels),
+            } => {
+                if labels.frame_id() != values.frame_id() || labels.profile() != values.profile() {
+                    return Err(SemanticError::Invalid(
+                        "binary Gini label context or precision mismatch",
+                    ));
+                }
+                binary_labeled_gini_gain(candidates, values, labels)?
+            }
         };
         self.evidence_kernel_calls = self.evidence_kernel_calls.saturating_add(calls);
         Ok(evidence)
@@ -475,6 +506,10 @@ fn materialize_node(
         ),
         FeatureOp::DecisionRegion { terms } => (
             decision_region(frame.profile(), terms, bank, frame.rows())?,
+            false,
+        ),
+        FeatureOp::RegionCount { regions } => (
+            region_count(frame.profile(), regions, bank, frame.rows())?,
             false,
         ),
     };
@@ -721,6 +756,87 @@ fn decision_region(
                 } else {
                     1.0
                 });
+            }
+            Ok(NumericColumn::from(output))
+        }
+    }
+}
+
+/// Target-free coverage-count materialization.  Membership inputs are summed
+/// as exact host integers first; only the completed row count is converted to
+/// the selected pointwise storage type.  This deliberately does not reuse a
+/// floating accumulation loop or reinterpret the count as a Boolean.
+fn region_count(
+    profile: PrecisionProfile,
+    regions: &[FeatureId],
+    bank: &BTreeMap<FeatureId, NumericColumn>,
+    rows: usize,
+) -> SemanticResult<NumericColumn> {
+    if regions.len() < 2 {
+        return Err(SemanticError::Invalid(
+            "region coverage requires at least two decision-region memberships",
+        ));
+    }
+    match profile {
+        PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+            let inputs = regions
+                .iter()
+                .map(|&region| {
+                    let values = operand(bank, region)?.as_f32()?;
+                    if values.len() != rows {
+                        return Err(SemanticError::Invalid(
+                            "unaligned region coverage membership",
+                        ));
+                    }
+                    Ok(values)
+                })
+                .collect::<SemanticResult<Vec<_>>>()?;
+            let mut output = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let mut count = 0usize;
+                for values in &inputs {
+                    match values[row] {
+                        0.0 => {}
+                        1.0 => count += 1,
+                        _ => {
+                            return Err(SemanticError::Invalid(
+                                "region coverage input is not an exact finite membership",
+                            ))
+                        }
+                    }
+                }
+                output.push(count as f32);
+            }
+            Ok(NumericColumn::from(output))
+        }
+        PrecisionProfile::Fp64 => {
+            let inputs = regions
+                .iter()
+                .map(|&region| {
+                    let values = operand(bank, region)?.as_f64()?;
+                    if values.len() != rows {
+                        return Err(SemanticError::Invalid(
+                            "unaligned region coverage membership",
+                        ));
+                    }
+                    Ok(values)
+                })
+                .collect::<SemanticResult<Vec<_>>>()?;
+            let mut output = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let mut count = 0usize;
+                for values in &inputs {
+                    match values[row] {
+                        0.0 => {}
+                        1.0 => count += 1,
+                        _ => {
+                            return Err(SemanticError::Invalid(
+                                "region coverage input is not an exact finite membership",
+                            ))
+                        }
+                    }
+                }
+                output.push(count as f64);
             }
             Ok(NumericColumn::from(output))
         }
@@ -1428,6 +1544,412 @@ fn parallel_graph_energy(
         .map(|&candidate| graph_energy(values.profile(), values.get_typed(candidate)?, graph))
         .collect();
     Ok(split_evidence(results?))
+}
+
+fn binary_occupancy(
+    candidates: &[FeatureId],
+    values: &MaterializedColumns,
+) -> SemanticResult<(Vec<EvidenceValue>, usize)> {
+    let result: SemanticResult<Vec<_>> = candidates
+        .par_iter()
+        .map(|&candidate| binary_occupancy_column(values.profile(), values.get_typed(candidate)?))
+        .collect();
+    let result = result?;
+    Ok((result, candidates.len()))
+}
+
+fn binary_occupancy_column(
+    profile: PrecisionProfile,
+    values: &NumericColumn,
+) -> SemanticResult<EvidenceValue> {
+    match profile {
+        PrecisionProfile::Fp32 => {
+            let values = values.as_f32()?;
+            let positives = binary_positive_count_f32(values)?;
+            // A binary occupancy fraction is defined for one observed row.
+            // Keep this in lockstep with the local RT finalizer: only an
+            // empty row domain has insufficient support.
+            if values.is_empty() {
+                return Ok(unavailable(
+                    UnavailableReason::InsufficientSupport,
+                    values.len(),
+                ));
+            }
+            Ok(EvidenceValue::measured_f32(
+                positives as f32 / values.len() as f32,
+                values.len(),
+            ))
+        }
+        PrecisionProfile::Mixed => {
+            let values = values.as_f32()?;
+            let positives = binary_positive_count_f32(values)?;
+            if values.is_empty() {
+                return Ok(unavailable(
+                    UnavailableReason::InsufficientSupport,
+                    values.len(),
+                ));
+            }
+            Ok(EvidenceValue::measured(
+                positives as f64 / values.len() as f64,
+                values.len(),
+            ))
+        }
+        PrecisionProfile::Fp64 => {
+            let values = values.as_f64()?;
+            let positives = binary_positive_count_f64(values)?;
+            if values.is_empty() {
+                return Ok(unavailable(
+                    UnavailableReason::InsufficientSupport,
+                    values.len(),
+                ));
+            }
+            Ok(EvidenceValue::measured(
+                positives as f64 / values.len() as f64,
+                values.len(),
+            ))
+        }
+    }
+}
+
+fn binary_paired(
+    candidates: &[FeatureId],
+    values: &MaterializedColumns,
+    paired: &MaterializedColumns,
+    statistic: BinaryPairedStatistic,
+) -> SemanticResult<(Vec<EvidenceValue>, usize)> {
+    let result: SemanticResult<Vec<_>> = candidates
+        .par_iter()
+        .map(|&candidate| {
+            binary_paired_columns(
+                values.profile(),
+                values.get_typed(candidate)?,
+                paired.get_typed(candidate)?,
+                statistic,
+            )
+        })
+        .collect();
+    let result = result?;
+    Ok((result, candidates.len()))
+}
+
+fn binary_paired_columns(
+    profile: PrecisionProfile,
+    left: &NumericColumn,
+    right: &NumericColumn,
+    statistic: BinaryPairedStatistic,
+) -> SemanticResult<EvidenceValue> {
+    let counts = match profile {
+        PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+            binary_pair_counts_f32(left.as_f32()?, right.as_f32()?)?
+        }
+        PrecisionProfile::Fp64 => binary_pair_counts_f64(left.as_f64()?, right.as_f64()?)?,
+    };
+    // Agreement and nonempty-union IoU are both defined for a singleton
+    // aligned row domain.  The RT finalizer reserves InsufficientSupport for
+    // an empty domain; IoU's separately undefined empty-union case is below.
+    if counts.rows == 0 {
+        return Ok(unavailable(
+            UnavailableReason::InsufficientSupport,
+            counts.rows,
+        ));
+    }
+    match (profile, statistic) {
+        (PrecisionProfile::Fp32, BinaryPairedStatistic::Agreement) => Ok(
+            EvidenceValue::measured_f32(counts.agreement as f32 / counts.rows as f32, counts.rows),
+        ),
+        (PrecisionProfile::Mixed, BinaryPairedStatistic::Agreement)
+        | (PrecisionProfile::Fp64, BinaryPairedStatistic::Agreement) => Ok(
+            EvidenceValue::measured(counts.agreement as f64 / counts.rows as f64, counts.rows),
+        ),
+        (_, BinaryPairedStatistic::IntersectionOverUnion) if counts.union == 0 => {
+            Ok(unavailable(UnavailableReason::ConstantOperand, counts.rows))
+        }
+        (PrecisionProfile::Fp32, BinaryPairedStatistic::IntersectionOverUnion) => {
+            Ok(EvidenceValue::measured_f32(
+                counts.intersection as f32 / counts.union as f32,
+                counts.rows,
+            ))
+        }
+        (PrecisionProfile::Mixed, BinaryPairedStatistic::IntersectionOverUnion)
+        | (PrecisionProfile::Fp64, BinaryPairedStatistic::IntersectionOverUnion) => {
+            Ok(EvidenceValue::measured(
+                counts.intersection as f64 / counts.union as f64,
+                counts.rows,
+            ))
+        }
+    }
+}
+
+fn binary_labeled_gini_gain(
+    candidates: &[FeatureId],
+    values: &MaterializedColumns,
+    labels: &LabelSet,
+) -> SemanticResult<(Vec<EvidenceValue>, usize)> {
+    if labels.rows().len() != labels.values_typed().len()
+        || !labels.values_typed().supports_profile(values.profile())
+    {
+        return Err(SemanticError::Invalid(
+            "binary Gini label rows and values are not aligned",
+        ));
+    }
+    if labels.rows().len() < 2 {
+        return Ok((
+            vec![
+                unavailable(UnavailableReason::InsufficientSupport, labels.rows().len());
+                candidates.len()
+            ],
+            0,
+        ));
+    }
+    let result: SemanticResult<Vec<_>> = candidates
+        .par_iter()
+        .map(|&candidate| {
+            binary_labeled_gini_column(values.profile(), values.get_typed(candidate)?, labels)
+        })
+        .collect();
+    Ok((result?, candidates.len()))
+}
+
+fn binary_labeled_gini_column(
+    profile: PrecisionProfile,
+    values: &NumericColumn,
+    labels: &LabelSet,
+) -> SemanticResult<EvidenceValue> {
+    let counts = match profile {
+        PrecisionProfile::Fp32 | PrecisionProfile::Mixed => binary_gini_counts_f32(
+            values.as_f32()?,
+            labels.rows(),
+            labels.values_typed().as_f32()?,
+        )?,
+        PrecisionProfile::Fp64 => binary_gini_counts_f64(
+            values.as_f64()?,
+            labels.rows(),
+            labels.values_typed().as_f64()?,
+        )?,
+    };
+    let support = counts.support();
+    if support < 2 {
+        return Ok(unavailable(UnavailableReason::InsufficientSupport, support));
+    }
+    if counts.inside() == 0
+        || counts.outside() == 0
+        || counts.class_zero() == 0
+        || counts.class_one() == 0
+    {
+        return Ok(unavailable(UnavailableReason::ConstantOperand, support));
+    }
+    match profile {
+        PrecisionProfile::Fp32 => Ok(EvidenceValue::measured_f32(gini_gain_f32(counts), support)),
+        PrecisionProfile::Mixed | PrecisionProfile::Fp64 => {
+            Ok(EvidenceValue::measured(gini_gain_f64(counts), support))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BinaryPairCounts {
+    rows: usize,
+    agreement: usize,
+    intersection: usize,
+    union: usize,
+}
+
+fn binary_pair_counts_f32(left: &[f32], right: &[f32]) -> SemanticResult<BinaryPairCounts> {
+    if left.len() != right.len() {
+        return Err(SemanticError::Invalid(
+            "paired binary columns have different row counts",
+        ));
+    }
+    let mut counts = BinaryPairCounts {
+        rows: left.len(),
+        ..BinaryPairCounts::default()
+    };
+    for (&left, &right) in left.iter().zip(right) {
+        let left = binary_bit_f32(left)?;
+        let right = binary_bit_f32(right)?;
+        if left == right {
+            counts.agreement += 1;
+        }
+        if left && right {
+            counts.intersection += 1;
+        }
+        if left || right {
+            counts.union += 1;
+        }
+    }
+    Ok(counts)
+}
+
+fn binary_pair_counts_f64(left: &[f64], right: &[f64]) -> SemanticResult<BinaryPairCounts> {
+    if left.len() != right.len() {
+        return Err(SemanticError::Invalid(
+            "paired binary columns have different row counts",
+        ));
+    }
+    let mut counts = BinaryPairCounts {
+        rows: left.len(),
+        ..BinaryPairCounts::default()
+    };
+    for (&left, &right) in left.iter().zip(right) {
+        let left = binary_bit_f64(left)?;
+        let right = binary_bit_f64(right)?;
+        if left == right {
+            counts.agreement += 1;
+        }
+        if left && right {
+            counts.intersection += 1;
+        }
+        if left || right {
+            counts.union += 1;
+        }
+    }
+    Ok(counts)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BinaryGiniCounts {
+    outside_zero: usize,
+    outside_one: usize,
+    inside_zero: usize,
+    inside_one: usize,
+}
+
+impl BinaryGiniCounts {
+    const fn outside(self) -> usize {
+        self.outside_zero + self.outside_one
+    }
+    const fn inside(self) -> usize {
+        self.inside_zero + self.inside_one
+    }
+    const fn class_zero(self) -> usize {
+        self.outside_zero + self.inside_zero
+    }
+    const fn class_one(self) -> usize {
+        self.outside_one + self.inside_one
+    }
+    const fn support(self) -> usize {
+        self.outside() + self.inside()
+    }
+}
+
+fn binary_gini_counts_f32(
+    values: &[f32],
+    rows: &[usize],
+    labels: &[f32],
+) -> SemanticResult<BinaryGiniCounts> {
+    if rows.len() != labels.len() {
+        return Err(SemanticError::Invalid(
+            "binary Gini label rows and values are not aligned",
+        ));
+    }
+    let mut counts = BinaryGiniCounts::default();
+    for (&row, &label) in rows.iter().zip(labels) {
+        let membership = binary_bit_f32(*values.get(row).ok_or(SemanticError::Invalid(
+            "binary Gini label row out of bounds",
+        ))?)?;
+        let label = binary_bit_f32(label)?;
+        match (membership, label) {
+            (false, false) => counts.outside_zero += 1,
+            (false, true) => counts.outside_one += 1,
+            (true, false) => counts.inside_zero += 1,
+            (true, true) => counts.inside_one += 1,
+        }
+    }
+    Ok(counts)
+}
+
+fn binary_gini_counts_f64(
+    values: &[f64],
+    rows: &[usize],
+    labels: &[f64],
+) -> SemanticResult<BinaryGiniCounts> {
+    if rows.len() != labels.len() {
+        return Err(SemanticError::Invalid(
+            "binary Gini label rows and values are not aligned",
+        ));
+    }
+    let mut counts = BinaryGiniCounts::default();
+    for (&row, &label) in rows.iter().zip(labels) {
+        let membership = binary_bit_f64(*values.get(row).ok_or(SemanticError::Invalid(
+            "binary Gini label row out of bounds",
+        ))?)?;
+        let label = binary_bit_f64(label)?;
+        match (membership, label) {
+            (false, false) => counts.outside_zero += 1,
+            (false, true) => counts.outside_one += 1,
+            (true, false) => counts.inside_zero += 1,
+            (true, true) => counts.inside_one += 1,
+        }
+    }
+    Ok(counts)
+}
+
+fn binary_positive_count_f32(values: &[f32]) -> SemanticResult<usize> {
+    values.iter().try_fold(0usize, |count, &value| {
+        Ok(count + usize::from(binary_bit_f32(value)?))
+    })
+}
+
+fn binary_positive_count_f64(values: &[f64]) -> SemanticResult<usize> {
+    values.iter().try_fold(0usize, |count, &value| {
+        Ok(count + usize::from(binary_bit_f64(value)?))
+    })
+}
+
+fn binary_bit_f32(value: f32) -> SemanticResult<bool> {
+    if value == 0.0 {
+        Ok(false)
+    } else if value == 1.0 {
+        Ok(true)
+    } else {
+        Err(SemanticError::Invalid(
+            "binary evidence received a value other than exact 0 or 1",
+        ))
+    }
+}
+
+fn binary_bit_f64(value: f64) -> SemanticResult<bool> {
+    if value == 0.0 {
+        Ok(false)
+    } else if value == 1.0 {
+        Ok(true)
+    } else {
+        Err(SemanticError::Invalid(
+            "binary evidence received a value other than exact 0 or 1",
+        ))
+    }
+}
+
+fn gini_gain_f32(counts: BinaryGiniCounts) -> f32 {
+    let support = counts.support() as f32;
+    let parent = gini_f32(counts.class_zero(), counts.class_one());
+    let outside = gini_f32(counts.outside_zero, counts.outside_one);
+    let inside = gini_f32(counts.inside_zero, counts.inside_one);
+    (parent - (counts.outside() as f32 / support) * outside)
+        - (counts.inside() as f32 / support) * inside
+}
+
+fn gini_gain_f64(counts: BinaryGiniCounts) -> f64 {
+    let support = counts.support() as f64;
+    let parent = gini_f64(counts.class_zero(), counts.class_one());
+    let outside = gini_f64(counts.outside_zero, counts.outside_one);
+    let inside = gini_f64(counts.inside_zero, counts.inside_one);
+    (parent - (counts.outside() as f64 / support) * outside)
+        - (counts.inside() as f64 / support) * inside
+}
+
+fn gini_f32(class_zero: usize, class_one: usize) -> f32 {
+    let support = (class_zero + class_one) as f32;
+    let zero = class_zero as f32 / support;
+    let one = class_one as f32 / support;
+    1.0 - zero * zero - one * one
+}
+
+fn gini_f64(class_zero: usize, class_one: usize) -> f64 {
+    let support = (class_zero + class_one) as f64;
+    let zero = class_zero as f64 / support;
+    let one = class_one as f64 / support;
+    1.0 - zero * zero - one * one
 }
 
 fn graph_energy(

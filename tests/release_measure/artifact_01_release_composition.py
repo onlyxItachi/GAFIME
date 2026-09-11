@@ -90,7 +90,7 @@ FORBIDDEN_PRECISION_DISTRIBUTION_IDENTITY = re.compile(
 FORBIDDEN_RT_ABI_IDENTITIES = re.compile(
     rb"(?<![A-Za-z0-9_])"
     rb"(?:gafime_gpu_decision_path_(?:membership|score|release_device_state)|"
-    rb"gafime_gpu_semantic_region_materialize_rt_v1)"
+    rb"gafime_gpu_semantic_region_(?:materialize_rt_v1|query_[a-z_]+_rt_v1))"
     rb"(?![A-Za-z0-9_])"
 )
 FORBIDDEN_OPTIX_IDENTIFIERS = re.compile(
@@ -673,6 +673,10 @@ def _assert_rt_matchers() -> None:
         b"gafime_gpu_decision_path_score",
         b"gafime_gpu_decision_path_release_device_state",
         b"gafime_gpu_semantic_region_materialize_rt_v1",
+        b"gafime_gpu_semantic_region_query_create_rt_v1",
+        b"gafime_gpu_semantic_region_query_execute_rt_v1",
+        b"gafime_gpu_semantic_region_query_free_rt_v1",
+        b"gafime_gpu_semantic_region_query_materialize_coverage_rt_v1",
         b"DecisionPathRtPolicy",
         b"GafimeDecisionPathScoreBatch",
         b"supports_decision_path_membership",
@@ -2756,6 +2760,7 @@ def _assert_source_tree(root: Path) -> None:
     required_sdist_exclusions = {
         "crates/gafime-types/src/local_cmake_experiment.rs",
         "crates/gafime-gpu-sys/src/local_cmake_experiment.rs",
+        "crates/gafime-gpu-sys/src/local_cmake_experiment/**",
         "crates/gafime-gpu-sys/src/tests/local_cmake_experiment.rs",
         "crates/gafime-gpu-sys/tests/local_cmake_experiment_numeric_domain.rs",
         "crates/gafime-py/src/generated/local_cmake_experiment.rs",

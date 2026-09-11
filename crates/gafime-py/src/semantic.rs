@@ -412,6 +412,7 @@ impl PyTabularSession {
                 ("hard_predicate", vec![*input])
             }
             FeatureOp::DecisionRegion { terms } => ("decision_region", terms.clone()),
+            FeatureOp::RegionCount { regions } => ("region_count", regions.clone()),
         };
         out.set_item("operation", operation)?;
         out.set_item("operands", PyCandidateSet { ids: operands })?;

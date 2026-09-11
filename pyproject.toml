@@ -92,6 +92,7 @@ include = [
 exclude = [
     { path = "crates/gafime-types/src/local_cmake_experiment.rs", format = "sdist" },
     { path = "crates/gafime-gpu-sys/src/local_cmake_experiment.rs", format = "sdist" },
+    { path = "crates/gafime-gpu-sys/src/local_cmake_experiment/**", format = "sdist" },
     { path = "crates/gafime-gpu-sys/src/tests/local_cmake_experiment.rs", format = "sdist" },
     { path = "crates/gafime-gpu-sys/tests/local_cmake_experiment_numeric_domain.rs", format = "sdist" },
     { path = "crates/gafime-py/src/generated/local_cmake_experiment.rs", format = "sdist" },

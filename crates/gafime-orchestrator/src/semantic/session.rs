@@ -259,6 +259,63 @@ impl MaterializedColumns {
     pub fn is_resident(&self) -> bool {
         matches!(self.storage, MaterializedStorage::Resident { .. })
     }
+
+    /// True when every stored feature is among `allowed`.  This stays local to
+    /// the orchestration boundary: native executors never receive a mutable
+    /// candidate identity map and cannot use this as a second semantic
+    /// registry.
+    fn contains_only(&self, allowed: &BTreeSet<FeatureId>) -> bool {
+        match &self.storage {
+            MaterializedStorage::Host(columns) => columns.keys().all(|id| allowed.contains(id)),
+            MaterializedStorage::Resident { slots, .. } => {
+                slots.keys().all(|id| allowed.contains(id))
+            }
+        }
+    }
+}
+
+/// One atomic compact-evidence result.  A compact executor may return only
+/// dependency columns instead of a dense column for every evaluated candidate,
+/// but it must return evidence for every requested channel in the same call.
+/// Candidate identity, context validation, selection, and later chosen-column
+/// materialization remain owned by the session.
+pub struct CompactEvidenceBatch {
+    dependencies: MaterializedColumns,
+    channel_values: Vec<Vec<EvidenceValue>>,
+    /// Conservative executor-owned peak for the compact call, including its
+    /// returned dependency bank and any persistent local query state it keeps
+    /// live after returning.  It excludes the session's separately retained
+    /// bank, which the caller accounts before invoking the hook.
+    explicit_peak_bytes: usize,
+}
+
+impl CompactEvidenceBatch {
+    /// Construct a local executor result.  The session validates context,
+    /// feature ownership, channel shape, finiteness, and the reported peak
+    /// before it records any evidence.
+    pub fn new(
+        dependencies: MaterializedColumns,
+        channel_values: Vec<Vec<EvidenceValue>>,
+        explicit_peak_bytes: usize,
+    ) -> Self {
+        Self {
+            dependencies,
+            channel_values,
+            explicit_peak_bytes,
+        }
+    }
+
+    pub fn dependencies(&self) -> &MaterializedColumns {
+        &self.dependencies
+    }
+
+    pub fn channel_values(&self) -> &[Vec<EvidenceValue>] {
+        &self.channel_values
+    }
+
+    pub const fn explicit_peak_bytes(&self) -> usize {
+        self.explicit_peak_bytes
+    }
 }
 
 /// Native kernels own arithmetic and candidate-level parallelism. The
@@ -283,6 +340,24 @@ pub trait NativeEvidenceExecutor {
         paired: Option<&MaterializedColumns>,
         max_bytes: usize,
     ) -> SemanticResult<Vec<EvidenceValue>>;
+
+    /// Optionally evaluate a complete compact batch before the ordinary dense
+    /// candidate materialization route.  `Some` is atomic over `channels`:
+    /// an executor must not return a mixture of compact and ordinary channel
+    /// values.  Returning `None` preserves the established materialize then
+    /// evaluate path exactly.  This is a local Rust seam, not a semantic ABI,
+    /// feature IR, target protocol, or backend policy catalog.
+    fn evaluate_compact(
+        &mut self,
+        _registry: &CandidateRegistry,
+        _frame: &FeatureFrame,
+        _candidates: &[FeatureId],
+        _channels: &[EvidenceChannel],
+        _retained: Option<&MaterializedColumns>,
+        _max_bytes: usize,
+    ) -> SemanticResult<Option<CompactEvidenceBatch>> {
+        Ok(None)
+    }
 
     /// Validate backend capabilities and return a conservative additional work
     /// charge before materialization. The session aggregates unique channels:
@@ -525,6 +600,18 @@ impl DiscoveryRound<'_> {
             self.operand(term)?;
         }
         let id = self.registry.decision_region(terms)?;
+        self.eligible.insert(id);
+        Ok(id)
+    }
+
+    /// Declare one target-free count of distinct frozen decision-region
+    /// memberships.  Region identity and dependency validation remain in the
+    /// canonical registry; this scope only enforces current-round authority.
+    pub fn region_count(&mut self, regions: Vec<FeatureId>) -> SemanticResult<FeatureId> {
+        for &region in &regions {
+            self.operand(region)?;
+        }
+        let id = self.registry.region_count(regions)?;
         self.eligible.insert(id);
         Ok(id)
     }
@@ -1133,6 +1220,9 @@ impl SemanticSession {
         }
         for channel in channels {
             channel.definition().validate(registry, &frame)?;
+            channel
+                .definition()
+                .validate_candidates(registry, &candidates)?;
             if let Some(reference) = channel.definition().reference() {
                 self.eligible(reference)?;
                 roots.push(reference);
@@ -1249,58 +1339,76 @@ impl SemanticSession {
         // Reserve half for the paired view; only one such view lives at a time.
         // The native budget includes its dependency bank and worker allocations.
         let budget = (self.limits.max_bytes - self.retained_bytes()) / 2;
-        let materialized = executor.materialize(registry, &frame, &roots, retained, budget)?;
-        validate_output(
-            registry,
-            &frame,
-            self.backend,
-            &roots,
-            &materialized,
-            budget,
-        )?;
-        let mut channel_values: Vec<Vec<EvidenceValue>> = Vec::with_capacity(channels.len());
-        for (index, channel) in channels.iter().enumerate() {
-            if let Some(previous) = channels[..index]
-                .iter()
-                .position(|old| old.same_work(channel))
-            {
-                channel_values.push(channel_values[previous].clone());
-                continue;
-            }
-            let paired = if let Some(view) = channel.definition().paired_view() {
-                let result = executor.materialize(registry, view, &candidates, None, budget)?;
-                validate_output(registry, view, self.backend, &candidates, &result, budget)?;
-                Some(result)
-            } else {
-                None
-            };
-            let values = executor.evaluate_channel(
-                channel.definition(),
-                &candidates,
-                &materialized,
-                paired.as_ref(),
-                self.limits
-                    .max_bytes
-                    .checked_sub(self.retained_bytes())
-                    .and_then(|n| n.checked_sub(materialized.bytes()))
-                    .and_then(|n| {
-                        n.checked_sub(paired.as_ref().map_or(0, MaterializedColumns::bytes))
-                    })
-                    .ok_or(SemanticError::Invalid(
-                        "native materialization exceeds session budget",
-                    ))?,
+        let compact =
+            executor.evaluate_compact(registry, &frame, &candidates, channels, retained, budget)?;
+        let (materialized, channel_values) = if let Some(compact) = compact {
+            let allowed = dependency_ids(registry, &roots)?;
+            validate_compact_batch(
+                registry,
+                &frame,
+                self.backend,
+                CompactBatchRequest {
+                    candidates: &candidates,
+                    channels,
+                    allowed_dependencies: &allowed,
+                    budget,
+                },
+                &compact,
             )?;
-            if values.len() != candidates.len()
-                || values
+            (compact.dependencies, compact.channel_values)
+        } else {
+            let materialized = executor.materialize(registry, &frame, &roots, retained, budget)?;
+            validate_output(
+                registry,
+                &frame,
+                self.backend,
+                &roots,
+                &materialized,
+                budget,
+            )?;
+            let mut channel_values: Vec<Vec<EvidenceValue>> = Vec::with_capacity(channels.len());
+            for (index, channel) in channels.iter().enumerate() {
+                if let Some(previous) = channels[..index]
                     .iter()
-                    .any(|v| matches!(v, EvidenceValue::Measured{value,..} if !value.is_finite() || (frame.profile() == PrecisionProfile::Fp32 && f64::from(*value as f32) != *value)))
-            {
-                return Err(SemanticError::Invalid(
-                    "native evidence output violates shape or finiteness",
-                ));
+                    .position(|old| old.same_work(channel))
+                {
+                    channel_values.push(channel_values[previous].clone());
+                    continue;
+                }
+                let paired = if let Some(view) = channel.definition().paired_view() {
+                    let result = executor.materialize(registry, view, &candidates, None, budget)?;
+                    validate_output(registry, view, self.backend, &candidates, &result, budget)?;
+                    Some(result)
+                } else {
+                    None
+                };
+                let values = executor.evaluate_channel(
+                    channel.definition(),
+                    &candidates,
+                    &materialized,
+                    paired.as_ref(),
+                    self.limits
+                        .max_bytes
+                        .checked_sub(self.retained_bytes())
+                        .and_then(|n| n.checked_sub(materialized.bytes()))
+                        .and_then(|n| {
+                            n.checked_sub(paired.as_ref().map_or(0, MaterializedColumns::bytes))
+                        })
+                        .ok_or(SemanticError::Invalid(
+                            "native materialization exceeds session budget",
+                        ))?,
+                )?;
+                validate_evidence_values(
+                    &values,
+                    candidates.len(),
+                    frame.profile(),
+                    channel.definition(),
+                    &frame,
+                )?;
+                channel_values.push(values);
             }
-            channel_values.push(values);
-        }
+            (materialized, channel_values)
+        };
         let mut records = Vec::with_capacity(candidates.len() * channels.len());
         for (row, &candidate) in candidates.iter().enumerate() {
             for (col, channel) in channels.iter().enumerate() {
@@ -1345,13 +1453,70 @@ impl SemanticSession {
             .cache
             .as_ref()
             .filter(|cache| cache.frame_id == table.frame.id());
+        let deferred = selected
+            .iter()
+            .any(|&feature| !table.materialized.contains(feature));
+        let selected_materialized;
+        let source = if deferred {
+            // The evidence table remains caller-owned and live through this
+            // call.  Reserve its dependency bank and any prior accepted bank
+            // before asking the backend for the selected dense columns.
+            let materialize_budget = self
+                .limits
+                .max_bytes
+                .checked_sub(table.materialized.bytes())
+                .and_then(|remaining| {
+                    remaining.checked_sub(prior.map_or(0, MaterializedColumns::bytes))
+                })
+                .ok_or(SemanticError::Invalid(
+                    "compact evidence dependencies and retained values exceed session budget",
+                ))?;
+            let dependencies =
+                if table.materialized.is_resident() && table.materialized.bytes() == 0 {
+                    None
+                } else {
+                    Some(&table.materialized)
+                };
+            selected_materialized = executor.materialize(
+                registry,
+                &table.frame,
+                &selected,
+                dependencies,
+                materialize_budget,
+            )?;
+            validate_output(
+                registry,
+                &table.frame,
+                self.backend,
+                &selected,
+                &selected_materialized,
+                materialize_budget,
+            )?;
+            &selected_materialized
+        } else {
+            &table.materialized
+        };
+        // A deferred selected bank is distinct from the compact dependency
+        // bank retained by the table, so reserve that table bank once before
+        // the backend accounts source, old retention and its output.  The
+        // established full-materialization path keeps its exact old budget.
+        let retain_budget = if deferred {
+            self.limits
+                .max_bytes
+                .checked_sub(table.materialized.bytes())
+                .ok_or(SemanticError::Invalid(
+                    "compact evidence dependency bank exceeds session budget",
+                ))?
+        } else {
+            self.limits.max_bytes
+        };
         let retained = executor.retain(
             registry,
             &table.frame,
-            &table.materialized,
+            source,
             prior,
             &selected,
-            self.limits.max_bytes,
+            retain_budget,
         )?;
         self.finish_accept(table, policy, selected, retained)
     }
@@ -1378,6 +1543,14 @@ impl SemanticSession {
         let selected = self.select_for_accept(table, policy)?;
         if selected.is_empty() {
             return Ok(Vec::new());
+        }
+        if selected
+            .iter()
+            .any(|&feature| !table.materialized.contains(feature))
+        {
+            return Err(SemanticError::Unsupported(
+                "compact evidence tables with deferred selected columns require accept_with",
+            ));
         }
         let registry = self.registry()?;
         let mut retained = match self
@@ -1623,6 +1796,119 @@ fn validate_output(
     Ok(())
 }
 
+fn validate_evidence_values(
+    values: &[EvidenceValue],
+    expected: usize,
+    profile: PrecisionProfile,
+    definition: &EvidenceDefinition,
+    frame: &FeatureFrame,
+) -> SemanticResult<()> {
+    let support_bound = if let Some(labels) = definition.labels() {
+        labels.as_ref().map_or(0, |labels| labels.rows().len())
+    } else if let Some(graph) = definition.graph() {
+        graph.edges().len()
+    } else {
+        frame.rows()
+    };
+    let missing_labels = matches!(definition.labels(), Some(None));
+    if values.len() != expected
+        || values.iter().any(|value| match value {
+            EvidenceValue::Measured { value, support } => {
+                missing_labels
+                    || *support > support_bound
+                    || !value.is_finite()
+                    || (profile == PrecisionProfile::Fp32 && f64::from(*value as f32) != *value)
+            }
+            EvidenceValue::Unavailable { reason, support } => {
+                *support > support_bound
+                    || (missing_labels
+                        && (*reason != super::UnavailableReason::MissingLabels || *support != 0))
+                    || (*reason == super::UnavailableReason::MissingLabels && !missing_labels)
+            }
+        })
+    {
+        return Err(SemanticError::Invalid(
+            "native evidence output violates shape, support, or missing-label semantics",
+        ));
+    }
+    Ok(())
+}
+
+struct CompactBatchRequest<'a> {
+    candidates: &'a [FeatureId],
+    channels: &'a [EvidenceChannel],
+    allowed_dependencies: &'a BTreeSet<FeatureId>,
+    budget: usize,
+}
+
+fn validate_compact_batch(
+    registry: &CandidateRegistry,
+    frame: &FeatureFrame,
+    backend: BackendKind,
+    request: CompactBatchRequest<'_>,
+    compact: &CompactEvidenceBatch,
+) -> SemanticResult<()> {
+    let dependencies = &compact.dependencies;
+    if dependencies.frame_id != frame.id()
+        || dependencies.profile != frame.profile()
+        || dependencies.backend != backend
+        || (backend != GAFIME_BACKEND_CPU && !dependencies.is_resident())
+        || dependencies.bytes() > request.budget
+        || compact.explicit_peak_bytes < dependencies.bytes()
+        || compact.explicit_peak_bytes > request.budget
+        || !dependencies.contains_only(request.allowed_dependencies)
+    {
+        return Err(SemanticError::Invalid(
+            "compact evidence dependencies or peak violate session context, ownership, or budget",
+        ));
+    }
+    // Recheck every output identity after the native call.  A native executor
+    // receives registry references only for lowering; it never gains the
+    // authority to introduce a feature outside this evaluated dependency DAG.
+    for &id in request.allowed_dependencies {
+        registry.program(id)?;
+    }
+    if compact.channel_values.len() != request.channels.len() {
+        return Err(SemanticError::Invalid(
+            "compact evidence must return every requested channel atomically",
+        ));
+    }
+    for (channel, values) in request.channels.iter().zip(&compact.channel_values) {
+        validate_evidence_values(
+            values,
+            request.candidates.len(),
+            frame.profile(),
+            channel.definition(),
+            frame,
+        )?;
+    }
+    Ok(())
+}
+
+fn dependency_ids(
+    registry: &CandidateRegistry,
+    roots: &[FeatureId],
+) -> SemanticResult<BTreeSet<FeatureId>> {
+    let mut ids = BTreeSet::new();
+    let mut pending = roots.to_vec();
+    while let Some(id) = pending.pop() {
+        if !ids.insert(id) {
+            continue;
+        }
+        match registry.program(id)?.op() {
+            FeatureOp::Source(_) => {}
+            FeatureOp::AbsoluteDifference(left, right) => pending.extend([*left, *right]),
+            FeatureOp::Softsign(input) | FeatureOp::HardPredicate { input, .. } => {
+                pending.push(*input)
+            }
+            FeatureOp::CenteredProduct { operands, .. } => pending.extend(operands),
+            FeatureOp::DecisionRegion { terms } => pending.extend(terms),
+            FeatureOp::RegionCount { regions } => pending.extend(regions),
+        }
+    }
+    Ok(ids)
+}
+
 fn validate_fitted_means(
     profile: PrecisionProfile,
     means: &FrozenMeans,
@@ -1678,6 +1964,7 @@ fn dependency_work(
             FeatureOp::Softsign(a) | FeatureOp::HardPredicate { input: a, .. } => pending.push(*a),
             FeatureOp::CenteredProduct { operands, .. } => pending.extend(operands),
             FeatureOp::DecisionRegion { terms } => pending.extend(terms),
+            FeatureOp::RegionCount { regions } => pending.extend(regions),
         }
     }
     units
@@ -2252,6 +2539,393 @@ mod tests {
                 .unwrap()
                 .len(),
             16
+        );
+    }
+
+    #[derive(Default)]
+    struct CompactLifecycleMock {
+        compact_calls: usize,
+        materialize_calls: usize,
+        retain_calls: usize,
+        last_materialize_budget: Option<usize>,
+        last_retain_budget: Option<usize>,
+    }
+
+    impl NativeEvidenceExecutor for CompactLifecycleMock {
+        fn backend_kind(&self) -> u32 {
+            GAFIME_BACKEND_CPU
+        }
+
+        fn materialize(
+            &mut self,
+            registry: &CandidateRegistry,
+            frame: &FeatureFrame,
+            candidates: &[FeatureId],
+            retained: Option<&MaterializedColumns>,
+            max_bytes: usize,
+        ) -> SemanticResult<MaterializedColumns> {
+            self.materialize_calls += 1;
+            self.last_materialize_budget = Some(max_bytes);
+            assert!(
+                retained.is_some(),
+                "deferred selected materialization receives dependencies"
+            );
+            let columns = candidates
+                .iter()
+                .map(|&candidate| (candidate, NumericColumn::from(vec![0.0f32, 0.0, 1.0, 1.0])))
+                .collect();
+            MaterializedColumns::from_columns(registry, frame, columns)
+        }
+
+        fn evaluate_channel(
+            &mut self,
+            _: &EvidenceDefinition,
+            _: &[FeatureId],
+            _: &MaterializedColumns,
+            _: Option<&MaterializedColumns>,
+            _: usize,
+        ) -> SemanticResult<Vec<EvidenceValue>> {
+            panic!("an atomic compact result must not fall through per-channel evaluation")
+        }
+
+        fn evaluate_compact(
+            &mut self,
+            registry: &CandidateRegistry,
+            frame: &FeatureFrame,
+            candidates: &[FeatureId],
+            channels: &[EvidenceChannel],
+            _: Option<&MaterializedColumns>,
+            _: usize,
+        ) -> SemanticResult<Option<CompactEvidenceBatch>> {
+            self.compact_calls += 1;
+            let source = registry.source(0)?;
+            let dependencies = MaterializedColumns::from_columns(
+                registry,
+                frame,
+                BTreeMap::from([(source, frame.column_typed(0)?.shared_clone())]),
+            )?;
+            let peak = dependencies.bytes();
+            Ok(Some(CompactEvidenceBatch::new(
+                dependencies,
+                channels
+                    .iter()
+                    .map(|_| vec![EvidenceValue::measured(1.0, frame.rows()); candidates.len()])
+                    .collect(),
+                peak,
+            )))
+        }
+
+        fn retain(
+            &mut self,
+            registry: &CandidateRegistry,
+            frame: &FeatureFrame,
+            source: &MaterializedColumns,
+            _: Option<&MaterializedColumns>,
+            selected: &[FeatureId],
+            max_live_bytes: usize,
+        ) -> SemanticResult<MaterializedColumns> {
+            self.retain_calls += 1;
+            self.last_retain_budget = Some(max_live_bytes);
+            let source = source.columns()?;
+            let columns = selected
+                .iter()
+                .map(|&candidate| {
+                    Ok((
+                        candidate,
+                        source
+                            .get(&candidate)
+                            .ok_or(SemanticError::Invalid(
+                                "deferred selected candidate was not materialized",
+                            ))?
+                            .shared_clone(),
+                    ))
+                })
+                .collect::<SemanticResult<BTreeMap<_, _>>>()?;
+            MaterializedColumns::from_columns(registry, frame, columns)
+        }
+    }
+
+    fn compact_fixture() -> (
+        Arc<FeatureFrame>,
+        SemanticSession,
+        FeatureId,
+        EvidenceChannel,
+    ) {
+        let frame = Arc::new(
+            FeatureFrame::new(
+                vec!["x".into()],
+                "compact-rows".into(),
+                vec![0, 1, 2, 3],
+                EvaluationRole::Discovery,
+                "compact fixture".into(),
+                vec![vec![-1.0, 0.0, 1.0, 2.0]],
+            )
+            .unwrap(),
+        );
+        let registry = CandidateRegistry::new(
+            frame.schema().to_vec(),
+            PrecisionProfile::Mixed,
+            ProgramLimits::default(),
+        )
+        .unwrap();
+        let mut session = SemanticSession::new(registry, GAFIME_BACKEND_CPU, 256).unwrap();
+        let region = {
+            let mut round = session.begin_round(&[]).unwrap();
+            let source = round.source(0).unwrap();
+            let predicate = round
+                .hard_predicate(source, PredicateComparator::GreaterThan, 0.0)
+                .unwrap();
+            round.decision_region(vec![predicate]).unwrap()
+        };
+        let channel =
+            EvidenceChannel::new("occupancy".into(), EvidenceDefinition::BinaryOccupancy).unwrap();
+        (frame, session, region, channel)
+    }
+
+    #[test]
+    fn compact_batch_defers_selected_dense_materialization_to_accept_with() {
+        let (frame, mut session, region, channel) = compact_fixture();
+        let mut executor = CompactLifecycleMock::default();
+        let table = session
+            .evaluate(
+                &mut executor,
+                Arc::clone(&frame),
+                &[region],
+                std::slice::from_ref(&channel),
+            )
+            .unwrap();
+        assert_eq!(executor.compact_calls, 1);
+        assert_eq!(executor.materialize_calls, 0);
+        assert!(!table.materialized.contains(region));
+        assert!(table
+            .materialized
+            .contains(session.registry().unwrap().source(0).unwrap()));
+
+        let policy = SelectionPolicy {
+            primary: channel.id(),
+            pareto_objectives: Vec::new(),
+            direction: crate::semantic::Direction::Maximize,
+            constraints: Vec::new(),
+            missing: crate::semantic::MissingEvidence::Error,
+            limit: 1,
+        };
+        assert_eq!(
+            session.accept(&table, &policy).unwrap_err(),
+            SemanticError::Unsupported(
+                "compact evidence tables with deferred selected columns require accept_with"
+            )
+        );
+        let accepted = session.accept_with(&mut executor, &table, &policy).unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].feature(), region);
+        assert_eq!(executor.materialize_calls, 1);
+        assert_eq!(executor.retain_calls, 1);
+        // Compact dependencies consume 16 bytes; the selected materialization
+        // therefore receives the remaining 240-byte budget. Retention sees
+        // that dependency bank reserved once rather than an unbounded call.
+        assert_eq!(executor.last_materialize_budget, Some(240));
+        assert_eq!(executor.last_retain_budget, Some(240));
+    }
+
+    struct MalformedCompact;
+
+    impl NativeEvidenceExecutor for MalformedCompact {
+        fn backend_kind(&self) -> u32 {
+            GAFIME_BACKEND_CPU
+        }
+
+        fn materialize(
+            &mut self,
+            _: &CandidateRegistry,
+            _: &FeatureFrame,
+            _: &[FeatureId],
+            _: Option<&MaterializedColumns>,
+            _: usize,
+        ) -> SemanticResult<MaterializedColumns> {
+            panic!("malformed compact output must reject before ordinary materialization")
+        }
+
+        fn evaluate_channel(
+            &mut self,
+            _: &EvidenceDefinition,
+            _: &[FeatureId],
+            _: &MaterializedColumns,
+            _: Option<&MaterializedColumns>,
+            _: usize,
+        ) -> SemanticResult<Vec<EvidenceValue>> {
+            panic!("malformed compact output must reject atomically")
+        }
+
+        fn evaluate_compact(
+            &mut self,
+            registry: &CandidateRegistry,
+            frame: &FeatureFrame,
+            _: &[FeatureId],
+            _: &[EvidenceChannel],
+            _: Option<&MaterializedColumns>,
+            _: usize,
+        ) -> SemanticResult<Option<CompactEvidenceBatch>> {
+            let source = registry.source(0)?;
+            let dependencies = MaterializedColumns::from_columns(
+                registry,
+                frame,
+                BTreeMap::from([(source, frame.column_typed(0)?.shared_clone())]),
+            )?;
+            // Deliberately omit the required channel vector.  The session must
+            // reject this rather than silently falling back to ordinary work.
+            Ok(Some(CompactEvidenceBatch::new(
+                dependencies,
+                Vec::new(),
+                16,
+            )))
+        }
+    }
+
+    #[test]
+    fn compact_batch_requires_all_channels_atomically() {
+        let (frame, mut session, region, channel) = compact_fixture();
+        let error = match session.evaluate(
+            &mut MalformedCompact,
+            frame,
+            &[region],
+            std::slice::from_ref(&channel),
+        ) {
+            Ok(_) => panic!("malformed compact batch must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            SemanticError::Invalid(
+                "compact evidence must return every requested channel atomically"
+            )
+        );
+    }
+
+    struct InvalidCompactValue {
+        value: EvidenceValue,
+        peak: usize,
+    }
+
+    impl NativeEvidenceExecutor for InvalidCompactValue {
+        fn backend_kind(&self) -> u32 {
+            GAFIME_BACKEND_CPU
+        }
+
+        fn materialize(
+            &mut self,
+            _: &CandidateRegistry,
+            _: &FeatureFrame,
+            _: &[FeatureId],
+            _: Option<&MaterializedColumns>,
+            _: usize,
+        ) -> SemanticResult<MaterializedColumns> {
+            panic!("invalid compact output must reject before ordinary materialization")
+        }
+
+        fn evaluate_channel(
+            &mut self,
+            _: &EvidenceDefinition,
+            _: &[FeatureId],
+            _: &MaterializedColumns,
+            _: Option<&MaterializedColumns>,
+            _: usize,
+        ) -> SemanticResult<Vec<EvidenceValue>> {
+            panic!("invalid compact output must reject atomically")
+        }
+
+        fn evaluate_compact(
+            &mut self,
+            registry: &CandidateRegistry,
+            frame: &FeatureFrame,
+            _: &[FeatureId],
+            _: &[EvidenceChannel],
+            _: Option<&MaterializedColumns>,
+            _: usize,
+        ) -> SemanticResult<Option<CompactEvidenceBatch>> {
+            let source = registry.source(0)?;
+            let dependencies = MaterializedColumns::from_columns(
+                registry,
+                frame,
+                BTreeMap::from([(source, frame.column_typed(0)?.shared_clone())]),
+            )?;
+            Ok(Some(CompactEvidenceBatch::new(
+                dependencies,
+                vec![vec![self.value]],
+                self.peak,
+            )))
+        }
+    }
+
+    #[test]
+    fn compact_batch_bounds_support_and_cannot_fabricate_missing_labels() {
+        let (frame, mut session, region, channel) = compact_fixture();
+        let error = match session.evaluate(
+            &mut InvalidCompactValue {
+                value: EvidenceValue::measured(1.0, frame.rows() + 1),
+                peak: 16,
+            },
+            Arc::clone(&frame),
+            &[region],
+            std::slice::from_ref(&channel),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized compact support must fail closed"),
+        };
+        assert_eq!(
+            error,
+            SemanticError::Invalid(
+                "native evidence output violates shape, support, or missing-label semantics"
+            )
+        );
+
+        let (frame, mut session, region, _) = compact_fixture();
+        let missing = EvidenceChannel::new(
+            "missing".into(),
+            EvidenceDefinition::BinaryLabeledGiniGain { labels: None },
+        )
+        .unwrap();
+        let error = match session.evaluate(
+            &mut InvalidCompactValue {
+                value: EvidenceValue::measured(0.0, 0),
+                peak: 16,
+            },
+            frame,
+            &[region],
+            std::slice::from_ref(&missing),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("missing-label compact evidence must not be fabricated"),
+        };
+        assert_eq!(
+            error,
+            SemanticError::Invalid(
+                "native evidence output violates shape, support, or missing-label semantics"
+            )
+        );
+    }
+
+    #[test]
+    fn compact_batch_rejects_an_unbudgeted_executor_peak() {
+        let (frame, mut session, region, channel) = compact_fixture();
+        let error = match session.evaluate(
+            &mut InvalidCompactValue {
+                value: EvidenceValue::measured(1.0, frame.rows()),
+                // Evaluation reserves half of this 256-byte session for
+                // a compact call; 129 must not hide a persistent query.
+                peak: 129,
+            },
+            frame,
+            &[region],
+            std::slice::from_ref(&channel),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("unbudgeted compact peak must fail closed"),
+        };
+        assert_eq!(
+            error,
+            SemanticError::Invalid(
+                "compact evidence dependencies or peak violate session context, ownership, or budget"
+            )
         );
     }
 }
