@@ -9,7 +9,7 @@ operational status, not an immutable historical release record.
 - Next repository/Cargo candidate target: `1.0.0-rc.2`
 - Next Python/PyPI candidate target: `1.0.0rc2`
 - Next canonical tag target: `v1.0.0-rc.2`
-- Phase: RC2 release-branch preparation; no RC2 tag or release
+- Phase: local RC2 hardening and review; no RC2 tag or release
 
 The source tree continues to carry the RC1 identity until a focused RC2
 preparation change is reviewed and merged. Creating
@@ -65,6 +65,18 @@ moment-in-time commit, workflow, or package-presence result.
   remote release tip, tag, dispatch/workflow SHA, downstream checkouts, and
   build SHA exactly, with job-local ref rechecks before irreversible uploads.
 
+## RC2 Hardening
+
+The [draft candidate note](v1.0.0-rc.2.md) records the proposed validation,
+guidance, and artifact-identity changes. Local tests and patch review do not
+replace the reviewed candidate's required hosted checks and artifact gates.
+
+A deep security review has completed for the preceding source checkpoint.
+Its finding dispositions and focused remediation evidence belong to the
+hardening review; that earlier scan does not establish security qualification
+for a later settled candidate. Remaining ownership decisions and release
+permission must be settled before RC2 preparation and publication.
+
 No RC2 tag, GitHub Release, or PyPI publication exists merely because branch
-preparation has begun. Stable qualification, the Deep Security Scan, and the
-permanent performance architecture tracked by issue #71 remain later work.
+preparation has begun. Stable qualification and the permanent performance
+architecture tracked by issue #71 remain later work.

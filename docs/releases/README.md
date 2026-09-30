@@ -16,6 +16,9 @@ final admission of that exact tip into `main`. Follow the mutable
 [GitHub Releases](https://github.com/onlyxItachi/GAFIME/releases) and
 [PyPI project](https://pypi.org/project/gafime/) for publication state.
 
+The [RC2 candidate note](v1.0.0-rc.2.md) is a draft for the hardening proposal;
+it is not yet a historical publication record.
+
 ## Release Operations
 
 - [Release operations runbook](release-operations.md)
