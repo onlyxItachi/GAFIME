@@ -5,16 +5,14 @@ operational status, not an immutable historical release record.
 
 ## Current Target
 
-- Current public release: `v1.0.0-rc.1` (`1.0.0rc1` on PyPI)
-- Next repository/Cargo candidate target: `1.0.0-rc.2`
-- Next Python/PyPI candidate target: `1.0.0rc2`
-- Next canonical tag target: `v1.0.0-rc.2`
-- Phase: RC2 release-branch preparation; no RC2 tag or release
+- Repository/Cargo candidate target: `1.0.0-rc.2`
+- Python/PyPI candidate target: `1.0.0rc2`
+- Canonical tag target: `v1.0.0-rc.2`
+- Phase: RC2 stabilization, exact-candidate qualification, and rollout
 
-The source tree continues to carry the RC1 identity until a focused RC2
-preparation change is reviewed and merged. Creating
-`release/v1.0.0-rc.2` does not by itself change that identity, create a tag, or
-create a release. Live publication state is authoritative on
+The source tree carries the RC2 identity. Creating or updating
+`release/v1.0.0-rc.2` does not by itself create a tag or publication.
+Live publication state is authoritative on
 [GitHub Releases](https://github.com/onlyxItachi/GAFIME/releases) and
 [PyPI](https://pypi.org/project/gafime/); this file does not duplicate a
 moment-in-time commit, workflow, or package-presence result.
@@ -34,7 +32,7 @@ moment-in-time commit, workflow, or package-presence result.
 - The three bounded input-validation defects are fixed, the public repository
   and documentation routers are established, and the bounded compiler/codegen
   audit found no evidence-backed product change to apply.
-- Repository, Cargo, and Python metadata use the canonical RC1 identities.
+- Repository, Cargo, and Python metadata use the canonical RC2 identities.
 - RC1 was built from frozen, verified artifacts and is publicly available as a
   prerelease.
 
@@ -65,6 +63,31 @@ moment-in-time commit, workflow, or package-presence result.
   remote release tip, tag, dispatch/workflow SHA, downstream checkouts, and
   build SHA exactly, with job-local ref rechecks before irreversible uploads.
 
-No RC2 tag, GitHub Release, or PyPI publication exists merely because branch
-preparation has begun. Stable qualification, the Deep Security Scan, and the
-permanent performance architecture tracked by issue #71 remain later work.
+## RC2 Hardening
+
+The [RC2 release note](v1.0.0-rc.2.md) records the bounded validation,
+guidance, and artifact-identity changes. Local tests and patch review do not
+replace the reviewed candidate's required hosted checks and artifact gates.
+
+A deep security review has completed for the preceding source checkpoint.
+Its finding dispositions and focused remediation evidence belong to the
+hardening review; that earlier scan does not establish security qualification
+for a later settled candidate. Resident NumPy input now uses privately owned
+snapshots to bind content identity to consumed bytes. Acquisition is not atomic
+against external writers; coherent datasets still require synchronization
+during acquisition. Broader retained/borrowed and low-copy ingestion belongs to
+future issue #100, not RC2.
+
+## RC2 Release Gates
+
+The accepted candidate requires current-head PR review and configured checks,
+an exact-candidate standard security record, and a complete frozen release
+bundle. Required Core/CUDA/ROCm/Metal execution evidence must identify the actual
+artifact hashes. The release tip is locked and admitted unchanged to `main`
+before canonical tagging; collision and publisher prerequisites are checked
+before the official frozen publisher runs. Live workflow and public-channel
+results establish completion rather than this source document forecasting it.
+
+No RC2 tag, GitHub Release, or PyPI publication follows merely from branch
+preparation. Stable qualification and the permanent performance
+architecture tracked by issue #71 remain later work.

@@ -147,6 +147,10 @@ CUDA payload translation units use C++20. The template-specialized kernels do
 not require C++23, and C++20 keeps the CUDA 13.3 payload build compatible with
 both supported Linux host compilers and Visual Studio 2026 on Windows.
 
+Host-only C++ ABI validation fixtures use C++23, including sanitizer runs.
+The external C ABI consumers remain C11 to verify that the public header does
+not require C++ for integration.
+
 `gafime-core-smoke` skips CUDA and ROCm, builds the base package, and runs a
 small Rust/PyO3 CPU smoke test.
 
@@ -234,7 +238,11 @@ maintainer approval.
 
 The GitHub wheel workflow targets CUDA Toolkit 13.3 for x86_64 Windows and
 x86_64 Linux GPU payload builds. Linux manylinux x86_64 builds install the CUDA
-compiler/runtime needed by the payload package. ROCm payloads compile in the
+compiler/runtime needed by the payload package from the SHA-256-pinned NVIDIA
+RPM list in `.github/scripts/cuda_13_3_rpms.sha256`. The CI provisioning helper
+checks the pinned signing key and package signatures before installing explicit
+local RPMs; it does not depend on mutable NVIDIA repository metadata. Ordinary
+OS dependency repositories remain enabled. ROCm payloads compile in the
 EL8-based `manylinux_2_28` image against the pinned ROCm 7.2.3 repository and
 retain their truthful, unrepaired `linux_x86_64` tag. Windows x64 CUDA builds
 install the CUDA compiler components and overlay NVIDIA's SHA-256-pinned

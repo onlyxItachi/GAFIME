@@ -63,6 +63,7 @@ import tempfile
 from time import perf_counter_ns
 from typing import Callable, Mapping, Sequence
 import zipfile
+import zlib
 
 
 SCHEMA = "gafime.precision-profile-performance.v2"
@@ -1667,11 +1668,50 @@ def _runtime_dependency_identities() -> dict[str, object]:
     return result
 
 
+def _wheel_member_paths(archive: zipfile.ZipFile) -> set[str]:
+    """Keep archive identities unambiguous after wheel installation."""
+    members: set[str] = set()
+    destinations: set[str] = set()
+    for info in archive.infolist():
+        raw = info.orig_filename
+        name = raw[:-1] if info.is_dir() else raw
+        parts = name.split("/")
+        # Match the canonical-path policy used by release composition checks.
+        if (
+            raw != info.filename
+            or "\x00" in raw
+            or "\\" in raw
+            or re.match(r"^[A-Za-z]:", raw)
+            or any(part in {"", ".", ".."} for part in parts)
+            or name in members
+        ):
+            raise ValueError("wheel member path must be canonical and unique")
+        members.add(name)
+        if info.is_dir():
+            continue
+        # Import schemes share the package root. Other schemes depend on the
+        # install prefix and can also alias that root (for example data/lib/
+        # pythonX.Y/site-packages). This identity helper does not model those
+        # destinations, so reject them rather than attest ambiguous bytes.
+        if parts[0].endswith(".data"):
+            if len(parts) < 3 or parts[1] not in {"purelib", "platlib"}:
+                raise ValueError(
+                    "wheel identity cannot bind non-import install schemes"
+                )
+            parts = parts[2:]
+        destination = "/".join(part.rstrip(" .").casefold() for part in parts)
+        if destination in destinations:
+            raise ValueError("wheel members must have unique install destinations")
+        destinations.add(destination)
+    return members
+
+
 def _wheel_identity(path: str | Path) -> dict[str, object]:
     identity = _file_identity(path)
     identity["format"] = "wheel"
     try:
         with zipfile.ZipFile(path) as archive:
+            member_paths = _wheel_member_paths(archive)
             metadata_paths = sorted(
                 name
                 for name in archive.namelist()
@@ -1703,10 +1743,25 @@ def _wheel_identity(path: str | Path) -> dict[str, object]:
                     if len(row) < 2 or not row[1].startswith("sha256="):
                         continue
                     encoded = row[1].partition("=")[2]
-                    padding = "=" * (-len(encoded) % 4)
-                    record_hashes[row[0]] = base64.urlsafe_b64decode(
-                        encoded + padding
-                    ).hex()
+                    if re.fullmatch(r"[A-Za-z0-9_-]{43}", encoded) is None:
+                        raise ValueError("invalid RECORD SHA-256 encoding")
+                    digest = base64.urlsafe_b64decode(encoded + "=")
+                    if (
+                        base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+                        != encoded
+                    ):
+                        raise ValueError("noncanonical RECORD SHA-256 encoding")
+                    if row[0] in record_hashes or row[0] not in member_paths:
+                        raise ValueError("RECORD member must be unique and present")
+                    # RECORD is an assertion inside the archive. Bind runtime
+                    # hashes only to bytes independently verified from it.
+                    observed = hashlib.sha256()
+                    with archive.open(row[0]) as member:
+                        for chunk in iter(lambda: member.read(1024 * 1024), b""):
+                            observed.update(chunk)
+                    if observed.digest() != digest:
+                        raise ValueError("RECORD SHA-256 does not match wheel member")
+                    record_hashes[row[0]] = digest.hex()
             identity.update(
                 {
                     "distribution": str(name),
@@ -1716,7 +1771,15 @@ def _wheel_identity(path: str | Path) -> dict[str, object]:
                     "record_hashes": record_hashes,
                 }
             )
-    except (OSError, ValueError, UnicodeError, zipfile.BadZipFile) as exc:
+    except (
+        OSError,
+        ValueError,
+        UnicodeError,
+        KeyError,
+        RuntimeError,
+        zipfile.BadZipFile,
+        zlib.error,
+    ) as exc:
         identity.update({"status": "invalid", "detail": str(exc)})
     return identity
 

@@ -377,7 +377,7 @@ def _cells() -> list:
             ```
 
             An unqualified `pip install gafime` prefers the latest stable release;
-            it does not select this beta automatically.
+            it does not select beta or release-candidate versions automatically.
             """
         ),
         _md(
@@ -799,6 +799,15 @@ def _cells() -> list:
             Mutable object identity is never trusted: cache lookup includes selected-
             dtype content identity. The cache is bounded and is not a process-global
             session API.
+
+            Resident NumPy input is staged in private immutable bytes; its
+            fingerprint and native execution use the same snapshot. Later writes
+            through caller aliases cannot alter that snapshot. Acquisition is not
+            atomic against an external writer or across `X` and `y`: synchronize
+            writers when a coherent dataset is required. Every resident lookup,
+            including a cache hit, acquires and hashes input. Explicit compiled
+            replay avoids repeated input acquisition because Rust already owns its
+            resident matrix. See the [execution lifecycle guide](../eager-resident-compiled-execution.md).
             """
         ),
         _code(

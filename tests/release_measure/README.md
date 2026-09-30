@@ -767,8 +767,15 @@ both variants, or the benchmark script/native binaries are not hash-bound. It
 also compares the interpreter's SHA-256 and size rather than requiring two
 isolated environments to share one path. Variant-bound library, module,
 `PYTHONPATH`, and virtual-environment paths may differ only when their presence
-matches; wheel/runtime hashes authenticate the bytes they load. Threading,
-device visibility, runtime search paths, and other semantic environment values
+matches; wheel/runtime hashes authenticate the bytes they load.
+Each claimed wheel `RECORD` SHA-256 is first checked against its unique archive
+member before it can authenticate a loaded module or native binary. Missing,
+duplicate, malformed, or mismatched claimed members invalidate that identity.
+Archive paths must be canonical and must not collide after wheel installation,
+including relocation through `.data/purelib` or `.data/platlib`.
+
+Threading, device visibility, runtime search paths, and other semantic
+environment values
 must match exactly. NumPy and Polars versions plus installed `RECORD` hashes,
 stable device/driver identity, CPU governor, toolchain, and process affinity
 must match. Raw before/after device clock and power readings
