@@ -238,7 +238,11 @@ maintainer approval.
 
 The GitHub wheel workflow targets CUDA Toolkit 13.3 for x86_64 Windows and
 x86_64 Linux GPU payload builds. Linux manylinux x86_64 builds install the CUDA
-compiler/runtime needed by the payload package. ROCm payloads compile in the
+compiler/runtime needed by the payload package from the SHA-256-pinned NVIDIA
+RPM list in `.github/scripts/cuda_13_3_rpms.sha256`. The CI provisioning helper
+checks the pinned signing key and package signatures before installing explicit
+local RPMs; it does not depend on mutable NVIDIA repository metadata. Ordinary
+OS dependency repositories remain enabled. ROCm payloads compile in the
 EL8-based `manylinux_2_28` image against the pinned ROCm 7.2.3 repository and
 retain their truthful, unrepaired `linux_x86_64` tag. Windows x64 CUDA builds
 install the CUDA compiler components and overlay NVIDIA's SHA-256-pinned
