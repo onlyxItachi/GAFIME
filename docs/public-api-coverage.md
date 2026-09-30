@@ -167,3 +167,7 @@ Focused regression tests require `GafimeSelector(k=...)` to reject negative
 values at construction and assignment. Streamer batch sizes and the bounded
 `benchmark_streaming(..., n_batches=...)` diagnostic reject non-positive values
 before reading input.
+
+The advanced compatibility `BatchScheduler(max_blocks=...)` requires a positive
+capacity and raises `ValueError` for zero before scheduling work. Its size hints
+are calculated without overflow when a large positive capacity is supplied.
