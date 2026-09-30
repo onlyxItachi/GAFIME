@@ -938,7 +938,7 @@ mod tests {
         ] {
             assert!(cargo_version_to_python(invalid).is_err(), "{invalid}");
         }
-        assert_eq!(public_package_version(), "1.0.0rc1");
+        assert_eq!(public_package_version(), "1.0.0rc2");
     }
 
     #[test]
