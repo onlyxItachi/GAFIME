@@ -137,6 +137,9 @@ def test_subfunctions_exports_and_runs_published_v047_helpers():
     assert scheduler.max_blocks() == 96
     assert scheduler.optimal_batch_size() == 96
 
+    with pytest.raises(ValueError, match="max_blocks must be positive"):
+        proxy.BatchScheduler(max_blocks=0)
+
     cache = proxy.CacheAwareScheduler(
         4, window_size=2, ops=[0, 1], interaction_types=[0], arity=2
     )

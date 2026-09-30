@@ -2,12 +2,31 @@
 
 ## Unreleased
 
+## v1.0.0-rc.2
+
+- Bind resident NumPy cache fingerprints and execution to the same privately
+  owned input snapshots, including target replacement. Snapshot acquisition
+  still requires caller synchronization for a coherent concurrently written
+  dataset; explicit compiled replay avoids repeated acquisition.
+- Reject zero-capacity compatibility schedulers and prevent size-hint
+  overflow while preserving ordinary scheduling behavior.
+- Validate typed-buffer ABI headers before reading a supported record prefix,
+  preserving frozen ABI 1.0 and compatible additive ABI 1.1 records.
+- Encode pipeline-generator paths and target names as data literals and verify
+  benchmark archive-member identities against actual bytes.
+- Validate manual production-Core benchmark sources before checkout; keep
+  supplemental leaf diagnostics distinct from product-throughput evidence.
+- Use C++23 for host C++ ABI fixtures, retaining C11 external consumers and
+  the documented CUDA C++20 compiler exception.
 - Constrain GAFIME v1 to `polars>=1.3,<2` so Polars 2 API and semantic changes
   cannot enter file-ingest or streaming paths before the dedicated v1.1/v1.2
   migration tracked by issue #87.
 - Establish protected `release/v<canonical-semver>` stabilization lanes while
   binding publication to the exact admitted release-branch tip, frozen bundle,
   and canonical tag rather than to independently advancing `main` contents.
+- Prepare canonical repository/Cargo `1.0.0-rc.2`, Python/PyPI `1.0.0rc2`, and
+  Git/GitHub `v1.0.0-rc.2` identity without adding a public runtime API,
+  numerical mode, backend, or distribution.
 
 ## v1.0.0-rc.1
 

@@ -103,16 +103,19 @@ pub struct BatchScheduler {
 }
 
 impl BatchScheduler {
-    pub fn new(max_blocks: usize, cuda_dll_path: PathBuf) -> Self {
+    pub fn new(max_blocks: usize, cuda_dll_path: PathBuf) -> Result<Self, &'static str> {
+        if max_blocks == 0 {
+            return Err("max_blocks must be positive");
+        }
         // Optimal batch is max_blocks or smaller for memory efficiency
         // We cap at 1024 (CUDA kernel limitation)
         let optimal_batch = max_blocks.min(1024);
 
-        Self {
+        Ok(Self {
             max_blocks,
             optimal_batch,
             cuda_dll_path,
-        }
+        })
     }
 
     /// Get optimal batch sizes based on GPU config
@@ -121,8 +124,8 @@ impl BatchScheduler {
         // Limited by CUDA kernel max of 1024
         vec![
             self.max_blocks,
-            (self.max_blocks * 2).min(1024),
-            (self.max_blocks * 4).min(1024),
+            self.max_blocks.saturating_mul(2).min(1024),
+            self.max_blocks.saturating_mul(4).min(1024),
             1024,
         ]
         .into_iter()
@@ -339,18 +342,22 @@ impl PyBatchScheduler {
     /// Create a new BatchScheduler
     ///
     /// Args:
-    ///     max_blocks: Maximum blocks for GPU (from GPU config)
+    ///     max_blocks: Positive maximum blocks for GPU (from GPU config).
     ///     cuda_dll_path: Path to gafime_cuda.dll
+    ///
+    /// Raises:
+    ///     ValueError: If max_blocks is zero.
     #[new]
     #[pyo3(signature = (max_blocks=96, cuda_dll_path=None))]
-    fn new(max_blocks: usize, cuda_dll_path: Option<String>) -> Self {
+    fn new(max_blocks: usize, cuda_dll_path: Option<String>) -> PyResult<Self> {
         let path = cuda_dll_path
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("gafime_cuda.dll"));
 
-        Self {
-            inner: BatchScheduler::new(max_blocks, path),
-        }
+        Ok(Self {
+            inner: BatchScheduler::new(max_blocks, path)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?,
+        })
     }
 
     /// Get optimal batch sizes for this GPU
@@ -505,8 +512,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_zero_batch_capacity_is_rejected_before_scheduling() {
+        assert_eq!(
+            BatchScheduler::new(0, PathBuf::from("test.dll")).err(),
+            Some("max_blocks must be positive")
+        );
+    }
+
+    #[test]
+    fn test_large_batch_capacity_does_not_overflow_size_hints() {
+        let scheduler = BatchScheduler::new(usize::MAX, PathBuf::from("test.dll")).unwrap();
+        assert_eq!(scheduler.optimal_batch, 1024);
+        assert_eq!(scheduler.get_optimal_batch_sizes(), vec![1024, usize::MAX]);
+    }
+
+    #[test]
     fn test_batch_scheduler() {
-        let scheduler = BatchScheduler::new(96, PathBuf::from("test.dll"));
+        let scheduler = BatchScheduler::new(96, PathBuf::from("test.dll")).unwrap();
 
         assert_eq!(scheduler.optimal_batch, 96);
 
@@ -531,7 +553,7 @@ mod tests {
 
     #[test]
     fn test_optimal_sizes() {
-        let scheduler = BatchScheduler::new(96, PathBuf::from("test.dll"));
+        let scheduler = BatchScheduler::new(96, PathBuf::from("test.dll")).unwrap();
         let sizes = scheduler.get_optimal_batch_sizes();
 
         assert!(sizes.contains(&96));
@@ -540,7 +562,7 @@ mod tests {
 
     #[test]
     fn test_cache_aware_order_groups_hot_feature() {
-        let scheduler = BatchScheduler::new(1024, PathBuf::from("test.dll"));
+        let scheduler = BatchScheduler::new(1024, PathBuf::from("test.dll")).unwrap();
         let candidates = vec![
             CandidateDescriptor {
                 kind: 0,
@@ -588,7 +610,7 @@ mod tests {
 
     #[test]
     fn test_equation_batches_return_original_indices_once() {
-        let scheduler = BatchScheduler::new(3, PathBuf::from("test.dll"));
+        let scheduler = BatchScheduler::new(3, PathBuf::from("test.dll")).unwrap();
         let feature_sets = vec![vec![10, 11], vec![2], vec![2, 3], vec![2, 4], vec![8, 9]];
         let batches = scheduler.schedule_equation_indices(&feature_sets, None);
         let mut flattened: Vec<usize> = batches.into_iter().flatten().collect();
@@ -598,7 +620,7 @@ mod tests {
 
     #[test]
     fn test_template_equation_batches_are_homogeneous() {
-        let scheduler = BatchScheduler::new(2, PathBuf::from("test.dll"));
+        let scheduler = BatchScheduler::new(2, PathBuf::from("test.dll")).unwrap();
         let feature_sets = vec![vec![0, 1], vec![0, 2], vec![5, 6], vec![0, 3], vec![5, 7]];
         let template_ids = vec![32, 64, 32, 64, 32];
         let batches = scheduler.schedule_template_equation_indices(&feature_sets, &template_ids);

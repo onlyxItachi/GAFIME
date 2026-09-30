@@ -2241,7 +2241,66 @@ def _assert_release_manifest_documentation(root: Path) -> None:
     )
 
 
-def _assert_build_workflow(workflow: str) -> None:
+def _assert_cuda_ci_bootstrap(root: Path) -> None:
+    scripts = root / ".github" / "scripts"
+    helper = (scripts / "provision_cuda_13_3_rpms.sh").read_text(encoding="utf-8")
+    entries = [
+        line.split()
+        for line in (scripts / "cuda_13_3_rpms.sha256").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    expected = {
+        "cccl-13-3-13.3.3.4.1-1.x86_64.rpm",
+        "cuda-crt-13-3-13.3.73-1.x86_64.rpm",
+        "cuda-cudart-13-3-13.3.29-1.x86_64.rpm",
+        "cuda-cudart-devel-13-3-13.3.29-1.x86_64.rpm",
+        "cuda-culibos-devel-13-3-13.3.33-1.x86_64.rpm",
+        "cuda-cuobjdump-13-3-13.3.73-1.x86_64.rpm",
+        "cuda-nvcc-13-3-13.3.73-1.x86_64.rpm",
+        "cuda-nvdisasm-13-3-13.3.73-1.x86_64.rpm",
+        "cuda-toolkit-13-3-config-common-13.3.29-1.noarch.rpm",
+        "cuda-toolkit-13-config-common-13.3.29-1.noarch.rpm",
+        "cuda-toolkit-config-common-13.3.29-1.noarch.rpm",
+        "libnvptxcompiler-13-3-13.3.73-1.x86_64.rpm",
+        "libnvvm-13-3-13.3.73-1.x86_64.rpm",
+    }
+    _require(
+        len(entries) == len(expected)
+        and all(
+            len(entry) == 2 and re.fullmatch(r"[0-9a-f]{64}", entry[0])
+            for entry in entries
+        )
+        and {entry[1] for entry in entries} == expected
+        and all(name in helper for name in expected),
+        "CUDA bootstrap must pin the complete 13-RPM compiler and inspection-tool closure",
+    )
+    for required in (
+        "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64",
+        "27e46a2d43e125859fb8a62c3b75bf798aeb95fa6f7d9bf790c1167ed9a0b39c",
+        "cuda_13_3_rpms.sha256",
+        "sha256sum --check --strict",
+        "rpm --checksig --verbose",
+        "Signature, key ID d42d0685: OK$",
+        "--disablerepo='cuda*' --setopt=localpkg_gpgcheck=1",
+        'install -y "${cuda_rpm_paths[@]}"',
+        "bin/cuobjdump bin/nvdisasm",
+        "nvvm/bin/cicc",
+    ):
+        _require(
+            required in helper,
+            f"CUDA bootstrap lost verified provisioning: {required}",
+        )
+    for forbidden in (
+        "cuda-rhel8.repo", "--nogpgcheck", "--nodeps", "--disablerepo='*'"
+    ):
+        _require(
+            forbidden not in helper,
+            f"CUDA bootstrap contains forbidden bypass: {forbidden}",
+        )
+
+
+def _assert_build_workflow(workflow: str, root: Path = ROOT) -> None:
     _assert_release_manifest_workflow(workflow)
     _require(
         "pull_request:" in workflow
@@ -2331,13 +2390,14 @@ def _assert_build_workflow(workflow: str) -> None:
         and '"nvdisasm_$componentVersion"' in workflow
         and '"$cudaRoot\\bin\\cuobjdump.exe"' in workflow
         and '"$cudaRoot\\bin\\nvdisasm.exe"' in workflow
-        and "cuda-nvdisasm-13-3" in workflow
+        and 'bash "{project}/.github/scripts/provision_cuda_13_3_rpms.sh"' in workflow
         and "command -v nvdisasm" in workflow
         and "where.exe nvdisasm.exe" in workflow,
         "the CUDA toolkit component manifest, immutable Windows cache key, and "
         "strict cross-platform preflights must cover the complete toolchain used "
         "for machine-code evidence",
     )
+    _assert_cuda_ci_bootstrap(root)
     validator_conditions = {
         "validate_wheels": (
             "needs.build_wheels.result == 'success' && "
@@ -2895,7 +2955,7 @@ def _assert_source_tree(root: Path) -> None:
     publish_workflow = (
         root / ".github" / "workflows" / "publish_release.yml"
     ).read_text(encoding="utf-8")
-    _assert_build_workflow(build_workflow)
+    _assert_build_workflow(build_workflow, root)
     _assert_publish_workflow(publish_workflow)
     _assert_release_manifest_documentation(root)
 

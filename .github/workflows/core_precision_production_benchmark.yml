@@ -70,15 +70,56 @@ jobs:
       PR_NUMBER: ${{ github.event.number || inputs.pull_request_number }}
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || inputs.expected_candidate_sha }}
-
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
+
+      - name: Validate manual dispatch source before checkout
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GITHUB_READ_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # -I excludes a stale self-hosted workspace from Python's import path.
+          python -I - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+
+          candidate = os.environ.get("EXPECTED_CANDIDATE_SHA", "")
+          if re.fullmatch(r"[0-9a-f]{40}", candidate) is None:
+              raise SystemExit("candidate must be a full lowercase SHA")
+          pr_number = os.environ.get("PR_NUMBER", "").strip()
+          if not pr_number.isdecimal() or int(pr_number) < 1:
+              raise SystemExit("a positive live pull request number is required")
+          request = urllib.request.Request(
+              f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/pulls/{pr_number}",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GITHUB_READ_TOKEN']}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              live = json.load(response)
+          if live.get("state") != "open":
+              raise SystemExit("PR is not open")
+          if live.get("head", {}).get("sha") != candidate:
+              raise SystemExit("live PR head changed from expected candidate")
+          if live.get("head", {}).get("repo", {}).get("full_name") != os.environ["GITHUB_REPOSITORY"]:
+              raise SystemExit("Core evidence requires a repository-owned PR head")
+          if live.get("base", {}).get("ref") != "main":
+              raise SystemExit("PR no longer targets main")
+          print("Manual Core benchmark source accepted before checkout")
+          PY
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || inputs.expected_candidate_sha }}
 
       - name: Install exact benchmark build tools
         shell: bash

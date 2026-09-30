@@ -2,6 +2,11 @@
 #include <cstdio>
 #include <cstring>
 
+#if defined(__unix__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #include "../../../src/common/gpu_abi_impl.hpp"
 
 namespace {
@@ -48,11 +53,74 @@ int expect(int actual, int expected, const char* label) {
     return 1;
 }
 
+int expect_short_buffer_headers_fail_before_payload_reads() {
+#if defined(__unix__)
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return 1;
+    const size_t page = static_cast<size_t>(page_size);
+    void* pages = mmap(nullptr, page * 2, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pages == MAP_FAILED) return 1;
+    auto* inaccessible = static_cast<unsigned char*>(pages) + page;
+    if (mprotect(inaccessible, page, PROT_NONE) != 0) {
+        munmap(pages, page * 2);
+        return 1;
+    }
+
+    // Only the version/size header is live. A later field read faults on the
+    // adjacent protected page instead of being hidden by adjacent allocation.
+    const uint32_t header[] = {GAFIME_PRECISION_ABI_VERSION, 8};
+    static_assert(sizeof(header) == 8, "ABI header must be eight bytes");
+    auto* bytes = inaccessible - sizeof(header);
+    std::memcpy(bytes, header, sizeof(header));
+    int failed = 0;
+    failed |= expect(
+        gafime_gpu_abi::validate_const_buffer(
+            reinterpret_cast<const GafimeConstBufferView*>(bytes), GAFIME_DTYPE_F32, 1),
+        GAFIME_STATUS_ABI_MISMATCH,
+        "short standalone const view");
+    failed |= expect(
+        gafime_gpu_abi::validate_mutable_buffer(
+            reinterpret_cast<const GafimeMutableBufferView*>(bytes), GAFIME_DTYPE_F32, 1),
+        GAFIME_STATUS_ABI_MISMATCH,
+        "short standalone mutable view");
+    munmap(pages, page * 2);
+    return failed;
+#else
+    return 0;
+#endif
+}
+
 }  // namespace
 
 int main() {
     float value = 1.0f;
     int failed = 0;
+    failed |= expect_short_buffer_headers_fail_before_payload_reads();
+
+    GafimeConstBufferView prefix_const = const_view(&value, 1);
+    prefix_const.struct_size = gafime_gpu_abi::kConstBufferStablePrefixSize;
+    failed |= expect(
+        gafime_gpu_abi::validate_const_buffer(&prefix_const, GAFIME_DTYPE_F32, 1),
+        GAFIME_STATUS_OK,
+        "complete standalone const stable prefix");
+    prefix_const.struct_size -= 1;
+    failed |= expect(
+        gafime_gpu_abi::validate_const_buffer(&prefix_const, GAFIME_DTYPE_F32, 1),
+        GAFIME_STATUS_ABI_MISMATCH,
+        "short standalone const stable prefix");
+
+    GafimeMutableBufferView prefix_mutable = mutable_view(&value, 1);
+    prefix_mutable.struct_size = gafime_gpu_abi::kMutableBufferStablePrefixSize;
+    failed |= expect(
+        gafime_gpu_abi::validate_mutable_buffer(&prefix_mutable, GAFIME_DTYPE_F32, 1),
+        GAFIME_STATUS_OK,
+        "complete standalone mutable stable prefix");
+    prefix_mutable.struct_size -= 1;
+    failed |= expect(
+        gafime_gpu_abi::validate_mutable_buffer(&prefix_mutable, GAFIME_DTYPE_F32, 1),
+        GAFIME_STATUS_ABI_MISMATCH,
+        "short standalone mutable stable prefix");
 
     FutureConstBufferView future_const{};
     future_const.known = const_view(&value, 1);

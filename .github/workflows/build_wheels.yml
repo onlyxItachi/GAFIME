@@ -443,7 +443,7 @@ jobs:
           CIBW_ARCHS_LINUX: "x86_64"
           CIBW_ARCHS_WINDOWS: "AMD64"
           CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
-          CIBW_BEFORE_ALL_LINUX: "rpm --import https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/D42D0685.pub && curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo -o /etc/yum.repos.d/cuda-rhel8.repo && dnf clean all && dnf install -y cuda-nvcc-13-3 cuda-cudart-devel-13-3 cuda-cuobjdump-13-3 cuda-nvdisasm-13-3 && ln -sfn /usr/local/cuda-13.3 /usr/local/cuda"
+          CIBW_BEFORE_ALL_LINUX: 'bash "{project}/.github/scripts/provision_cuda_13_3_rpms.sh"'
           CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair --plat manylinux_2_28_x86_64 --exclude libcudart.so.13 -w {dest_dir} {wheel}"
           CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: 'delvewheel repair --exclude "cudart64_13.dll;nvcudart_hybrid64.dll" -w {dest_dir} {wheel}'
