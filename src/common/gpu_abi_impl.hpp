@@ -234,12 +234,22 @@ inline int validate_const_buffer(
     if (view == nullptr || !naturally_aligned(view)) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
+    // A direct ABI caller may provide only the version/size header. Copy that
+    // header before reading any field in the stable prefix.
+    uint32_t header[2]{};
+    std::memcpy(header, view, sizeof(header));
+    if (!abi_1_1_compatible(header[0], header[1], kConstBufferStablePrefixSize)) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    GafimeConstBufferView known{};
+    std::memcpy(&known, view,
+        header[1] >= sizeof(known) ? sizeof(known) : kConstBufferStablePrefixSize);
     const int status = validate_buffer_common(
-        view->abi_version, view->struct_size, view->dtype, view->flags, view->data,
-        view->element_count, view->byte_length, view->byte_stride, expected_dtype,
+        known.abi_version, known.struct_size, known.dtype, known.flags, known.data,
+        known.element_count, known.byte_length, known.byte_stride, expected_dtype,
         expected_elements, kConstBufferStablePrefixSize);
     if (status != GAFIME_STATUS_OK) return status;
-    if (view->struct_size >= sizeof(GafimeConstBufferView) && !all_zero(view->reserved)) {
+    if (header[1] >= sizeof(known) && !all_zero(known.reserved)) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     return GAFIME_STATUS_OK;
@@ -253,12 +263,20 @@ inline int validate_mutable_buffer(
     if (view == nullptr || !naturally_aligned(view)) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
+    uint32_t header[2]{};
+    std::memcpy(header, view, sizeof(header));
+    if (!abi_1_1_compatible(header[0], header[1], kMutableBufferStablePrefixSize)) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    GafimeMutableBufferView known{};
+    std::memcpy(&known, view,
+        header[1] >= sizeof(known) ? sizeof(known) : kMutableBufferStablePrefixSize);
     const int status = validate_buffer_common(
-        view->abi_version, view->struct_size, view->dtype, view->flags, view->data,
-        view->element_capacity, view->byte_length, view->byte_stride, expected_dtype,
+        known.abi_version, known.struct_size, known.dtype, known.flags, known.data,
+        known.element_capacity, known.byte_length, known.byte_stride, expected_dtype,
         expected_elements, kMutableBufferStablePrefixSize);
     if (status != GAFIME_STATUS_OK) return status;
-    if (view->struct_size >= sizeof(GafimeMutableBufferView) && !all_zero(view->reserved)) {
+    if (header[1] >= sizeof(known) && !all_zero(known.reserved)) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     return GAFIME_STATUS_OK;

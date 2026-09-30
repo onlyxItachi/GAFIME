@@ -61,6 +61,10 @@ exclude an ABI 1.1 caller that supplies the complete 1.1 prefix.
 - A major-version mismatch fails with `GAFIME_STATUS_ABI_MISMATCH`.
 - A newer minor is accepted when the complete known stable prefix is present.
 - A shorter-than-required stable prefix fails closed.
+- Standalone typed-buffer consumers inspect the version/size header before
+  reading the stable prefix. Callers must provide a live, aligned header and
+  readable storage for the known fields their accepted size makes present;
+  pointer validity and lifetime remain caller responsibilities.
 - A consumer ignores fields after the smaller of its known structure size and
   the producer record's `struct_size`.
 - Current producers zero reserved fields. A current record with a nonzero known

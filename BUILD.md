@@ -147,6 +147,10 @@ CUDA payload translation units use C++20. The template-specialized kernels do
 not require C++23, and C++20 keeps the CUDA 13.3 payload build compatible with
 both supported Linux host compilers and Visual Studio 2026 on Windows.
 
+Host-only C++ ABI validation fixtures use C++23, including sanitizer runs.
+The external C ABI consumers remain C11 to verify that the public header does
+not require C++ for integration.
+
 `gafime-core-smoke` skips CUDA and ROCm, builds the base package, and runs a
 small Rust/PyO3 CPU smoke test.
 
