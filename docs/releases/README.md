@@ -7,17 +7,16 @@ the historical record for that release or checkpoint.
 
 ## Current Release Train
 
-`v1.0.0-rc.1` is the current public prerelease. The next candidate target is
-`v1.0.0-rc.2`; its release-branch preparation does not itself change the source
-version or create a tag or release. Its protected settled branch tip will be
-the candidate source while `main` may continue; publication still requires
-final admission of that exact tip into `main`. Follow the mutable
+The current source targets `v1.0.0-rc.2`. Its protected settled branch tip is
+the candidate source while `main` may continue; publication requires final
+admission of that exact tip into `main` and its verified frozen artifacts.
+Source version preparation does not itself create a tag or release. Follow the mutable
 [release status](STATUS.md) for current gates and the live
 [GitHub Releases](https://github.com/onlyxItachi/GAFIME/releases) and
 [PyPI project](https://pypi.org/project/gafime/) for publication state.
 
-The [RC2 candidate note](v1.0.0-rc.2.md) is a draft for the hardening proposal;
-it is not yet a historical publication record.
+The [RC2 release note](v1.0.0-rc.2.md) describes the bounded hardening scope;
+live release presence is established by the public channels above.
 
 ## Release Operations
 
@@ -29,6 +28,8 @@ it is not yet a historical publication record.
 
 ### v1
 
+- [`v1.0.0-rc.2`](v1.0.0-rc.2.md) — validation and artifact-identity hardening;
+  see current status and public channels for publication state.
 - [`v1.0.0-rc.1`](v1.0.0-rc.1.md) — public release candidate.
 - [`1.0.0-beta.2`](v1.0.0-beta.2.md) — unreleased pre-RC checkpoint; its frozen
   artifacts were qualification evidence, not a public release.

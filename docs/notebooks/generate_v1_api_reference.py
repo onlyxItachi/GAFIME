@@ -377,7 +377,7 @@ def _cells() -> list:
             ```
 
             An unqualified `pip install gafime` prefers the latest stable release;
-            it does not select this beta automatically.
+            it does not select beta or release-candidate versions automatically.
             """
         ),
         _md(
