@@ -31,6 +31,24 @@ on every lookup.
 For small list inputs, one-shot eager can therefore be faster even though it
 recreates native matrix state.
 
+Resident NumPy staging acquires private immutable bytes before range validation
+and content hashing. The feature and target fingerprints identify the same
+selected-dtype bytes consumed by compilation or target replacement. Readonly
+views of those bytes serve compatibility conversion; the caller's arrays and
+their writeability are untouched. Later writes to caller storage, including a
+NumPy memmap, cannot change the acquired snapshot or poison its cache identity.
+Matching-dtype contiguous input reuses its source snapshot as native transport;
+conversion cases retain the existing dtype/range checks. Snapshot storage is
+transient and is not retained as another matrix in the resident LRU.
+
+This is not an atomic transaction with an external writer, nor an atomic paired
+snapshot of `X` and `y`. Applications that require a coherent dataset must
+synchronize writers during acquisition. A read-only view of caller memory would
+not provide this isolation: another alias could still write to the same buffer.
+Resident cache hits also acquire and hash a snapshot, adding temporary storage
+proportional to input size and copy traffic. Explicit compiled replay avoids that per-call input
+acquisition; its matrix is already owned by Rust.
+
 Only the resident path computes those content digests. One-shot and explicit
 compile still perform selected-storage-dtype validation and contiguous
 conversion, but do not hash the input they will not look up. Changing

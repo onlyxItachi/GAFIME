@@ -171,3 +171,12 @@ before reading input.
 The advanced compatibility `BatchScheduler(max_blocks=...)` requires a positive
 capacity and raises `ValueError` for zero before scheduling work. Its size hints
 are calculated without overflow when a large positive capacity is supplied.
+
+Resident NumPy input ownership is covered by deterministic external-writer
+regressions across all three profiles, for arrays and memmaps. Fingerprints,
+native compilation, and target reuse consume the same private snapshot; a later
+stable cache hit cannot reuse content changed after hashing. Layout/conversion
+tests cover readonly isolation, selected dtype, signed zero/non-finites,
+strides, endian conversion, and range rejection. Acquisition is not an atomic
+cross-array transaction; see the
+[execution lifecycle guide](eager-resident-compiled-execution.md).
