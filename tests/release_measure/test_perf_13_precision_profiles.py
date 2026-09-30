@@ -198,16 +198,62 @@ def test_wheel_record_rejects_install_destination_aliases(
     assert perf13._wheel_identity(wheel)["status"] == "invalid"
 
 
-def test_wheel_record_accepts_noncolliding_relocated_members(tmp_path: Path) -> None:
+@pytest.mark.parametrize("scheme", ["purelib", "platlib"])
+def test_wheel_record_accepts_noncolliding_relocated_members(
+    tmp_path: Path, scheme: str
+) -> None:
     members = [
         ("gafime/__init__.py", b"original"),
-        ("gafime-1.0.0rc1.data/purelib/helper.py", b"helper"),
+        (f"gafime-1.0.0rc1.data/{scheme}/helper.py", b"helper"),
     ]
     wheel = tmp_path / "gafime.whl"
     _record_wheel(
         wheel, members, "".join(_record_row(name, data) for name, data in members)
     )
     assert perf13._wheel_identity(wheel).get("status") != "invalid"
+
+
+@pytest.mark.parametrize("scheme", ["data", "scripts", "headers", "unknown"])
+def test_wheel_runtime_binding_rejects_unmodeled_install_schemes(
+    tmp_path: Path, scheme: str
+) -> None:
+    runtime = tmp_path / "installed"
+    package = runtime / "gafime"
+    package.mkdir(parents=True)
+    original = b"original-python"
+    (package / "__init__.py").write_bytes(original)
+    members = [
+        ("gafime/__init__.py", original),
+        (
+            f"gafime-1.0.0rc1.data/{scheme}/lib/python3.14/"
+            "site-packages/gafime/__init__.py",
+            b"different-bytes",
+        ),
+    ]
+    wheel = tmp_path / "gafime.whl"
+    # Both assertions are accurate: rejection must concern install destinations,
+    # not a conveniently broken RECORD checksum.
+    _record_wheel(
+        wheel, members, "".join(_record_row(name, data) for name, data in members)
+    )
+    binding = perf13._wheel_runtime_binding(
+        [str(wheel)],
+        {"gafime": {"version": "1.0.0rc1", "root": str(runtime)}},
+        [
+            {
+                **_identity(package / "__init__.py"),
+                "kind": "python",
+                "module": "gafime",
+            }
+        ],
+        [],
+        None,
+        "core",
+    )
+    identity = perf13._wheel_identity(wheel)
+    assert identity["status"] == "invalid"
+    assert "non-import install schemes" in identity["detail"]
+    assert binding["complete"] is False
 
 
 def test_wheel_record_rejects_corrupt_deflate_without_raising(tmp_path: Path) -> None:

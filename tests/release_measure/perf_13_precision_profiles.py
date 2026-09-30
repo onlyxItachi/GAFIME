@@ -1689,13 +1689,15 @@ def _wheel_member_paths(archive: zipfile.ZipFile) -> set[str]:
         members.add(name)
         if info.is_dir():
             continue
-        # Wheel installers relocate these scheme directories into the same
-        # import root as ordinary package members. Compare destinations too.
-        if (
-            len(parts) >= 3
-            and parts[0].endswith(".data")
-            and parts[1] in {"purelib", "platlib"}
-        ):
+        # Import schemes share the package root. Other schemes depend on the
+        # install prefix and can also alias that root (for example data/lib/
+        # pythonX.Y/site-packages). This identity helper does not model those
+        # destinations, so reject them rather than attest ambiguous bytes.
+        if parts[0].endswith(".data"):
+            if len(parts) < 3 or parts[1] not in {"purelib", "platlib"}:
+                raise ValueError(
+                    "wheel identity cannot bind non-import install schemes"
+                )
             parts = parts[2:]
         destination = "/".join(part.rstrip(" .").casefold() for part in parts)
         if destination in destinations:
