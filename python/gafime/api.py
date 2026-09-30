@@ -40,6 +40,11 @@ class GafimeEngine:
         requests fail closed if their payload, device, family, or precision is
         unsupported; only ``backend="auto"`` may select another backend.
 
+        Resident NumPy input is staged in private immutable bytes: cache
+        fingerprints and native ingest use the same snapshot.  Acquisition is
+        not atomic against concurrent writers or across ``X`` and ``y``;
+        callers needing a coherent dataset must synchronize those writes.
+
         Returns a :class:`DiagnosticReport`.  Generated time-series or
         decision-path execution is selected by the corresponding mutually
         exclusive ``EngineConfig`` switch.

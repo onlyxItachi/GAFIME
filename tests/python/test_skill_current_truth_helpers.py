@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import tempfile
 import unittest
@@ -281,6 +282,38 @@ class CurrentTruthHelperTests(unittest.TestCase):
         )
         self.assertIn("astype(np.float64)", script)
         self.assertNotIn("astype(np.float32)", script)
+
+    def test_generated_pipeline_treats_dataset_names_as_data(self) -> None:
+        data_path = 'data/{item}"\\name\n.csv'
+        target = 'target"\\{item}\n'
+        for path in (data_path, data_path + ".parquet", "data/{item}.csv"):
+            with self.subTest(path=path):
+                script = self.generator.generate_pipeline_script(
+                    "classification", data_path=path, target=target
+                )
+                tree = ast.parse(script)
+                assignments = {
+                    statement.targets[0].id: ast.literal_eval(statement.value)
+                    for statement in tree.body
+                    if isinstance(statement, ast.Assign)
+                    and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Name)
+                    and statement.targets[0].id in {"data_path", "target_column"}
+                }
+                self.assertEqual(
+                    assignments, {"data_path": path, "target_column": target}
+                )
+                compile(tree, "generated-pipeline.py", "exec")
+                self.assertNotIn(
+                    "item",
+                    {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)},
+                )
+                self.assertIn(
+                    "df = pl.read_parquet(data_path)"
+                    if path.endswith(".parquet")
+                    else "df = pl.read_csv(data_path, infer_schema_length=10000)",
+                    script,
+                )
 
     def test_validation_uses_neutral_status_and_paired_finite_rows(self) -> None:
         x = np.arange(60, dtype=np.float32).reshape(20, 3)

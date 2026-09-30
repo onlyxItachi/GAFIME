@@ -80,41 +80,48 @@ def generate_pipeline_script(
 
     # Data loading section
     if data_path:
+        # These values are data in the generated program, not source fragments.
+        data_path_literal = repr(str(data_path))
+        target_literal = repr(str(target))
         ext = Path(data_path).suffix
         if ext == ".parquet":
             data_load = f'''# Load data
 import polars as pl
 
-df = pl.read_parquet("{data_path}")
-if not df.schema["{target}"].is_numeric():
+data_path = {data_path_literal}
+target_column = {target_literal}
+df = pl.read_parquet(data_path)
+if not df.schema[target_column].is_numeric():
     raise TypeError("GAFIME requires a numeric target; encode the target first")
 feature_cols = [
     name for name, dtype in df.schema.items()
-    if name != "{target}" and dtype.is_numeric()
+    if name != target_column and dtype.is_numeric()
 ]
 if not feature_cols:
     raise ValueError("No numeric feature columns remain after excluding the target")
 X = df.select(feature_cols).to_numpy().astype({numpy_dtype})
-y = df["{target}"].to_numpy().astype({numpy_dtype})
+y = df[target_column].to_numpy().astype({numpy_dtype})
 feature_names = feature_cols
-print(f"Loaded {{X.shape[0]}} samples x {{X.shape[1]}} features from {data_path}")'''
+print(f"Loaded {{X.shape[0]}} samples x {{X.shape[1]}} features from {{data_path}}")'''
         else:
             data_load = f'''# Load data
 import polars as pl
 
-df = pl.read_csv("{data_path}", infer_schema_length=10000)
-if not df.schema["{target}"].is_numeric():
+data_path = {data_path_literal}
+target_column = {target_literal}
+df = pl.read_csv(data_path, infer_schema_length=10000)
+if not df.schema[target_column].is_numeric():
     raise TypeError("GAFIME requires a numeric target; encode the target first")
 feature_cols = [
     name for name, dtype in df.schema.items()
-    if name != "{target}" and dtype.is_numeric()
+    if name != target_column and dtype.is_numeric()
 ]
 if not feature_cols:
     raise ValueError("No numeric feature columns remain after excluding the target")
 X = df.select(feature_cols).to_numpy().astype({numpy_dtype})
-y = df["{target}"].to_numpy().astype({numpy_dtype})
+y = df[target_column].to_numpy().astype({numpy_dtype})
 feature_names = feature_cols
-print(f"Loaded {{X.shape[0]}} samples x {{X.shape[1]}} features from {data_path}")'''
+print(f"Loaded {{X.shape[0]}} samples x {{X.shape[1]}} features from {{data_path}}")'''
     else:
         data_load = f'''# Generate synthetic data (replace with your own data loading)
 n_samples, n_features = 5000, 20

@@ -11,11 +11,12 @@ import types
 
 import pytest
 
+from gafime import __version__
 from gafime import _payloads as payloads
 from gafime import v1_adapter
 
 
-VERSION = "1.0.0rc1"
+VERSION = __version__
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -135,7 +136,6 @@ def test_discovers_exactly_one_matching_installed_payload(tmp_path, monkeypatch)
     assert Path(payloads.os.environ[payloads.CUDA_LIBRARY_ENV]) == expected
 
 
-
 def test_legacy_distributed_rt_identity_is_not_discovered(tmp_path, monkeypatch):
     site = tmp_path / "site"
     site.mkdir()
@@ -181,7 +181,7 @@ def test_reads_installed_payload_policy_without_loading_library(tmp_path, monkey
     policy, detail = payloads.installed_payload_build_policy("rocm")
 
     assert policy == expected
-    assert "gafime-rocm 1.0.0rc1" in detail
+    assert f"gafime-rocm {VERSION}" in detail
     assert payloads.ROCM_LIBRARY_ENV not in payloads.os.environ
     assert ("gafime_rocm" in sys.modules) is was_imported
 
@@ -515,7 +515,6 @@ def test_staged_rocm_rejects_unimplemented_wheel_policies(tmp_path, policy):
     assert "invalid choice" in result.stderr
 
 
-
 def test_staged_rocm_policy_is_immutable_and_matches_system_manifest(
     tmp_path, monkeypatch
 ):
@@ -534,9 +533,9 @@ def test_staged_rocm_policy_is_immutable_and_matches_system_manifest(
     )
 
     expected = json.loads(
-        (
-            ROOT / ".github" / "scripts" / "rocm_7_2_3_system_policy.json"
-        ).read_text(encoding="utf-8")
+        (ROOT / ".github" / "scripts" / "rocm_7_2_3_system_policy.json").read_text(
+            encoding="utf-8"
+        )
     )
     actual = json.loads(
         (output / "gafime_rocm" / "build_policy.json").read_text(encoding="utf-8")
@@ -546,7 +545,7 @@ def test_staged_rocm_policy_is_immutable_and_matches_system_manifest(
 
     assert actual == expected
     assert 'name = "gafime-rocm"' in pyproject
-    assert 'dependencies = ["gafime==1.0.0rc1"]' in pyproject
+    assert f'dependencies = ["gafime=={VERSION}"]' in pyproject
     assert 'ROCM_WHEEL_POLICY = "system"' in setup_source
     assert "restage the payload instead" in setup_source
     assert not (
@@ -592,7 +591,7 @@ def test_staged_cuda_has_one_distribution_identity_and_no_rt_sources(tmp_path):
     }
 
     assert 'name = "gafime-cuda"' in pyproject
-    assert 'dependencies = ["gafime==1.0.0rc1"]' in pyproject
+    assert f'dependencies = ["gafime=={VERSION}"]' in pyproject
     assert "abi3" not in setup_source
     assert '"-cudart",\n            "shared"' in setup_source
     assert '"-cudart",\n            "static"' not in setup_source
@@ -609,8 +608,7 @@ def test_staged_cuda_has_one_distribution_identity_and_no_rt_sources(tmp_path):
     distributed_code = "\n".join(
         path.read_text(encoding="utf-8")
         for path in sorted(output.rglob("*"))
-        if path.is_file()
-        and path.name not in {"README.md", "build_policy.json"}
+        if path.is_file() and path.name not in {"README.md", "build_policy.json"}
     )
     for forbidden_identity in (
         "GafimeDecisionPathTerm",
@@ -658,12 +656,10 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     assert "--built-source-sha" in build
     assert "--authoritative-source-sha" in build
     assert (
-        "auditwheel repair --plat manylinux_2_28_x86_64 "
-        "--exclude libcudart.so.13"
+        "auditwheel repair --plat manylinux_2_28_x86_64 --exclude libcudart.so.13"
     ) in build
     assert (
-        'delvewheel repair --exclude "cudart64_13.dll;nvcudart_hybrid64.dll"'
-        in build
+        'delvewheel repair --exclude "cudart64_13.dll;nvcudart_hybrid64.dll"' in build
     )
     assert "cudart_static.lib" not in build
     assert not re.search(r"(?m)^\s+target\s*$", build)
@@ -715,9 +711,9 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     assert "gafime_rocm-*.tar.gz" in rocm
     assert "gafime_rocm-*.whl" not in rocm
     assert publish.count("release_bundle.py verify") >= 5
-    assert publish.count(
-        "ref: ${{ needs.publication_preflight.outputs.source_sha }}"
-    ) == 7
+    assert (
+        publish.count("ref: ${{ needs.publication_preflight.outputs.source_sha }}") == 7
+    )
     assert publish.count("verify_release_ref_identity.py") == 4
     assert "ref: ${{ inputs.release_tag }}" not in publish
     assert "verify_public_core_and_cuda" in publish
@@ -807,9 +803,9 @@ def test_publish_workflow_keeps_adversarial_dispatch_values_out_of_shell_source(
     assert '[ "$branch_sha" != "$tag_sha" ]' in publish
     assert 'git merge-base --is-ancestor "$tag_sha" origin/main' in publish
     assert '[[ ! "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]]' in publish
-    assert publish.count(
-        "ref: ${{ needs.publication_preflight.outputs.source_sha }}"
-    ) == 7
+    assert (
+        publish.count("ref: ${{ needs.publication_preflight.outputs.source_sha }}") == 7
+    )
     assert publish.count("verify_release_ref_identity.py") == 4
     assert "ref: ${{ inputs.release_tag }}" not in publish
 

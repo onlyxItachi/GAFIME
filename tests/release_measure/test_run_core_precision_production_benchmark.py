@@ -823,6 +823,22 @@ def test_workflow_uses_the_compatible_before_fix_precision_head_and_tracks_the_r
     assert (
         "tests/release_measure/run_core_precision_production_benchmark.py" in workflow
     )
+
+    setup = workflow.index("- name: Set up Python")
+    preflight = workflow.index("- name: Validate manual dispatch source before checkout")
+    checkout = workflow.index("- uses: actions/checkout@")
+    install = workflow.index("- name: Install exact benchmark build tools")
+    assert setup < preflight < checkout < install
+    preflight_step = workflow[preflight:checkout]
+    assert "if: github.event_name == 'workflow_dispatch'" in preflight_step
+    assert "python -I - <<'PY'" in preflight_step
+    for predicate in (
+        'live.get("state") != "open"',
+        'live.get("head", {}).get("sha") != candidate',
+        'live.get("head", {}).get("repo", {}).get("full_name")',
+        'live.get("base", {}).get("ref") != "main"',
+    ):
+        assert predicate in preflight_step
     assert (
         "tests/release_measure/test_run_core_precision_production_benchmark.py"
         in workflow

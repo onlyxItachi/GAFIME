@@ -90,6 +90,8 @@ class _CachedCoercedInput:
     precision: str
     feature_digest: bytes | None
     target_digest: bytes | None
+    feature_snapshot: bytes | None = None
+    target_snapshot: bytes | None = None
 
     def feature_list(self) -> List[float]:
         return _numeric_storage_to_list(self.features)
@@ -98,9 +100,13 @@ class _CachedCoercedInput:
         return _numeric_storage_to_list(self.target)
 
     def feature_bytes(self) -> bytes:
+        if self.feature_snapshot is not None:
+            return self.feature_snapshot
         return _numeric_storage_to_le_bytes(self.features, self.precision)
 
     def target_bytes(self) -> bytes:
+        if self.target_snapshot is not None:
+            return self.target_snapshot
         return _numeric_storage_to_le_bytes(self.target, self.precision)
 
 
@@ -268,7 +274,7 @@ def _analyze_continuous_with_resident_cache(
                     entry = None
                 else:
                     if entry.target_digest != coerced.target_digest:
-                        entry.artifact.update_target(coerced.target_list())
+                        entry.artifact.update_target(coerced.target)
                         entry.target_digest = coerced.target_digest
                     return entry.artifact.analyze()
         except BaseException:
@@ -1514,6 +1520,19 @@ def _try_coerce_numpy_row_major_f32_for_cache(
     if int(source_target.shape[0]) != rows:
         raise ValueError("X and y must have the same number of samples.")
 
+    feature_snapshot = target_snapshot = None
+    if include_digests:
+        # NumPy coercion may alias caller storage, including a writable memmap.
+        # Freeze transport data before validation/hash so a later external write
+        # cannot associate one content key with a different native matrix.
+        # Acquisition is not atomic against a writer, or across X and y.
+        feature_snapshot = source_features.tobytes(order="C")
+        target_snapshot = source_target.tobytes(order="C")
+        source_features = np.frombuffer(
+            feature_snapshot, dtype=source_features.dtype
+        ).reshape(rows, cols)
+        source_target = np.frombuffer(target_snapshot, dtype=source_target.dtype)
+
     source_features_finite = np.isfinite(source_features)
     source_target_finite = np.isfinite(source_target)
     if precision != "fp64":
@@ -1549,6 +1568,18 @@ def _try_coerce_numpy_row_major_f32_for_cache(
         )
     features = np.ascontiguousarray(features, dtype=numpy_dtype)
     target = np.ascontiguousarray(target, dtype=numpy_dtype)
+    if include_digests:
+        # Matching-dtype inputs reuse their source snapshot: no copy followed by
+        # another full-size transport copy on the common path. Conversion still
+        # uses the established range checks and never quantizes fp64 through f32.
+        if features is not source_features:
+            feature_snapshot = features.tobytes(order="C")
+        if target is not source_target:
+            target_snapshot = target.tobytes(order="C")
+        features = np.frombuffer(feature_snapshot, dtype=numpy_dtype).reshape(
+            rows, cols
+        )
+        target = np.frombuffer(target_snapshot, dtype=numpy_dtype)
     names = _coerce_feature_names(feature_names, cols)
     return _CachedCoercedInput(
         features=features,
@@ -1558,17 +1589,17 @@ def _try_coerce_numpy_row_major_f32_for_cache(
         feature_names=names,
         precision=precision,
         feature_digest=(
-            _numeric_buffer_digest(
-                rows * cols, memoryview(features).cast("B"), precision
-            )
-            if include_digests
+            _numeric_buffer_digest(rows * cols, feature_snapshot, precision)
+            if feature_snapshot is not None
             else None
         ),
         target_digest=(
-            _numeric_buffer_digest(rows, memoryview(target).cast("B"), precision)
-            if include_digests
+            _numeric_buffer_digest(rows, target_snapshot, precision)
+            if target_snapshot is not None
             else None
         ),
+        feature_snapshot=feature_snapshot,
+        target_snapshot=target_snapshot,
     )
 
 
