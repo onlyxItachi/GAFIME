@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import base64
 import copy
 import hashlib
 import importlib.util
@@ -81,6 +82,145 @@ def _identity(path: Path) -> dict[str, object]:
         "size_bytes": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
     }
+
+
+def _record_wheel(path: Path, members: list[tuple[str, bytes]], record: str) -> None:
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "gafime-1.0.0rc1.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: gafime\nVersion: 1.0.0rc1\n",
+        )
+        for name, data in members:
+            archive.writestr(name, data)
+        archive.writestr("gafime-1.0.0rc1.dist-info/RECORD", record)
+
+
+def _record_row(name: str, data: bytes) -> str:
+    digest = (
+        base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
+    )
+    return f"{name},sha256={digest},{len(data)}\n"
+
+
+def test_wheel_runtime_binding_uses_verified_archive_bytes(tmp_path: Path) -> None:
+    runtime = tmp_path / "installed"
+    package = runtime / "gafime"
+    package.mkdir(parents=True)
+    members = [
+        ("gafime/__init__.py", b"original-python"),
+        ("gafime/native.so", b"native"),
+    ]
+    for name, data in members:
+        (runtime / name).write_bytes(data)
+    modules = [
+        {**_identity(package / "__init__.py"), "kind": "python", "module": "gafime"}
+    ]
+    native = [_identity(package / "native.so")]
+    distributions = {"gafime": {"version": "1.0.0rc1", "root": str(runtime)}}
+    wheel = tmp_path / "gafime.whl"
+    record = "".join(_record_row(name, data) for name, data in members)
+
+    def binding() -> dict[str, object]:
+        return perf13._wheel_runtime_binding(
+            [str(wheel)], distributions, modules, native, None, "core"
+        )
+
+    _record_wheel(wheel, members, record)
+    assert binding()["complete"] is True
+    for changed_index in range(len(members)):
+        changed = list(members)
+        changed[changed_index] = (changed[changed_index][0], b"different-bytes")
+        _record_wheel(wheel, changed, record)
+        assert perf13._wheel_identity(wheel)["status"] == "invalid"
+        assert binding()["complete"] is False
+
+    changed = [(members[0][0], b"different-bytes"), members[1]]
+    _record_wheel(
+        wheel, changed, "".join(_record_row(name, data) for name, data in changed)
+    )
+    assert perf13._wheel_identity(wheel).get("status") != "invalid"
+    assert binding()["complete"] is False
+    assert any(
+        "loaded_module_wheel_hash_mismatch" in failure
+        for failure in binding()["failures"]
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["missing", "duplicate_member", "duplicate_row", "malformed", "noncanonical"],
+)
+def test_wheel_record_rejects_ambiguous_or_invalid_claims(
+    tmp_path: Path, case: str
+) -> None:
+    member = ("gafime/__init__.py", b"original")
+    members = [member]
+    record = _record_row(*member)
+    if case == "missing":
+        members = []
+    elif case == "duplicate_member":
+        members.append(member)
+    elif case == "duplicate_row":
+        record *= 2
+    elif case == "malformed":
+        record = f"{member[0]},sha256=not-a-sha256,8\n"
+    else:
+        record = f"{member[0]},sha256={'A' * 42}B,8\n"
+    wheel = tmp_path / "gafime.whl"
+    if case == "duplicate_member":
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            _record_wheel(wheel, members, record)
+    else:
+        _record_wheel(wheel, members, record)
+    assert perf13._wheel_identity(wheel)["status"] == "invalid"
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "gafime/./__init__.py",
+        "gafime//__init__.py",
+        "gafime/../gafime/__init__.py",
+        "gafime-1.0.0rc1.data/purelib/gafime/__init__.py",
+        "gafime-1.0.0rc1.data/platlib/gafime/__init__.py",
+        "GAFIME/__init__.py",
+        "gafime/__init__.py.",
+    ],
+)
+def test_wheel_record_rejects_install_destination_aliases(
+    tmp_path: Path, alias: str
+) -> None:
+    members = [("gafime/__init__.py", b"original"), (alias, b"different")]
+    wheel = tmp_path / "gafime.whl"
+    _record_wheel(
+        wheel, members, "".join(_record_row(name, data) for name, data in members)
+    )
+    assert perf13._wheel_identity(wheel)["status"] == "invalid"
+
+
+def test_wheel_record_accepts_noncolliding_relocated_members(tmp_path: Path) -> None:
+    members = [
+        ("gafime/__init__.py", b"original"),
+        ("gafime-1.0.0rc1.data/purelib/helper.py", b"helper"),
+    ]
+    wheel = tmp_path / "gafime.whl"
+    _record_wheel(
+        wheel, members, "".join(_record_row(name, data) for name, data in members)
+    )
+    assert perf13._wheel_identity(wheel).get("status") != "invalid"
+
+
+def test_wheel_record_rejects_corrupt_deflate_without_raising(tmp_path: Path) -> None:
+    member = ("gafime/__init__.py", b"original")
+    wheel = tmp_path / "gafime.whl"
+    _record_wheel(wheel, [member], _record_row(*member))
+    with zipfile.ZipFile(wheel) as archive:
+        info = archive.getinfo(member[0])
+    data = bytearray(wheel.read_bytes())
+    offset = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+    data[offset : offset + info.compress_size] = b"\xff" * info.compress_size
+    wheel.write_bytes(data)
+    assert perf13._wheel_identity(wheel)["status"] == "invalid"
 
 
 def _native_plan_case(
@@ -554,6 +694,9 @@ def test_native_ab_rejects_identical_product_identities_without_public_results(
     baseline_manifest, candidate_manifest = _scheduled_native_manifests(
         tmp_path, include_reverse=True, candidate_commit="a" * 40
     )
+    assert (tmp_path / "baseline" / "gafime.whl").read_bytes() == (
+        tmp_path / "candidate" / "gafime.whl"
+    ).read_bytes()
     evidence = perf13._load_native_evidence_specs(
         [("baseline", str(baseline_manifest)), ("candidate", str(candidate_manifest))]
     )
@@ -659,10 +802,15 @@ def _core_artifact(
     binary.write_bytes(b"binary")
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr(
-            "gafime-1.0.0b2.dist-info/METADATA",
+            zipfile.ZipInfo(
+                "gafime-1.0.0b2.dist-info/METADATA", date_time=(1980, 1, 1, 0, 0, 0)
+            ),
             "Metadata-Version: 2.1\nName: gafime\nVersion: 1.0.0b2\n",
         )
-        archive.writestr("gafime/gafime_py.so", b"core-native")
+        archive.writestr(
+            zipfile.ZipInfo("gafime/gafime_py.so", date_time=(1980, 1, 1, 0, 0, 0)),
+            b"core-native",
+        )
     repeats = (
         perf13.CORE_BALANCED_SCHEDULE_CYCLES
         * perf13.CORE_PROFILE_ORDER_COUNT
