@@ -7,6 +7,8 @@ pub mod input;
 pub mod plan;
 pub mod reduce;
 pub mod schedule;
+#[doc(hidden)]
+pub mod semantic;
 
 pub use backend::{
     BackendExecutionStats, ComputeBackend, MatrixHandle, OrchestratorError, OrchestratorResult,

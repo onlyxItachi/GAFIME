@@ -32,6 +32,8 @@ documents that own each subject.
 - [CUDA template-kernel hardening](cuda-template-kernel-hardening.md)
 - [GPU target-statistics cache](gpu-continuous-target-stats-cache.md)
 - [GPU Spearman target-rank cache](gpu-spearman-target-rank-cache.md)
+- [v1.1 semantic evidence spine](v1.1-semantic-evidence-spine.md) — internal
+  candidate/evidence semantics and staged migration boundary.
 
 ## Build and Contribution
 

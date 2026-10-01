@@ -2,6 +2,18 @@
 
 This contract defines the boundaries that GAFIME v1 implementation work must preserve. It is a maintainer policy document, not a performance tuning note. Passing tests does not make a boundary violation acceptable.
 
+## Internal v1.1 Semantic Development
+
+The bounded [semantic evidence spine](v1.1-semantic-evidence-spine.md) is
+mainline development, not an expansion of the frozen public v1 Python/native
+ABI. Rust owns candidate programs, transitive dependencies, evaluation context,
+selection and acceptance; native Core owns its arithmetic. Semantic identities
+must not be substituted with execution ordinals, target slots or metric IDs.
+Evidence and accepted values remain context-bound; accepted program identity is
+independent of its scores. Unsupported backend/profile/evidence requests fail
+closed. This bounded internal slice supports explicit Core fp32/mixed/fp64, with no change to
+the existing supervised backend/profile contract or release-branch scope.
+
 ## Repository Layout
 
 Tracked project source, runtime, test, and documentation content must converge into:
