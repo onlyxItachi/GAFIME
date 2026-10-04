@@ -107,6 +107,7 @@ class CudaPayloadBuildExt(build_ext):
                 "-fPIC",
                 "-fvisibility=hidden",
                 "-fvisibility-inlines-hidden",
+                "-pthread",
             ]
 
         gencode_flags = [
@@ -314,6 +315,7 @@ class RocmPayloadBuildExt(build_ext):
                 "-fPIC",
                 "-fvisibility=hidden",
                 "-fvisibility-inlines-hidden",
+                "-pthread",
                 f"-Wl,--version-script={{src_dir / 'common' / 'gafime_gpu_exports.map'}}",
             ]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -503,6 +505,7 @@ def stage_payload(
         "gafime_gpu_internal_abi.hpp",
         "gafime_gpu_exports.map",
         "gpu_abi_impl.hpp",
+        "gpu_execution_gate.hpp",
     )
     for source_name in common_source_names:
         shutil.copy2(
