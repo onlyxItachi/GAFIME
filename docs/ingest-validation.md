@@ -48,6 +48,15 @@ keeps that convenience function's existing default seed. Non-default budgets
 which the shortcut cannot express continue through the configured route rather
 than being silently discarded.
 
+Shortcut eligibility also requires default values for omitted threshold fields,
+`significance_top_n`, and `mi_bins`, even when no significance or MI work is
+requested. Non-default or invalid values must reach the configured Rust parser's
+universal checks. The two shortcut count arguments must already be positive
+integers representable as u32/u64; other requests use the configured path rather
+than allowing PyO3's convenience signature to choose a different exception.
+These conditions admit the shortcut; they do not replace Rust validation or
+raise their own validation errors.
+
 ## Focused evidence and remaining gates
 
 `tests/python/test_v1_public_truthfulness.py` checks seed forwarding, per-call
@@ -65,3 +74,9 @@ instead of skipping. Focused tests do not replace the installed-package feature
 generation gate, precision gates, physical GPU validation, performance evidence,
 or release qualification. GIL, thread-local cache, Rayon and shutdown behavior
 are outside this change.
+
+The `test_integrated_dataload_*` cases specifically require the combined ingest
+and Rust config-validation fixes. They check uniform ValueError rejection for
+invalid omitted fields and count ranges, finite non-negative thresholds without
+an invented upper-one limit, and threshold representability in the result lane.
+They are installed-package tests, not evidence for the ingest-only parent wheel.
