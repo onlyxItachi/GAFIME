@@ -35,6 +35,8 @@ endif()
 
 set(_gafime_abi_suffix "${GAFIME_ABI_CONSUMER_TEST_SUFFIX}")
 
+find_package(Threads REQUIRED)
+
 function(gafime_configure_c_consumer target)
     set_target_properties(${target} PROPERTIES
         C_STANDARD 11
@@ -66,6 +68,37 @@ function(gafime_configure_cxx_contract_test target)
         target_compile_options(${target} PRIVATE /W4 /WX)
     endif()
 endfunction()
+
+# Host-only synchronization/fault-injection test; never opens a GPU payload.
+set(_gafime_execution_gate_target
+    "gafime_payload_execution_gate_${_gafime_abi_suffix}")
+add_executable(${_gafime_execution_gate_target} payload_execution_gate_test.cpp)
+gafime_configure_cxx_contract_test(${_gafime_execution_gate_target})
+target_link_libraries(${_gafime_execution_gate_target} PRIVATE Threads::Threads)
+add_test(NAME ${_gafime_execution_gate_target} COMMAND ${_gafime_execution_gate_target})
+set_tests_properties(${_gafime_execution_gate_target} PROPERTIES TIMEOUT 15)
+
+# Deliberately not a CTest workload: collision qualification needs an explicitly
+# selected fixed candidate, hashes, bounded subprocesses and operator preflight.
+option(GAFIME_ABI_CONSUMER_BUILD_CONCURRENCY_SHIMS
+    "Build foreign-call shims for the opt-in execution coordination regression" OFF)
+if(GAFIME_ABI_CONSUMER_BUILD_CONCURRENCY_SHIMS)
+    foreach(_abi_version IN ITEMS 1_0 1_1)
+        set(_shim "gafime_abi_${_abi_version}_concurrency_${_gafime_abi_suffix}")
+        add_library(${_shim} SHARED "abi_${_abi_version}_c_consumer.c")
+        gafime_configure_c_consumer(${_shim})
+        target_compile_definitions(${_shim} PRIVATE
+            "main=gafime_abi_${_abi_version}_consumer_main")
+        set_target_properties(${_shim} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    endforeach()
+endif()
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME "gafime_execution_gate_source_${_gafime_abi_suffix}"
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_LIST_DIR}/../test_execution_gate_source.py")
+endif()
 
 set(_gafime_validation_contract_target
     "gafime_abi_validation_contract_${_gafime_abi_suffix}")

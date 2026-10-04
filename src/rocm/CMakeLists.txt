@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.26)
 project(gafime_rocm_v1 LANGUAGES CXX HIP)
 
+find_package(Threads REQUIRED)
+
 if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
     set(CMAKE_HIP_ARCHITECTURES "gfx1150")
 endif()
@@ -32,6 +34,7 @@ add_library(gafime_rocm_v1 SHARED
     kernels.hip
     launcher.hip
 )
+target_link_libraries(gafime_rocm_v1 PRIVATE Threads::Threads)
 set_target_properties(gafime_rocm_v1 PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     HIP_VISIBILITY_PRESET hidden

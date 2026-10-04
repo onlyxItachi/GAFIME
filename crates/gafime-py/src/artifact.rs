@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 
+use gafime_cpu::precision::CpuPrecisionValues;
 use gafime_orchestrator::config::EngineConfig;
 use gafime_types::PrecisionProfile;
 #[cfg(test)]
@@ -20,7 +21,10 @@ use crate::continuous::{
 };
 #[cfg(feature = "local-cmake-experiment")]
 use crate::generated::local_cmake_experiment::CompactDecisionPathState;
-use crate::generated::{PrecisionDecisionPathCompiledState, PrecisionDecisionPathRebuild};
+use crate::generated::{
+    PrecisionDecisionPathCompiledState, PrecisionDecisionPathRebuild,
+    PrecisionTimeSeriesCompiledState,
+};
 use crate::py_api::PyContinuousReport;
 use crate::runtime::{
     backend_capability_name_for_kind, backend_device_for_kind, backend_is_gpu,
@@ -78,6 +82,7 @@ pub(crate) fn compile_continuous_input(
         runtime_cache_counters: RefCell::new(RuntimeCacheCounters::default()),
         decision_path_params: Vec::new(),
         decision_path_state: None,
+        time_series_state: None,
         feature_names: Vec::new(),
         target_updates_supported: true,
         closed: false,
@@ -91,10 +96,14 @@ pub(crate) fn execute_compiled_artifact(
             "compiled artifact is closed".to_string(),
         ));
     }
-    let execution_config = artifact.decision_path_state.as_ref().map_or_else(
-        || artifact.config.clone(),
-        |state| state.execution_config(&artifact.config),
-    );
+    let execution_config = if let Some(state) = artifact.time_series_state.as_ref() {
+        state.execution_config(&artifact.config)
+    } else {
+        artifact.decision_path_state.as_ref().map_or_else(
+            || artifact.config.clone(),
+            |state| state.execution_config(&artifact.config),
+        )
+    };
     let result = (|| {
         #[cfg(feature = "local-cmake-experiment")]
         if let Some(report) = crate::generated::local_cmake_experiment::execute_compiled(artifact)?
@@ -116,6 +125,9 @@ pub(crate) fn execute_compiled_artifact(
     })()
     .and_then(|mut report| {
         if let Some(state) = artifact.decision_path_state.as_ref() {
+            state.apply_significance(&artifact.config, &mut report)?;
+        }
+        if let Some(state) = artifact.time_series_state.as_ref() {
             state.apply_significance(&artifact.config, &mut report)?;
         }
         Ok(report)
@@ -152,6 +164,7 @@ pub(crate) struct PyCompiledContinuousArtifact {
     pub(crate) runtime_cache_counters: RefCell<RuntimeCacheCounters>,
     pub(crate) decision_path_params: Vec<DecisionPathResultParams>,
     pub(crate) decision_path_state: Option<PrecisionDecisionPathCompiledState>,
+    pub(crate) time_series_state: Option<PrecisionTimeSeriesCompiledState>,
     pub(crate) feature_names: Vec<String>,
     pub(crate) target_updates_supported: bool,
     pub(crate) closed: bool,
@@ -182,6 +195,9 @@ impl PyCompiledContinuousArtifact {
         }
         if self.decision_path_state.is_some() {
             return self.rebuild_decision_path_target(target);
+        }
+        if self.time_series_state.is_some() {
+            return self.rebuild_time_series_target(target);
         }
         let backend_kind = self.backend_kind();
         let update_result = {
@@ -262,6 +278,30 @@ impl PyCompiledContinuousArtifact {
         Ok(())
     }
 
+    fn rebuild_time_series_target(&mut self, target: PrecisionTarget) -> PyResult<()> {
+        let mut temporal_state = self
+            .time_series_state
+            .take()
+            .ok_or_else(|| PyValueError::new_err("time-series rebuild state is missing"))?;
+        let target = match target {
+            PrecisionTarget::F32(values) => CpuPrecisionValues::F32(values),
+            PrecisionTarget::F64(values) => CpuPrecisionValues::F64(values),
+        };
+        match temporal_state.rebuild_target(&self.config, target) {
+            Ok(rebuilt) => {
+                *self = rebuilt;
+                self.time_series_state = Some(temporal_state);
+                Ok(())
+            }
+            Err(error) => {
+                // Preparation used new, privately owned native state. Neither
+                // original discovery inputs nor the old artifact was changed.
+                self.time_series_state = Some(temporal_state);
+                Err(PyErr::from(error))
+            }
+        }
+    }
+
     fn rebuild_decision_path_target(&mut self, target: PrecisionTarget) -> PyResult<()> {
         let mut decision_state = self
             .decision_path_state
@@ -304,7 +344,18 @@ impl PyCompiledContinuousArtifact {
                     path,
                 )
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>();
+        let decision_path_params = match decision_path_params {
+            Ok(params) => params,
+            Err(error) => {
+                // Discovery already committed its new inputs before this
+                // conversion. Restoring it beside old executable state would
+                // split artifact identity; losing it would silently disable
+                // rediscovery. Retire on this internal invariant failure.
+                self.close();
+                return Err(error);
+            }
+        };
         self.config = rebuilt.config.clone();
         self.rows = rebuilt.rows;
         self.cols = rebuilt.cols;
@@ -400,6 +451,12 @@ impl PyCompiledContinuousArtifact {
         self.decision_path_state
             .as_ref()
             .map(PrecisionDecisionPathCompiledState::base_candidate_cols)
+            .or_else(|| {
+                self.time_series_state
+                    .as_ref()
+                    .map(PrecisionTimeSeriesCompiledState::base_candidate_cols)
+                    .filter(|&start| start != 0 && self.feature_names.len() > start)
+            })
     }
 
     #[getter]
@@ -500,6 +557,19 @@ impl PyCompiledContinuousArtifact {
                 }
             };
         }
+        if let Some(mut temporal_state) = self.time_series_state.take() {
+            return match temporal_state.rebuild_current(&config) {
+                Ok(rebuilt) => {
+                    *self = rebuilt;
+                    self.time_series_state = Some(temporal_state);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.time_series_state = Some(temporal_state);
+                    Err(PyErr::from(error))
+                }
+            };
+        }
         #[cfg(feature = "local-cmake-experiment")]
         if self.local_cmake_experiment_state.is_some() {
             // The compact route is admitted only for the complete unary plan,
@@ -550,6 +620,7 @@ impl PyCompiledContinuousArtifact {
     fn close(&mut self) {
         self.state = None;
         self.decision_path_state = None;
+        self.time_series_state = None;
         #[cfg(feature = "local-cmake-experiment")]
         {
             self.local_cmake_experiment_state = None;
@@ -746,5 +817,105 @@ mod tests {
 
         assert!(artifact.state.is_none());
         assert!(execute_compiled_artifact(&mut artifact).is_err());
+    }
+
+    #[test]
+    fn decision_path_metadata_failure_retires_advanced_discovery_and_old_execution() {
+        use gafime_cpu::decision_path::{
+            DecisionPathParams, PrecisionDecisionPath, PrecisionPathNode, SplitSign,
+        };
+        use gafime_cpu::precision::CpuPrecisionScalar;
+
+        for precision in [
+            PrecisionProfile::Fp32,
+            PrecisionProfile::Mixed,
+            PrecisionProfile::Fp64,
+        ] {
+            for invalid_threshold in [true, false] {
+                let mut config = EngineConfig {
+                    precision,
+                    metric_ids: vec![GAFIME_METRIC_PEARSON],
+                    permutation_tests: 0,
+                    num_repeats: 1,
+                    ..Default::default()
+                };
+                config.budget.max_comb_size = 1;
+                let input = match precision {
+                    PrecisionProfile::Fp32 | PrecisionProfile::Mixed => OwnedNumericInput::F32 {
+                        features: vec![0.0, 1.0, 2.0, 3.0],
+                        target: vec![0.0, 0.0, 1.0, 1.0],
+                    },
+                    PrecisionProfile::Fp64 => OwnedNumericInput::F64 {
+                        features: vec![0.0, 1.0, 2.0, 3.0],
+                        target: vec![0.0, 0.0, 1.0, 1.0],
+                    },
+                };
+                let mut artifact =
+                    compile_continuous_input(config.clone(), 4, 1, input.clone()).unwrap();
+                artifact.decision_path_state = Some(PrecisionDecisionPathCompiledState::new(
+                    input,
+                    config.clone(),
+                    1,
+                    1,
+                    vec!["source".to_string()],
+                    1,
+                    DecisionPathParams {
+                        max_depth: 1,
+                        rounds: 1,
+                        max_paths: 1,
+                        max_bins: 4,
+                        min_leaf: 1,
+                        learning_rate: 1.0,
+                    },
+                    vec![0],
+                    Vec::new(),
+                ));
+                let mut discovery = artifact.decision_path_state.take().unwrap();
+                let mut rebuilt = match precision {
+                    PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                        discovery.rebuild_target_f32(&config, vec![1.0, 1.0, 0.0, 0.0])
+                    }
+                    PrecisionProfile::Fp64 => {
+                        discovery.rebuild_target_f64(&config, vec![1.0, 1.0, 0.0, 0.0])
+                    }
+                }
+                .unwrap();
+                // Deliberately break an internal dtype invariant AFTER a real
+                // rebuild advanced discovery. This is fault injection, not a
+                // claim that supported public input produces such a path.
+                let threshold = if (precision == PrecisionProfile::Fp64) != invalid_threshold {
+                    CpuPrecisionScalar::F64(1.5)
+                } else {
+                    CpuPrecisionScalar::F32(1.5)
+                };
+                let gain = if (precision != PrecisionProfile::Fp32) == invalid_threshold {
+                    CpuPrecisionScalar::F64(0.25)
+                } else {
+                    CpuPrecisionScalar::F32(0.25)
+                };
+                rebuilt.paths = vec![PrecisionDecisionPath {
+                    nodes: vec![PrecisionPathNode {
+                        feature: 0,
+                        threshold,
+                        sign: SplitSign::Le,
+                    }],
+                    gain,
+                    support: 2,
+                    round: 0,
+                }];
+                let error = artifact
+                    .apply_decision_path_rebuild(rebuilt, discovery)
+                    .unwrap_err();
+                assert!(error.to_string().contains(if invalid_threshold {
+                    "threshold"
+                } else {
+                    "gain"
+                }));
+                assert!(artifact.closed);
+                assert!(artifact.state.is_none());
+                assert!(artifact.decision_path_state.is_none());
+                assert!(execute_compiled_artifact(&mut artifact).is_err());
+            }
+        }
     }
 }
