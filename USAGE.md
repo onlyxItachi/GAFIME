@@ -109,6 +109,10 @@ compiled artifacts do not use that LRU: they own their matrix and plan until
 [docs/eager-resident-compiled-execution.md](docs/eager-resident-compiled-execution.md)
 for lifetime, performance, and correctness details.
 
+Native calls currently hold the Python GIL; other Python threads and Ctrl-C
+handling may wait for the call to return. Core's internal candidate-level Rayon
+parallelism is unaffected. This is not an asynchronous or cancellation API.
+
 The current extension transports validated continuous inputs as contiguous
 little-endian buffers in the selected resident dtype: fp32 for `fp32`/`mixed`
 and fp64 for `fp64`. Representable NaN and infinity values are accepted; finite

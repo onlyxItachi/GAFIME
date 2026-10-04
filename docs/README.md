@@ -21,6 +21,9 @@ documents that own each subject.
 - [Capability reporting](capabilities.md)
 - [Precision profiles](precision-contract.md)
 - [Eager, resident, and compiled lifecycles](eager-resident-compiled-execution.md)
+- [Checked file ingest](ingest-validation.md)
+- [Adaptive time-series significance and target updates](adaptive-time-series.md)
+- [Native CUDA/HIP execution coordination](gpu-execution-coordination.md)
 - [ROCm distribution policy](rocm-wheel-policy.md)
 
 ## Maintainer Architecture

@@ -76,6 +76,20 @@ Python report remains readable because it owns its report view independently.
 The artifact records its creation thread and rejects cross-thread analysis,
 target updates, export access, and closure before calling the native boundary.
 
+## Python thread and signal limitation
+
+The current PyO3 analysis, compilation, replay, target-update, and reseeding
+calls hold the Python GIL during native execution. Core still uses Rayon across
+candidates inside that call; this does not permit other Python threads to
+progress through Python code concurrently. Python signal handling, including
+Ctrl-C, can be delayed until native execution returns. There is no cooperative
+cancellation or free-threaded-Python guarantee. GIL release is separately
+tracked work, not part of stable hardening.
+
+Native CUDA/HIP call coordination is independent of this Python limitation:
+direct C ABI consumers can run without the GIL. See the
+[native coordination boundary](gpu-execution-coordination.md).
+
 ## Compiled Replay Contract
 
 A prepared plan is fully validated when the artifact is built. General

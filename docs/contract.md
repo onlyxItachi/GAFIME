@@ -390,6 +390,14 @@ end-to-end fp32 cross-backend gate retains its separate `2e-4` absolute and
 either gate requires new Apple-hardware evidence and explicit maintainer
 approval.
 
+Ordinary CUDA/HIP ABI 1.0 and ABI 1.1 exports serialize complete calls through
+one nonrecursive gate per loaded payload instance, acquired before device
+selection and released after caller-device restoration and cleanup. Shared
+internal adapters must not recursively acquire it. Callers still own handle
+and buffer lifetimes and must coordinate multi-call mutation/free; the gate
+does not coordinate separately loaded payloads, foreign frameworks, or local
+experimental RT entry points. See `docs/gpu-execution-coordination.md`.
+
 ## Numerical Policy
 
 GAFIME targets bit parity with the approved reference implementation for every backend.
