@@ -162,8 +162,10 @@ def _assert_same_report(actual, expected):
     ]
     for left, right in zip(actual.interactions, expected.interactions):
         assert left.metrics == pytest.approx(right.metrics, nan_ok=True)
-    assert actual.permutations == expected.permutations
-    assert actual.stability == expected.stability
+    # Public result sequences are lazy wrappers without value-based __eq__.
+    # Compare every materialized dataclass field exactly, not wrapper identity.
+    assert list(actual.permutations) == list(expected.permutations)
+    assert list(actual.stability) == list(expected.stability)
 
 
 @pytest.mark.parametrize("precision", ["fp32", "mixed", "fp64"])
