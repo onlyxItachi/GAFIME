@@ -996,7 +996,10 @@ def analyze_arrow_with_v1_boundary(
             random_seed=random_seed,
         )
         report = _diagnostic_from_native_report(
-            config, native_report, feature_names, []
+            config,
+            native_report,
+            feature_names,
+            _continuous_cap_warnings(config, len(feature_names)),
         )
         report.decision = Decision(
             bool(report.interactions), "v1 continuous Arrow ingest path executed."
