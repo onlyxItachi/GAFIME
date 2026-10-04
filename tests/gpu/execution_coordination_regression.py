@@ -10,7 +10,9 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
+import secrets
 import subprocess
 import sys
 import threading
@@ -33,6 +35,8 @@ SOURCE_FILES = (
     "tests/gpu/execution_coordination_regression.py",
 )
 LOG_LIMIT_BYTES = 16 * 1024 * 1024
+COMPLETION_LIMIT_BYTES = 64 * 1024
+COMPLETION_FILE = "completion.json"
 
 
 @dataclass
@@ -88,7 +92,265 @@ def progress_summary(progress, started_at, deadline):
     }
 
 
-def run_bounded_subprocess(command, output, timeout, *, log_limit=LOG_LIMIT_BYTES):
+def config_sha256(config):
+    encoded = json.dumps(
+        {key: value for key, value in config.items() if key != "config_sha256"},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def selected_abis(case):
+    if case == "graph-abi10":
+        return ["abi10"]
+    if case == "graph-abi11":
+        return ["abi11"]
+    return ["abi10", "abi11"]
+
+
+def write_completion(output, config, identity, result):
+    """Exactly one bounded record, separate from interleaved C/Python stdout."""
+    record = {
+        "version": 1,
+        "run_id": config["run_id"],
+        "config_sha256": config["config_sha256"],
+        "identity": identity,
+        "result": result,
+    }
+    encoded = (json.dumps(record, allow_nan=False) + "\n").encode()
+    if len(encoded) > COMPLETION_LIMIT_BYTES:
+        raise ValueError("completion record exceeds size limit")
+    with (output / COMPLETION_FILE).open("xb") as stream:
+        stream.write(encoded)
+
+
+def validate_completion(output, config, child_pid, controller_elapsed):
+    """Fail closed on absent, repeated, malformed or unrelated child evidence."""
+
+    def require(condition, message):
+        if not condition:
+            raise ValueError(message)
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, f"duplicate completion key: {key}")
+            result[key] = value
+        return result
+
+    def finite_number(value):
+        return type(value) in (int, float) and math.isfinite(value)
+
+    def digest(value):
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    def check_progress(value, calls, elapsed, name):
+        require(isinstance(value, dict), f"missing {name} progress")
+        require(type(calls) is int and calls >= 2, f"invalid {name} call count")
+        require(
+            type(value["calls"]) is int and value["calls"] == calls,
+            f"inconsistent {name} call count",
+        )
+        first, last = (
+            value["first_call_offset_seconds"],
+            value["last_call_offset_seconds"],
+        )
+        total = value["call_seconds"]
+        require(
+            all(finite_number(item) for item in (first, last, total))
+            and 0 <= first <= last <= elapsed
+            and 0 <= total <= last - first + 1e-8,
+            f"invalid {name} timing",
+        )
+        recomputed = progress_summary(
+            CallProgress(calls, first, last, total), 0.0, config["seconds"]
+        )
+        require(set(value) == set(recomputed), f"malformed {name} progress")
+        require(
+            value["covered_interval"] is True and recomputed["covered_interval"],
+            f"incomplete {name} interval",
+        )
+        for key in ("active_span_seconds", "coverage_slack_seconds"):
+            require(
+                finite_number(value[key])
+                and math.isclose(
+                    value[key], recomputed[key], rel_tol=1e-9, abs_tol=1e-8
+                ),
+                f"inconsistent {name} {key}",
+            )
+
+    try:
+        path = output / COMPLETION_FILE
+        require(
+            path.is_file() and not path.is_symlink(), "missing regular completion file"
+        )
+        with path.open("rb") as stream:
+            encoded = stream.read(COMPLETION_LIMIT_BYTES + 1)
+        require(
+            len(encoded) <= COMPLETION_LIMIT_BYTES,
+            "completion record exceeds size limit",
+        )
+        record = json.loads(encoded, object_pairs_hook=unique_object)
+        require(
+            isinstance(record, dict)
+            and set(record)
+            == {"version", "run_id", "config_sha256", "identity", "result"},
+            "malformed completion envelope",
+        )
+        require(
+            type(record["version"]) is int and record["version"] == 1,
+            "unknown completion version",
+        )
+        require(
+            record["run_id"] == config["run_id"], "completion run identity mismatch"
+        )
+        require(
+            record["config_sha256"] == config["config_sha256"] == config_sha256(config),
+            "completion configuration hash mismatch",
+        )
+        identity = record["identity"]
+        require(
+            isinstance(identity, dict)
+            and set(identity)
+            == {"event", "pid", "python", "core", "core_sha256", "config"},
+            "malformed child identity",
+        )
+        require(identity["event"] == "identity", "missing child identity event")
+        require(
+            type(identity["pid"]) is int and identity["pid"] == child_pid,
+            "child pid mismatch",
+        )
+        require(identity["python"] == config["python"], "child interpreter mismatch")
+        require(
+            identity["config"] == config
+            and config_sha256(identity["config"]) == config["config_sha256"],
+            "child configuration mismatch",
+        )
+        core = Path(identity["core"])
+        require(core.is_absolute() and core.is_file(), "missing child Core")
+        require(
+            digest(identity["core_sha256"]) and sha256(core) == identity["core_sha256"],
+            "child Core hash mismatch",
+        )
+        result = record["result"]
+        require(
+            isinstance(result, dict)
+            and set(result)
+            == {
+                "event",
+                "status",
+                "requested_seconds",
+                "elapsed_seconds",
+                "primary_calls",
+                "primary_progress",
+                "foreign_calls",
+                "foreign_progress",
+                "incomplete_interval_workers",
+                "foreign_failures",
+                "primary_error",
+                "parity_sha256",
+                "excluded_report_fields",
+            },
+            "malformed child result",
+        )
+        require(
+            result["event"] == "result" and result["status"] == "pass",
+            "child workload did not pass",
+        )
+        require(
+            type(result["requested_seconds"]) is int
+            and result["requested_seconds"] == config["seconds"],
+            "child interval mismatch",
+        )
+        elapsed = result["elapsed_seconds"]
+        require(
+            finite_number(elapsed)
+            and config["seconds"]
+            <= elapsed
+            <= min(config["timeout"], controller_elapsed),
+            "invalid workload elapsed time",
+        )
+        require(
+            result["incomplete_interval_workers"] == []
+            and result["foreign_failures"] == []
+            and result["primary_error"] is None,
+            "child workload reports failures",
+        )
+        workers = {
+            f"{abi}-{worker}"
+            for abi in selected_abis(config["case"])
+            for worker in range(config["workers"])
+        }
+        require(
+            isinstance(result["foreign_calls"], dict)
+            and isinstance(result["foreign_progress"], dict)
+            and set(result["foreign_calls"]) == workers
+            and set(result["foreign_progress"]) == workers,
+            "child ABI worker set mismatch",
+        )
+        for worker in workers:
+            check_progress(
+                result["foreign_progress"][worker],
+                result["foreign_calls"][worker],
+                elapsed,
+                worker,
+            )
+        if config["case"] == "foreign-only":
+            require(
+                type(result["primary_calls"]) is int
+                and result["primary_calls"] == 0
+                and result["primary_progress"] is None
+                and result["parity_sha256"] is None,
+                "unexpected primary workload evidence",
+            )
+        else:
+            check_progress(
+                result["primary_progress"], result["primary_calls"], elapsed, "primary"
+            )
+            require(digest(result["parity_sha256"]), "missing full-report parity hash")
+        require(
+            result["excluded_report_fields"] == ["backend.memory_free_mb"],
+            "unexpected report comparison exclusions",
+        )
+        return {
+            "valid": True,
+            "error": None,
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        OverflowError,
+        RecursionError,
+    ) as error:
+        return {"valid": False, "error": str(error), "sha256": None}
+
+
+def terminate_and_reap(process, deadline, *, clock=time.monotonic):
+    """Never wait without a timeout, even after requesting termination."""
+    error = None
+    try:
+        process.kill()
+    except OSError as failure:
+        error = str(failure)
+    try:
+        process.wait(timeout=max(0.0, deadline - clock()))
+    except subprocess.TimeoutExpired:
+        return {"reaped": False, "reap_timed_out": True, "kill_error": error}
+    return {"reaped": True, "reap_timed_out": False, "kill_error": error}
+
+
+def run_bounded_subprocess(
+    command, output, timeout, *, expected_config, log_limit=LOG_LIMIT_BYTES
+):
     """Drain both pipes continuously with bounded retained logs and memory."""
     logs = {
         name: {"bytes": 0, "retained_bytes": 0, "truncated": False, "error": None}
@@ -96,9 +358,13 @@ def run_bounded_subprocess(command, output, timeout, *, log_limit=LOG_LIMIT_BYTE
     }
     began = time.monotonic()
     deadline = began + timeout
+    # Cleanup uses part of this same budget, never a fresh unbounded wait.
+    workload_deadline = deadline - min(1.0, timeout * 0.1)
     process = subprocess.Popen(
         command, cwd=output, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
+    cleanup_attempted = False
+    cleanup = {"reaped": False, "reap_timed_out": False, "kill_error": None}
     try:
 
         def drain(name, pipe):
@@ -122,31 +388,44 @@ def run_bounded_subprocess(command, output, timeout, *, log_limit=LOG_LIMIT_BYTE
             reader.start()
         timed_out = False
         try:
-            returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            returncode = process.wait(
+                timeout=max(0.0, workload_deadline - time.monotonic())
+            )
+            cleanup["reaped"] = True
         except subprocess.TimeoutExpired:
             timed_out = True
-            process.kill()
-            process.wait()
-            returncode = None
+            cleanup_attempted = True
+            cleanup = terminate_and_reap(process, deadline)
+            returncode = process.returncode
         for reader in readers:
             reader.join(timeout=max(0.0, deadline - time.monotonic()))
         logs_complete = all(not reader.is_alive() for reader in readers)
     finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+        if process.poll() is None and not cleanup_attempted:
+            cleanup = terminate_and_reap(process, deadline)
     # A descendant retaining a pipe must not keep the controller alive. Such
     # incomplete capture fails; daemon readers own/close their own pipe objects.
     logs = {name: record.copy() for name, record in logs.items()}
+    elapsed = time.monotonic() - began
+    completion = (
+        validate_completion(output, expected_config, process.pid, elapsed)
+        if cleanup["reaped"]
+        else {"valid": False, "error": "child was not reaped", "sha256": None}
+    )
     return {
         "returncode": returncode,
         "timed_out": timed_out,
+        **cleanup,
+        "completion": completion,
         "elapsed_seconds": time.monotonic() - began,
         "log_limit_bytes": log_limit,
         "logs_complete": logs_complete,
         "logs": logs,
         "passed": returncode == 0
         and not timed_out
+        and cleanup["reaped"]
+        and cleanup["kill_error"] is None
+        and completion["valid"]
         and logs_complete
         and all(
             not record["truncated"] and record["error"] is None
@@ -206,6 +485,10 @@ def child(config: dict) -> int:
     import importlib
     import os
 
+    if config_sha256(config) != config["config_sha256"]:
+        raise RuntimeError("child configuration hash mismatch")
+    if {name: sha256(ROOT / name) for name in SOURCE_FILES} != config["source_sha256"]:
+        raise RuntimeError("runner sources changed before child startup")
     payload = Path(config["payload"])
     if (
         not config.get("acknowledge_fixed_candidate")
@@ -225,17 +508,15 @@ def child(config: dict) -> int:
 
     core = importlib.import_module("gafime.gafime_py")
     core_path = Path(core.__file__).resolve()
-    print(
-        json.dumps(
-            {
-                "event": "identity",
-                "core": str(core_path),
-                "core_sha256": sha256(core_path),
-                "config": config,
-            }
-        ),
-        flush=True,
-    )
+    identity = {
+        "event": "identity",
+        "pid": os.getpid(),
+        "python": str(Path(sys.executable).resolve()),
+        "core": str(core_path),
+        "core_sha256": sha256(core_path),
+        "config": config,
+    }
+    print(json.dumps(identity), flush=True)
     # Keep this exact loaded payload alive while consumer dlopen/dlclose cycles
     # run. Both shims receive this same canonical path as the Core selector.
     payload_pin = ctypes.CDLL(str(payload))
@@ -288,13 +569,7 @@ def child(config: dict) -> int:
 
     has_primary = config["case"] != "foreign-only"
     reference = primary() if has_primary else None
-    selected = (
-        ["abi10"]
-        if config["case"] == "graph-abi10"
-        else ["abi11"]
-        if config["case"] == "graph-abi11"
-        else ["abi10", "abi11"]
-    )
+    selected = selected_abis(config["case"])
     stop = threading.Event()
     window = {}
 
@@ -390,28 +665,23 @@ def child(config: dict) -> int:
         and not incomplete
         and (not has_primary or primary_progress.calls > 0)
     )
-    print(
-        json.dumps(
-            {
-                "event": "result",
-                "status": "pass" if passed else "fail",
-                "requested_seconds": config["seconds"],
-                "elapsed_seconds": elapsed,
-                "primary_calls": primary_progress.calls,
-                "primary_progress": primary_summary,
-                "foreign_calls": {key: value.calls for key, value in progress.items()},
-                "foreign_progress": summaries,
-                "incomplete_interval_workers": incomplete,
-                "foreign_failures": failures,
-                "primary_error": primary_error,
-                "parity_sha256": hashlib.sha256(reference).hexdigest()
-                if reference
-                else None,
-                "excluded_report_fields": ["backend.memory_free_mb"],
-            }
-        ),
-        flush=True,
-    )
+    result = {
+        "event": "result",
+        "status": "pass" if passed else "fail",
+        "requested_seconds": config["seconds"],
+        "elapsed_seconds": elapsed,
+        "primary_calls": primary_progress.calls,
+        "primary_progress": primary_summary,
+        "foreign_calls": {key: value.calls for key, value in progress.items()},
+        "foreign_progress": summaries,
+        "incomplete_interval_workers": incomplete,
+        "foreign_failures": failures,
+        "primary_error": primary_error,
+        "parity_sha256": hashlib.sha256(reference).hexdigest() if reference else None,
+        "excluded_report_fields": ["backend.memory_free_mb"],
+    }
+    write_completion(Path(config["output_dir"]), config, identity, result)
+    print(json.dumps(result), flush=True)
     return 0 if passed else 1
 
 
@@ -471,6 +741,8 @@ def main() -> int:
         ("source_status", ["git", "status", "--short"]),
     ):
         config[key] = subprocess.check_output(command, cwd=ROOT, text=True).strip()
+    config["run_id"] = secrets.token_hex(16)
+    config["config_sha256"] = config_sha256(config)
     output = Path(config["output_dir"])
     output.mkdir(parents=True, exist_ok=False)
     (output / "identity.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -481,7 +753,9 @@ def main() -> int:
         "--child",
         json.dumps(config),
     ]
-    status = run_bounded_subprocess(command, output, args.timeout)
+    status = run_bounded_subprocess(
+        command, output, args.timeout, expected_config=config
+    )
     (output / "status.json").write_text(json.dumps(status, indent=2) + "\n")
     print(json.dumps({"artifacts": str(output), **status}))
     return 0 if status["passed"] else 1
