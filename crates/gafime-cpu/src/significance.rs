@@ -304,6 +304,9 @@ pub fn evaluate_precision_signals(
 /// with `rows` entries for each selected generated descriptor. Lags, windows,
 /// source feature ids, and descriptor ordering stay outside the numeric values
 /// and therefore remain their existing structural types.
+/// This helper conditions on that fixed expansion. Target-dependent source
+/// screening and ordered expansion caps require the caller to rebuild the full
+/// null family; the public temporal boundary does that separately for maxT.
 pub fn evaluate_precision_time_series_columns(
     profile: PrecisionProfile,
     columns: CpuPrecisionSlice<'_>,
@@ -390,8 +393,7 @@ pub fn evaluate_precision_time_series_columns(
 
 /// Evaluate a decision-path family with target-aware maxT null construction.
 ///
-/// Unlike continuous interactions and time-series transforms, decision paths
-/// are discovered from the target/residual.  Each permutation therefore
+/// Decision paths are discovered from the target/residual. Each permutation
 /// rediscovers its own path family before its metric maximum is compared to the
 /// observed paths. This prevents a target-dependent observed path from being
 /// treated as a fixed null feature. Bootstrap mean/std remain aligned to each

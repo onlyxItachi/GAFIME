@@ -123,7 +123,8 @@ class EngineConfig:
     and minimum leaf must be positive; ``decision_path_max_bins=0`` requests
     exhaustive splits; learning rate must be positive; and the discovery
     shortlist must be non-negative.  Threshold fields affect the report
-    decision but do not replace holdout or out-of-fold validation.
+    decision but do not replace holdout or out-of-fold validation. Both must
+    be finite, non-negative, and representable in the public result precision.
 
     Deprecated ``storage_dtype``/``compute_policy`` keyword pairs are accepted
     only when they map unambiguously to one precision profile and emit a

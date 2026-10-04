@@ -497,8 +497,8 @@ def _cells() -> list:
             | `num_repeats` | `3` | selected-candidate bootstrap repeats; `1` disables bootstrap work |
             | `permutation_tests` | `25` | maxT target permutations; `0` disables permutation work |
             | `random_seed` | `7` | deterministic seed; `None` requests a fresh stream per analysis |
-            | `stability_std_threshold` | `0.10` | report decision threshold for conditional bootstrap variability |
-            | `permutation_p_threshold` | `0.05` | report decision threshold for maxT p-values |
+            | `stability_std_threshold` | `0.10` | finite non-negative report decision threshold, representable in result precision, for conditional bootstrap variability |
+            | `permutation_p_threshold` | `0.05` | finite non-negative report decision threshold, representable in result precision, for maxT p-values |
             | `mi_bins` | `96` | adaptive maximum, rounded down to a sample-safe supported template |
             | `backend` | `"auto"` | `auto`, `core`/`cpu`, `cuda`, `rocm`/`hip`, or `metal` |
             | `device_id` | `0` | non-negative device index for GPU selection/probing |
@@ -854,9 +854,17 @@ def _cells() -> list:
             target update, export, and close must occur on its creation thread.
 
             There is no context-manager or `run()` API. Use explicit `try/finally` and
-            `close()`. `update_target()` keeps features resident and invalidates
-            target-dependent plans/caches; decision paths are rediscovered. A native
+            `close()`. Continuous `update_target()` keeps its feature matrix
+            resident and invalidates target-dependent plans/caches. Generated
+            families retain original inputs but rebuild their expansion and
+            execution state: decision paths and time-series source selection are
+            rediscovered, which can require new allocation/upload. A native
             failure that closes the underlying state makes the wrapper fail closed.
+
+            Native calls currently hold the Python GIL, including compiled replay.
+            Core's internal Rayon parallelism remains active, but other Python
+            threads and Python signal handling (including Ctrl-C) can wait until
+            the call returns. There is no cooperative cancellation API.
             """
         ),
         _md(
@@ -1138,8 +1146,12 @@ def _cells() -> list:
 
             `gafime.dataload(path, target, features=None, *, config=..., **kwargs)`
             supports Parquet, CSV/TSV/text, and Arrow IPC/Feather through Polars. It
-            selects one target column, casts to the profile's resident dtype, rechunks
-            to one Arrow record batch, and runs analysis. A raw Arrow table/stream is
+            selects one target column, preserves source dtypes until checked ingest,
+            rechunks, and runs analysis. Finite feature or target values outside the
+            selected storage range raise `ValueError`; existing NaN/inf values keep
+            their native semantics. The strict Arrow shortcut requires matching
+            column dtypes and preserves the configured seed, including arbitrary-size
+            integers; `None` resolves fresh entropy once per analysis. A raw Arrow table/stream is
             not a top-level `analyze()` input; use the shipped file-oriented
             `dataload()` boundary for Arrow IPC.
 

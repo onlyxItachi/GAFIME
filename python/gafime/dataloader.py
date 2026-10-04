@@ -1,7 +1,7 @@
 """Polars-backed data loading for GAFIME's top-level API.
 
 ``gafime.dataload(path, target)`` reads a parquet/CSV/Arrow file with Polars,
-converts to the selected profile's resident dtype, and runs the engine. Polars is
+preserves the source numeric dtype until ingest, and runs the engine. Polars is
 the *external* loader; GAFIME still owns all compute memory internally. The
 Polars import is lazy so importing this module never requires Polars. GAFIME v1
 supports Polars 1.x from 1.3 onward; Polars 2 migration is deferred to the
@@ -94,9 +94,10 @@ def dataload(
 
     Notes
     -----
-    The frame is cast to the selected resident dtype and validated before the
-    native boundary runs.  A one-batch Arrow shortcut is used only when it can
-    preserve the complete configuration; otherwise this function routes
+    Source values are preserved until checked ingest into the selected resident
+    dtype. A one-batch Arrow shortcut is used only when source dtypes already
+    match that dtype and the shortcut can preserve the complete configuration;
+    otherwise this function routes
     through the normal configured backend.  Missing/duplicate columns,
     unsupported suffixes, impossible precision/backend requests, and ordinary
     engine input failures are rejected rather than silently changing policy.
@@ -107,19 +108,17 @@ def dataload(
     # Validate the complete request before importing Polars, reading a file, or
     # coercing any values. In particular, explicit Metal mixed/fp64 requests
     # fail closed without an fp32 intermediate.
-    precision = _validate_precision_config(effective_config)
-
-    import polars as pl
+    _validate_precision_config(effective_config)
 
     frame = _read_frame(Path(path), **read_kwargs)
     feature_cols = _resolve_feature_columns(frame.columns, target, features)
 
-    # fp32/mixed intentionally own fp32 resident values; fp64 preserves f64
-    # from this first conversion onward. Rechunk so each frame arrives as one
-    # Arrow record batch.
-    resident_dtype = pl.Float64 if precision == "fp64" else pl.Float32
-    feature_frame = frame.select(feature_cols).cast(resident_dtype).rechunk()
-    target_frame = frame.select(target).cast(resident_dtype).rechunk()
+    # Preserve finite f64 values until checked ingest. A Polars Float32 cast
+    # here would erase finite overflow by turning it into an allowed source
+    # infinity. Rechunk without changing values or their source dtype; the
+    # adapter admits only matching dtypes to the strict raw-Arrow shortcut.
+    feature_frame = frame.select(feature_cols).rechunk()
+    target_frame = frame.select(target).rechunk()
 
     # The adapter retains the Arrow-native shortcut only when it can honor every
     # relevant setting. Other configurations use the normal configured boundary

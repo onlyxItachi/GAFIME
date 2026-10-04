@@ -182,6 +182,23 @@ wrappers, but they are not independent exported implementation owners. Generic
 ABI dispatch selects a route once; backend hot loops remain statically
 specialized.
 
+## Concurrency and capture interoperability
+
+Ordinary CUDA and HIP exports in both ABI generations serialize complete calls
+through one nonrecursive mutex per loaded payload instance. This includes
+device selection and restoration, graph capture, execution, synchronization,
+and cleanup. Independent live handles may be called from different threads;
+internal ABI adapters use shared unguarded implementations rather than taking
+the same lock recursively.
+
+This is not an atomic multi-call transaction: callers must retain handles and
+buffers for every call and coordinate shared mutable handles, including free.
+Separately loaded payload instances and foreign frameworks do not share this
+gate. Avoid overlapping their graph capture with incompatible device-wide work
+unless the application coordinates them. Metal has no stream-capture path and
+is outside this mitigation. See [execution coordination](gpu-execution-coordination.md)
+for the exact boundary and regression evidence.
+
 ## Enum-ID allocation
 
 Zero is invalid for dtype, profile, route, and overflow-policy enums. Existing

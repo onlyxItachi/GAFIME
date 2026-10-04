@@ -9,7 +9,7 @@ use gafime_types::{
     GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
 };
 use pyo3::{
-    exceptions::PyValueError,
+    exceptions::{PyOverflowError, PyValueError},
     prelude::*,
     types::{PyAny, PyDict},
 };
@@ -27,6 +27,13 @@ pub(crate) fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<Engine
     .map_err(PyErr::from)?;
     let precision = validate_precision_request(&get_string(config, "precision", "mixed")?)
         .map_err(PyErr::from)?;
+    for (name, default) in [
+        ("stability_std_threshold", 0.10),
+        ("permutation_p_threshold", 0.05),
+    ] {
+        validate_decision_threshold(name, get_f64(config, name, default)?, precision)
+            .map_err(PyErr::from)?;
+    }
 
     let mut out = EngineConfig::default();
     let backend_name = get_string(config, "backend", "auto")?;
@@ -102,6 +109,24 @@ fn validate_precision_request(precision: &str) -> Result<PrecisionProfile, PyBou
     }
 }
 
+fn validate_decision_threshold(
+    name: &str,
+    value: f64,
+    precision: PrecisionProfile,
+) -> Result<(), PyBoundaryError> {
+    // The report compares thresholds in its public result lane. A finite f64
+    // that overflows that lane must not silently become an unbounded cutoff.
+    if !value.is_finite()
+        || value < 0.0
+        || (precision == PrecisionProfile::Fp32 && !(value as f32).is_finite())
+    {
+        return Err(PyBoundaryError::InvalidInput(format!(
+            "{name} must be finite, non-negative, and representable in the result precision"
+        )));
+    }
+    Ok(())
+}
+
 fn precision_profile_name(precision: PrecisionProfile) -> &'static str {
     match precision {
         PrecisionProfile::Fp32 => "fp32",
@@ -114,6 +139,11 @@ fn validate_family_flags(
     enable_time_series: bool,
     enable_decision_path: bool,
 ) -> Result<(), PyBoundaryError> {
+    if enable_time_series && enable_decision_path {
+        return Err(PyBoundaryError::InvalidInput(
+            "time-series and decision-path families are mutually exclusive".to_string(),
+        ));
+    }
     if enable_time_series {
         return Err(PyBoundaryError::UnsupportedFeature(
             "time-series families must use v1 Rust family descriptors; device kernels are not wired to this Python boundary yet"
@@ -142,7 +172,7 @@ fn backend_kind_from_name_result(
     device_id: u32,
     precision: PrecisionProfile,
 ) -> Result<u32, PyBoundaryError> {
-    match name {
+    match name.trim().to_ascii_lowercase().as_str() {
         "auto" => Ok(resolve_auto_backend(device_id, precision)),
         "cpu" | "core" | "rust" | "v1-rust-cpu" => Ok(GAFIME_BACKEND_CPU),
         "cuda" => Ok(GAFIME_BACKEND_CUDA),
@@ -331,7 +361,7 @@ fn cpu_isa_rank(isa: IsaLevel) -> i64 {
 }
 
 fn normalize_runtime_backend(name: &str) -> Result<&'static str, PyBoundaryError> {
-    match name {
+    match name.trim().to_ascii_lowercase().as_str() {
         "auto" => Ok("auto"),
         "cpu" | "core" | "rust" | "v1-rust-cpu" => Ok("core"),
         "cuda" => Ok("cuda"),
@@ -749,16 +779,37 @@ fn get_bool(dict: &Bound<'_, PyDict>, key: &str, default: bool) -> PyResult<bool
     }
 }
 
+fn get_f64(dict: &Bound<'_, PyDict>, key: &str, default: f64) -> PyResult<f64> {
+    match dict.get_item(key)? {
+        Some(value) if !value.is_none() => value.extract::<f64>(),
+        _ => Ok(default),
+    }
+}
+
+fn unsigned_integer_error(py: Python<'_>, error: PyErr, key: &str, bits: u32) -> PyErr {
+    // Preserve type errors, but report out-of-domain counts as invalid values
+    // rather than leaking the storage type's conversion exception to users.
+    if error.is_instance_of::<PyOverflowError>(py) {
+        PyValueError::new_err(format!("{key} must be an integer in the u{bits} range"))
+    } else {
+        error
+    }
+}
+
 pub(crate) fn get_u32(dict: &Bound<'_, PyDict>, key: &str, default: u32) -> PyResult<u32> {
     match dict.get_item(key)? {
-        Some(value) if !value.is_none() => value.extract::<u32>(),
+        Some(value) if !value.is_none() => value
+            .extract::<u32>()
+            .map_err(|error| unsigned_integer_error(value.py(), error, key, 32)),
         _ => Ok(default),
     }
 }
 
 fn get_u64(dict: &Bound<'_, PyDict>, key: &str, default: u64) -> PyResult<u64> {
     match dict.get_item(key)? {
-        Some(value) if !value.is_none() => value.extract::<u64>(),
+        Some(value) if !value.is_none() => value
+            .extract::<u64>()
+            .map_err(|error| unsigned_integer_error(value.py(), error, key, 64)),
         _ => Ok(default),
     }
 }
@@ -892,6 +943,47 @@ mod tests {
     }
 
     #[test]
+    fn backend_names_use_the_same_case_normalization_for_execution_and_diagnostics() {
+        for name in ["Core", " CORE ", "RuSt", "V1-RUST-CPU"] {
+            assert_eq!(
+                backend_kind_from_name_result(name, 0, PrecisionProfile::Mixed).unwrap(),
+                GAFIME_BACKEND_CPU
+            );
+            assert_eq!(normalize_runtime_backend(name).unwrap(), "core");
+        }
+        for name in ["HIP", "RoCm"] {
+            assert_eq!(
+                backend_kind_from_name_result(name, 0, PrecisionProfile::Mixed).unwrap(),
+                GAFIME_BACKEND_ROCM
+            );
+            assert_eq!(normalize_runtime_backend(name).unwrap(), "rocm");
+        }
+        assert!(backend_kind_from_name_result("METAL", 0, PrecisionProfile::Fp64).is_err());
+    }
+
+    #[test]
+    fn report_thresholds_reject_invalid_and_unrepresentable_values() {
+        for precision in [
+            PrecisionProfile::Fp32,
+            PrecisionProfile::Mixed,
+            PrecisionProfile::Fp64,
+        ] {
+            for value in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert!(validate_decision_threshold("threshold", value, precision).is_err());
+            }
+            for value in [0.0, -0.0, 0.05, 1.0, 2.0] {
+                assert!(validate_decision_threshold("threshold", value, precision).is_ok());
+            }
+        }
+        assert!(
+            validate_decision_threshold("threshold", f64::MAX, PrecisionProfile::Fp32).is_err()
+        );
+        assert!(
+            validate_decision_threshold("threshold", f64::MAX, PrecisionProfile::Mixed).is_ok()
+        );
+    }
+
+    #[test]
     fn rust_config_boundary_accepts_explicit_metal() {
         assert_eq!(
             backend_kind_from_name_result("metal", 0, PrecisionProfile::Fp32).unwrap(),
@@ -1002,6 +1094,12 @@ mod tests {
         let error = validate_family_flags(true, false).unwrap_err();
 
         assert!(error.to_string().contains("time-series families"));
+    }
+
+    #[test]
+    fn conflicting_families_are_reported_before_individual_route_restrictions() {
+        let error = validate_family_flags(true, true).unwrap_err();
+        assert!(error.to_string().contains("mutually exclusive"));
     }
 
     #[test]
