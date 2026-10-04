@@ -797,6 +797,15 @@ def test_workflow_uses_the_compatible_before_fix_precision_head_and_tracks_the_r
         / "core_precision_production_benchmark.yml"
     ).read_text(encoding="utf-8")
 
+    # Skip ineligible automatic PR diagnostics without bypassing the manual
+    # exact-head/main-base checks or changing stable sampling eligibility.
+    assert (
+        "    if: >-\n"
+        "      github.event_name != 'pull_request' ||\n"
+        "      (github.event.pull_request.base.ref == 'main' &&\n"
+        "       github.event.pull_request.head.repo.full_name == github.repository)"
+        in workflow
+    )
     assert "d52199f44aa80ab8ef50c18db95dd1630961cdaf" in workflow
     assert "expected_baseline_sha:" not in workflow
     assert (

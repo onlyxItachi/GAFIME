@@ -51,10 +51,13 @@ env:
 jobs:
   core-production-ab:
     name: Core production A/B+B/A (${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'informational' }})
-    # The job intentionally measures only repository-owned PR heads. A forked
-    # PR can still receive ordinary correctness CI without using a native build
-    # comparison as release evidence.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Automatic diagnostics measure only repository-owned PR heads targeting
+    # main. Candidate-base stabilization PRs and forked PRs still receive
+    # ordinary correctness CI; manual evidence retains its exact-source gates.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.base.ref == 'main' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     # Informational PR diagnostics run on GitHub-hosted capacity. Stable
     # release evidence is admitted only from the repository's pinned,
     # quiesced Core benchmark runner label.

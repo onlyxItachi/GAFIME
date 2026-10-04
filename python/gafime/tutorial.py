@@ -18,7 +18,10 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
     cells = [
         _md(
             "# GAFIME v1 Practice Notebook\n\n"
-            "This notebook uses bounded deterministic data and the public API. "
+            "This notebook targets the 1.0.0 source identity and uses bounded "
+            "deterministic data and the public API. Source identity does not "
+            "establish publication; consult docs/releases/STATUS.md and the "
+            "public release channels for available exact versions. "
             "It probes capabilities before running continuous, compiled, "
             "time-series, decision-path, and selector examples. For every public "
             "parameter, lifecycle, result field, and compatibility surface, use "
@@ -166,8 +169,10 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
         _md(
             "For model evaluation, place `GafimeSelector` inside a scikit-learn "
             "Pipeline so discovery is refit on every training fold. Install the "
-            "current published prerelease integration with "
-            "`python -m pip install --pre 'gafime[sklearn]'`."
+            "published stable integration with "
+            "`python -m pip install 'gafime[sklearn]'`; use "
+            "`python -m pip install --pre 'gafime[sklearn]'` only for an "
+            "intentional beta or release-candidate install."
         ),
     ]
     notebook = {

@@ -32,8 +32,9 @@ def _missing_gafime_install_record() -> dict[str, str]:
     return {
         "error": (
             "scikit-learn or gafime.sklearn is unavailable. See "
-            "docs/releases/STATUS.md and install the current published prerelease "
-            "or use the repository development environment."
+            "docs/releases/STATUS.md and install the published stable integration "
+            "with pip install \"gafime[sklearn]\"; add --pre only for an intentional "
+            "beta/RC install, or use the repository development environment."
         ),
         "release_status": RELEASE_STATUS,
         "prerelease_install": PRERELEASE_SKLEARN_INSTALL,

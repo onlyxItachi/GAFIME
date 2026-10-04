@@ -18,7 +18,9 @@ NVIDIA/ROCm hints, installed GAFIME distribution versions, and the public `auto`
 capability probe when GAFIME is installed. It reports
 `release_status="see_docs_releases_status"`, routes mutable publication state
 to `docs/releases/STATUS.md`, and exposes a `--pre` command under
-`prerelease_install`. Hardware hints guide installation only; the validated
+`prerelease_install` as an explicit beta/RC alternative. Stable installs use
+the same projects without `--pre`; source version metadata is not publication
+evidence. Hardware hints guide installation only; the validated
 capability result is the authority for runtime selection.
 
 Current v1 distribution policy:

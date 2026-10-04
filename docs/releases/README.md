@@ -7,15 +7,19 @@ the historical record for that release or checkpoint.
 
 ## Current Release Train
 
-The current source targets `v1.0.0-rc.2`. Its protected settled branch tip is
-the candidate source while `main` may continue; publication requires final
-admission of that exact tip into `main` and its verified frozen artifacts.
-Source version preparation does not itself create a tag or release. Follow the mutable
+The current source targets stable `v1.0.0`. Durable stabilization fixes land
+through reviewed PRs on `main`, then the candidate branch is cut from green
+`main`. Stable identity is prepared through its own reviewed candidate-branch
+PR. The protected settled branch tip is the candidate source; publication
+requires exact-tip qualification, a verified frozen bundle, and final admission
+of that unchanged tip into `main`.
+Source version preparation does not itself complete those gates or create a
+tag or release. Follow the mutable
 [release status](STATUS.md) for current gates and the live
 [GitHub Releases](https://github.com/onlyxItachi/GAFIME/releases) and
 [PyPI project](https://pypi.org/project/gafime/) for publication state.
 
-The [RC2 release note](v1.0.0-rc.2.md) describes the bounded hardening scope;
+The [stable release note](v1.0.0.md) describes the bounded stabilization scope;
 live release presence is established by the public channels above.
 
 ## Release Operations
@@ -28,6 +32,8 @@ live release presence is established by the public channels above.
 
 ### v1
 
+- [`v1.0.0`](v1.0.0.md) — stable source identity and bounded stabilization;
+  exact-candidate qualification and publication remain gated by current status.
 - [`v1.0.0-rc.2`](v1.0.0-rc.2.md) — validation and artifact-identity hardening;
   see current status and public channels for publication state.
 - [`v1.0.0-rc.1`](v1.0.0-rc.1.md) — public release candidate.

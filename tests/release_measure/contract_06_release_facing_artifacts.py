@@ -529,7 +529,7 @@ def _validate_release_docs() -> None:
         )
     for token in (
         "Windows ARM64 contributes",
-        "five dedicated wheels",
+        "dedicated CPython",
         "including CPython 3.10",
         "`pythonarm64` NuGet packages",
     ):

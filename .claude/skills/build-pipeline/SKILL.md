@@ -41,10 +41,11 @@ rediscovering paths for every permuted target; never reuse target-dependent
 paths across folds or permutations.
 
 Consult `docs/releases/STATUS.md`, GitHub Releases, and PyPI for current
-publication state. Install a published prerelease with
-`pip install --pre "gafime[sklearn]" "polars>=1.3,<2"`, or use an exact
-published version when reproducibility is required. Before presenting a
-generated script, run `python -m py_compile` on it and confirm the selected
+publication state. Install a published stable version with
+`pip install "gafime[sklearn]" "polars>=1.3,<2"`; use
+`pip install --pre "gafime[sklearn]" "polars>=1.3,<2"` only for an intentional
+beta/RC install, or pin an exact published version for reproducibility. Before
+presenting a generated script, run `python -m py_compile` on it and confirm the selected
 third-party model is installed. Never describe `backend="auto"` as guaranteed GPU execution; report
 the selected backend from the fitted GAFIME report or capability probe. The
 helper defaults to `precision="mixed"`; Metal is fp32-only and an explicit Metal

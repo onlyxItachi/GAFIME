@@ -20,7 +20,7 @@ sys.path.insert(0, str(RELEASE_MEASURE))
 
 import artifact_01_release_composition as artifact_gate  # noqa: E402
 from release_manifest import load_release_manifest, render_release_matrix  # noqa: E402
-from release_version import validate_project_versions  # noqa: E402
+from release_version import ReleaseVersion, validate_project_versions  # noqa: E402
 
 
 def test_manifest_derives_bundle_count_and_generated_document() -> None:
@@ -36,8 +36,7 @@ def test_manifest_derives_bundle_count_and_generated_document() -> None:
     )
     sdist_count = len(manifest.standard_distributions)
     assert manifest.standard_artifact_count == sum(
-        distribution.artifact_count
-        for distribution in manifest.standard_distributions
+        distribution.artifact_count for distribution in manifest.standard_distributions
     )
     assert manifest.standard_artifact_count == wheel_count + sdist_count
     assert "validation_limit" not in manifest_text
@@ -149,7 +148,9 @@ def test_polars_v1_dependency_accepts_metadata_specifier_order(
 
 
 def test_polars_v1_dependency_rejects_environment_marker() -> None:
-    with pytest.raises(AssertionError, match=r"Polars dependency must be unconditional"):
+    with pytest.raises(
+        AssertionError, match=r"Polars dependency must be unconditional"
+    ):
         artifact_gate._assert_polars_v1_requirement(
             ["polars>=1.3,<2; python_version < '3.11'"], "test metadata"
         )
@@ -169,10 +170,34 @@ def test_release_tag_uses_semver_while_artifacts_use_pep440() -> None:
         artifact_gate._assert_release_tag(
             ROOT,
             release,
-            f"refs/tags/v{release.pep440}",
+            f"refs/tags/{release.tag}-unexpected",
             None,
             False,
         )
+
+
+@pytest.mark.parametrize("semver", ["1.0.0-rc.2", "1.0.0"])
+def test_release_tag_mapping_preserves_prerelease_and_stable_rules(
+    tmp_path: Path, semver: str
+) -> None:
+    release = ReleaseVersion.from_semver(semver)
+    note = tmp_path / release.release_note
+    note.parent.mkdir(parents=True)
+    note.write_text("# Release-note fixture\n", encoding="utf-8")
+    artifact_gate._assert_release_tag(
+        tmp_path, release, f"refs/tags/{release.tag}", None, False
+    )
+    # Compact Python prerelease spellings cannot become Git tags. Stable
+    # SemVer and PEP 440 intentionally share the same spelling instead.
+    pep440_ref = f"refs/tags/v{release.pep440}"
+    if release.prerelease:
+        with pytest.raises(AssertionError, match="canonical SemVer tag|must equal"):
+            artifact_gate._assert_release_tag(
+                tmp_path, release, pep440_ref, None, False
+            )
+    else:
+        assert pep440_ref == f"refs/tags/{release.tag}"
+        artifact_gate._assert_release_tag(tmp_path, release, pep440_ref, None, False)
 
 
 def test_rocm_policy_report_aggregates_every_cpython_wheel_deterministically(
@@ -181,8 +206,7 @@ def test_rocm_policy_report_aggregates_every_cpython_wheel_deterministically(
     python_tags = ("cp310", "cp311", "cp312", "cp313", "cp314")
     artifacts = [
         artifact_gate.Artifact(
-            path=tmp_path
-            / f"gafime_rocm-1.0.0b2-{tag}-{tag}-linux_x86_64.whl",
+            path=tmp_path / f"gafime_rocm-1.0.0b2-{tag}-{tag}-linux_x86_64.whl",
             kind="wheel",
             distribution="gafime-rocm",
             version="1.0.0b2",
@@ -224,24 +248,21 @@ def test_rocm_policy_report_aggregates_every_cpython_wheel_deterministically(
             ],
         }
 
-    monkeypatch.setattr(
-        artifact_gate, "_assert_rocm_system_wheel", fake_wheel_report
-    )
+    monkeypatch.setattr(artifact_gate, "_assert_rocm_system_wheel", fake_wheel_report)
     report = artifact_gate._rocm_system_policy_report(artifacts, ROOT)
 
     assert report["schema_version"] == 2
     assert report["wheel_count"] == len(python_tags)
     assert [wheel["artifact"] for wheel in report["wheels"]] == [
-        f"gafime_rocm-1.0.0b2-{tag}-{tag}-linux_x86_64.whl"
-        for tag in python_tags
+        f"gafime_rocm-1.0.0b2-{tag}-{tag}-linux_x86_64.whl" for tag in python_tags
     ]
 
 
 def test_rocm_build_marker_requires_the_exact_thirteen_target_policy() -> None:
     policy = json.loads(
-        (
-            ROOT / ".github" / "scripts" / "rocm_7_2_3_system_policy.json"
-        ).read_text(encoding="utf-8")
+        (ROOT / ".github" / "scripts" / "rocm_7_2_3_system_policy.json").read_text(
+            encoding="utf-8"
+        )
     )
     targets = policy["gfx_targets"]
     payload = (
@@ -256,6 +277,4 @@ def test_rocm_build_marker_requires_the_exact_thirteen_target_policy() -> None:
 
     incomplete = payload.replace(b",gfx1201", b"")
     with pytest.raises(AssertionError, match="exact policy target set"):
-        artifact_gate._assert_rocm_build_target_marker(
-            incomplete, "test.so", targets
-        )
+        artifact_gate._assert_rocm_build_target_marker(incomplete, "test.so", targets)

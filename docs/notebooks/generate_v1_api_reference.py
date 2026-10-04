@@ -338,7 +338,7 @@ def _cells() -> list:
             # GAFIME v1 Public API Reference & Cookbook
 
             This is the authoritative long-form reference for the current GAFIME
-            v1 public Python surface. It targets the current v1 source tree; mutable
+            v1 public Python surface. It targets the `1.0.0` source identity; mutable
             publication state and exact install identities live in
             [docs/releases/STATUS.md](../releases/STATUS.md), GitHub Releases, and
             PyPI.
@@ -367,8 +367,16 @@ def _cells() -> list:
             ## 1. Installation and package topology
 
             GAFIME supports CPython 3.10–3.14 with dedicated interpreter-specific
-            wheels rather than `abi3`. Install the current published prerelease;
-            payload metadata enforces exact Core alignment:
+            wheels rather than `abi3`. Stable installs prefer published stable
+            versions; payload metadata enforces exact Core alignment:
+
+            ```bash
+            python -m pip install gafime
+            python -m pip install gafime gafime-cuda
+            python -m pip install gafime gafime-rocm
+            ```
+
+            Opt into beta and release-candidate versions explicitly:
 
             ```bash
             python -m pip install --pre gafime
@@ -378,6 +386,8 @@ def _cells() -> list:
 
             An unqualified `pip install gafime` prefers the latest stable release;
             it does not select beta or release-candidate versions automatically.
+            The `1.0.0` source identity does not establish that its artifacts are
+            published or qualified; check the release-status links above.
             """
         ),
         _md(
@@ -1393,8 +1403,10 @@ def _cells() -> list:
             """
             ### scikit-learn
 
-            Install the current published prerelease `sklearn` extra, place
-            `GafimeSelector` inside the pipeline, and let each fold run its own fit.
+            Install the published stable `sklearn` extra with
+            `python -m pip install "gafime[sklearn]"`; add `--pre` only for an
+            intentional beta/RC install. Place `GafimeSelector` inside the pipeline,
+            and let each fold run its own fit.
             See section 18 for the executable bounded example.
             """
         ),

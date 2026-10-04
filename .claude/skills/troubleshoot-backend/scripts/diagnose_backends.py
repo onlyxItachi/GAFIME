@@ -12,7 +12,8 @@ from pathlib import Path
 RELEASE_STATUS = "see_docs_releases_status"
 CURRENT_INSTALL_GUIDANCE = (
     "Consult docs/releases/STATUS.md, GitHub Releases, and PyPI for mutable "
-    "publication state."
+    "publication state. Stable installs omit --pre; prerelease_install is the "
+    "explicit beta/RC alternative, not the stable default."
 )
 PRERELEASE_INSTALLS = {
     "core": 'pip install --pre gafime "polars>=1.3,<2"',

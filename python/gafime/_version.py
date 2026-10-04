@@ -1,3 +1,3 @@
-"""Single Python package-version declaration for the v1 pre-release."""
+"""Single Python package-version declaration for the v1 release line."""
 
-__version__ = "1.0.0rc2"
+__version__ = "1.0.0"
