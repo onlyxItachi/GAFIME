@@ -16,7 +16,9 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 CASES = ("graph-abi10", "graph-abi11", "graph-both", "eager-both", "foreign-only")
-KNOWN_UNFIXED_CUDA_RC2 = "ab4051b0de2d363c472ac3f02d35104927636b2404fc43a0832901cb4a7c08c0"
+KNOWN_UNFIXED_CUDA_RC2 = (
+    "ab4051b0de2d363c472ac3f02d35104927636b2404fc43a0832901cb4a7c08c0"
+)
 SOURCE_FILES = (
     "src/common/gpu_execution_gate.hpp",
     "src/cuda/precision_launcher.cu",
@@ -43,6 +45,7 @@ def bounded_int(lower: int, upper: int):
         if not lower <= number <= upper:
             raise argparse.ArgumentTypeError(f"must be between {lower} and {upper}")
         return number
+
     return parse
 
 
@@ -82,8 +85,10 @@ def child(config: dict) -> int:
     import time
 
     payload = Path(config["payload"])
-    if (not config.get("acknowledge_fixed_candidate")
-            or config["payload_sha256"] == KNOWN_UNFIXED_CUDA_RC2):
+    if (
+        not config.get("acknowledge_fixed_candidate")
+        or config["payload_sha256"] == KNOWN_UNFIXED_CUDA_RC2
+    ):
         raise RuntimeError("only an explicitly acknowledged fixed candidate may run")
     if sha256(payload) != config["payload_sha256"]:
         raise RuntimeError("candidate payload changed before child startup")
@@ -98,8 +103,17 @@ def child(config: dict) -> int:
 
     core = importlib.import_module("gafime.gafime_py")
     core_path = Path(core.__file__).resolve()
-    print(json.dumps({"event": "identity", "core": str(core_path),
-                      "core_sha256": sha256(core_path), "config": config}), flush=True)
+    print(
+        json.dumps(
+            {
+                "event": "identity",
+                "core": str(core_path),
+                "core_sha256": sha256(core_path),
+                "config": config,
+            }
+        ),
+        flush=True,
+    )
     # Keep this exact loaded payload alive while consumer dlopen/dlclose cycles
     # run. Both shims receive this same canonical path as the Core selector.
     payload_pin = ctypes.CDLL(str(payload))
@@ -124,20 +138,27 @@ def child(config: dict) -> int:
     features = rng.normal(size=(4096, 8)).astype(dtype)
     target = rng.normal(size=4096).astype(dtype)
     engine_config = EngineConfig(
-        backend=config["backend"], precision=config["precision"],
-        permutation_tests=0, num_repeats=1, metric_names=("pearson", "r2"),
+        backend=config["backend"],
+        precision=config["precision"],
+        permutation_tests=0,
+        num_repeats=1,
+        metric_names=("pearson", "r2"),
         budget=ComputeBudget(max_comb_size=2),
     )
     graph = config["case"].startswith("graph-")
 
     def primary():
-        artifact = gafime.compile(features, target, config=engine_config,
-                                  flags=CompileFlags(graph=graph))
+        artifact = gafime.compile(
+            features, target, config=engine_config, flags=CompileFlags(graph=graph)
+        )
         try:
             report = artifact.analyze()
             if bool(artifact.graph_replayed) != graph:
                 raise AssertionError("graph replay/fallback contract mismatch")
-            if report.backend is None or report.backend.selected_backend != config["backend"]:
+            if (
+                report.backend is None
+                or report.backend.selected_backend != config["backend"]
+            ):
                 raise AssertionError("unexpected backend fallback")
             return stable_report(report)
         finally:
@@ -145,12 +166,19 @@ def child(config: dict) -> int:
 
     has_primary = config["case"] != "foreign-only"
     reference = primary() if has_primary else None
-    selected = (["abi10"] if config["case"] == "graph-abi10" else
-                ["abi11"] if config["case"] == "graph-abi11" else ["abi10", "abi11"])
+    selected = (
+        ["abi10"]
+        if config["case"] == "graph-abi10"
+        else ["abi11"]
+        if config["case"] == "graph-abi11"
+        else ["abi10", "abi11"]
+    )
     stop = threading.Event()
     start = threading.Barrier(config["workers"] * len(selected) + 1)
     results_lock = threading.Lock()
-    counts = {f"{abi}-{worker}": 0 for abi in selected for worker in range(config["workers"])}
+    counts = {
+        f"{abi}-{worker}": 0 for abi in selected for worker in range(config["workers"])
+    }
     failures = []
 
     def foreign(abi, worker):
@@ -174,8 +202,11 @@ def child(config: dict) -> int:
                 failures.append({"worker": key, "exception": repr(error)})
                 stop.set()
 
-    workers = [threading.Thread(target=foreign, args=(abi, worker))
-               for abi in selected for worker in range(config["workers"])]
+    workers = [
+        threading.Thread(target=foreign, args=(abi, worker))
+        for abi in selected
+        for worker in range(config["workers"])
+    ]
     for worker in workers:
         worker.start()
     primary_count = 0
@@ -186,7 +217,9 @@ def child(config: dict) -> int:
         while time.monotonic() < deadline and not stop.is_set():
             if has_primary:
                 if primary() != reference:
-                    raise AssertionError("full deterministic report differs from serial reference")
+                    raise AssertionError(
+                        "full deterministic report differs from serial reference"
+                    )
                 primary_count += 1
             # Let independent callers queue their next native entries.
             time.sleep(0.001)
@@ -197,19 +230,40 @@ def child(config: dict) -> int:
         # The controller enforces the hard deadline even if native work hangs.
         for worker in workers:
             worker.join()
-    passed = (not failures and primary_error is None and all(counts.values())
-              and (not has_primary or primary_count > 0))
-    print(json.dumps({"event": "result", "status": "pass" if passed else "fail",
-                      "primary_calls": primary_count, "foreign_calls": counts,
-                      "foreign_failures": failures, "primary_error": primary_error,
-                      "parity_sha256": hashlib.sha256(reference).hexdigest() if reference else None,
-                      "excluded_report_fields": ["backend.memory_free_mb"]}), flush=True)
+    passed = (
+        not failures
+        and primary_error is None
+        and all(counts.values())
+        and (not has_primary or primary_count > 0)
+    )
+    print(
+        json.dumps(
+            {
+                "event": "result",
+                "status": "pass" if passed else "fail",
+                "primary_calls": primary_count,
+                "foreign_calls": counts,
+                "foreign_failures": failures,
+                "primary_error": primary_error,
+                "parity_sha256": hashlib.sha256(reference).hexdigest()
+                if reference
+                else None,
+                "excluded_report_fields": ["backend.memory_free_mb"],
+            }
+        ),
+        flush=True,
+    )
     return 0 if passed else 1
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--python", type=Path, required=True, help="installed candidate Core interpreter")
+    parser.add_argument(
+        "--python",
+        type=Path,
+        required=True,
+        help="installed candidate Core interpreter",
+    )
     parser.add_argument("--payload", type=Path, required=True)
     parser.add_argument("--expected-payload-sha256", required=True)
     parser.add_argument("--legacy-shim", type=Path, required=True)
@@ -218,15 +272,29 @@ def main() -> int:
     parser.add_argument("--precision", choices=("fp32", "mixed", "fp64"), required=True)
     parser.add_argument("--case", choices=CASES, required=True)
     parser.add_argument("--seconds", type=bounded_int(1, 10), default=2)
-    parser.add_argument("--workers", type=bounded_int(1, 3), default=1,
-                        help="foreign workers per selected ABI generation")
+    parser.add_argument(
+        "--workers",
+        type=bounded_int(1, 3),
+        default=1,
+        help="foreign workers per selected ABI generation",
+    )
     parser.add_argument("--timeout", type=bounded_int(5, 120), default=45)
-    parser.add_argument("--output-dir", type=Path, required=True, help="new directory; never overwrites logs")
-    parser.add_argument("--acknowledge-fixed-candidate", action="store_true",
-                        help="operator confirms candidate build provenance and safe hardware preflight")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="new directory; never overwrites logs",
+    )
+    parser.add_argument(
+        "--acknowledge-fixed-candidate",
+        action="store_true",
+        help="operator confirms candidate build provenance and safe hardware preflight",
+    )
     args = parser.parse_args()
     if not args.acknowledge_fixed_candidate:
-        parser.error("explicit fixed-candidate acknowledgement is required; no baseline stress is permitted")
+        parser.error(
+            "explicit fixed-candidate acknowledgement is required; no baseline stress is permitted"
+        )
     config = vars(args).copy()
     for key in ("python", "payload", "legacy_shim", "numeric_shim", "output_dir"):
         config[key] = str(config[key].resolve())
@@ -237,16 +305,30 @@ def main() -> int:
     if config["payload_sha256"] == KNOWN_UNFIXED_CUDA_RC2:
         parser.error("the known unfixed RC2 payload is not permitted")
     config["source_sha256"] = {name: sha256(ROOT / name) for name in SOURCE_FILES}
-    for key, command in (("source_head", ["git", "rev-parse", "HEAD"]),
-                         ("source_status", ["git", "status", "--short"])):
+    for key, command in (
+        ("source_head", ["git", "rev-parse", "HEAD"]),
+        ("source_status", ["git", "status", "--short"]),
+    ):
         config[key] = subprocess.check_output(command, cwd=ROOT, text=True).strip()
     output = Path(config["output_dir"])
     output.mkdir(parents=True, exist_ok=False)
     (output / "identity.json").write_text(json.dumps(config, indent=2) + "\n")
-    command = [config["python"], "-I", str(Path(__file__).resolve()), "--child", json.dumps(config)]
+    command = [
+        config["python"],
+        "-I",
+        str(Path(__file__).resolve()),
+        "--child",
+        json.dumps(config),
+    ]
     try:
-        result = subprocess.run(command, cwd=output, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, timeout=args.timeout, check=False)
+        result = subprocess.run(
+            command,
+            cwd=output,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=args.timeout,
+            check=False,
+        )
         stdout, stderr = result.stdout, result.stderr
         status = {"returncode": result.returncode, "timed_out": False}
     except subprocess.TimeoutExpired as error:
