@@ -92,12 +92,41 @@ Do not run the retained unfixed reproducer or delete existing crash records.
 
 Each invocation selects exactly one case (`graph-abi10`, `graph-abi11`,
 `graph-both`, `eager-both`, or `foreign-only`) in an isolated installed-package
-subprocess. Runtime, worker and foreign-call counts are bounded. The controller
+subprocess. A barrier action sets one shared start/deadline for the primary and
+every foreign worker. All loops run until that deadline or a failure stop, not
+until an arbitrary call-count cap. `--seconds` accepts 1 through 20, so a planned
+twenty-run campaign can request fifteen seconds per sequential invocation.
+The separate hard subprocess timeout remains mandatory, is capped at 120 seconds,
+and must exceed the requested interval to leave room for setup and teardown.
+An in-flight native call may finish after the interval; the hard timeout still
+fails and terminates a stuck subprocess.
+
+Each foreign worker must make at least two calls, begin within
+`min(0.25 seconds, 5% of the interval)` of the synchronized start, and complete
+its last call within that same allowance of the deadline or later. A run fails
+if any selected ABI worker misses this coverage: one ABI finishing early cannot
+be masked by progress from the other. Results retain counts, first/last call
+offsets, active wall spans, summed call durations, and total elapsed workload
+time. When selected, the primary workload must meet the same coverage checks.
+These spans include waiting for the payload gate or Python scheduling;
+they prove timed caller participation, not device utilization or a particular
+driver interleaving. No actual lock-contention instrumentation is claimed.
+
+The controller drains stdout/stderr continuously, retaining at most 16 MiB per
+stream; truncation, incomplete draining or a capture error fails qualification
+and is recorded rather than silently dropping evidence. The existing C consumers
+are unchanged. The controller
 records source HEAD/status/file hashes, payload/shim hashes, child Core hash,
 raw stdout/stderr, timeout and return status in a new directory. A signal,
 timeout, unavailable status, nonzero consumer result, fallback, missing progress
 or parity difference fails the run; it is not silently skipped. Process exit
 also exercises teardown. Existing crash artifacts are never removed.
+
+Host-only fake-clock tests exercise the actual loop controller past 512 calls,
+deadline and stop handling, and per-worker interval coverage. Small isolated
+Python children test complete and truncated log capture plus timeout handling;
+they do not import GAFIME or load a GPU runtime. These tests validate control
+logic, not physical driver scheduling or a completed qualification campaign.
 
 Graph cases repeatedly create, analyze and close independent matrices. Every
 deterministic public report field is compared against its serial reference,
