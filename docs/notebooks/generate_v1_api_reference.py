@@ -854,9 +854,11 @@ def _cells() -> list:
             target update, export, and close must occur on its creation thread.
 
             There is no context-manager or `run()` API. Use explicit `try/finally` and
-            `close()`. `update_target()` keeps features resident and invalidates
-            target-dependent plans/caches; decision paths and time-series source
-            selection are rediscovered. A native
+            `close()`. Continuous `update_target()` keeps its feature matrix
+            resident and invalidates target-dependent plans/caches. Generated
+            families retain original inputs but rebuild their expansion and
+            execution state: decision paths and time-series source selection are
+            rediscovered, which can require new allocation/upload. A native
             failure that closes the underlying state makes the wrapper fail closed.
 
             Native calls currently hold the Python GIL, including compiled replay.
