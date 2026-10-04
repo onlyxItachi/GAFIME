@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.26)
 project(gafime_cuda_v1 LANGUAGES CXX CUDA)
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
 
 option(GAFIME_CUDA_ENABLE_OPTIX_RT "Build primary CUDA payload with OptiX RT-core support (legacy; prefer GAFIME_CUDA_RT_BUILD_MODE=on|both)" OFF)
 option(GAFIME_CUDA_BUILD_TESTS "Build CUDA payload ABI and RT lifecycle regression fixtures" OFF)
@@ -77,7 +78,7 @@ function(gafime_cuda_add_v1_target target_name output_name enable_optix_rt)
         ${CMAKE_CURRENT_LIST_DIR}
         ${CMAKE_CURRENT_LIST_DIR}/../common
     )
-    target_link_libraries(${target_name} PRIVATE CUDA::cudart)
+    target_link_libraries(${target_name} PRIVATE CUDA::cudart Threads::Threads)
     if(UNIX AND NOT APPLE)
         set(gafime_cuda_exports_map
             "${CMAKE_CURRENT_LIST_DIR}/../common/gafime_gpu_exports.map")
