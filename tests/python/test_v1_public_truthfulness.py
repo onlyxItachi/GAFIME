@@ -41,6 +41,7 @@ class _Frame:
         self._rows = [tuple(row) for row in rows]
         self.columns = list(columns)
         self.width = len(self.columns)
+        self.dtypes = ["Float32"] * self.width
 
     def iter_rows(self):
         return iter(self._rows)
@@ -60,6 +61,7 @@ class _ArrowSeries:
 class _ArrowTargetFrame:
     def __init__(self, values):
         self.num_columns = 1
+        self.dtypes = ["Float32"]
         self._column = _ArrowSeries(values)
 
     def column(self, index):
@@ -187,6 +189,7 @@ def _boundary(*, honor_graph=True):
         max_arity,
         max_combinations_per_k,
         metric_ids,
+        random_seed,
     ):
         raw_arrow_calls.append(
             {
@@ -194,6 +197,7 @@ def _boundary(*, honor_graph=True):
                 "max_arity": max_arity,
                 "max_combinations_per_k": max_combinations_per_k,
                 "metric_ids": metric_ids,
+                "random_seed": random_seed,
             }
         )
         return _NativeReport(metric_count=len(metric_ids))
@@ -255,7 +259,133 @@ def test_arrow_cpu_shortcut_is_used_only_for_compatible_config(monkeypatch):
 
     assert len(boundary.raw_arrow_calls) == 1
     assert boundary.configured_calls == []
+    assert boundary.raw_arrow_calls[0]["random_seed"] == 7
     assert report.backend.device == "cpu"
+
+
+@pytest.mark.parametrize("seed", [7, 123, (1 << 129) + 123, -((1 << 129) + 123)])
+def test_arrow_shortcut_preserves_python_integer_seed(monkeypatch, seed):
+    boundary = _boundary()
+    monkeypatch.setattr(v1_adapter, "_load_boundary", lambda: boundary)
+    features, target = _frames()
+    config = EngineConfig(
+        backend="cpu", permutation_tests=0, num_repeats=1, random_seed=seed
+    )
+
+    analyze_arrow_with_v1_boundary(config, features, target, ["x"])
+
+    assert boundary.raw_arrow_calls[0]["random_seed"] == seed
+
+
+def test_arrow_shortcut_none_seed_uses_fresh_entropy_each_time(monkeypatch):
+    boundary = _boundary()
+    monkeypatch.setattr(v1_adapter, "_load_boundary", lambda: boundary)
+    seeds = [(1 << 200) + 7, (1 << 200) + 123]
+    entropy = iter(seeds)
+    monkeypatch.setattr(v1_adapter, "_fresh_random_seed", lambda: next(entropy))
+    features, target = _frames()
+    config = EngineConfig(
+        backend="cpu", permutation_tests=0, num_repeats=1, random_seed=None
+    )
+
+    for _ in seeds:
+        analyze_arrow_with_v1_boundary(config, features, target, ["x"])
+
+    assert [call["random_seed"] for call in boundary.raw_arrow_calls] == seeds
+
+
+@pytest.mark.parametrize("mismatch", ["features", "target", "unknown"])
+def test_arrow_shortcut_requires_matching_source_dtype(monkeypatch, mismatch):
+    # Assert dispatch, not a resident-cache hit from an earlier fake boundary.
+    monkeypatch.setenv("GAFIME_V1_ANALYZE_CACHE_SIZE", "0")
+    boundary = _boundary()
+    monkeypatch.setattr(v1_adapter, "_load_boundary", lambda: boundary)
+    features, target = _frames()
+    if mismatch == "unknown":
+        del features.dtypes
+    else:
+        frame = features if mismatch == "features" else target
+        frame.dtypes = ["Float64"]
+    config = EngineConfig(backend="cpu", permutation_tests=0, num_repeats=1)
+
+    analyze_arrow_with_v1_boundary(config, features, target, ["x"])
+
+    assert boundary.raw_arrow_calls == []
+    assert len(boundary.configured_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"stability_std_threshold": 0.2},
+        {"stability_std_threshold": -0.1},
+        {"stability_std_threshold": float("nan")},
+        {"stability_std_threshold": float("inf")},
+        {"permutation_p_threshold": 2.0},
+        {"permutation_p_threshold": -0.1},
+        {"permutation_p_threshold": float("nan")},
+        {"permutation_p_threshold": float("inf")},
+        {"significance_top_n": 25},
+        {"significance_top_n": 0},
+        {"significance_top_n": -1},
+        {"significance_top_n": 1 << 32},
+        {"mi_bins": 24},
+        {"mi_bins": 1},
+        {"mi_bins": -1},
+        {"mi_bins": 1 << 32},
+        {"budget": ComputeBudget(max_comb_size=-1)},
+        {"budget": ComputeBudget(max_comb_size=0)},
+        {"budget": ComputeBudget(max_comb_size=1 << 32)},
+        {"budget": ComputeBudget(max_combinations_per_k=-1)},
+        {"budget": ComputeBudget(max_combinations_per_k=0)},
+        {"budget": ComputeBudget(max_combinations_per_k=1 << 64)},
+    ],
+)
+def test_arrow_shortcut_defers_omitted_fields_and_counts_to_configured_boundary(
+    monkeypatch, changes
+):
+    monkeypatch.setenv("GAFIME_V1_ANALYZE_CACHE_SIZE", "0")
+    boundary = _boundary()
+    monkeypatch.setattr(v1_adapter, "_load_boundary", lambda: boundary)
+    features, target = _frames()
+    # No MI or significance work: universal config validation still applies.
+    config = EngineConfig(
+        backend="cpu", metric_names=("pearson",), permutation_tests=0,
+        num_repeats=1, **changes,
+    )
+
+    analyze_arrow_with_v1_boundary(config, features, target, ["x"])
+
+    assert boundary.raw_arrow_calls == []
+    assert len(boundary.configured_calls) == 1
+    payload = boundary.configured_calls[0]["config"]
+    expected = v1_adapter._config_payload(config)
+    assert {key: payload[key] for key in expected} == expected
+
+
+@pytest.mark.parametrize("field", ["max_comb_size", "max_combinations_per_k"])
+@pytest.mark.parametrize("value", [None, True, 1.5, "2", float("inf")])
+def test_arrow_shortcut_does_not_normalize_unusual_count_types(field, value):
+    config = EngineConfig(
+        backend="cpu", permutation_tests=0, num_repeats=1,
+        budget=ComputeBudget(**{field: value}),
+    )
+
+    assert not v1_adapter._raw_arrow_config_supported(config)
+
+
+@pytest.mark.parametrize(
+    "max_arity,max_combinations", [(1, 1), (2, 5000), ((1 << 32) - 1, (1 << 64) - 1)]
+)
+def test_arrow_shortcut_accepts_representable_positive_counts(max_arity, max_combinations):
+    config = EngineConfig(
+        backend="cpu", permutation_tests=0, num_repeats=1,
+        budget=ComputeBudget(
+            max_comb_size=max_arity, max_combinations_per_k=max_combinations,
+        ),
+    )
+
+    assert v1_adapter._raw_arrow_config_supported(config)
 
 
 @pytest.mark.parametrize(
