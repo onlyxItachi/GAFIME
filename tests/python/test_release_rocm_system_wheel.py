@@ -110,7 +110,13 @@ def test_rocm_system_wheel_pthread_preserves_exact_hip_soname(
 
 @pytest.mark.parametrize(
     "vendored_member",
-    ["gafime_rocm.libs/libpthread.so.0", "gafime_rocm/libamdhip64.so.7"],
+    [
+        "gafime_rocm.libs/libpthread.so.0",
+        "gafime_rocm/libpthread.so.0",
+        "gafime_rocm/vendor/libpthread-2.28.so",
+        "libpthread.so.0",
+        "gafime_rocm/libamdhip64.so.7",
+    ],
 )
 def test_rocm_system_wheel_pthread_does_not_allow_vendoring(
     rocm_system_wheel, vendored_member: str

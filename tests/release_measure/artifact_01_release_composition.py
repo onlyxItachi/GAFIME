@@ -1614,6 +1614,7 @@ def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, objec
                     "libhsa",
                     "librocprofiler",
                     "libdrm",
+                    "libpthread",
                 )
             )
         )
