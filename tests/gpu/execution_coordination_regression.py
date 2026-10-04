@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import secrets
 import subprocess
@@ -37,6 +38,46 @@ SOURCE_FILES = (
 LOG_LIMIT_BYTES = 16 * 1024 * 1024
 COMPLETION_LIMIT_BYTES = 64 * 1024
 COMPLETION_FILE = "completion.json"
+
+
+def invocation_path(path):
+    """Normalize an executable spelling without following its venv symlink."""
+    return os.path.abspath(os.fspath(path))
+
+
+def expected_venv_prefix(executable):
+    directory = Path(executable).parent
+    for candidate in (directory, directory.parent):
+        if (candidate / "pyvenv.cfg").is_file():
+            return invocation_path(candidate)
+    return None
+
+
+def python_identity():
+    return {
+        "python": invocation_path(sys.executable),
+        "python_prefix": invocation_path(sys.prefix),
+        "python_base_prefix": invocation_path(sys.base_prefix),
+    }
+
+
+def check_python_identity(identity, config):
+    if identity["python"] != config["python"]:
+        raise ValueError("child interpreter mismatch")
+    for key in ("python_prefix", "python_base_prefix"):
+        if not (
+            isinstance(identity[key], str)
+            and invocation_path(identity[key]) == identity[key]
+            and Path(identity[key]).is_dir()
+        ):
+            raise ValueError(f"invalid child {key}")
+    venv_prefix = config["python_venv_prefix"]
+    if venv_prefix is not None and not (
+        Path(identity["python_prefix"]).resolve() == Path(venv_prefix).resolve()
+        and Path(identity["python_base_prefix"]).resolve()
+        != Path(venv_prefix).resolve()
+    ):
+        raise ValueError("child virtualenv prefix mismatch")
 
 
 @dataclass
@@ -218,7 +259,16 @@ def validate_completion(output, config, child_pid, controller_elapsed):
         require(
             isinstance(identity, dict)
             and set(identity)
-            == {"event", "pid", "python", "core", "core_sha256", "config"},
+            == {
+                "event",
+                "pid",
+                "python",
+                "python_prefix",
+                "python_base_prefix",
+                "core",
+                "core_sha256",
+                "config",
+            },
             "malformed child identity",
         )
         require(identity["event"] == "identity", "missing child identity event")
@@ -226,7 +276,7 @@ def validate_completion(output, config, child_pid, controller_elapsed):
             type(identity["pid"]) is int and identity["pid"] == child_pid,
             "child pid mismatch",
         )
-        require(identity["python"] == config["python"], "child interpreter mismatch")
+        check_python_identity(identity, config)
         require(
             identity["config"] == config
             and config_sha256(identity["config"]) == config["config_sha256"],
@@ -483,10 +533,11 @@ def stable_report(report):
 def child(config: dict) -> int:
     import ctypes
     import importlib
-    import os
 
     if config_sha256(config) != config["config_sha256"]:
         raise RuntimeError("child configuration hash mismatch")
+    observed_python = python_identity()
+    check_python_identity(observed_python, config)
     if {name: sha256(ROOT / name) for name in SOURCE_FILES} != config["source_sha256"]:
         raise RuntimeError("runner sources changed before child startup")
     payload = Path(config["payload"])
@@ -511,7 +562,7 @@ def child(config: dict) -> int:
     identity = {
         "event": "identity",
         "pid": os.getpid(),
-        "python": str(Path(sys.executable).resolve()),
+        **observed_python,
         "core": str(core_path),
         "core_sha256": sha256(core_path),
         "config": config,
@@ -727,7 +778,9 @@ def main() -> int:
     if args.timeout <= args.seconds:
         parser.error("--timeout must exceed --seconds to allow setup and teardown")
     config = vars(args).copy()
-    for key in ("python", "payload", "legacy_shim", "numeric_shim", "output_dir"):
+    config["python"] = invocation_path(config["python"])
+    config["python_venv_prefix"] = expected_venv_prefix(config["python"])
+    for key in ("payload", "legacy_shim", "numeric_shim", "output_dir"):
         config[key] = str(config[key].resolve())
     for key in ("payload", "legacy_shim", "numeric_shim"):
         config[key + "_sha256"] = sha256(Path(config[key]))

@@ -1,7 +1,10 @@
 """Host-only regression for complete ordinary-export coverage; no GPU imports."""
 
 import argparse
+from contextlib import redirect_stdout
+import io
 import json
+import os
 from pathlib import Path
 from copy import deepcopy
 import re
@@ -10,6 +13,8 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
+import venv
 
 from execution_coordination_regression import (
     CallProgress,
@@ -17,7 +22,11 @@ from execution_coordination_regression import (
     COMPLETION_LIMIT_BYTES,
     bounded_int,
     config_sha256,
+    expected_venv_prefix,
+    invocation_path,
+    main,
     progress_summary,
+    python_identity,
     run_bounded_subprocess,
     run_until_deadline,
     selected_abis,
@@ -62,7 +71,8 @@ def synthetic_completion(case="graph-both"):
     """Host protocol fixture, explicitly not native execution evidence."""
     config = {
         "run_id": "host-only-fixture",
-        "python": str(Path(sys.executable).resolve()),
+        "python": invocation_path(sys.executable),
+        "python_venv_prefix": expected_venv_prefix(invocation_path(sys.executable)),
         "case": case,
         "seconds": 1,
         "timeout": 5,
@@ -77,7 +87,7 @@ def synthetic_completion(case="graph-both"):
     identity = {
         "event": "identity",
         "pid": 123,
-        "python": config["python"],
+        **python_identity(),
         "core": str(Path(__file__).resolve()),
         "core_sha256": sha256(Path(__file__)),
         "config": deepcopy(config),
@@ -496,6 +506,98 @@ class CompletionEvidenceTest(unittest.TestCase):
                     "x" * COMPLETION_LIMIT_BYTES,
                 )
             self.assertFalse((Path(directory) / COMPLETION_FILE).exists())
+
+
+class InterpreterInvocationTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "POSIX virtualenv symlink regression")
+    def test_main_keeps_venv_symlink_and_validates_actual_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Path(directory) / "candidate-venv"
+            venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+            executable = environment / "bin" / "python"
+            self.assertTrue(executable.is_symlink())
+            spelling = executable.parent / ".." / "bin" / "python"
+            # This main-path check stops before launching any GAFIME child.
+            fixture = Path(__file__).resolve()
+            arguments = [
+                "runner",
+                "--python",
+                str(spelling),
+                "--payload",
+                str(fixture),
+                "--expected-payload-sha256",
+                sha256(fixture),
+                "--legacy-shim",
+                str(fixture),
+                "--numeric-shim",
+                str(fixture),
+                "--backend",
+                "cuda",
+                "--precision",
+                "fp32",
+                "--case",
+                "graph-both",
+                "--seconds",
+                "1",
+                "--timeout",
+                "5",
+                "--output-dir",
+                str(Path(directory) / "output"),
+                "--acknowledge-fixed-candidate",
+            ]
+            with (
+                patch.object(sys, "argv", arguments),
+                patch(
+                    "execution_coordination_regression.run_bounded_subprocess",
+                    return_value={"passed": False},
+                ) as launch,
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(main(), 1)
+            command = launch.call_args.args[0]
+            config = launch.call_args.kwargs["expected_config"]
+            self.assertEqual(command[0], str(executable))
+            self.assertEqual(config["python"], str(executable))
+            self.assertNotEqual(command[0], str(executable.resolve()))
+            self.assertEqual(config["python_venv_prefix"], str(environment))
+            self.assertEqual(config["payload"], str(fixture.resolve()))
+            runner = ROOT / "tests/gpu/execution_coordination_regression.py"
+            # Only stdlib/module definitions run; no GAFIME import or GPU runtime.
+            script = (
+                "import json, runpy; "
+                f"namespace = runpy.run_path({str(runner)!r}); "
+                "print(json.dumps(namespace['python_identity']()))"
+            )
+            probe = subprocess.run(
+                [command[0], "-I", "-c", script],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            )
+            actual = json.loads(probe.stdout)
+            self.assertEqual(actual["python"], str(executable))
+            self.assertEqual(
+                Path(actual["python_prefix"]).resolve(), environment.resolve()
+            )
+            self.assertNotEqual(actual["python_prefix"], actual["python_base_prefix"])
+            _, record = synthetic_completion()
+            record["run_id"] = config["run_id"]
+            record["config_sha256"] = config["config_sha256"]
+            record["identity"].update(actual)
+            record["identity"]["config"] = config
+            output = Path(directory) / "output"
+
+            def validate():
+                (output / COMPLETION_FILE).write_text(json.dumps(record))
+                return validate_completion(output, config, 123, 2.0)
+
+            self.assertTrue(validate()["valid"])
+            record["identity"]["python_prefix"] = actual["python_base_prefix"]
+            self.assertFalse(validate()["valid"])
+            record["identity"]["python_prefix"] = actual["python_prefix"]
+            record["identity"]["python"] = str(executable.resolve())
+            self.assertFalse(validate()["valid"])
 
 
 if __name__ == "__main__":

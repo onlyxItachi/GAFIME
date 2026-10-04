@@ -89,6 +89,13 @@ build provenance, device availability/memory and that desktop/display or other
 GPU users will not be disrupted. The known unfixed RC2 CUDA hash is rejected;
 the script does not establish arbitrary candidate build provenance by itself.
 Do not run the retained unfixed reproducer or delete existing crash records.
+The interpreter path is made lexically absolute without resolving executable
+symlinks, preserving a selected virtualenv and its installed candidate package.
+Payload/shim/source paths and hashes retain their canonical treatment. Child
+identity records the invoked executable, `sys.prefix` and `sys.base_prefix`;
+when the requested interpreter has an adjacent/parent `pyvenv.cfg`, completion
+also requires that virtualenv prefix rather than the base interpreter prefix.
+The child checks this identity before importing GAFIME or opening any payload.
 
 Each invocation selects exactly one case (`graph-abi10`, `graph-abi11`,
 `graph-both`, `eager-both`, or `foreign-only`) in an isolated installed-package
@@ -148,7 +155,10 @@ Python children test bounded log capture, timeout handling, and acceptance or
 rejection of explicitly synthetic completion records. Empty clean exits and
 wrong/missing/malformed/duplicate evidence fail; a synthetic unreapable process
 checks that post-kill waits remain bounded. These tests do not import GAFIME or
-load a GPU runtime. They validate control logic, not physical driver scheduling
+load a GPU runtime. A POSIX regression creates a temporary no-pip symlink venv,
+checks the controller's invocation path, and runs a stdlib-only identity probe
+to verify its actual prefix and rejection of a base-interpreter substitution.
+They validate control logic, not physical driver scheduling
 or a completed qualification campaign.
 
 Graph cases repeatedly create, analyze and close independent matrices. Every
