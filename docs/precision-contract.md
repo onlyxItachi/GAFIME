@@ -155,10 +155,12 @@ not be labelled Metal fp64.
 
 The requested profile and backend/profile compatibility are validated before
 conversion. `fp32` and `mixed` intentionally own fp32 input storage; `fp64`
-preserves fp64 input without an fp32 intermediate. The Polars adapter chooses
-`Float32` or `Float64` only after this validation. Arrow input must match the
-selected storage domain and fail closed on a mismatched dtype rather than
-silently converting through fp32.
+preserves fp64 input without an fp32 intermediate. File ingest retains the
+source Polars dtypes until checked configured ingest; it must not cast a finite
+out-of-range source value to infinity before validation. The strict raw Arrow
+shortcut is used only when every column already matches the selected storage
+domain. Low-level Arrow input still fails closed on a mismatched dtype rather
+than silently converting through fp32. See [ingest validation](ingest-validation.md).
 
 ## ABI And Resident Identity
 
