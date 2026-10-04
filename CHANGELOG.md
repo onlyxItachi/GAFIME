@@ -19,8 +19,9 @@
   payload through cleanup and caller-device restoration; retain caller-owned
   handle/buffer lifetime obligations and the experimental RT exclusion.
 - Add bounded, run-bound native coordination qualification and refresh current
-  stable/prerelease installation guidance without changing APIs, ABI layouts,
-  package topology, numerical profiles, GIL policy, or thread affinity.
+  stable/prerelease installation guidance while preserving public API
+  compatibility, ABI layouts, package topology, numerical profiles, GIL policy,
+  and thread affinity.
 
 ## v1.0.0-rc.2
 
