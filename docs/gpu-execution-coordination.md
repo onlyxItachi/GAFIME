@@ -98,8 +98,12 @@ until an arbitrary call-count cap. `--seconds` accepts 1 through 20, so a planne
 twenty-run campaign can request fifteen seconds per sequential invocation.
 The separate hard subprocess timeout remains mandatory, is capped at 120 seconds,
 and must exceed the requested interval to leave room for setup and teardown.
-An in-flight native call may finish after the interval; the hard timeout still
-fails and terminates a stuck subprocess.
+Up to one second (10% for short timeouts) of that same budget is reserved for
+kill/reap and pipe draining; cleanup never starts a fresh unbounded wait. An
+in-flight native call may finish after the interval. A timeout requests child
+termination and fails qualification, including when the OS does not finish
+reaping within the remaining budget. `status.json` records reaping/kill errors;
+the controller does not claim successful process retirement in that case.
 
 Each foreign worker must make at least two calls, begin within
 `min(0.25 seconds, 5% of the interval)` of the synchronized start, and complete
@@ -122,11 +126,30 @@ timeout, unavailable status, nonzero consumer result, fallback, missing progress
 or parity difference fails the run; it is not silently skipped. Process exit
 also exercises teardown. Existing crash artifacts are never removed.
 
+Zero process exit alone is not qualification. The child must write exactly one
+create-once `completion.json` record, at most 64 KiB, separately from potentially
+interleaved C/Python stdout. Its fresh run ID and canonical configuration digest
+bind it to this invocation, including selected case/precision/backend, payload,
+shim and source hashes. Before workload startup the child rechecks those source,
+payload and shim hashes. The controller verifies the record's exact identity and
+result structure, child PID/interpreter/configuration, and the reported Core
+file hash. It independently recomputes interval coverage for the exact selected
+ABI worker set and primary workload, checks elapsed time against its own child
+observation, and requires the full-report parity hash and unchanged exclusions.
+Missing, oversized, malformed, repeated or duplicate-key records, contradictory
+counts/timings, failure status and incomplete work all fail qualification.
+`status.json` includes completion validation and its file hash. This is a local
+evidence-consistency check, not cryptographic attestation of an untrusted runner,
+an arbitrary payload build, or physical device execution.
+
 Host-only fake-clock tests exercise the actual loop controller past 512 calls,
 deadline and stop handling, and per-worker interval coverage. Small isolated
-Python children test complete and truncated log capture plus timeout handling;
-they do not import GAFIME or load a GPU runtime. These tests validate control
-logic, not physical driver scheduling or a completed qualification campaign.
+Python children test bounded log capture, timeout handling, and acceptance or
+rejection of explicitly synthetic completion records. Empty clean exits and
+wrong/missing/malformed/duplicate evidence fail; a synthetic unreapable process
+checks that post-kill waits remain bounded. These tests do not import GAFIME or
+load a GPU runtime. They validate control logic, not physical driver scheduling
+or a completed qualification campaign.
 
 Graph cases repeatedly create, analyze and close independent matrices. Every
 deterministic public report field is compared against its serial reference,
