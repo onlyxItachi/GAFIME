@@ -1627,14 +1627,6 @@ fn update_ranked_plan_maxima<T: HostSignificanceScalar>(
     Ok(())
 }
 
-/// Build one permutation-specific expanded decision-path family on the
-/// requested GPU backend and return its lane-typed maxT extrema.
-///
-/// Decision-path discovery and membership materialization remain host-owned,
-/// but every score contributing to a GPU null-family maximum is evaluated and
-/// ranked through the device's bounded `top_k=1` execution surface. Retaining
-/// the complete screened plan is deliberate: the unary screening result may
-/// select a different higher-order family for every permuted target.
 pub(crate) fn execute_device_decision_path_null_maxima(
     config: &EngineConfig,
     rows: u64,
@@ -1649,9 +1641,26 @@ pub(crate) fn execute_device_decision_path_null_maxima(
             "decision-path device maxT requires an explicit GPU backend".to_string(),
         ));
     }
+    let mut config = config.clone();
+    config.budget.max_feature_candidate = -2;
+    execute_generated_null_maxima(&config, rows, cols, input)
+}
 
+/// Build one permutation-specific expanded generated family on the requested
+/// backend and return its lane-typed maxT extrema.
+///
+/// Generated-family selection and materialization remain host-owned,
+/// but every score contributing to a GPU null-family maximum is evaluated and
+/// ranked through the device's bounded `top_k=1` execution surface. Retaining
+/// the complete screened plan is deliberate: the unary screening result may
+/// select a different higher-order family for every permuted target.
+pub(crate) fn execute_generated_null_maxima(
+    config: &EngineConfig,
+    rows: u64,
+    cols: u32,
+    input: OwnedNumericInput,
+) -> Result<CpuPrecisionValues, PyBoundaryError> {
     let mut null_config = config.clone();
-    null_config.budget.max_feature_candidate = -2;
     // This flag retains the complete permutation-specific screened family. The
     // helper never invokes ordinary significance recursively.
     null_config.permutation_tests = 1;
@@ -1659,7 +1668,9 @@ pub(crate) fn execute_device_decision_path_null_maxima(
     null_config.graph_requested = false;
     let metric_ids = null_config.metric_ids.clone();
     let state = build_continuous_state(&null_config, rows, cols, input)?;
-    require_device_ranking(&state.backend)?;
+    if !matches!(&state.backend, CompiledContinuousBackend::Cpu { .. }) {
+        require_device_ranking(&state.backend)?;
+    }
     let complete_family = state.complete_family()?;
 
     match null_config.precision {

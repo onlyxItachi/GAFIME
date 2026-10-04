@@ -539,7 +539,11 @@ def analyze_time_series_with_v1_boundary(
     features, target, rows, cols, names = _coerce_row_major_f32(
         X, y, feature_names, precision=config.precision
     )
-    payload = _config_payload(replace(config, enable_time_series_functions=False))
+    payload = _config_payload(
+        config
+        if config.enable_decision_path_functions
+        else replace(config, enable_time_series_functions=False)
+    )
     native_report, all_names = boundary.analyze_time_series(
         payload,
         features,
@@ -575,7 +579,11 @@ def analyze_decision_path_with_v1_boundary(
     features, target, rows, cols, names = _coerce_row_major_f32(
         X, y, feature_names, precision=config.precision
     )
-    payload = _config_payload(replace(config, enable_decision_path_functions=False))
+    payload = _config_payload(
+        config
+        if config.enable_time_series_functions
+        else replace(config, enable_decision_path_functions=False)
+    )
     native_report, all_names = boundary.analyze_decision_path(
         payload,
         features,
@@ -687,7 +695,11 @@ def compile_with_v1_boundary(
     if config.enable_time_series_functions:
         if not hasattr(boundary, "compile_time_series"):
             raise V1UnsupportedError("native boundary lacks compile_time_series")
-        payload = _config_payload(replace(config, enable_time_series_functions=False))
+        payload = _config_payload(
+            config
+            if config.enable_decision_path_functions
+            else replace(config, enable_time_series_functions=False)
+        )
         payload["compile_flags"] = compile_flags
         handle, all_names = boundary.compile_time_series(
             payload,
@@ -706,7 +718,11 @@ def compile_with_v1_boundary(
     elif config.enable_decision_path_functions:
         if not hasattr(boundary, "compile_decision_path"):
             raise V1UnsupportedError("native boundary lacks compile_decision_path")
-        payload = _config_payload(replace(config, enable_decision_path_functions=False))
+        payload = _config_payload(
+            config
+            if config.enable_time_series_functions
+            else replace(config, enable_decision_path_functions=False)
+        )
         payload["compile_flags"] = compile_flags
         handle, all_names = boundary.compile_decision_path(
             payload,
@@ -1181,6 +1197,7 @@ class NativeCompiledGafime:
             except BaseException:
                 self._close_after_native_failure()
                 raise
+            self._refresh_generated_feature_names()
         try:
             native_report = self.native_handle.analyze()
         except BaseException:
@@ -1208,8 +1225,9 @@ class NativeCompiledGafime:
     def update_target(self, y: Iterable[float]) -> "NativeCompiledGafime":
         """Resident-session reuse: replace the target and re-use the resident
         matrix on the next analyze() — the features stay uploaded (on GPU) or held
-        (on CPU), so only y crosses the boundary. Decision-path artifacts
-        rediscover target-dependent paths and refresh their public identities.
+        (on CPU), so only y crosses the boundary. Generated-family artifacts
+        reselect sources and rebuild target-dependent expansions as needed,
+        refreshing their public identities after the native commit.
         Target length/range must match the compiled contract. Returns self for
         chaining."""
         self._ensure_open()
@@ -1225,11 +1243,21 @@ class NativeCompiledGafime:
         except BaseException:
             self._close_after_native_failure()
             raise
-        if self.config.enable_decision_path_functions:
+        self._refresh_generated_feature_names()
+        self._native_report = None
+        self._last_report = None
+        self._graph_replayed = False
+        return self
+
+    def _refresh_generated_feature_names(self) -> None:
+        if (
+            self.config.enable_decision_path_functions
+            or self.config.enable_time_series_functions
+        ):
             native_names = getattr(self.native_handle, "feature_names", None)
             if native_names is None:
                 raise V1UnsupportedError(
-                    "compiled decision-path target replacement did not expose its "
+                    "compiled generated-family rebuild did not expose its "
                     "rediscovered feature identities."
                 )
             self.feature_names = [str(name) for name in native_names]
@@ -1237,10 +1265,9 @@ class NativeCompiledGafime:
                 self.native_handle, "generated_feature_start", None
             )
             self._scenario_plan = None
-        self._native_report = None
-        self._last_report = None
-        self._graph_replayed = False
-        return self
+            self._native_report = None
+            self._last_report = None
+            self._graph_replayed = False
 
     def __arrow_c_array__(self, requested_schema=None):
         """Zero-copy Arrow C Data Interface export of the compact result table.

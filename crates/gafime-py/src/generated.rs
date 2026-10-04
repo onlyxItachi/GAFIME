@@ -13,14 +13,17 @@ use gafime_types::{
 };
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyDict};
 
-use crate::artifact::{compile_continuous_input, PyCompiledContinuousArtifact};
+use crate::artifact::{
+    compile_continuous_input, execute_compiled_artifact, PyCompiledContinuousArtifact,
+};
 use crate::common::{
     combo_from_table, validate_shape, ContinuousReport, DecisionPathResultParams,
     OwnedNumericInput, PyBoundaryError, ResultTableView, SignificanceEntry,
 };
 use crate::continuous::{
     analyze_continuous_input_once, bounded_ranked_indices,
-    execute_device_decision_path_null_maxima, unary_strengths_from_table,
+    execute_device_decision_path_null_maxima, execute_generated_null_maxima,
+    unary_strengths_from_table,
 };
 use crate::py_api::PyContinuousReport;
 use crate::runtime::{get_u32, parse_engine_config};
@@ -743,7 +746,7 @@ pub(crate) struct PrecisionDecisionPathRebuild {
 
 impl PrecisionDecisionPathCompiledState {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub(crate) fn new(
         input: OwnedNumericInput,
         selection_config: EngineConfig,
         source_cols: u32,
@@ -1269,6 +1272,335 @@ fn expand_decision_path_bounded(
     Ok((expanded, expanded_cols, paths))
 }
 
+/// Original temporal inputs and selection policy. Source ranking is adaptive
+/// even when top_k includes every source: generated-column and downstream
+/// candidate caps can make the ranking order affect the executed family.
+pub(crate) struct PrecisionTimeSeriesCompiledState {
+    input: OwnedNumericInput,
+    selection_config: EngineConfig,
+    source_cols: u32,
+    base_names: Vec<String>,
+    lags: Vec<u32>,
+    windows: Vec<u32>,
+    velocity: bool,
+}
+
+struct TimeSeriesExpansion {
+    config: EngineConfig,
+    input: OwnedNumericInput,
+    cols: u32,
+    names: Vec<String>,
+}
+
+impl PrecisionTimeSeriesCompiledState {
+    pub(crate) fn base_candidate_cols(&self) -> usize {
+        self.selection_config
+            .effective_feature_candidate_count(self.source_cols) as usize
+    }
+
+    pub(crate) fn execution_config(&self, current: &EngineConfig) -> EngineConfig {
+        let mut config = current.clone();
+        // Ordinary continuous bootstrap describes the observed, materialized
+        // candidates. Its fixed-expansion permutation family is not valid here.
+        config.permutation_tests = 0;
+        config
+    }
+
+    fn prepare(
+        &self,
+        current: &EngineConfig,
+        input: &OwnedNumericInput,
+    ) -> Result<TimeSeriesExpansion, PyBoundaryError> {
+        let rows = input.target_len();
+        validate_shape(rows as u64, self.source_cols, input.feature_len(), rows)?;
+        let mut config = self.selection_config.clone();
+        config.random_seed = current.random_seed;
+        config
+            .planning_seed_words
+            .clone_from(&current.planning_seed_words);
+        config.graph_requested = current.graph_requested;
+        let base_cols = self.base_candidate_cols();
+        let limit =
+            generated_feature_limit(config.budget.max_time_series_candidates, rows, base_cols);
+        let sources = if base_cols == 0 || limit == 0 {
+            Vec::new()
+        } else {
+            select_generated_source_features_precision(
+                &config,
+                rows as u64,
+                self.source_cols,
+                input,
+                config.budget.top_k_features_for_time_series,
+            )?
+        };
+        let (expanded, cols, descriptors) = if base_cols == 0 {
+            (input.clone(), self.source_cols as usize, Vec::new())
+        } else {
+            config.budget.max_feature_candidate = -2;
+            expand_time_series_precision(
+                config.precision,
+                input.clone(),
+                rows,
+                self.source_cols as usize,
+                base_cols,
+                &sources,
+                &self.lags,
+                &self.windows,
+                self.velocity,
+                limit,
+            )?
+        };
+        let mut names = if base_cols == 0 {
+            self.base_names.clone()
+        } else {
+            self.base_names[..base_cols.min(self.base_names.len())].to_vec()
+        };
+        append_unique_generated_names(
+            &mut names,
+            descriptors.iter().map(|descriptor| {
+                let base = self
+                    .base_names
+                    .get(descriptor.base_feature as usize)
+                    .map(String::as_str)
+                    .unwrap_or("feature");
+                gafime_cpu::time_series::feature_label(base, descriptor.op)
+            }),
+        );
+        Ok(TimeSeriesExpansion {
+            config,
+            input: expanded,
+            cols: u32::try_from(cols).map_err(|_| {
+                PyBoundaryError::InvalidInput(
+                    "time-series expanded feature count exceeds u32".to_string(),
+                )
+            })?,
+            names,
+        })
+    }
+
+    pub(crate) fn rebuild_target(
+        &mut self,
+        current: &EngineConfig,
+        target: CpuPrecisionValues,
+    ) -> Result<PyCompiledContinuousArtifact, PyBoundaryError> {
+        let input = match (&self.input, target) {
+            (OwnedNumericInput::F32 { features, .. }, CpuPrecisionValues::F32(target)) => {
+                OwnedNumericInput::F32 {
+                    features: features.clone(),
+                    target,
+                }
+            }
+            (OwnedNumericInput::F64 { features, .. }, CpuPrecisionValues::F64(target)) => {
+                OwnedNumericInput::F64 {
+                    features: features.clone(),
+                    target,
+                }
+            }
+            _ => {
+                return Err(PyBoundaryError::InvalidInput(
+                    "time-series target replacement changed the resident dtype".to_string(),
+                ))
+            }
+        };
+        self.rebuild(current, input)
+    }
+
+    pub(crate) fn rebuild_current(
+        &mut self,
+        current: &EngineConfig,
+    ) -> Result<PyCompiledContinuousArtifact, PyBoundaryError> {
+        self.rebuild(current, self.input.clone())
+    }
+
+    fn rebuild(
+        &mut self,
+        current: &EngineConfig,
+        input: OwnedNumericInput,
+    ) -> Result<PyCompiledContinuousArtifact, PyBoundaryError> {
+        let expanded = self.prepare(current, &input)?;
+        let mut artifact = compile_continuous_input(
+            expanded.config,
+            input.target_len() as u64,
+            expanded.cols,
+            expanded.input,
+        )?;
+        artifact.feature_names = expanded.names;
+        // Commit retained discovery inputs only after native preparation succeeds.
+        // The caller's final artifact/state swap is infallible.
+        self.input = input;
+        self.selection_config.random_seed = current.random_seed;
+        self.selection_config
+            .planning_seed_words
+            .clone_from(&current.planning_seed_words);
+        self.selection_config.graph_requested = current.graph_requested;
+        Ok(artifact)
+    }
+
+    pub(crate) fn apply_significance(
+        &self,
+        current: &EngineConfig,
+        report: &mut ContinuousReport,
+    ) -> Result<(), PyBoundaryError> {
+        let permutations = self.selection_config.permutation_tests;
+        if permutations == 0 || report.table.row_count() == 0 {
+            return Ok(());
+        }
+        let order = bounded_ranked_indices(
+            &report.table,
+            &report.metric_ids,
+            None,
+            true,
+            self.selection_config.significance_top_n.max(1) as usize,
+        );
+        let kernels = report
+            .metric_ids
+            .iter()
+            .copied()
+            .map(MetricKernel::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                PyBoundaryError::InvalidInput(
+                    "unknown metric id for time-series significance".to_string(),
+                )
+            })?;
+        let observed = order
+            .iter()
+            .map(|&row| {
+                let base = row * report.metric_ids.len();
+                match &report.table {
+                    PrecisionOwnedResultTable::Fp32(table) => CpuPrecisionValues::F32(
+                        table.metric_values()[base..base + report.metric_ids.len()].to_vec(),
+                    ),
+                    PrecisionOwnedResultTable::F64 { table, .. } => CpuPrecisionValues::F64(
+                        table.metric_values()[base..base + report.metric_ids.len()].to_vec(),
+                    ),
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut counts = vec![vec![0_u32; kernels.len()]; observed.len()];
+        let (_, target) = input_slices(&self.input);
+        let mut null_current = current.clone();
+        null_current.graph_requested = false;
+        for index in 0..permutations {
+            let target = significance::precision_permutation_target(
+                current.precision,
+                target,
+                current.random_seed,
+                index,
+            )?;
+            let input = match (&self.input, target) {
+                (OwnedNumericInput::F32 { features, .. }, CpuPrecisionValues::F32(target)) => {
+                    OwnedNumericInput::F32 {
+                        features: features.clone(),
+                        target,
+                    }
+                }
+                (OwnedNumericInput::F64 { features, .. }, CpuPrecisionValues::F64(target)) => {
+                    OwnedNumericInput::F64 {
+                        features: features.clone(),
+                        target,
+                    }
+                }
+                _ => {
+                    return Err(PyBoundaryError::InvalidInput(
+                        "time-series permutation changed the resident dtype".to_string(),
+                    ))
+                }
+            };
+            // Replay source screening, ordered expansion/truncation, and all
+            // downstream candidate screening with this permutation's target.
+            let expanded = self.prepare(&null_current, &input)?;
+            let maxima = execute_generated_null_maxima(
+                &expanded.config,
+                input.target_len() as u64,
+                expanded.cols,
+                expanded.input,
+            )?;
+            update_decision_path_device_exceedances(&mut counts, &observed, &maxima, &kernels)?;
+        }
+        if report.significance.is_empty() {
+            report.significance = order
+                .iter()
+                .zip(&observed)
+                .map(|(&row, values)| {
+                    let stds = match values {
+                        CpuPrecisionValues::F32(values) => {
+                            CpuPrecisionValues::F32(vec![0.0; values.len()])
+                        }
+                        CpuPrecisionValues::F64(values) => {
+                            CpuPrecisionValues::F64(vec![0.0; values.len()])
+                        }
+                    };
+                    SignificanceEntry {
+                        row,
+                        pvalues: stds.clone(),
+                        means: values.clone(),
+                        stds,
+                    }
+                })
+                .collect();
+        }
+        if report.significance.len() != order.len() {
+            return Err(PyBoundaryError::InvalidInput(
+                "time-series significance shortlist changed".to_string(),
+            ));
+        }
+        for ((entry, row), counts) in report.significance.iter_mut().zip(order).zip(counts) {
+            if entry.row != row {
+                return Err(PyBoundaryError::InvalidInput(
+                    "time-series significance candidate identity changed".to_string(),
+                ));
+            }
+            entry.pvalues = match current.precision {
+                PrecisionProfile::Fp32 => CpuPrecisionValues::F32(
+                    counts
+                        .into_iter()
+                        .map(|count| {
+                            (u64::from(count) + 1) as f32 / (u64::from(permutations) + 1) as f32
+                        })
+                        .collect(),
+                ),
+                PrecisionProfile::Mixed | PrecisionProfile::Fp64 => CpuPrecisionValues::F64(
+                    counts
+                        .into_iter()
+                        .map(|count| (f64::from(count) + 1.0) / (f64::from(permutations) + 1.0))
+                        .collect(),
+                ),
+            };
+        }
+        Ok(())
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the native temporal boundary"
+)]
+fn compile_time_series_input(
+    config: EngineConfig,
+    rows: u64,
+    cols: u32,
+    input: OwnedNumericInput,
+    base_names: Vec<String>,
+    lags: Vec<u32>,
+    windows: Vec<u32>,
+    velocity: bool,
+) -> Result<PyCompiledContinuousArtifact, PyBoundaryError> {
+    validate_shape(rows, cols, input.feature_len(), input.target_len())?;
+    let mut state = PrecisionTimeSeriesCompiledState {
+        input,
+        selection_config: config.clone(),
+        source_cols: cols,
+        base_names,
+        lags,
+        windows,
+        velocity,
+    };
+    let mut artifact = state.rebuild_current(&config)?;
+    artifact.time_series_state = Some(state);
+    Ok(artifact)
+}
+
 /// time_series family: expand the feature matrix with lag/delta/velocity/
 /// acceleration and rolling mean/std/sum columns, then mine the expanded matrix
 /// through the normal continuous path
@@ -1292,71 +1624,12 @@ pub(crate) fn analyze_time_series(
     windows: Vec<u32>,
     velocity: bool,
 ) -> PyResult<(PyContinuousReport, Vec<String>)> {
-    let mut parsed = parse_engine_config(config)?;
-    let input = extract_generated_input(parsed.precision, features, target)?;
-    validate_shape(rows, cols, input.feature_len(), input.target_len()).map_err(PyErr::from)?;
-    let rows_usize = usize::try_from(rows)
-        .map_err(|_| PyValueError::new_err("rows exceed host address space"))?;
-    let cols_usize = cols as usize;
-    let base_candidate_cols = parsed.effective_feature_candidate_count(cols) as usize;
-    let generated_limit = generated_feature_limit(
-        parsed.budget.max_time_series_candidates,
-        rows_usize,
-        base_candidate_cols,
-    );
-    let source_features = if base_candidate_cols == 0 || generated_limit == 0 {
-        Vec::new()
-    } else {
-        select_generated_source_features_precision(
-            &parsed,
-            rows,
-            cols,
-            &input,
-            parsed.budget.top_k_features_for_time_series,
-        )
-        .map_err(PyErr::from)?
-    };
-    let (expanded, expanded_cols, descriptors) = if base_candidate_cols == 0 {
-        (input, cols_usize, Vec::new())
-    } else {
-        parsed.budget.max_feature_candidate = -2;
-        expand_time_series_precision(
-            parsed.precision,
-            input,
-            rows_usize,
-            cols_usize,
-            base_candidate_cols,
-            &source_features,
-            &lags,
-            &windows,
-            velocity,
-            generated_limit,
-        )
-        .map_err(PyErr::from)?
-    };
-    let report = analyze_continuous_input_once(
-        parsed,
-        rows,
-        expanded_column_count(expanded_cols)?,
-        expanded,
-    )
-    .map(PyContinuousReport::from)
-    .map_err(PyErr::from)?;
-    let mut names = if base_candidate_cols == 0 {
-        base_names.clone()
-    } else {
-        base_names[..base_candidate_cols.min(base_names.len())].to_vec()
-    };
-    append_unique_generated_names(
-        &mut names,
-        descriptors.iter().map(|descriptor| {
-            let base = base_names
-                .get(descriptor.base_feature as usize)
-                .map(String::as_str)
-                .unwrap_or("feature");
-            gafime_cpu::time_series::feature_label(base, descriptor.op)
-        }),
-    );
+    let (mut artifact, names) = compile_time_series(
+        config, features, target, rows, cols, base_names, lags, windows, velocity,
+    )?;
+    let report = execute_compiled_artifact(&mut artifact)
+        .map(PyContinuousReport::from)
+        .map_err(PyErr::from)?;
     Ok((report, names))
 }
 
@@ -1380,70 +1653,13 @@ pub(crate) fn compile_time_series(
     windows: Vec<u32>,
     velocity: bool,
 ) -> PyResult<(PyCompiledContinuousArtifact, Vec<String>)> {
-    let mut parsed = parse_engine_config(config)?;
+    let parsed = parse_engine_config(config)?;
     let input = extract_generated_input(parsed.precision, features, target)?;
-    validate_shape(rows, cols, input.feature_len(), input.target_len()).map_err(PyErr::from)?;
-    let rows_usize = usize::try_from(rows)
-        .map_err(|_| PyValueError::new_err("rows exceed host address space"))?;
-    let cols_usize = cols as usize;
-    let base_candidate_cols = parsed.effective_feature_candidate_count(cols) as usize;
-    let generated_limit = generated_feature_limit(
-        parsed.budget.max_time_series_candidates,
-        rows_usize,
-        base_candidate_cols,
-    );
-    let source_features = if base_candidate_cols == 0 || generated_limit == 0 {
-        Vec::new()
-    } else {
-        select_generated_source_features_precision(
-            &parsed,
-            rows,
-            cols,
-            &input,
-            parsed.budget.top_k_features_for_time_series,
-        )
-        .map_err(PyErr::from)?
-    };
-    let (expanded, expanded_cols, descriptors) = if base_candidate_cols == 0 {
-        (input, cols_usize, Vec::new())
-    } else {
-        parsed.budget.max_feature_candidate = -2;
-        expand_time_series_precision(
-            parsed.precision,
-            input,
-            rows_usize,
-            cols_usize,
-            base_candidate_cols,
-            &source_features,
-            &lags,
-            &windows,
-            velocity,
-            generated_limit,
-        )
-        .map_err(PyErr::from)?
-    };
-    let artifact = compile_continuous_input(
-        parsed,
-        rows,
-        expanded_column_count(expanded_cols)?,
-        expanded,
+    let artifact = compile_time_series_input(
+        parsed, rows, cols, input, base_names, lags, windows, velocity,
     )
     .map_err(PyErr::from)?;
-    let mut names = if base_candidate_cols == 0 {
-        base_names.clone()
-    } else {
-        base_names[..base_candidate_cols.min(base_names.len())].to_vec()
-    };
-    append_unique_generated_names(
-        &mut names,
-        descriptors.iter().map(|descriptor| {
-            let base = base_names
-                .get(descriptor.base_feature as usize)
-                .map(String::as_str)
-                .unwrap_or("feature");
-            gafime_cpu::time_series::feature_label(base, descriptor.op)
-        }),
-    );
+    let names = artifact.feature_names.clone();
     Ok((artifact, names))
 }
 
