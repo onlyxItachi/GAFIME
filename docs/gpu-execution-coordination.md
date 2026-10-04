@@ -56,14 +56,10 @@ general cleanup-error redesign.
 
 ## Evidence and regression layers
 
-The motivating operator report is an RC2 installed CUDA graph-versus-foreign
-ABI 1.0 eager collision: three failures in thirteen reported runs, with clean
-graph-free and eager-only controls. Retained crash artifacts examined during
-the audit showed two `libcuda`/`cudaDeviceSynchronize` failures; the complete
-three-failure aggregate and exact scheduling are reported evidence, not a new
-independent reproduction. No baseline GPU crash run is needed or authorized by
-this change. A source-level interleaving risk and that hardware report justify
-the coordination boundary, but source tests alone do not prove a physical fix.
+Source review and retained private operator evidence identified an ordinary
+capture/eager concurrency risk. Detailed failure reports remain private. No
+unfixed-payload stress rerun is part of this change, and source tests alone do
+not prove a physical fix.
 
 Host-only checks:
 
