@@ -127,6 +127,12 @@ class CurrentTruthHelperTests(unittest.TestCase):
         self.assertIn(
             "docs/releases/STATUS.md", platform_fields["current_install_guidance"]
         )
+        self.assertIn(
+            "Stable installs omit --pre", platform_fields["current_install_guidance"]
+        )
+        self.assertIn(
+            "Stable installs omit --pre", self.troubleshooter.CURRENT_INSTALL_GUIDANCE
+        )
         self.assertEqual(
             platform_fields["prerelease_install"],
             'pip install --pre gafime gafime-cuda "polars>=1.3,<2"',
@@ -135,6 +141,8 @@ class CurrentTruthHelperTests(unittest.TestCase):
 
         missing = self.benchmark._missing_gafime_install_record()
         self.assertIn("docs/releases/STATUS.md", missing["error"])
+        self.assertIn('pip install "gafime[sklearn]"', missing["error"])
+        self.assertIn("add --pre only", missing["error"])
         self.assertEqual(missing["release_status"], "see_docs_releases_status")
         self.assertEqual(
             missing["prerelease_install"],

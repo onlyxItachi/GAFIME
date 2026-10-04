@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## v1.0.0
+
+- Prepare stable repository/Cargo and Python/PyPI `1.0.0` identities under
+  canonical tag `v1.0.0`, with Production/Stable package classification.
+  Version preparation does not establish publication or final qualification.
+- Preserve dataload source values until checked Rust ingest, forward the full
+  planning seed, and admit the strict raw Arrow shortcut only when its dtype
+  and complete configuration are supported.
+- Repeat adaptive time-series selection and expansion for every maxT target;
+  refresh compiled generated-family metadata after target replacement/reseed
+  and retire artifacts on inconsistent post-update metadata.
+- Reject invalid threshold/count configurations consistently at the Rust
+  boundary while preserving the selected precision lane and NaN/Inf semantics.
+- Serialize ordinary CUDA/HIP ABI 1.0 and generic ABI 1.1 calls per loaded
+  payload through cleanup and caller-device restoration; retain caller-owned
+  handle/buffer lifetime obligations and the experimental RT exclusion.
+- Add bounded, run-bound native coordination qualification and refresh current
+  stable/prerelease installation guidance without changing APIs, ABI layouts,
+  package topology, numerical profiles, GIL policy, or thread affinity.
+
 ## v1.0.0-rc.2
 
 - Bind resident NumPy cache fingerprints and execution to the same privately

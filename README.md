@@ -34,13 +34,14 @@ python -m pip install --pre gafime gafime-rocm "polars>=1.3,<2"  # Linux x86_64 
 ```
 
 Ordinary `pip install` prefers a stable release; `--pre` permits beta and RC
-versions. For reproducible RC2 testing, pin Core and any vendor payload to the
-same exact version:
+versions. This source line targets stable `1.0.0`; version preparation alone
+does not publish it. Once that exact release is available on the public channels,
+pin Core and any vendor payload to the same version for reproducibility:
 
 ```bash
-python -m pip install gafime==1.0.0rc2 "polars>=1.3,<2"
-python -m pip install gafime==1.0.0rc2 gafime-cuda==1.0.0rc2 "polars>=1.3,<2"
-python -m pip install gafime==1.0.0rc2 gafime-rocm==1.0.0rc2 "polars>=1.3,<2"
+python -m pip install gafime==1.0.0 "polars>=1.3,<2"
+python -m pip install gafime==1.0.0 gafime-cuda==1.0.0 "polars>=1.3,<2"
+python -m pip install gafime==1.0.0 gafime-rocm==1.0.0 "polars>=1.3,<2"
 ```
 
 Core never depends on a GPU payload, while CUDA and ROCm payload versions must

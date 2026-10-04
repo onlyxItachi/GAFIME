@@ -914,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn cargo_prerelease_version_maps_to_python_public_version() {
+    fn cargo_release_version_maps_to_python_public_version() {
         assert_eq!(
             cargo_version_to_python("1.0.0-alpha.0"),
             Ok("1.0.0a0".to_string())
@@ -938,7 +938,7 @@ mod tests {
         ] {
             assert!(cargo_version_to_python(invalid).is_err(), "{invalid}");
         }
-        assert_eq!(public_package_version(), "1.0.0rc2");
+        assert_eq!(public_package_version(), "1.0.0");
     }
 
     #[test]

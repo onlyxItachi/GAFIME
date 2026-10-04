@@ -5,19 +5,24 @@ operational status, not an immutable historical release record.
 
 ## Current Target
 
-- Repository/Cargo candidate target: `1.0.0-rc.2`
-- Python/PyPI candidate target: `1.0.0rc2`
-- Canonical tag target: `v1.0.0-rc.2`
-- Phase: RC2 stabilization, exact-candidate qualification, and rollout
+- Repository/Cargo candidate target: `1.0.0`
+- Python/PyPI candidate target: `1.0.0`
+- Canonical tag target: `v1.0.0`
+- Phase: stable stabilization, exact-candidate qualification, and rollout
 
-The source tree carries the RC2 identity. Creating or updating
-`release/v1.0.0-rc.2` does not by itself create a tag or publication.
-Live publication state is authoritative on
+This source line carries the stable identity. Durable fixes must first land
+on `main` through their reviewed PRs; the identity preparation follows through
+its own PR. Creating or updating `release/v1.0.0` does not by itself create a
+tag or publication, complete a security review, or qualify frozen artifacts.
+Live gate and publication results are authoritative in
+[GitHub Actions](https://github.com/onlyxItachi/GAFIME/actions),
 [GitHub Releases](https://github.com/onlyxItachi/GAFIME/releases) and
 [PyPI](https://pypi.org/project/gafime/); this file does not duplicate a
 moment-in-time commit, workflow, or package-presence result.
 
-## Completed Gates
+## Established Contracts And Prior Evidence
+
+These records do not complete the final stable-candidate gates below.
 
 - The v1 architecture, precision, ABI, package, and public API documentation
   contracts are established and machine checked.
@@ -32,13 +37,14 @@ moment-in-time commit, workflow, or package-presence result.
 - The three bounded input-validation defects are fixed, the public repository
   and documentation routers are established, and the bounded compiler/codegen
   audit found no evidence-backed product change to apply.
-- Repository, Cargo, and Python metadata use the canonical RC2 identities.
+- Repository, Cargo, and Python metadata now agree on the canonical stable
+  target; this is source preparation, not publication evidence.
 - RC1 was built from frozen, verified artifacts and is publicly available as a
   prerelease.
 
-## RC2 Branch Preparation
+## Stable Branch Preparation
 
-- Cut the planned `release/v1.0.0-rc.2` branch only from a green `main`, under
+- Cut the planned `release/v1.0.0` branch only from a green `main`, under
   the [candidate release-branch policy](release-branches.md).
 - Keep stabilization bounded. Use focused pull requests, merge commits,
   current-head AI review, strict required checks, and resolved review threads.
@@ -63,31 +69,43 @@ moment-in-time commit, workflow, or package-presence result.
   remote release tip, tag, dispatch/workflow SHA, downstream checkouts, and
   build SHA exactly, with job-local ref rechecks before irreversible uploads.
 
-## RC2 Hardening
+## Stable Stabilization Scope
 
-The [RC2 release note](v1.0.0-rc.2.md) records the bounded validation,
-guidance, and artifact-identity changes. Local tests and patch review do not
-replace the reviewed candidate's required hosted checks and artifact gates.
+The [stable release note](v1.0.0.md) records checked file-ingest and seed parity,
+adaptive time-series significance and compiled metadata retirement, uniform
+Rust configuration checks, and ordinary CUDA/HIP native-call coordination.
+The [RC2 release note](v1.0.0-rc.2.md) remains its unchanged historical record.
+Local tests, physical candidate runs, and patch review do not replace the final
+reviewed candidate's required hosted checks, security record, and artifact gates.
 
-A deep security review has completed for the preceding source checkpoint.
-Its finding dispositions and focused remediation evidence belong to the
-hardening review; that earlier scan does not establish security qualification
-for a later settled candidate. Resident NumPy input now uses privately owned
-snapshots to bind content identity to consumed bytes. Acquisition is not atomic
+Earlier security records, finding dispositions, and focused remediation
+evidence remain bound to their original source checkpoints; they do not
+establish final stable-candidate qualification. Resident NumPy input uses
+privately owned snapshots to bind content identity to consumed bytes. Acquisition is not atomic
 against external writers; coherent datasets still require synchronization
 during acquisition. Broader retained/borrowed and low-copy ingestion belongs to
-future issue #100, not RC2.
+future issue #100, not stable v1.0.0. GIL release, TLS/cache ownership changes,
+Rayon topology, and shutdown redesign are outside this stabilization scope.
 
-## RC2 Release Gates
+## Stable Release Gate Sequence
 
-The accepted candidate requires current-head PR review and configured checks,
-an exact-candidate standard security record, and a complete frozen release
-bundle. Required Core/CUDA/ROCm/Metal execution evidence must identify the actual
-artifact hashes. The release tip is locked and admitted unchanged to `main`
-before canonical tagging; collision and publisher prerequisites are checked
-before the official frozen publisher runs. Live workflow and public-channel
-results establish completion rather than this source document forecasting it.
+- Land the durable fixes and stable identity through focused PRs with
+  current-head AI review, configured checks, and resolved review conversations.
+- Complete required hosted correctness checks and final exact-candidate deep
+  Codex Security qualification with retained finding dispositions; earlier
+  scans do not qualify this later source tip.
+- Build, verify, and freeze the complete manifest-derived release bundle from
+  that settled tip; local candidate artifacts are not the final frozen bundle.
+- Then execute the required Core/CUDA/ROCm/Metal gates against exact members
+  of that verified frozen bundle, retaining their hashes and physical execution
+  evidence separately from hosted compilation and local candidate runs.
+- Lock the release tip and admit it unchanged to `main` before canonical
+  tagging; verify tag protections, collision checks, and publisher prerequisites.
+- Run the official frozen publisher in Core-first order and verify public
+  exact-version installations before the GitHub Release is created.
 
-No RC2 tag, GitHub Release, or PyPI publication follows merely from branch
-preparation. Stable qualification and the permanent performance
-architecture tracked by issue #71 remain later work.
+Live workflow and public-channel results establish completion rather than this
+source document forecasting it. No stable tag, GitHub Release, PyPI publication,
+or completed final security qualification is claimed by this preparation.
+The permanent performance architecture tracked by issue #71 remains separate
+future work; no universal throughput or comparative GPU speedup is claimed.

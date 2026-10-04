@@ -22,8 +22,9 @@ precision, version-alignment warnings, and payload-discovery errors. The Metal
 payload-health probe always uses its supported `fp32` profile; the requested
 profile remains visible separately. The script does not execute a scoring
 workload. It reports `release_status="see_docs_releases_status"`, routes
-mutable publication state to `docs/releases/STATUS.md`, and offers current
-prerelease commands under `prerelease_install`.
+mutable publication state to `docs/releases/STATUS.md`, and offers explicit
+beta/RC alternatives under `prerelease_install`. Stable installs omit `--pre`;
+neither source metadata nor a suggested command establishes publication.
 
 Interpret capability evidence literally:
 
@@ -36,7 +37,8 @@ required):
 
 - CUDA payload missing or damaged: reinstall Core and CUDA at one explicit
   version:
-  `pip install --pre --force-reinstall gafime gafime-cuda "polars>=1.3,<2"`.
+  `pip install --force-reinstall gafime gafime-cuda "polars>=1.3,<2"`.
+  Add `--pre` only when intentionally selecting beta/RC versions.
 - CUDA runtime load failure: verify system `libcudart.so.13` on Linux or
   driver-provided `nvcudart_hybrid64.dll` on Windows; the payload wheel does not
   vendor it.
@@ -45,7 +47,8 @@ required):
   buildable ROCm sdist; the matching GitHub Release is the prebuilt thin
   raw-Linux wheel channel. Both require the compatible system ROCm runtime.
   The source command is
-  `pip install --pre --force-reinstall gafime gafime-rocm "polars>=1.3,<2"`.
+  `pip install --force-reinstall gafime gafime-rocm "polars>=1.3,<2"`.
+  Add `--pre` only for the beta/RC alternative.
 - Metal payload missing on macOS arm64: reinstall `gafime`; the dylib
   and metallib are bundled in the Core wheel.
 - Core/native boundary missing: reinstall `gafime` for the active

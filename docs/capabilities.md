@@ -1,9 +1,9 @@
 # GAFIME v1 Capability Reporting
 
 This document describes the public capability contract for the
-`1.0.0-rc.2` repository candidate (`1.0.0rc2` on Python/PyPI). It is a report
-of implementation placement, not a promise that a payload or device is
-installed.
+stable `1.0.0` source identity on Cargo and Python/PyPI. It is a report of
+implementation placement, not proof of publication, final release qualification,
+or an installed payload/device. See [release status](releases/STATUS.md).
 
 ## Public API
 
