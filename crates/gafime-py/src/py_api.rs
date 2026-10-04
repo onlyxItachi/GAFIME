@@ -25,6 +25,7 @@ use crate::continuous::{
 use crate::runtime::{
     backend_capability_name_for_kind, backend_device_for_kind, backend_is_gpu,
     backend_name_for_kind, execution_placement_for_kind, parse_engine_config,
+    parse_python_integer_seed,
 };
 
 type InteractionComponents = (Vec<u32>, Py<PyAny>, u64);
@@ -846,7 +847,8 @@ fn struct_to_row_major_f64(sa: &StructArray) -> PyResult<(u64, u32, Vec<f64>)> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (features, target, *, precision="mixed", max_arity=2, max_combinations_per_k=5000, metric_ids=None))]
+#[pyo3(signature = (features, target, *, precision="mixed", max_arity=2, max_combinations_per_k=5000, metric_ids=None, random_seed=None))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn analyze_continuous_arrow(
     _py: Python<'_>,
     features: &Bound<'_, PyAny>,
@@ -855,10 +857,12 @@ pub(crate) fn analyze_continuous_arrow(
     max_arity: u32,
     max_combinations_per_k: u64,
     metric_ids: Option<Vec<u32>>,
+    random_seed: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<PyContinuousReport> {
     // Validate the profile before importing an Arrow stream. This ordering is
     // important: a rejected request must not trigger conversion or allocation.
     let precision = parse_precision_name(precision)?;
+    let random_seed = random_seed.map(parse_python_integer_seed).transpose()?;
     let features = import_arrow_struct(features)?;
     let target = import_arrow_struct(target)?;
     if target.num_columns() != 1 {
@@ -935,6 +939,10 @@ pub(crate) fn analyze_continuous_arrow(
     });
     let mut config = continuous_config_for_cpu(max_arity, max_combinations_per_k, metric_ids)?;
     config.precision = precision;
+    if let Some((seed, words)) = random_seed {
+        config.random_seed = seed;
+        config.planning_seed_words = words;
+    }
     analyze_continuous_input_once(config, rows, cols, input)
         .map(PyContinuousReport::from)
         .map_err(PyErr::from)

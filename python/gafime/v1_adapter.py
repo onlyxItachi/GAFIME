@@ -948,8 +948,9 @@ def analyze_arrow_with_v1_boundary(
     """Analyze Arrow-backed frames without changing requested engine semantics.
 
     The low-level Arrow entrypoint is a CPU/no-significance convenience API. Use
-    it only when that is exactly what the configuration requests. All other
-    configurations route through the normal configured boundary using the
+    it only when that is exactly what the configuration requests and source
+    dtypes already match resident storage. All other inputs route through the
+    normal configured boundary using the
     frame's row iterator; this may materialize GAFIME's owned selected-profile
     input buffer, but it cannot silently discard backend, family, MI, or
     significance options.
@@ -957,13 +958,18 @@ def analyze_arrow_with_v1_boundary(
     _validate_precision_config(config)
     target = _validate_arrow_target_frame(target_frame)
     boundary = _load_boundary_for_backend(config.backend)
-    if _raw_arrow_config_supported(config) and hasattr(
-        boundary, "analyze_continuous_arrow"
+    if (
+        _raw_arrow_config_supported(config)
+        and _raw_arrow_dtypes_supported(config.precision, feature_frame, target_frame)
+        and hasattr(boundary, "analyze_continuous_arrow")
     ):
         try:
             metric_ids = [_METRIC_IDS[str(name)] for name in config.metric_names]
         except KeyError as exc:
             raise ValueError(f"unsupported metric for Arrow ingest: {exc}") from exc
+        # Reuse the ordinary config path's per-analysis entropy policy. The
+        # native parser retains every word of arbitrary-size Python integers.
+        random_seed = _config_payload(config)["random_seed"]
         native_report = boundary.analyze_continuous_arrow(
             feature_frame,
             target_frame,
@@ -971,6 +977,7 @@ def analyze_arrow_with_v1_boundary(
             max_arity=int(config.budget.max_comb_size),
             max_combinations_per_k=int(config.budget.max_combinations_per_k),
             metric_ids=metric_ids,
+            random_seed=random_seed,
         )
         report = _diagnostic_from_native_report(
             config, native_report, feature_names, []
@@ -1844,6 +1851,25 @@ def _native_graph_replayed(native_report: object, native_handle: object) -> bool
                 return None
             return value > 0
     return None
+
+
+def _raw_arrow_dtypes_supported(precision: str, *frames: object) -> bool:
+    """Admit only already-matching Polars/Arrow schema types to raw ingest.
+
+    This inspects schema metadata, never numeric values. Missing or unknown
+    metadata takes the configured ingest route instead of guessing a dtype.
+    """
+    expected = {"Float64", "double"} if precision == "fp64" else {"Float32", "float"}
+    for frame in frames:
+        dtypes = getattr(frame, "dtypes", None)
+        if dtypes is None:
+            schema = getattr(frame, "schema", None)
+            if schema is None:
+                return False
+            dtypes = getattr(schema, "types", None)
+        if not dtypes or any(str(dtype) not in expected for dtype in dtypes):
+            return False
+    return True
 
 
 def _raw_arrow_config_supported(config: EngineConfig) -> bool:

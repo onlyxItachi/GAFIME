@@ -41,6 +41,7 @@ class _Frame:
         self._rows = [tuple(row) for row in rows]
         self.columns = list(columns)
         self.width = len(self.columns)
+        self.dtypes = ["Float32"] * self.width
 
     def iter_rows(self):
         return iter(self._rows)
@@ -60,6 +61,7 @@ class _ArrowSeries:
 class _ArrowTargetFrame:
     def __init__(self, values):
         self.num_columns = 1
+        self.dtypes = ["Float32"]
         self._column = _ArrowSeries(values)
 
     def column(self, index):
@@ -187,6 +189,7 @@ def _boundary(*, honor_graph=True):
         max_arity,
         max_combinations_per_k,
         metric_ids,
+        random_seed,
     ):
         raw_arrow_calls.append(
             {
@@ -194,6 +197,7 @@ def _boundary(*, honor_graph=True):
                 "max_arity": max_arity,
                 "max_combinations_per_k": max_combinations_per_k,
                 "metric_ids": metric_ids,
+                "random_seed": random_seed,
             }
         )
         return _NativeReport(metric_count=len(metric_ids))
@@ -255,7 +259,59 @@ def test_arrow_cpu_shortcut_is_used_only_for_compatible_config(monkeypatch):
 
     assert len(boundary.raw_arrow_calls) == 1
     assert boundary.configured_calls == []
+    assert boundary.raw_arrow_calls[0]["random_seed"] == 7
     assert report.backend.device == "cpu"
+
+
+@pytest.mark.parametrize("seed", [7, 123, (1 << 129) + 123, -((1 << 129) + 123)])
+def test_arrow_shortcut_preserves_python_integer_seed(monkeypatch, seed):
+    boundary = _boundary()
+    monkeypatch.setattr(v1_adapter, "_load_boundary", lambda: boundary)
+    features, target = _frames()
+    config = EngineConfig(
+        backend="cpu", permutation_tests=0, num_repeats=1, random_seed=seed
+    )
+
+    analyze_arrow_with_v1_boundary(config, features, target, ["x"])
+
+    assert boundary.raw_arrow_calls[0]["random_seed"] == seed
+
+
+def test_arrow_shortcut_none_seed_uses_fresh_entropy_each_time(monkeypatch):
+    boundary = _boundary()
+    monkeypatch.setattr(v1_adapter, "_load_boundary", lambda: boundary)
+    seeds = [(1 << 200) + 7, (1 << 200) + 123]
+    entropy = iter(seeds)
+    monkeypatch.setattr(v1_adapter, "_fresh_random_seed", lambda: next(entropy))
+    features, target = _frames()
+    config = EngineConfig(
+        backend="cpu", permutation_tests=0, num_repeats=1, random_seed=None
+    )
+
+    for _ in seeds:
+        analyze_arrow_with_v1_boundary(config, features, target, ["x"])
+
+    assert [call["random_seed"] for call in boundary.raw_arrow_calls] == seeds
+
+
+@pytest.mark.parametrize("mismatch", ["features", "target", "unknown"])
+def test_arrow_shortcut_requires_matching_source_dtype(monkeypatch, mismatch):
+    # Assert dispatch, not a resident-cache hit from an earlier fake boundary.
+    monkeypatch.setenv("GAFIME_V1_ANALYZE_CACHE_SIZE", "0")
+    boundary = _boundary()
+    monkeypatch.setattr(v1_adapter, "_load_boundary", lambda: boundary)
+    features, target = _frames()
+    if mismatch == "unknown":
+        del features.dtypes
+    else:
+        frame = features if mismatch == "features" else target
+        frame.dtypes = ["Float64"]
+    config = EngineConfig(backend="cpu", permutation_tests=0, num_repeats=1)
+
+    analyze_arrow_with_v1_boundary(config, features, target, ["x"])
+
+    assert boundary.raw_arrow_calls == []
+    assert len(boundary.configured_calls) == 1
 
 
 @pytest.mark.parametrize(
