@@ -1,11 +1,22 @@
 """Host-only regression for complete ordinary-export coverage; no GPU imports."""
 
+import argparse
 from pathlib import Path
 from copy import deepcopy
 import re
+import sys
+import tempfile
+import threading
 import unittest
 
-from execution_coordination_regression import stable_report
+from execution_coordination_regression import (
+    CallProgress,
+    bounded_int,
+    progress_summary,
+    run_bounded_subprocess,
+    run_until_deadline,
+    stable_report,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -123,6 +134,116 @@ class ExecutionGateSourceTest(unittest.TestCase):
         modified["new_future_report_field"] = "must also compare"
         self.assertNotEqual(reference, stable_report(Report(modified)))
         self.assertEqual(fields["backend"]["memory_free_mb"], 100)
+
+
+class TimedRunnerTest(unittest.TestCase):
+    def test_foreign_loop_runs_past_512_calls_until_deadline(self):
+        now = [0.0]
+        progress = CallProgress()
+
+        def operation():
+            now[0] += 0.001
+
+        run_until_deadline(
+            operation, 1.0, threading.Event(), progress, clock=lambda: now[0]
+        )
+        self.assertGreater(progress.calls, 512)
+        self.assertGreaterEqual(now[0], 1.0)
+        self.assertTrue(progress_summary(progress, 0.0, 1.0)["covered_interval"])
+
+    def test_stop_and_expired_deadline_do_not_start_more_calls(self):
+        now = [0.0]
+        stop = threading.Event()
+        progress = CallProgress()
+
+        def operation():
+            now[0] += 0.01
+            if now[0] >= 0.02:
+                stop.set()
+
+        run_until_deadline(operation, 1.0, stop, progress, clock=lambda: now[0])
+        self.assertEqual(progress.calls, 2)
+        self.assertFalse(progress_summary(progress, 0.0, 1.0)["covered_interval"])
+        expired = CallProgress()
+        run_until_deadline(
+            lambda: self.fail("started after deadline"),
+            1.0,
+            threading.Event(),
+            expired,
+            clock=lambda: 1.0,
+        )
+        self.assertEqual(expired.calls, 0)
+
+    def test_both_abis_must_span_the_interval(self):
+        summaries = {
+            "abi10-0": progress_summary(CallProgress(512, 0.0, 0.2, 0.2), 0.0, 15.0),
+            "abi11-0": progress_summary(CallProgress(100, 0.0, 15.1, 15.1), 0.0, 15.0),
+        }
+        self.assertEqual(
+            [key for key, value in summaries.items() if not value["covered_interval"]],
+            ["abi10-0"],
+        )
+        self.assertFalse(
+            progress_summary(CallProgress(100, 10.0, 15.1, 5.1), 0.0, 15.0)[
+                "covered_interval"
+            ]
+        )
+        self.assertFalse(
+            progress_summary(CallProgress(1, 0.0, 15.1, 15.1), 0.0, 15.0)[
+                "covered_interval"
+            ]
+        )
+
+    def test_log_capture_is_bounded_and_truncation_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            status = run_bounded_subprocess(
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    "import sys; sys.stdout.write('x' * 4096); sys.stderr.write('y' * 4096)",
+                ],
+                output,
+                5,
+                log_limit=128,
+            )
+            self.assertEqual(status["returncode"], 0)
+            self.assertTrue(status["logs_complete"])
+            self.assertFalse(status["passed"])
+            for name in ("stdout", "stderr"):
+                self.assertEqual(status["logs"][name]["bytes"], 4096)
+                self.assertTrue(status["logs"][name]["truncated"])
+                self.assertEqual((output / f"{name}.log").stat().st_size, 128)
+
+    def test_successful_bounded_capture_keeps_complete_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            status = run_bounded_subprocess(
+                [sys.executable, "-I", "-c", "print('host-only')"],
+                output,
+                5,
+            )
+            self.assertTrue(status["passed"])
+            self.assertTrue(status["logs_complete"])
+            self.assertEqual((output / "stdout.log").read_bytes(), b"host-only\n")
+
+    def test_hard_timeout_fails_without_gpu_imports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status = run_bounded_subprocess(
+                [sys.executable, "-I", "-c", "import time; time.sleep(2)"],
+                Path(directory),
+                0.05,
+            )
+            self.assertTrue(status["timed_out"])
+            self.assertFalse(status["passed"])
+
+    def test_interval_accepts_twenty_seconds_but_remains_bounded(self):
+        self.assertEqual(bounded_int(1, 20)("15"), 15)
+        self.assertEqual(bounded_int(1, 20)("20"), 20)
+        for value in ("0", "21"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                bounded_int(1, 20)(value)
 
 
 if __name__ == "__main__":

@@ -7,11 +7,14 @@ Python subprocess; only that subprocess imports GAFIME or opens the payload.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
 import subprocess
 import sys
+import threading
+import time
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,6 +32,127 @@ SOURCE_FILES = (
     "tests/gpu/abi_consumers/CMakeLists.txt",
     "tests/gpu/execution_coordination_regression.py",
 )
+LOG_LIMIT_BYTES = 16 * 1024 * 1024
+
+
+@dataclass
+class CallProgress:
+    calls: int = 0
+    first_started_at: float | None = None
+    last_finished_at: float | None = None
+    call_seconds: float = 0.0
+
+
+def run_until_deadline(
+    operation, deadline, stop, progress, *, clock=time.monotonic, pause=None
+):
+    """Timed control shared by the real primary/foreign loops and host tests."""
+    while not stop.is_set():
+        began = clock()
+        if began >= deadline:
+            return
+        if progress.first_started_at is None:
+            progress.first_started_at = began
+        try:
+            operation()
+        finally:
+            finished = clock()
+            progress.calls += 1
+            progress.last_finished_at = finished
+            progress.call_seconds += finished - began
+        if pause is not None:
+            pause()
+
+
+def progress_summary(progress, started_at, deadline):
+    requested = deadline - started_at
+    # Allow bounded scheduling/loop overhead, not an arbitrary early finish.
+    slack = min(0.25, requested * 0.05)
+    first = progress.first_started_at
+    last = progress.last_finished_at
+    covered = (
+        progress.calls >= 2
+        and first is not None
+        and last is not None
+        and first <= started_at + slack
+        and last >= deadline - slack
+    )
+    return {
+        "calls": progress.calls,
+        "first_call_offset_seconds": None if first is None else first - started_at,
+        "last_call_offset_seconds": None if last is None else last - started_at,
+        "active_span_seconds": 0.0 if first is None or last is None else last - first,
+        "call_seconds": progress.call_seconds,
+        "coverage_slack_seconds": slack,
+        "covered_interval": covered,
+    }
+
+
+def run_bounded_subprocess(command, output, timeout, *, log_limit=LOG_LIMIT_BYTES):
+    """Drain both pipes continuously with bounded retained logs and memory."""
+    logs = {
+        name: {"bytes": 0, "retained_bytes": 0, "truncated": False, "error": None}
+        for name in ("stdout", "stderr")
+    }
+    began = time.monotonic()
+    deadline = began + timeout
+    process = subprocess.Popen(
+        command, cwd=output, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+
+        def drain(name, pipe):
+            record = logs[name]
+            try:
+                with pipe, (output / f"{name}.log").open("xb") as stream:
+                    while chunk := pipe.read(65536):
+                        record["bytes"] += len(chunk)
+                        retained = chunk[: max(0, log_limit - record["retained_bytes"])]
+                        stream.write(retained)
+                        record["retained_bytes"] += len(retained)
+                        record["truncated"] = record["bytes"] > log_limit
+            except BaseException as error:
+                record["error"] = repr(error)
+
+        readers = [
+            threading.Thread(target=drain, args=(name, pipe), daemon=True)
+            for name, pipe in (("stdout", process.stdout), ("stderr", process.stderr))
+        ]
+        for reader in readers:
+            reader.start()
+        timed_out = False
+        try:
+            returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            process.wait()
+            returncode = None
+        for reader in readers:
+            reader.join(timeout=max(0.0, deadline - time.monotonic()))
+        logs_complete = all(not reader.is_alive() for reader in readers)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    # A descendant retaining a pipe must not keep the controller alive. Such
+    # incomplete capture fails; daemon readers own/close their own pipe objects.
+    logs = {name: record.copy() for name, record in logs.items()}
+    return {
+        "returncode": returncode,
+        "timed_out": timed_out,
+        "elapsed_seconds": time.monotonic() - began,
+        "log_limit_bytes": log_limit,
+        "logs_complete": logs_complete,
+        "logs": logs,
+        "passed": returncode == 0
+        and not timed_out
+        and logs_complete
+        and all(
+            not record["truncated"] and record["error"] is None
+            for record in logs.values()
+        ),
+    }
 
 
 def sha256(path: Path) -> str:
@@ -81,8 +205,6 @@ def child(config: dict) -> int:
     import ctypes
     import importlib
     import os
-    import threading
-    import time
 
     payload = Path(config["payload"])
     if (
@@ -174,29 +296,38 @@ def child(config: dict) -> int:
         else ["abi10", "abi11"]
     )
     stop = threading.Event()
-    start = threading.Barrier(config["workers"] * len(selected) + 1)
+    window = {}
+
+    def begin_window():
+        window["started_at"] = time.monotonic()
+        window["deadline"] = window["started_at"] + config["seconds"]
+
+    start = threading.Barrier(
+        config["workers"] * len(selected) + 1, action=begin_window
+    )
     results_lock = threading.Lock()
-    counts = {
-        f"{abi}-{worker}": 0 for abi in selected for worker in range(config["workers"])
+    progress = {
+        f"{abi}-{worker}": CallProgress()
+        for abi in selected
+        for worker in range(config["workers"])
     }
     failures = []
 
     def foreign(abi, worker):
         function, argv = functions[abi]
         key = f"{abi}-{worker}"
+
+        def invoke():
+            # CDLL releases the GIL; the product's attachment policy is unchanged.
+            status = function(len(argv), argv)
+            if status != 0:
+                with results_lock:
+                    failures.append({"worker": key, "status": status})
+                    stop.set()
+
         try:
             start.wait()
-            # At least one call per worker, at most 512. CDLL releases the GIL
-            # for these calls; no Python detachment feature is involved.
-            for _ in range(512):
-                status = function(len(argv), argv)
-                with results_lock:
-                    counts[key] += 1
-                    if status != 0:
-                        failures.append({"worker": key, "status": status})
-                        stop.set()
-                if stop.is_set():
-                    return
+            run_until_deadline(invoke, window["deadline"], stop, progress[key])
         except BaseException as error:
             with results_lock:
                 failures.append({"worker": key, "exception": repr(error)})
@@ -209,20 +340,28 @@ def child(config: dict) -> int:
     ]
     for worker in workers:
         worker.start()
-    primary_count = 0
+    primary_progress = CallProgress()
     primary_error = None
     start.wait()
-    deadline = time.monotonic() + config["seconds"]
+
+    def invoke_primary():
+        if primary() != reference:
+            raise AssertionError(
+                "full deterministic report differs from serial reference"
+            )
+
     try:
-        while time.monotonic() < deadline and not stop.is_set():
-            if has_primary:
-                if primary() != reference:
-                    raise AssertionError(
-                        "full deterministic report differs from serial reference"
-                    )
-                primary_count += 1
-            # Let independent callers queue their next native entries.
-            time.sleep(0.001)
+        if has_primary:
+            run_until_deadline(
+                invoke_primary,
+                window["deadline"],
+                stop,
+                primary_progress,
+                pause=lambda: time.sleep(0.001),
+            )
+        else:
+            while time.monotonic() < window["deadline"] and not stop.is_set():
+                time.sleep(0.001)
     except BaseException as error:
         primary_error = repr(error)
     finally:
@@ -230,19 +369,39 @@ def child(config: dict) -> int:
         # The controller enforces the hard deadline even if native work hangs.
         for worker in workers:
             worker.join()
+    elapsed = time.monotonic() - window["started_at"]
+    summaries = {
+        key: progress_summary(value, window["started_at"], window["deadline"])
+        for key, value in progress.items()
+    }
+    incomplete = [
+        key for key, summary in summaries.items() if not summary["covered_interval"]
+    ]
+    primary_summary = (
+        progress_summary(primary_progress, window["started_at"], window["deadline"])
+        if has_primary
+        else None
+    )
+    if primary_summary is not None and not primary_summary["covered_interval"]:
+        incomplete.append("primary")
     passed = (
         not failures
         and primary_error is None
-        and all(counts.values())
-        and (not has_primary or primary_count > 0)
+        and not incomplete
+        and (not has_primary or primary_progress.calls > 0)
     )
     print(
         json.dumps(
             {
                 "event": "result",
                 "status": "pass" if passed else "fail",
-                "primary_calls": primary_count,
-                "foreign_calls": counts,
+                "requested_seconds": config["seconds"],
+                "elapsed_seconds": elapsed,
+                "primary_calls": primary_progress.calls,
+                "primary_progress": primary_summary,
+                "foreign_calls": {key: value.calls for key, value in progress.items()},
+                "foreign_progress": summaries,
+                "incomplete_interval_workers": incomplete,
                 "foreign_failures": failures,
                 "primary_error": primary_error,
                 "parity_sha256": hashlib.sha256(reference).hexdigest()
@@ -271,7 +430,7 @@ def main() -> int:
     parser.add_argument("--backend", choices=("cuda", "rocm"), required=True)
     parser.add_argument("--precision", choices=("fp32", "mixed", "fp64"), required=True)
     parser.add_argument("--case", choices=CASES, required=True)
-    parser.add_argument("--seconds", type=bounded_int(1, 10), default=2)
+    parser.add_argument("--seconds", type=bounded_int(1, 20), default=2)
     parser.add_argument(
         "--workers",
         type=bounded_int(1, 3),
@@ -295,6 +454,8 @@ def main() -> int:
         parser.error(
             "explicit fixed-candidate acknowledgement is required; no baseline stress is permitted"
         )
+    if args.timeout <= args.seconds:
+        parser.error("--timeout must exceed --seconds to allow setup and teardown")
     config = vars(args).copy()
     for key in ("python", "payload", "legacy_shim", "numeric_shim", "output_dir"):
         config[key] = str(config[key].resolve())
@@ -320,25 +481,10 @@ def main() -> int:
         "--child",
         json.dumps(config),
     ]
-    try:
-        result = subprocess.run(
-            command,
-            cwd=output,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=args.timeout,
-            check=False,
-        )
-        stdout, stderr = result.stdout, result.stderr
-        status = {"returncode": result.returncode, "timed_out": False}
-    except subprocess.TimeoutExpired as error:
-        stdout, stderr = error.stdout or b"", error.stderr or b""
-        status = {"returncode": None, "timed_out": True}
-    (output / "stdout.log").write_bytes(stdout)
-    (output / "stderr.log").write_bytes(stderr)
+    status = run_bounded_subprocess(command, output, args.timeout)
     (output / "status.json").write_text(json.dumps(status, indent=2) + "\n")
     print(json.dumps({"artifacts": str(output), **status}))
-    return 0 if status == {"returncode": 0, "timed_out": False} else 1
+    return 0 if status["passed"] else 1
 
 
 if __name__ == "__main__":
