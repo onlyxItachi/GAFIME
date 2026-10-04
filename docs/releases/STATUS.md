@@ -46,6 +46,8 @@ These records do not complete the final stable-candidate gates below.
 
 - Cut the planned `release/v1.0.0` branch only from a green `main`, under
   the [candidate release-branch policy](release-branches.md).
+- Prepare stable identity through its own reviewed PR into that protected
+  candidate branch; the later admission PR brings it to `main` unchanged.
 - Keep stabilization bounded. Use focused pull requests, merge commits,
   current-head AI review, strict required checks, and resolved review threads.
 - Land durable fixes on `main` first where practical. An urgent release-first
@@ -89,8 +91,9 @@ Rayon topology, and shutdown redesign are outside this stabilization scope.
 
 ## Stable Release Gate Sequence
 
-- Land the durable fixes and stable identity through focused PRs with
-  current-head AI review, configured checks, and resolved review conversations.
+- Land durable fixes on `main` and stable identity on the candidate branch
+  through focused PRs with current-head AI review, configured checks, and
+  resolved review conversations.
 - Complete required hosted correctness checks and final exact-candidate deep
   Codex Security qualification with retained finding dispositions; earlier
   scans do not qualify this later source tip.

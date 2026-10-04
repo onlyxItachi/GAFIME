@@ -7,11 +7,12 @@ the historical record for that release or checkpoint.
 
 ## Current Release Train
 
-The current source targets stable `v1.0.0`. Durable stabilization fixes must
-land through reviewed PRs before the stable identity is admitted and a candidate
-branch is cut from green `main`. The eventual protected settled branch tip is
-the candidate source; publication requires exact-tip qualification, a verified
-frozen bundle, and final admission of that unchanged tip into `main`.
+The current source targets stable `v1.0.0`. Durable stabilization fixes land
+through reviewed PRs on `main`, then the candidate branch is cut from green
+`main`. Stable identity is prepared through its own reviewed candidate-branch
+PR. The protected settled branch tip is the candidate source; publication
+requires exact-tip qualification, a verified frozen bundle, and final admission
+of that unchanged tip into `main`.
 Source version preparation does not itself complete those gates or create a
 tag or release. Follow the mutable
 [release status](STATUS.md) for current gates and the live
