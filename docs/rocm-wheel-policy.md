@@ -29,6 +29,13 @@ must:
 - report precision ABI 1.1 with `fp32`, `mixed`, and `fp64`; all three
   specializations are compiled into the same payload binary.
 
+The direct-dependency allow-list also admits the host OS threading library
+`libpthread.so.0` for POSIX mutex linkage on the glibc 2.28 build baseline.
+This dependency is optional because newer glibc can provide threading through
+`libc.so.6` without a separate `DT_NEEDED` entry. It does not authorize bundling
+threading libraries or additional ROCm userspace. Undeclared SONAMEs remain
+rejected, and the no-vendoring and RPATH/RUNPATH checks are unchanged.
+
 The optimized thirteen-target payload measures 27,957,568 bytes through the
 current CMake release path and 29,675,360 bytes through the staged-wheel
 release path on the local ROCm 7.1 validation toolchain. The corresponding

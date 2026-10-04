@@ -13,6 +13,7 @@
 #include "kernels.hpp"
 #include "../common/covariance_policy.hpp"
 #include "../common/gpu_abi_impl.hpp"
+#include "../common/gpu_execution_gate.hpp"
 #include "../common/gafime_gpu_internal_abi.hpp"
 
 #ifndef GAFIME_GPU_MI_ACCUMULATION_FP64
@@ -723,6 +724,10 @@ hipError_t launch_copy_selected_metric_rows(
 }  // namespace gafime_rocm_v1
 
 namespace {
+
+// One ordinary-ABI gate per loaded payload, shared by both ABI generations.
+// This is not a device-memory reservation or a lock for foreign runtime users.
+std::mutex payload_execution_mutex;
 
 
 struct DescriptorBufferUpdateTransition {
@@ -3493,6 +3498,8 @@ int precision_permutation_pvalues_host(
 extern "C" {
 
 GAFIME_GPU_API int gafime_gpu_device_info(uint32_t device_id, GafimeGpuDeviceInfo* info_out) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     if (info_out == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
@@ -3541,6 +3548,8 @@ GAFIME_GPU_API int gafime_gpu_device_info(uint32_t device_id, GafimeGpuDeviceInf
 }
 
 GAFIME_GPU_API int gafime_gpu_graph_capability(uint32_t device_id, GafimeGpuGraphCapability* capability_out) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     (void)device_id;
     const int status = gafime_gpu_abi::fill_graph_capability(
         GAFIME_BACKEND_ROCM,
@@ -3727,6 +3736,8 @@ GAFIME_GPU_API int gafime_gpu_numeric_routes_v2(
     uint32_t route_capacity,
     uint32_t* route_count_out
 ) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     ScopedHipDevice device(device_id);
     if (device.status() != hipSuccess) {
         return GAFIME_STATUS_DEVICE_ERROR;
@@ -3751,6 +3762,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc_v2(
     const GafimeNumericMatrixDesc* desc,
     GafimeGpuMatrix* matrix_out
 ) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     int status = gafime_gpu_abi::validate_numeric_matrix_desc(desc);
     if (status != GAFIME_STATUS_OK) return status;
     GafimePrecisionMatrixDesc internal{};
@@ -3773,6 +3786,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload_v2(
     uint64_t rows,
     uint32_t cols
 ) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
     if (matrix == nullptr || matrix->legacy_abi10) return GAFIME_STATUS_INVALID_ARGUMENT;
     int status = gafime_gpu_abi::validate_numeric_route(route);
@@ -3813,6 +3828,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target_v2(
     const GafimeConstBufferView* target,
     uint64_t rows
 ) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
     if (matrix == nullptr || matrix->legacy_abi10) return GAFIME_STATUS_INVALID_ARGUMENT;
     int status = gafime_gpu_abi::validate_numeric_route(route);
@@ -3838,6 +3855,8 @@ GAFIME_GPU_API int gafime_gpu_execute_v2(
     const GafimeNumericLaunchProtocol* protocol,
     GafimeNumericResultTable* result_out
 ) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
     if (matrix == nullptr || matrix->legacy_abi10) return GAFIME_STATUS_INVALID_ARGUMENT;
     int status = gafime_gpu_abi::validate_numeric_launch_protocol(protocol, matrix->profile);
@@ -3895,6 +3914,8 @@ GAFIME_GPU_API int gafime_gpu_execution_memory_peak_v2(
     const GafimeNumericLaunchProtocol* protocol,
     uint64_t* peak_bytes_out
 ) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
     if (matrix == nullptr || matrix->legacy_abi10) return GAFIME_STATUS_INVALID_ARGUMENT;
     int status = gafime_gpu_abi::validate_numeric_launch_protocol(protocol, matrix->profile);
@@ -3912,6 +3933,8 @@ GAFIME_GPU_API int gafime_gpu_permutation_memory_peak_v2(
     uint64_t selected_row_count,
     uint64_t* peak_bytes_out
 ) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
     if (matrix == nullptr || matrix->legacy_abi10 || peak_bytes_out == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
@@ -3940,6 +3963,8 @@ GAFIME_GPU_API int gafime_gpu_permutation_pvalues_v2(
     const GafimeNumericLaunchProtocol* protocol,
     GafimeNumericSignificanceTable* significance
 ) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
     if (matrix == nullptr || matrix->legacy_abi10) return GAFIME_STATUS_INVALID_ARGUMENT;
     int status = gafime_gpu_abi::validate_numeric_launch_protocol(protocol, matrix->profile);
@@ -3992,6 +4017,8 @@ GAFIME_GPU_API int gafime_gpu_interaction_diagnostics_v2(
     GafimeGpuMatrix matrix_handle,
     GafimeNumericInteractionDiagnosticBatch* diagnostics
 ) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
     if (matrix == nullptr || matrix->legacy_abi10) return GAFIME_STATUS_INVALID_ARGUMENT;
     int status = gafime_gpu_abi::validate_numeric_diagnostics(diagnostics, matrix->profile);
@@ -4008,6 +4035,8 @@ GAFIME_GPU_API int gafime_gpu_interaction_diagnostics_v2(
 }
 
 GAFIME_GPU_API int gafime_gpu_matrix_free_v2(GafimeGpuMatrix matrix_handle) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
     if (matrix == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
     // Teardown is generation-neutral: after magic validation either ABI
@@ -4025,6 +4054,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     const GafimeMatrixDesc* matrix_desc,
     GafimeGpuMatrix* matrix_out
 ) try {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     if (matrix_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
     *matrix_out = nullptr;
     int status = validate_matrix_desc(matrix_desc);
@@ -4052,6 +4083,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     uint64_t rows,
     uint32_t cols
 ) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
     if (matrix == nullptr || !matrix->legacy_abi10 || features_host == nullptr ||
         target_host == nullptr || matrix->dispatch->storage_dtype != GAFIME_DTYPE_F32) {
@@ -4066,6 +4099,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     const float* target_host,
     uint64_t rows
 ) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
     if (matrix == nullptr || !matrix->legacy_abi10 || target_host == nullptr ||
         matrix->dispatch->storage_dtype != GAFIME_DTYPE_F32) {
@@ -4075,6 +4110,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
 }
 
 GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return;
     // ABI 1.0 historically accepts null and also tears down an additive matrix
     // owner.  Both generations now share this single destruction path.
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
@@ -4085,6 +4122,8 @@ GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
     GafimeGpuMatrix matrix_handle,
     GafimeInteractionDiagnosticBatch* diagnostics
 ) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
     if (matrix == nullptr || !matrix->legacy_abi10 || diagnostics == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
@@ -4097,6 +4136,8 @@ GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
     const GafimeLaunchProtocol* protocol,
     uint64_t* peak_bytes_out
 ) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     if (peak_bytes_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
     *peak_bytes_out = 0;
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
@@ -4116,6 +4157,8 @@ GAFIME_GPU_API int gafime_gpu_execute(
     const GafimeLaunchProtocol* protocol,
     GafimeResultTable* result_out
 ) {
+    gafime_gpu::PayloadExecutionGuard execution_guard(payload_execution_mutex);
+    if (!execution_guard.acquired()) return GAFIME_STATUS_DEVICE_ERROR;
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
     if (matrix == nullptr || !matrix->legacy_abi10) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
