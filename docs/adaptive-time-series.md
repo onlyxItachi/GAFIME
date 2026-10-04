@@ -40,9 +40,12 @@ then commits it with refreshed public generated names and plan metadata. A
 failed preparation does not commit the new discovery inputs. Reseeding repeats
 this preparation because the seed-ordered unary cap can change the eligible
 sources. `random_seed=None` therefore refreshes the family and its public names
-before each analysis. Ordinary repeated analysis with a fixed seed reuses the
-resident observed expansion. No GIL, thread-affinity, or scheduling changes are
-part of this behavior.
+before each analysis. After a native commit, the wrapper invalidates old report,
+export, and plan state before reading new metadata. A metadata read/conversion
+failure retires the wrapper and attempts native closure. A cleanup failure
+does not reopen the wrapper or restore stale reports. Ordinary repeated analysis
+with a fixed seed reuses the resident observed expansion. No GIL,
+thread-affinity, or scheduling changes are part of this behavior.
 
 The existing decision-path metadata conversion now retires its artifact on an
 internal dtype-invariant error after discovery has advanced. Restoring advanced
