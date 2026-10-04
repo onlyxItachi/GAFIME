@@ -186,6 +186,20 @@ validates layouts and lengths, while direct callers remain responsible for the
 actual allocation and lifetime. Safe Python and Rust APIs must not transfer
 that responsibility to untrusted data.
 
+Ordinary exported CUDA/HIP ABI 1.0 and ABI 1.1 entry points serialize through one
+nonrecursive gate per loaded payload instance, covering device selection,
+runtime work, cleanup, and caller-device restoration. This coordination does
+not depend on the Python GIL and does not change GIL behavior.
+
+Call serialization does not provide multi-call atomicity, handle-lifetime
+management, device-memory reservation, or process-wide coordination. Callers
+retain buffer and handle lifetime obligations, including coordination of shared
+mutation/free sequences. Separately loaded payloads and foreign frameworks
+require external coordination when necessary; Metal and local experimental RT
+entry points are outside this gate. See
+[execution coordination](docs/gpu-execution-coordination.md) for scope and failure
+limits.
+
 Vendor GPU runtimes and drivers remain responsible for their own security.
 GAFIME's checksums and frozen provenance protect its release workflow but are
 not a general code-signing or sandbox guarantee.

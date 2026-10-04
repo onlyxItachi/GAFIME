@@ -134,6 +134,12 @@ memory, and safe-API construction of invalid native layouts. Existing controls
 include exact dtype and dimensionality checks, checked multiplication, owned or
 borrowed-lifetime discipline, and fail-closed configuration validation.
 
+Dataload preserves source values until checked ingest. Raw Arrow shortcut
+admission requires matching storage dtypes and a representable complete
+configuration; it must not bypass configured Rust validation
+(`python/gafime/v1_adapter.py:1895`, `python/gafime/v1_adapter.py:1914`, and
+[`ingest-validation.md`](../ingest-validation.md)).
+
 A realistic high-impact story is an attacker-controlled array shape or Arrow
 descriptor reaching a slice construction or transpose with a smaller backing
 allocation, causing host out-of-bounds access. A mere Python exception or
@@ -176,10 +182,19 @@ bind resources to a device/profile/generation, synchronize borrowed data before
 return, and fail closed on unsupported routes. Metal intentionally exposes only
 fp32.
 
-A realistic high finding would require malformed supported input to cause a
-device out-of-bounds access, cross-device resource confusion, or asynchronous
-use after host memory was released. A missing driver, unsupported precision, or
-vendor-runtime failure without a GAFIME misuse path is not reportable.
+Independent native callers may enter supported ABI exports concurrently,
+including across ABI generations. Ordinary CUDA/HIP payloads coordinate complete
+calls per loaded instance; caller-owned lifetimes and coordination across
+separate payloads/frameworks remain separate obligations
+(`src/common/gpu_execution_gate.hpp`, and
+[`gpu-execution-coordination.md`](../gpu-execution-coordination.md)).
+
+Malformed supported inputs or supported concurrent calls with valid buffers may
+expose memory corruption, cross-device resource confusion, or asynchronous
+lifetime misuse. Reportability and severity require a reachable GAFIME-specific
+path and concrete security impact; a crash or vendor-runtime failure alone is
+insufficient. Missing drivers and explicitly unsupported precision remain
+non-findings absent such impact.
 
 ### Payload discovery and resident caches
 
@@ -189,6 +204,14 @@ rejects ambiguous candidates. Explicit environment paths and boundary modules
 deliberately load operator-selected executable code. Resident caches must not
 reuse analysis or device state across incompatible payload, backend, profile,
 device, content, or generation identities.
+
+Generated-family target updates and reseeding must keep retained inputs, native
+plans, feature identities, and exported reports coherent. Preparation failures
+preserve the prior artifact where rollback is proven; failures after committed
+mutation must retire inconsistent state rather than expose stale reports
+(`crates/gafime-py/src/artifact.rs:281`,
+`python/gafime/v1_adapter.py:1249`, and
+[`adaptive-time-series.md`](../adaptive-time-series.md)).
 
 An unintended library selected despite automatic-discovery controls, a package
 path escape, or an under-keyed cache that exposes stale memory could be
