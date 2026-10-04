@@ -8,6 +8,7 @@ planning, or significance. Native eager/compiled parity is a separate check.
 
 from __future__ import annotations
 
+import importlib
 import math
 import os
 import random
@@ -22,7 +23,12 @@ _PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
 if os.environ.get("GAFIME_TEST_INSTALLED_PACKAGE") != "1":
     sys.path.insert(0, str(_PYTHON_SRC))
 
-pytest.importorskip("gafime.gafime_py")
+if os.environ.get("GAFIME_TEST_INSTALLED_PACKAGE") == "1":
+    # An installed-package qualification must fail, not skip, if the native
+    # extension is absent or cannot be imported from that installation.
+    importlib.import_module("gafime.gafime_py")
+else:
+    pytest.importorskip("gafime.gafime_py")
 
 from gafime import ComputeBudget, EngineConfig, GafimeEngine  # noqa: E402
 import gafime.v1_adapter as adapter  # noqa: E402

@@ -1244,30 +1244,42 @@ class NativeCompiledGafime:
             self._close_after_native_failure()
             raise
         self._refresh_generated_feature_names()
-        self._native_report = None
-        self._last_report = None
-        self._graph_replayed = False
         return self
 
     def _refresh_generated_feature_names(self) -> None:
+        # The native update/reseed has committed. No old report or plan may be
+        # exported if obtaining the new generated identities fails afterwards.
+        self._native_report = None
+        self._last_report = None
+        self._graph_replayed = False
+        self._scenario_plan = None
         if (
             self.config.enable_decision_path_functions
             or self.config.enable_time_series_functions
         ):
-            native_names = getattr(self.native_handle, "feature_names", None)
-            if native_names is None:
-                raise V1UnsupportedError(
-                    "compiled generated-family rebuild did not expose its "
-                    "rediscovered feature identities."
+            self._generated_feature_start = None
+            try:
+                native_names = getattr(self.native_handle, "feature_names", None)
+                if native_names is None:
+                    raise V1UnsupportedError(
+                        "compiled generated-family rebuild did not expose its "
+                        "rediscovered feature identities."
+                    )
+                names = [str(name) for name in native_names]
+                generated_start = getattr(
+                    self.native_handle, "generated_feature_start", None
                 )
-            self.feature_names = [str(name) for name in native_names]
-            self._generated_feature_start = getattr(
-                self.native_handle, "generated_feature_start", None
-            )
-            self._scenario_plan = None
-            self._native_report = None
-            self._last_report = None
-            self._graph_replayed = False
+            except BaseException:
+                # The native artifact may still be healthy, but its public
+                # identity cannot be completed. Retire both owners and preserve
+                # the metadata failure even if best-effort cleanup also fails.
+                try:
+                    self._close_native()
+                except BaseException:
+                    pass
+                raise
+            self.feature_names = names
+            self._generated_feature_start = generated_start
 
     def __arrow_c_array__(self, requested_schema=None):
         """Zero-copy Arrow C Data Interface export of the compact result table.
