@@ -1614,6 +1614,7 @@ def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, objec
                     "libhsa",
                     "librocprofiler",
                     "libdrm",
+                    "libpthread",
                 )
             )
         )
@@ -1655,6 +1656,8 @@ def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, objec
         "libc.so.6",
         "libgcc_s.so.1",
         "libm.so.6",
+        # POSIX threading is separate from libc on the glibc 2.28 builder.
+        "libpthread.so.0",
         "libstdc++.so.6",
     }
     unexpected_needed = sorted(set(dynamic["NEEDED"]) - allowed_needed)
