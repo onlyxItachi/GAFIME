@@ -57,6 +57,17 @@ than allowing PyO3's convenience signature to choose a different exception.
 These conditions admit the shortcut; they do not replace Rust validation or
 raise their own validation errors.
 
+## Report diagnostics
+
+The raw Arrow shortcut includes the same continuous candidate-cap warnings as
+configured analysis, including unary/per-arity limits and an arity exceeding
+the feature count. These warnings coexist with native aggregate interaction
+overflow warnings; they do not change candidate IDs, order, metric bits, or
+the no-significance decision boolean. The shortcut retains its existing
+Arrow-specific `Decision.message`, so complete report text equality is not
+claimed. This reporting repair does not change dtype conversion, seed handling,
+or shortcut eligibility.
+
 ## Focused evidence and remaining gates
 
 `tests/python/test_v1_public_truthfulness.py` checks seed forwarding, per-call
