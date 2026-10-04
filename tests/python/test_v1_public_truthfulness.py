@@ -315,6 +315,80 @@ def test_arrow_shortcut_requires_matching_source_dtype(monkeypatch, mismatch):
 
 
 @pytest.mark.parametrize(
+    "changes",
+    [
+        {"stability_std_threshold": 0.2},
+        {"stability_std_threshold": -0.1},
+        {"stability_std_threshold": float("nan")},
+        {"stability_std_threshold": float("inf")},
+        {"permutation_p_threshold": 2.0},
+        {"permutation_p_threshold": -0.1},
+        {"permutation_p_threshold": float("nan")},
+        {"permutation_p_threshold": float("inf")},
+        {"significance_top_n": 25},
+        {"significance_top_n": 0},
+        {"significance_top_n": -1},
+        {"significance_top_n": 1 << 32},
+        {"mi_bins": 24},
+        {"mi_bins": 1},
+        {"mi_bins": -1},
+        {"mi_bins": 1 << 32},
+        {"budget": ComputeBudget(max_comb_size=-1)},
+        {"budget": ComputeBudget(max_comb_size=0)},
+        {"budget": ComputeBudget(max_comb_size=1 << 32)},
+        {"budget": ComputeBudget(max_combinations_per_k=-1)},
+        {"budget": ComputeBudget(max_combinations_per_k=0)},
+        {"budget": ComputeBudget(max_combinations_per_k=1 << 64)},
+    ],
+)
+def test_arrow_shortcut_defers_omitted_fields_and_counts_to_configured_boundary(
+    monkeypatch, changes
+):
+    monkeypatch.setenv("GAFIME_V1_ANALYZE_CACHE_SIZE", "0")
+    boundary = _boundary()
+    monkeypatch.setattr(v1_adapter, "_load_boundary", lambda: boundary)
+    features, target = _frames()
+    # No MI or significance work: universal config validation still applies.
+    config = EngineConfig(
+        backend="cpu", metric_names=("pearson",), permutation_tests=0,
+        num_repeats=1, **changes,
+    )
+
+    analyze_arrow_with_v1_boundary(config, features, target, ["x"])
+
+    assert boundary.raw_arrow_calls == []
+    assert len(boundary.configured_calls) == 1
+    payload = boundary.configured_calls[0]["config"]
+    expected = v1_adapter._config_payload(config)
+    assert {key: payload[key] for key in expected} == expected
+
+
+@pytest.mark.parametrize("field", ["max_comb_size", "max_combinations_per_k"])
+@pytest.mark.parametrize("value", [None, True, 1.5, "2", float("inf")])
+def test_arrow_shortcut_does_not_normalize_unusual_count_types(field, value):
+    config = EngineConfig(
+        backend="cpu", permutation_tests=0, num_repeats=1,
+        budget=ComputeBudget(**{field: value}),
+    )
+
+    assert not v1_adapter._raw_arrow_config_supported(config)
+
+
+@pytest.mark.parametrize(
+    "max_arity,max_combinations", [(1, 1), (2, 5000), ((1 << 32) - 1, (1 << 64) - 1)]
+)
+def test_arrow_shortcut_accepts_representable_positive_counts(max_arity, max_combinations):
+    config = EngineConfig(
+        backend="cpu", permutation_tests=0, num_repeats=1,
+        budget=ComputeBudget(
+            max_comb_size=max_arity, max_combinations_per_k=max_combinations,
+        ),
+    )
+
+    assert v1_adapter._raw_arrow_config_supported(config)
+
+
+@pytest.mark.parametrize(
     "config",
     [
         EngineConfig(

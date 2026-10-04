@@ -254,3 +254,96 @@ def test_dataload_fp64_has_no_f32_intermediate(native, tmp_path, shortcut):
 
     assert len(report.interactions) == 1
     assert report.interactions[0].metrics["pearson"] == pytest.approx(1.0, abs=1e-12)
+
+
+@pytest.mark.skipif(
+    not _INSTALLED,
+    reason="requires the installed combined ingest and Rust config-validation fixes",
+)
+@pytest.mark.parametrize("precision", ["fp32", "mixed", "fp64"])
+@pytest.mark.parametrize(
+    "changes,field",
+    [
+        ({"stability_std_threshold": -0.1}, "stability_std_threshold"),
+        ({"stability_std_threshold": math.nan}, "stability_std_threshold"),
+        ({"stability_std_threshold": math.inf}, "stability_std_threshold"),
+        ({"permutation_p_threshold": -0.1}, "permutation_p_threshold"),
+        ({"permutation_p_threshold": math.nan}, "permutation_p_threshold"),
+        ({"permutation_p_threshold": math.inf}, "permutation_p_threshold"),
+        ({"significance_top_n": 0}, "significance_top_n"),
+        ({"significance_top_n": -1}, "significance_top_n"),
+        ({"significance_top_n": 1 << 32}, "significance_top_n"),
+        ({"mi_bins": 1}, "mi_bins"),
+        ({"mi_bins": -1}, "mi_bins"),
+        ({"mi_bins": 1 << 32}, "mi_bins"),
+        ({"budget": gafime.ComputeBudget(max_comb_size=-1)}, "max_comb_size"),
+        ({"budget": gafime.ComputeBudget(max_comb_size=0)}, "max_comb_size"),
+        ({"budget": gafime.ComputeBudget(max_comb_size=1 << 32)}, "max_comb_size"),
+        ({"budget": gafime.ComputeBudget(max_combinations_per_k=-1)}, "max_combinations_per_k"),
+        ({"budget": gafime.ComputeBudget(max_combinations_per_k=0)}, "max_combinations_per_k"),
+        ({"budget": gafime.ComputeBudget(max_combinations_per_k=1 << 64)}, "max_combinations_per_k"),
+    ],
+)
+def test_integrated_dataload_uses_configured_rust_rejections(
+    native, tmp_path, precision, changes, field
+):
+    """Needs the combined wheel's universal checks and integer error mapping."""
+    dtype = native.Float64 if precision == "fp64" else native.Float32
+    frame = native.DataFrame(
+        {"x": [1.0, 2.0, 3.0, 4.0], "target": [4.0, 1.0, 3.0, 2.0]}
+    ).cast(dtype)
+    path = tmp_path / "invalid_config.parquet"
+    frame.write_parquet(path)
+    config = replace(_config(precision), **changes)
+    assert v1_adapter._raw_arrow_dtypes_supported(
+        precision, frame.select("x"), frame.select("target")
+    )
+
+    with pytest.raises(ValueError, match=field):
+        gafime.dataload(path, "target", config=config)
+    with pytest.raises(ValueError, match=field):
+        _direct(frame, config)
+
+
+@pytest.mark.skipif(
+    not _INSTALLED,
+    reason="requires the installed combined ingest and Rust config-validation fixes",
+)
+@pytest.mark.parametrize("field", ["stability_std_threshold", "permutation_p_threshold"])
+@pytest.mark.parametrize("precision", ["fp32", "mixed", "fp64"])
+def test_integrated_dataload_threshold_range_follows_result_lane(
+    native, tmp_path, field, precision
+):
+    frame = native.DataFrame(
+        {"x": [1.0, 2.0, 3.0, 4.0], "target": [4.0, 1.0, 3.0, 2.0]}
+    ).cast(native.Float64 if precision == "fp64" else native.Float32)
+    path = tmp_path / "threshold_lane.parquet"
+    frame.write_parquet(path)
+    config = replace(_config(precision), **{field: 1e100})
+
+    if precision == "fp32":
+        with pytest.raises(ValueError, match=field):
+            gafime.dataload(path, "target", config=config)
+    else:
+        loaded = gafime.dataload(path, "target", config=config)
+        assert _records(loaded) == _records(_direct(frame, config))
+
+
+@pytest.mark.skipif(
+    not _INSTALLED,
+    reason="requires the installed combined ingest and Rust config-validation fixes",
+)
+@pytest.mark.parametrize("value", [-0.0, 2.0])
+def test_integrated_dataload_accepts_nondefault_valid_thresholds(native, tmp_path, value):
+    frame = native.DataFrame(
+        {"x": [1.0, 2.0, 3.0, 4.0], "target": [4.0, 1.0, 3.0, 2.0]}
+    ).cast(native.Float32)
+    path = tmp_path / "valid_threshold.parquet"
+    frame.write_parquet(path)
+    config = replace(
+        _config(), stability_std_threshold=value, permutation_p_threshold=value,
+    )
+
+    loaded = gafime.dataload(path, "target", config=config)
+
+    assert _records(loaded) == _records(_direct(frame, config))

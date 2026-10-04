@@ -1906,8 +1906,29 @@ def _raw_arrow_config_supported(config: EngineConfig) -> bool:
         return False
     if config.enable_time_series_functions or config.enable_decision_path_functions:
         return False
-    if "mutual_info" in config.metric_names and (
-        config.mi_bins != 96 or config.mi_approximate
+    # The convenience entrypoint cannot pass these fields through Rust's full
+    # config parser. Only their defaults can use it; non-default and invalid
+    # requests must reach the ordinary configured validation path, even when
+    # the corresponding metric/significance work is not requested.
+    if (
+        config.stability_std_threshold != 0.10
+        or config.permutation_p_threshold != 0.05
+        or config.significance_top_n != 50
+        or config.mi_bins != 96
+    ):
+        return False
+    if "mutual_info" in config.metric_names and config.mi_approximate:
+        return False
+    # This is shortcut representability, not input validation: leave rejection
+    # and exception policy to the configured boundary rather than PyO3's typed
+    # convenience arguments. Do not normalize unusual count types here.
+    max_arity = config.budget.max_comb_size
+    max_combinations = config.budget.max_combinations_per_k
+    if (
+        type(max_arity) is not int
+        or not 0 < max_arity < (1 << 32)
+        or type(max_combinations) is not int
+        or not 0 < max_combinations < (1 << 64)
     ):
         return False
     default_budget = ComputeBudget()
