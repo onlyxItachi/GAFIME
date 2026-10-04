@@ -263,6 +263,76 @@ def test_arrow_cpu_shortcut_is_used_only_for_compatible_config(monkeypatch):
     assert report.backend.device == "cpu"
 
 
+@pytest.mark.parametrize(
+    "columns,max_arity,max_combinations,cap_warnings",
+    [
+        (
+            16,
+            3,
+            4,
+            [
+                "Unary combinations capped by max_combinations_per_k.",
+                "k=2 combinations capped by max_combinations_per_k.",
+                "k=3 combinations capped by max_combinations_per_k.",
+            ],
+        ),
+        (3, 3, 64, []),
+        (
+            2,
+            3,
+            64,
+            ["max_comb_size exceeds feature count; will cap to n_features."],
+        ),
+    ],
+)
+@pytest.mark.parametrize("overflow", [False, True])
+def test_arrow_shortcut_preserves_cap_and_overflow_warnings(
+    monkeypatch, columns, max_arity, max_combinations, cap_warnings, overflow
+):
+    boundary = _boundary()
+    raw_analyze = boundary.analyze_continuous_arrow
+
+    def analyze_with_diagnostics(*args, **kwargs):
+        native_report = raw_analyze(*args, **kwargs)
+        if overflow:
+            native_report.interaction_diagnostics_available = True
+            native_report.interaction_overflow_candidate_count = 1
+            native_report.interaction_overflow_max_rows = 2
+            native_report.rows = 3
+        return native_report
+
+    monkeypatch.setattr(boundary, "analyze_continuous_arrow", analyze_with_diagnostics)
+    monkeypatch.setattr(v1_adapter, "_load_boundary", lambda: boundary)
+    names = [f"x{index}" for index in range(columns)]
+    features = _Frame([(float(row),) * columns for row in range(3)], names)
+    target = _Frame([(1.0,), (2.0,), (3.0,)], ["y"])
+    config = EngineConfig(
+        backend="cpu",
+        metric_names=("pearson",),
+        permutation_tests=0,
+        num_repeats=1,
+        budget=ComputeBudget(
+            max_comb_size=max_arity, max_combinations_per_k=max_combinations
+        ),
+    )
+
+    report = analyze_arrow_with_v1_boundary(config, features, target, names)
+
+    expected_warnings = list(cap_warnings)
+    if overflow:
+        expected_warnings.append(
+            "Finite-input mixed interaction materialization overflowed for "
+            "1 surfaced candidate(s); the worst candidate lost 2 of 3 sample rows. "
+            "Scores cannot recover those values; inspect "
+            "InteractionResult.interaction_overflow_rows."
+        )
+    assert report.warnings == expected_warnings
+    assert len(boundary.raw_arrow_calls) == 1
+    assert boundary.configured_calls == []
+    assert report.decision.signal_detected is True
+    assert report.decision.message == "v1 continuous Arrow ingest path executed."
+
+
 @pytest.mark.parametrize("seed", [7, 123, (1 << 129) + 123, -((1 << 129) + 123)])
 def test_arrow_shortcut_preserves_python_integer_seed(monkeypatch, seed):
     boundary = _boundary()

@@ -9,6 +9,7 @@ from dataclasses import replace
 import math
 import os
 from pathlib import Path
+import struct
 import sys
 
 import pytest
@@ -145,6 +146,91 @@ def test_dataload_seed_matches_direct_with_binding_caps(
     )
     if seed is None:
         assert len(entropy_calls) == 1
+
+
+@pytest.mark.parametrize("precision", ["fp32", "mixed", "fp64"])
+@pytest.mark.parametrize("capped", [False, True])
+def test_dataload_shortcut_matches_direct_cap_warnings_and_metric_bits(
+    native, monkeypatch, tmp_path, precision, capped
+):
+    from gafime import gafime_py as boundary
+
+    monkeypatch.setenv("GAFIME_V1_ANALYZE_CACHE_SIZE", "0")
+    arrow_calls = []
+    raw_analyze = boundary.analyze_continuous_arrow
+
+    def record_arrow_call(*args, **kwargs):
+        arrow_calls.append(True)
+        return raw_analyze(*args, **kwargs)
+
+    monkeypatch.setattr(boundary, "analyze_continuous_arrow", record_arrow_call)
+    columns = 16 if capped else 4
+    data = {
+        f"x{col}": [
+            math.sin((row + 1) * (col + 2) * 0.173)
+            + math.cos((row + 3) * (col + 1) * 0.071)
+            for row in range(32)
+        ]
+        for col in range(columns)
+    }
+    data["target"] = [math.sin(row * 0.321) for row in range(32)]
+    dtype = native.Float64 if precision == "fp64" else native.Float32
+    frame = native.DataFrame(data).cast(dtype)
+    path = tmp_path / "cap_warnings.parquet"
+    frame.write_parquet(path)
+    config = replace(
+        _config(
+            precision,
+            max_comb_size=3,
+            max_combinations_per_k=4 if capped else 64,
+            seed=(1 << 129) + 123,
+        ),
+        metric_names=("pearson", "spearman", "mutual_info", "r2"),
+    )
+    assert v1_adapter._raw_arrow_config_supported(config)
+    assert v1_adapter._raw_arrow_dtypes_supported(
+        precision, frame.select(frame.columns[:-1]), frame.select("target")
+    )
+
+    loaded = gafime.dataload(path, "target", config=config)
+    direct = _direct(frame, config)
+
+    expected_warnings = (
+        [
+            "Unary combinations capped by max_combinations_per_k.",
+            "k=2 combinations capped by max_combinations_per_k.",
+            "k=3 combinations capped by max_combinations_per_k.",
+        ]
+        if capped
+        else []
+    )
+    assert arrow_calls == [True]
+    assert loaded.warnings == direct.warnings == expected_warnings
+    assert loaded.feature_names == direct.feature_names
+    assert len(loaded.interactions) == len(direct.interactions) == (12 if capped else 14)
+    def bit_records(report):
+        return [
+            (
+                row.candidate_id,
+                row.combo,
+                tuple(
+                    # fp32 public scalars are already finalized Python floats;
+                    # packing as f32 again could hide unexpected excess bits.
+                    (name, struct.pack("<d", value))
+                    for name, value in row.metrics.items()
+                ),
+            )
+            for row in report.interactions
+        ]
+
+    assert bit_records(loaded) == bit_records(direct)
+    assert loaded.decision.signal_detected is direct.decision.signal_detected is True
+    # The no-significance result is the same, but the established path-specific
+    # explanatory text is intentionally not a full-report equality contract.
+    assert loaded.decision.message == "v1 continuous Arrow ingest path executed."
+    assert direct.decision.message == (
+        "v1 continuous native path executed (no significance computed)."
+    )
 
 
 def test_dataload_preserves_ineligible_feature_caps(native, tmp_path):
