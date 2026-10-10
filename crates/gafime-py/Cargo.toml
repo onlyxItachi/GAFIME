@@ -21,6 +21,7 @@ local-cmake-experiment = [
 
 [dependencies]
 arrow = { version = "54.3.1", default-features = false, features = ["ffi"] }
+blake2 = "0.10.6"
 gafime-cpu = { path = "../gafime-cpu" }
 gafime-gpu-sys = { path = "../gafime-gpu-sys", default-features = false }
 gafime-orchestrator = { path = "../gafime-orchestrator" }

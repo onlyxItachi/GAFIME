@@ -51,6 +51,7 @@ def test_check_reports_core_package_native_version_and_static_capabilities():
     assert "family time_series: generation=gafime_cpu" in result.stdout
     assert "family decision_path: generation=gafime_cpu" in result.stdout
     assert "significance=permutation:True,stability:True" in result.stdout
+    assert "incremental multiple batches for public file acquisition" in result.stdout
 
 
 def test_check_reports_explicit_unavailable_backend_without_cpu_substitution():

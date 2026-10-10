@@ -647,6 +647,64 @@ silently serialize an established parallel production workload.
 Single-core microbenchmarks are supplemental leaf-kernel diagnostics. They are
 not Core product-throughput evidence and must not be reported or gated as such.
 
+## Performance Evidence And Boundary Costs
+
+> Every kernel must earn its performance claim. Every boundary must earn its cost. Every public workflow must pass end-to-end validation.
+
+This rule applies to every development area, including ingestion, validation,
+ownership conversion, planning, scheduling, caching, native execution, result
+construction, bindings, and packaging. Evidence is proportionate to the
+affected critical path: changing documentation alone does not require an
+unrelated hardware campaign, and a focused fix does not authorize an open-ended
+benchmark redesign.
+
+Before accepting an execution change, identify its affected public workflows
+and boundaries. Record a coverage matrix containing the entry point, default
+and realistic configurations, input shape/format/dtype, precision, selected
+backend, cache state, independent correctness oracle, measurement scope,
+latency, peak RSS, allocation/copy accounting, and exact source/artifact
+identity. Include supported edge cases and explain every skip or unsupported
+path. An easy no-significance configuration cannot stand in for a default or
+configured workflow it does not exercise.
+
+Keep the evidence ladder distinct:
+
+- kernel or leaf timing establishes only the measured arithmetic claim;
+- resident production timing establishes only the executor lifecycle it includes;
+- component timing accounts for the affected acquisition, conversion, ownership,
+  planning/cache, transfer, execution, and reporting boundaries; and
+- public end-to-end timing includes the actual user workflow, including file
+  reading and parsing when the entry point accepts a file.
+
+A fast kernel or resident executor is not proof of a fast public API. Require
+both affected-component and public end-to-end evidence, with independent
+numerical/error parity established before timing. Existing numerical, backend,
+ABI, safety, and release guarantees cannot be relaxed to improve a chart.
+
+Measure cold acquisition/cache misses and repeat/cache-hit behavior separately.
+Use fresh processes for peak-memory comparisons; distinguish process-cold from
+filesystem-cache-cold state. Record raw wall-time samples, relevant CPU usage,
+peak RSS and its measurement baseline/scope, and a justified copy/materialization
+ledger. Do not label a cumulative RSS high-water difference an exact allocation
+count. Distinguish measured copy counters from source-derived byte estimates;
+importing an Arrow buffer without copying is not resident zero-copy when
+validation, dtype/layout conversion, or owned storage requires a copy.
+
+Name only stages that are actually observable. Keep inseparable phases
+`combined` and inaccessible phases `not_observable`; do not manufacture kernel,
+parsing, transfer, or report times by subtracting unrelated runs. Preserve raw
+samples, input/configuration identities, cache state, toolchain/environment,
+ordering, and installed wheel/native hashes for matched comparisons. A
+performance claim remains bounded to those workloads and environments.
+
+Release-relevant public workflows must pass from an installed package outside
+the checkout import path. Structural regression tests must guard optimized
+paths against whole-dataset Python row/scalar materialization, in addition to
+correctness and measured latency/memory gates. The implementation plan and
+initial ingestion evidence gaps are recorded in
+`docs/rc3-ingestion-hardening.md`; this policy is not a claim that those gates
+have already passed.
+
 ## Migration Rules
 
 Do not treat placeholder GPU files as real runtime sources. Do not delete legacy backend/device code until the v1 structure carries required capability and equivalence tests pass.

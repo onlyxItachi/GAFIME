@@ -110,6 +110,23 @@ class _CachedCoercedInput:
         return _numeric_storage_to_le_bytes(self.target, self.precision)
 
 
+@dataclass
+class _CachedAcquiredInput:
+    """Metadata for one immutable, native-owned acquisition.
+
+    The handle is consumed on a miss or target replacement. Only its compact
+    fingerprints cross into the Python cache; numeric storage never does.
+    """
+
+    native_input: object
+    rows: int
+    cols: int
+    feature_names: List[str]
+    precision: str
+    feature_digest: bytes
+    target_digest: bytes
+
+
 _ANALYZE_CACHE_LOCAL = _AnalyzeCacheLocal()
 
 
@@ -235,9 +252,25 @@ def _analyze_continuous_with_resident_cache(
         precision=config.precision,
         include_digests=True,
     )
+    return _analyze_continuous_resident_input(config, boundary, coerced)
+
+
+def _analyze_continuous_resident_input(
+    config: EngineConfig,
+    boundary: ModuleType,
+    coerced: _CachedCoercedInput | _CachedAcquiredInput,
+    *,
+    payload: dict[str, object] | None = None,
+) -> DiagnosticReport:
+    """Reuse the existing LRU with either transport or native-owned input.
+
+    Both fingerprints bind the validated snapshot actually used by execution.
+    Acquisition changes do not introduce a second cache or backend policy.
+    """
     assert coerced.feature_digest is not None
     assert coerced.target_digest is not None
-    payload = _config_payload(config)
+    if payload is None:
+        payload = _config_payload(config)
     cache_payload = payload
     if config.random_seed is None:
         cache_payload = {**payload, "random_seed": None}
@@ -274,7 +307,12 @@ def _analyze_continuous_with_resident_cache(
                     entry = None
                 else:
                     if entry.target_digest != coerced.target_digest:
-                        entry.artifact.update_target(coerced.target)
+                        if isinstance(coerced, _CachedAcquiredInput):
+                            entry.artifact._update_target_from_acquired(
+                                coerced.native_input
+                            )
+                        else:
+                            entry.artifact.update_target(coerced.target)
                         entry.target_digest = coerced.target_digest
                     return entry.artifact.analyze()
         except BaseException:
@@ -290,7 +328,9 @@ def _analyze_continuous_with_resident_cache(
                 cache.pop(cache_key)
 
     compile_buffers = getattr(boundary, "compile_continuous_buffers", None)
-    if callable(compile_buffers):
+    if isinstance(coerced, _CachedAcquiredInput):
+        handle = boundary._compile_acquired_continuous(payload, coerced.native_input)
+    elif callable(compile_buffers):
         handle = compile_buffers(
             payload,
             coerced.feature_bytes(),
@@ -961,19 +1001,20 @@ def analyze_arrow_with_v1_boundary(
     target_frame: object,
     feature_names: Sequence[str],
 ) -> DiagnosticReport:
-    """Analyze Arrow-backed frames without changing requested engine semantics.
+    """Acquire frame values natively, then use the normal configured executor.
 
-    The low-level Arrow entrypoint is a CPU/no-significance convenience API. Use
-    it only when that is exactly what the configuration requests and source
-    dtypes already match resident storage. All other inputs route through the
-    normal configured boundary using the
-    frame's row iterator; this may materialize GAFIME's owned selected-profile
-    input buffer, but it cannot silently discard backend, family, MI, or
-    significance options.
+    Arrow is an acquisition protocol, not a backend or significance policy.
+    Ordinary numeric columns use checked native Arrow acquisition. Unusual
+    compatible scalar types use a bounded native row iterator instead. Older
+    custom boundary modules retain their existing compatibility route.
     """
     _validate_precision_config(config)
-    target = _validate_arrow_target_frame(target_frame)
     boundary = _load_boundary_for_backend(config.backend)
+    if callable(getattr(boundary, "_acquire_arrow_input", None)):
+        return _analyze_frames_with_native_acquisition(
+            config, boundary, feature_frame, target_frame, feature_names
+        )
+    target = _validate_arrow_target_frame(target_frame)
     if (
         _raw_arrow_config_supported(config)
         and _raw_arrow_dtypes_supported(config.precision, feature_frame, target_frame)
@@ -986,9 +1027,17 @@ def analyze_arrow_with_v1_boundary(
         # Reuse the ordinary config path's per-analysis entropy policy. The
         # native parser retains every word of arbitrary-size Python integers.
         random_seed = _config_payload(config)["random_seed"]
+        # Older custom boundaries still require one batch. Do not impose their
+        # rechunk copy on the current incremental acquisition path above.
+        feature_rechunk = getattr(feature_frame, "rechunk", None)
+        target_rechunk = getattr(target_frame, "rechunk", None)
+        legacy_features = (
+            feature_rechunk() if callable(feature_rechunk) else feature_frame
+        )
+        legacy_target = target_rechunk() if callable(target_rechunk) else target_frame
         native_report = boundary.analyze_continuous_arrow(
-            feature_frame,
-            target_frame,
+            legacy_features,
+            legacy_target,
             precision=config.precision,
             max_arity=int(config.budget.max_comb_size),
             max_combinations_per_k=int(config.budget.max_combinations_per_k),
@@ -1020,6 +1069,159 @@ def analyze_arrow_with_v1_boundary(
             config, rows, target, feature_names
         )
     return analyze_with_v1_boundary(config, rows, target, feature_names)
+
+
+@dataclass
+class _PreparedFrameAcquisition:
+    payload: dict[str, object]
+    acquired: object
+    names: List[str]
+    legacy_arrow_report: bool
+
+
+def _prepare_frames_with_native_acquisition(
+    config: EngineConfig,
+    boundary: ModuleType,
+    feature_frame: object,
+    target_frame: object,
+    feature_names: Sequence[str],
+) -> _PreparedFrameAcquisition:
+    if config.enable_decision_path_functions:
+        _validate_decision_path_config(config)
+    # Existing family entrypoints receive the continuous execution config and
+    # their own descriptors. Preserve that split, including rejection when both
+    # families are requested, rather than adding an Arrow-specific planner.
+    execution_config = config
+    if (
+        config.enable_time_series_functions
+        and not config.enable_decision_path_functions
+    ):
+        execution_config = replace(config, enable_time_series_functions=False)
+    elif (
+        config.enable_decision_path_functions
+        and not config.enable_time_series_functions
+    ):
+        execution_config = replace(config, enable_decision_path_functions=False)
+    payload = _config_payload(execution_config)
+    if _native_arrow_dtypes_supported(feature_frame, target_frame):
+        # Frame height is allocation metadata only; Rust still validates the
+        # complete stream counts before publishing the owned acquisition.
+        expected_rows = getattr(feature_frame, "height", None)
+        acquired = boundary._acquire_arrow_input(
+            payload, feature_frame, target_frame, expected_rows=expected_rows
+        )
+    else:
+        # Compatibility conversion is deliberately row-bounded in Rust. Never
+        # send this iterator through _sequence(), which collects the whole file.
+        target = _validate_arrow_target_frame(target_frame)
+        iter_rows = getattr(feature_frame, "iter_rows", None)
+        acquire_rows = getattr(boundary, "_acquire_rows_input", None)
+        if not callable(iter_rows) or not callable(acquire_rows):
+            raise V1UnsupportedError(
+                "this frame requires bounded native scalar acquisition support."
+            )
+        acquired = acquire_rows(payload, iter_rows(), iter(target))
+    cols = int(acquired.cols)
+    names = _coerce_feature_names(feature_names, cols)
+    legacy_arrow_report = _raw_arrow_config_supported(
+        config
+    ) and _raw_arrow_dtypes_supported(config.precision, feature_frame, target_frame)
+    return _PreparedFrameAcquisition(payload, acquired, names, legacy_arrow_report)
+
+
+def _analyze_prepared_frame_acquisition(
+    config: EngineConfig,
+    boundary: ModuleType,
+    prepared: _PreparedFrameAcquisition,
+) -> DiagnosticReport:
+    # Preparation retains only the checked Rust-owned snapshot and metadata.
+    # File callers can release foreign frames before resident allocation/plan
+    # creation, rather than overlap a parsed file with two native layouts.
+    payload = prepared.payload
+    acquired = prepared.acquired
+    names = prepared.names
+    legacy_arrow_report = prepared.legacy_arrow_report
+    rows, cols = int(acquired.rows), int(acquired.cols)
+    if _continuous_analyze_cache_enabled(config) and not legacy_arrow_report:
+        coerced = _CachedAcquiredInput(
+            native_input=acquired,
+            rows=rows,
+            cols=cols,
+            feature_names=names,
+            precision=config.precision,
+            feature_digest=bytes(acquired.feature_digest),
+            target_digest=bytes(acquired.target_digest),
+        )
+        report = _analyze_continuous_resident_input(
+            config, boundary, coerced, payload=payload
+        )
+        return report
+    generated_feature_start = None
+    if config.enable_time_series_functions:
+        handle, all_names = boundary._compile_acquired_time_series(
+            payload,
+            acquired,
+            names,
+            [int(lag) for lag in config.time_series_lags],
+            [int(window) for window in config.time_series_windows],
+            True,
+        )
+        all_names = list(all_names)
+        report_warnings = [
+            f"time_series expanded {cols} base features to {len(all_names)}."
+        ]
+        generated_feature_start = _generated_feature_start(config, cols, len(all_names))
+    elif config.enable_decision_path_functions:
+        handle, all_names = boundary._compile_acquired_decision_path(
+            payload,
+            acquired,
+            names,
+            int(config.decision_path_max_depth),
+            int(config.decision_path_rounds),
+            int(config.decision_path_max_paths),
+            int(config.decision_path_max_bins),
+            int(config.decision_path_min_leaf),
+            float(config.decision_path_learning_rate),
+        )
+        all_names = list(all_names)
+        report_warnings = [
+            f"decision_path discovered {len(all_names) - cols} conjunction path(s) from {cols} features."
+        ]
+        generated_feature_start = _generated_feature_start(config, cols, len(all_names))
+    else:
+        handle = boundary._compile_acquired_continuous(payload, acquired)
+        all_names = names
+        report_warnings = _continuous_cap_warnings(config, cols)
+    try:
+        # Eager family/uncached calls use the one seed already parsed above.
+        # Resident cached calls keep their established per-analysis reseeding.
+        report = _diagnostic_from_native_report(
+            config,
+            handle.analyze(),
+            all_names,
+            report_warnings,
+            generated_feature_start=generated_feature_start,
+        )
+        if legacy_arrow_report:
+            report.decision = Decision(
+                bool(report.interactions), "v1 continuous Arrow ingest path executed."
+            )
+        return report
+    finally:
+        handle.close()
+
+
+def _analyze_frames_with_native_acquisition(
+    config: EngineConfig,
+    boundary: ModuleType,
+    feature_frame: object,
+    target_frame: object,
+    feature_names: Sequence[str],
+) -> DiagnosticReport:
+    prepared = _prepare_frames_with_native_acquisition(
+        config, boundary, feature_frame, target_frame, feature_names
+    )
+    return _analyze_prepared_frame_acquisition(config, boundary, prepared)
 
 
 @dataclass
@@ -1248,6 +1450,16 @@ class NativeCompiledGafime:
             raise
         self._refresh_generated_feature_names()
         return self
+
+    def _update_target_from_acquired(self, acquired: object) -> None:
+        """Move a checked native target without reserializing its values."""
+        self._ensure_open()
+        try:
+            self.native_handle._update_target_acquired(acquired)
+        except BaseException:
+            self._close_after_native_failure()
+            raise
+        self._refresh_generated_feature_names()
 
     def _refresh_generated_feature_names(self) -> None:
         # The native update/reseed has committed. No old report or plan may be
@@ -1910,6 +2122,31 @@ def _raw_arrow_dtypes_supported(precision: str, *frames: object) -> bool:
                 return False
             dtypes = getattr(schema, "types", None)
         if not dtypes or any(str(dtype) not in expected for dtype in dtypes):
+            return False
+    return True
+
+
+def _native_arrow_dtypes_supported(*frames: object) -> bool:
+    """Select primitive acquisition by schema, without inspecting values."""
+    supported = {
+        "Float32",
+        "Float64",
+        "float",
+        "double",
+        "Boolean",
+        "bool",
+        *(f"Int{width}" for width in (8, 16, 32, 64)),
+        *(f"UInt{width}" for width in (8, 16, 32, 64)),
+        *(f"int{width}" for width in (8, 16, 32, 64)),
+        *(f"uint{width}" for width in (8, 16, 32, 64)),
+    }
+    for frame in frames:
+        if not callable(getattr(frame, "__arrow_c_stream__", None)):
+            return False
+        dtypes = getattr(frame, "dtypes", None)
+        if dtypes is None:
+            dtypes = getattr(getattr(frame, "schema", None), "types", None)
+        if not dtypes or any(str(dtype) not in supported for dtype in dtypes):
             return False
     return True
 

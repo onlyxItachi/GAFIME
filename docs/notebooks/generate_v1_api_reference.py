@@ -1146,12 +1146,23 @@ def _cells() -> list:
 
             `gafime.dataload(path, target, features=None, *, config=..., **kwargs)`
             supports Parquet, CSV/TSV/text, and Arrow IPC/Feather through Polars. It
-            selects one target column, preserves source dtypes until checked ingest,
-            rechunks, and runs analysis. Finite feature or target values outside the
+            selects one target column and preserves source dtypes until checked
+            native acquisition. Numeric Arrow batches feed the normal full-config
+            Rust planner, including defaults, significance and generated families;
+            they do not pass through a whole-dataset Python row list. Finite feature
+            or target values outside the
             selected storage range raise `ValueError`; existing NaN/inf values keep
-            their native semantics. The strict Arrow shortcut requires matching
-            column dtypes and preserves the configured seed, including arbitrary-size
-            integers; `None` resolves fresh entropy once per analysis. A raw Arrow table/stream is
+            their native semantics. Acquisition preserves the configured seed,
+            including arbitrary-size integers; `None` preserves the existing fresh
+            per-analysis execution stream and reseeding policy. Compatible unusual
+            scalar schemas use a bounded, slower
+            row iterator. The acquired values are Rust-owned, not resident zero-copy:
+            the loader releases its foreign frames before resident construction,
+            though allocators can retain freed pages.
+            Dtype/layout conversion, Core's column-major copy and GPU upload can
+            require additional storage. See
+            [ingest validation](../ingest-validation.md) for ownership and cache rules.
+            A raw Arrow table/stream is
             not a top-level `analyze()` input; use the shipped file-oriented
             `dataload()` boundary for Arrow IPC.
 

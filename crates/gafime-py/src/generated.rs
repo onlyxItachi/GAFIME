@@ -1576,7 +1576,7 @@ impl PrecisionTimeSeriesCompiledState {
     clippy::too_many_arguments,
     reason = "mirrors the native temporal boundary"
 )]
-fn compile_time_series_input(
+pub(crate) fn compile_time_series_input(
     config: EngineConfig,
     rows: u64,
     cols: u32,
@@ -2080,11 +2080,9 @@ pub(crate) fn compile_decision_path(
     min_leaf: u32,
     learning_rate: f64,
 ) -> PyResult<(PyCompiledContinuousArtifact, Vec<String>)> {
-    let mut parsed = parse_engine_config(config)?;
+    let parsed = parse_engine_config(config)?;
     let input = extract_generated_input(parsed.precision, features, target)?;
     validate_shape(rows, cols, input.feature_len(), input.target_len()).map_err(PyErr::from)?;
-    let retained_input = input.clone();
-    let selection_config = parsed.clone();
     let params = gafime_cpu::decision_path::DecisionPathParams {
         max_depth,
         rounds,
@@ -2093,11 +2091,37 @@ pub(crate) fn compile_decision_path(
         min_leaf,
         learning_rate,
     };
+    let top_k_features = get_u32(config, "decision_path_top_k_features", 50)?;
+    compile_decision_path_input(
+        parsed,
+        rows,
+        cols,
+        input,
+        base_names,
+        params,
+        top_k_features,
+    )
+}
+
+/// Both sequence and Arrow acquisition enter the same discovery/retention path.
+/// Keeping ownership below extraction avoids a second planner or a Python
+/// serialization round trip for file-backed input.
+pub(crate) fn compile_decision_path_input(
+    mut parsed: EngineConfig,
+    rows: u64,
+    cols: u32,
+    input: OwnedNumericInput,
+    base_names: Vec<String>,
+    params: gafime_cpu::decision_path::DecisionPathParams,
+    top_k_features: u32,
+) -> PyResult<(PyCompiledContinuousArtifact, Vec<String>)> {
+    validate_shape(rows, cols, input.feature_len(), input.target_len()).map_err(PyErr::from)?;
+    let retained_input = input.clone();
+    let selection_config = parsed.clone();
     let rows_usize = usize::try_from(rows)
         .map_err(|_| PyValueError::new_err("rows exceed host address space"))?;
     let cols_usize = cols as usize;
     let base_candidate_cols = parsed.effective_feature_candidate_count(cols) as usize;
-    let top_k_features = get_u32(config, "decision_path_top_k_features", 50)?;
     let discovery_features = if base_candidate_cols == 0 || params.max_paths == 0 {
         Vec::new()
     } else {

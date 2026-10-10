@@ -7,9 +7,9 @@ Polars import is lazy so importing this module never requires Polars. GAFIME v1
 supports Polars 1.x from 1.3 onward; Polars 2 migration is deferred to the
 dedicated v1.1/v1.2 compatibility work.
 
-The adapter uses the Arrow-native CPU shortcut only when that entrypoint can
-honor the complete ``EngineConfig``. Other configurations use the configured
-native boundary, which copies rows into profile-keyed GAFIME-owned storage.
+Arrow transfers the source values to checked Rust acquisition independently of
+the requested execution configuration. GAFIME owns the selected-profile numeric
+snapshot; acquisition is not a promise of zero-copy resident storage.
 """
 
 from __future__ import annotations
@@ -95,14 +95,19 @@ def dataload(
     Notes
     -----
     Source values are preserved until checked ingest into the selected resident
-    dtype. A one-batch Arrow shortcut is used only when source dtypes already
-    match that dtype and the shortcut can preserve the complete configuration;
-    otherwise this function routes
-    through the normal configured backend.  Missing/duplicate columns,
+    dtype. Numeric Arrow batches feed the normal configured planner/executor
+    without whole-dataset Python row materialization. Other compatible scalar
+    types use bounded native acquisition. Missing/duplicate columns,
     unsupported suffixes, impossible precision/backend requests, and ordinary
     engine input failures are rejected rather than silently changing policy.
     """
-    from .v1_adapter import _validate_precision_config, analyze_arrow_with_v1_boundary
+    from .v1_adapter import (
+        _analyze_prepared_frame_acquisition,
+        _load_boundary_for_backend,
+        _prepare_frames_with_native_acquisition,
+        _validate_precision_config,
+        analyze_arrow_with_v1_boundary,
+    )
 
     effective_config = config or EngineConfig()
     # Validate the complete request before importing Polars, reading a file, or
@@ -115,14 +120,27 @@ def dataload(
 
     # Preserve finite f64 values until checked ingest. A Polars Float32 cast
     # here would erase finite overflow by turning it into an allowed source
-    # infinity. Rechunk without changing values or their source dtype; the
-    # adapter admits only matching dtypes to the strict raw-Arrow shortcut.
-    feature_frame = frame.select(feature_cols).rechunk()
-    target_frame = frame.select(target).rechunk()
+    # infinity. Preserve source chunks too: native acquisition consumes batches
+    # incrementally, so a full-frame rechunk copy is not required here.
+    # These are resolved literal names, not Polars expressions. ``select`` can
+    # expand '*' / regex-like names and score the wrong columns; name indexing
+    # preserves their order/chunks without starting an expression query planner.
+    feature_frame = frame[feature_cols]
+    target_frame = frame[[target]]
 
-    # The adapter retains the Arrow-native shortcut only when it can honor every
-    # relevant setting. Other configurations use the normal configured boundary
-    # rather than silently becoming a CPU/no-significance run.
+    boundary = _load_boundary_for_backend(effective_config.backend)
+    if callable(getattr(boundary, "_acquire_arrow_input", None)):
+        prepared = _prepare_frames_with_native_acquisition(
+            effective_config, boundary, feature_frame, target_frame, feature_cols
+        )
+        # Native acquisition has finished and released its Arrow callbacks.
+        # Nothing in preparation borrows these loader-owned frames. Drop every
+        # local foreign owner before Core transpose / GPU upload / family
+        # expansion so parsed input does not remain live throughout execution.
+        del frame, feature_frame, target_frame
+        return _analyze_prepared_frame_acquisition(effective_config, boundary, prepared)
+
+    # Acquisition does not choose a separate CPU/no-significance execution policy.
     return analyze_arrow_with_v1_boundary(
         effective_config, feature_frame, target_frame, feature_cols
     )

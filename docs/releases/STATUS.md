@@ -5,13 +5,15 @@ operational status, not an immutable historical release record.
 
 ## Current Target
 
-- Repository/Cargo candidate target: `1.0.0-rc.2`
-- Python/PyPI candidate target: `1.0.0rc2`
-- Canonical tag target: `v1.0.0-rc.2`
-- Phase: RC2 stabilization, exact-candidate qualification, and rollout
+- Repository/Cargo next candidate target: `1.0.0-rc.3`
+- Python/PyPI next candidate target: `1.0.0rc3`
+- Canonical next tag target: `v1.0.0-rc.3`
+- Phase: release-blocking public ingestion hardening; stable postponed
 
-The source tree carries the RC2 identity. Creating or updating
-`release/v1.0.0-rc.2` does not by itself create a tag or publication.
+The source tree still carries the RC2 identity while focused fixes are reviewed.
+RC3 identity, branch preparation and exact-wheel qualification follow separately;
+this target does not authorize tagging or publication. The unpublished stable
+candidate is an earlier checkpoint, not the source to publish as stable now.
 Live publication state is authoritative on
 [GitHub Releases](https://github.com/onlyxItachi/GAFIME/releases) and
 [PyPI](https://pypi.org/project/gafime/); this file does not duplicate a
@@ -35,10 +37,27 @@ moment-in-time commit, workflow, or package-presence result.
 - Repository, Cargo, and Python metadata use the canonical RC2 identities.
 - RC1 was built from frozen, verified artifacts and is publicly available as a
   prerelease.
+- RC2 is also publicly available from its immutable qualified artifacts. Its
+  resident/kernel evidence does not establish public file-ingestion performance.
 
-## RC2 Branch Preparation
+## RC3 Required Boundary Work
 
-- Cut the planned `release/v1.0.0-rc.2` branch only from a green `main`, under
+The [ingestion hardening plan](../rc3-ingestion-hardening.md) records the defect,
+minimal owned native acquisition boundary, copy ledger and acceptance matrix.
+Default `dataload` must preserve full configuration without whole-dataset Python
+row/scalar materialization. Independent numerical parity, installed-wheel tests,
+matched latency/fresh-process memory samples and applicable backend routing are
+required before readiness. Every kernel, boundary and affected public workflow
+must carry its own evidence; resident throughput is not an end-to-end claim.
+
+Cut the next candidate only from a green reviewed `main` and prepare canonical
+RC3 identity through normal PR governance. No old RC2 or stable frozen bundle
+qualifies changed RC3 source. Issue #71 stays open; broader Polars 2/combined
+streaming and borrowed-memory architecture remain post-v1 work.
+
+## Candidate Branch Preparation
+
+- Cut the planned `release/v1.0.0-rc.3` branch only from a green `main`, under
   the [candidate release-branch policy](release-branches.md).
 - Keep stabilization bounded. Use focused pull requests, merge commits,
   current-head AI review, strict required checks, and resolved review threads.

@@ -154,6 +154,39 @@ The reviewed SHA must equal the current PR head. A later head commit invalidates
 
 Intermediate PR commits do not need to be green. Merge eligibility is based on the final reviewed head and required checks that execute against GitHub's current PR merge commit for that exact head/base pair. Workflows configured for `main` must then validate the resulting commit on `main`; a failure blocks release use and follow-on integration until it is corrected or reverted through another PR.
 
+## Performance Evidence And Boundary Costs
+
+> Every kernel must earn its performance claim. Every boundary must earn its cost. Every public workflow must pass end-to-end validation.
+
+For an execution change, include an affected-surface evidence matrix in the PR
+or linked durable design/evidence document. This applies to every development
+area, not only work labelled performance. The matrix should answer:
+
+| Evidence | Required distinction |
+|---|---|
+| Public workflow | Real entry point, default and realistic configurations, formats/shapes/dtypes, precision and selected backend |
+| Correctness | Independent oracle, deterministic identity/order, numerical and rejection parity before timing |
+| Components | Acquisition, validation/ownership copies, planning/cache, execution and reporting; genuinely observed, combined or not observable |
+| End-to-end | Installed public call outside the checkout; include file reading/parsing when users start from a file |
+| Cache | Cold acquisition/miss, repeat hit, target-only update and invalidation where affected |
+| Resource cost | Raw wall-time samples, relevant CPU usage, fresh-process peak RSS with scope/baseline, and measured versus estimated allocation/copy bytes |
+| Provenance | Exact base/candidate source, installed wheel/native hashes, input/configuration identity, common environment/toolchain, ordering and limitations |
+
+Kernel timings, resident throughput, and public-workflow costs are different
+evidence categories. None substitutes for another. Guard optimized ingest paths
+against whole-dataset Python row/scalar materialization; do not hide acquisition
+cost by preparing inputs before the claimed end-to-end timer. Arrow import is
+not resident zero-copy when dtype/layout conversion or owned storage requires a
+copy. Do not invent sub-times for inseparable phases or treat cumulative RSS as
+an exact allocation count.
+
+Use proportionate focused gates for the affected paths. Unrelated documentation
+changes do not require a giant hardware campaign. See the normative
+[performance policy](docs/contract.md#performance-evidence-and-boundary-costs),
+[measurement suite](tests/release_measure/README.md), and
+[RC3 ingestion plan](docs/rc3-ingestion-hardening.md). Existing numerical,
+ownership, backend, ABI, and release guarantees remain binding.
+
 ## Release Branches
 
 Candidate stabilization uses protected branches named

@@ -3,6 +3,7 @@
     reason = "PyO3 macros generate identity PyErr conversions around required PyResult boundary signatures"
 )]
 
+mod acquisition;
 mod artifact;
 mod common;
 mod continuous;
@@ -13,6 +14,10 @@ mod runtime;
 
 use pyo3::prelude::*;
 
+use acquisition::{
+    acquire_arrow_input, acquire_rows_input, compile_acquired_continuous,
+    compile_acquired_decision_path, compile_acquired_time_series, PyAcquiredNumericInput,
+};
 use artifact::PyCompiledContinuousArtifact;
 use common::native_version;
 use generated::{
@@ -42,6 +47,7 @@ fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", public_package_version())?;
     m.add("BOUNDARY_NAME", BOUNDARY_NAME)?;
     m.add_class::<PyCompiledContinuousArtifact>()?;
+    m.add_class::<PyAcquiredNumericInput>()?;
     m.add_class::<PyContinuousRecord>()?;
     m.add_class::<PyContinuousReport>()?;
     m.add_class::<PyOTSEncoder>()?;
@@ -57,6 +63,11 @@ fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(analyze_continuous_buffers, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_cpu, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(acquire_arrow_input, m)?)?;
+    m.add_function(wrap_pyfunction!(acquire_rows_input, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_acquired_continuous, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_acquired_time_series, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_acquired_decision_path, m)?)?;
     m.add_function(wrap_pyfunction!(compile_time_series, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_time_series, m)?)?;
     m.add_function(wrap_pyfunction!(compile_decision_path, m)?)?;
