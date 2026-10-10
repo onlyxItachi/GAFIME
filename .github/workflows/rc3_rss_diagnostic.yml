@@ -1,0 +1,99 @@
+name: RC3 RSS attribution diagnostic
+
+# A single purpose-built investigation branch, not a product or release gate.
+on:
+  push:
+    branches: [diagnostic/rc3-rss-attribution]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  attribute:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: 509d68a99a70182d117dad84eb905dae04764ec1
+      RC2_SHA: 69a45631df7e6df41702e75d77feb947543d344a
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: diagnostic
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11.17'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cibw-wheels-linux-x86_64
+          run-id: 38087123389
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/cibw
+      - name: Build unchanged source once through the original cost-gate route
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/retained/wheels"
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+          python -m pip install pip==26.2.1
+          python -m pip install -r diagnostic/tests/release_measure/diag_15_requirements.txt
+          cd source
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          python -m pip wheel --no-deps --verbose . --wheel-dir "$RUNNER_TEMP/retained/wheels" 2>&1 | tee "$RUNNER_TEMP/retained/build.log"
+          python -m pip freeze > "$RUNNER_TEMP/retained/dependencies.txt"
+          rustc -vV > "$RUNNER_TEMP/retained/rustc.txt"
+          python -VV > "$RUNNER_TEMP/retained/python.txt"
+          uname -a > "$RUNNER_TEMP/retained/kernel.txt"
+          ldd --version > "$RUNNER_TEMP/retained/glibc.txt"
+          cp /proc/meminfo "$RUNNER_TEMP/retained/meminfo.txt"
+          cp /proc/cpuinfo "$RUNNER_TEMP/retained/cpuinfo.txt"
+          cp /sys/kernel/mm/transparent_hugepage/enabled "$RUNNER_TEMP/retained/thp.txt"
+      - name: Prepare separately authenticated installed-wheel environments
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          original=("$RUNNER_TEMP/retained/wheels"/gafime-*.whl)
+          test "${#original[@]}" -eq 1
+          cibw=("$RUNNER_TEMP/cibw"/gafime-*-cp311-cp311-*.whl)
+          test "${#cibw[@]}" -eq 1
+          echo '5aabab8fd2e5e76ec3a2417af28e7f9bc403bb9b6664c378b336c9e214c7c676' "${cibw[0]}" | sha256sum --check
+          cp "${cibw[0]}" "$RUNNER_TEMP/retained/wheels/"
+          mkdir "$RUNNER_TEMP/retained/rc2"
+          python -m pip download --no-deps --only-binary=:all: gafime==1.0.0rc2 --dest "$RUNNER_TEMP/retained/rc2"
+          rc2=("$RUNNER_TEMP/retained/rc2"/*.whl)
+          test "${#rc2[@]}" -eq 1
+          python diagnostic/tests/release_measure/diag_15_ingest_setup.py --rc2-wheel "${rc2[0]}" --output "$RUNNER_TEMP/retained/pypi-rc2.json"
+          for label in candidate cibw rc2; do
+            python -m venv "$RUNNER_TEMP/env-$label"
+            "$RUNNER_TEMP/env-$label/bin/python" -m pip install -r diagnostic/tests/release_measure/diag_15_requirements.txt
+          done
+          "$RUNNER_TEMP/env-candidate/bin/python" -m pip install --no-deps "${original[0]}"
+          "$RUNNER_TEMP/env-cibw/bin/python" -m pip install --no-deps "${cibw[0]}"
+          "$RUNNER_TEMP/env-rc2/bin/python" -m pip install --no-deps "${rc2[0]}"
+          echo "CANDIDATE_WHEEL=${original[0]}" >> "$GITHUB_ENV"
+          echo "CIBW_WHEEL=${cibw[0]}" >> "$GITHUB_ENV"
+          echo "RC2_WHEEL=${rc2[0]}" >> "$GITHUB_ENV"
+      - name: Collect uninstrumented controls and separate allocator attribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          python diagnostic/tests/release_measure/diag_15_ingest_memory.py \
+            --source-root "$GITHUB_WORKSPACE/source" --source-sha "$SOURCE_SHA" --rc2-sha "$RC2_SHA" \
+            --candidate-python "$RUNNER_TEMP/env-candidate/bin/python" --candidate-wheel "$CANDIDATE_WHEEL" \
+            --cibw-python "$RUNNER_TEMP/env-cibw/bin/python" --cibw-wheel "$CIBW_WHEEL" \
+            --rc2-python "$RUNNER_TEMP/env-rc2/bin/python" --rc2-wheel "$RC2_WHEEL" \
+            --output "$RUNNER_TEMP/retained/evidence"
+      - name: Preserve wheels, build identity and all raw evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rc3-rss-attribution
+          path: ${{ runner.temp }}/retained/
+          retention-days: 30
+          if-no-files-found: error

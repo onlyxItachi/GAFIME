@@ -1,0 +1,26 @@
+# Original cost job 114315852056, successful install log. No runtime policy change.
+attrs==26.1.0
+cloudpickle==3.1.2
+fastjsonschema==2.22.2
+iniconfig==2.3.1
+joblib==1.6.0
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+jupyter-core==5.9.1
+narwhals==2.27.1
+nbformat==5.11.1
+numpy==2.4.6
+packaging==26.3
+platformdirs==4.12.4
+pluggy==1.6.0
+polars==1.44.2
+polars-runtime-32==1.44.2
+pygments==2.21.0
+pytest==9.1.1
+referencing==0.37.0
+rpds-py==2026.9.1
+scikit-learn==1.9.1
+scipy==1.17.1
+threadpoolctl==3.7.0
+traitlets==5.16.1
+typing-extensions==4.16.0
