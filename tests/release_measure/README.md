@@ -97,6 +97,13 @@ measured here is v1.
 
 > Every kernel must earn its performance claim. Every boundary must earn its cost. Every public workflow must pass end-to-end validation.
 
+The ingestion collector's optional component probes retain process RSS/HWM at
+entry and exit as well as inclusive wall times. They are cumulative,
+non-additive observations, not isolated allocator peaks or copy counts.
+Instrumented samples do not satisfy the uninstrumented cost budgets. V1 CI
+preserves both forms, and the budget validator prints the failed cell and its
+actual/allowed values without changing the retained verdict or thresholds.
+
 Classify each affected workflow before selecting a benchmark. Kernel/leaf,
 resident production, boundary/component, and public end-to-end evidence remain
 separate. A prepared resident executor excludes costs paid before residency;

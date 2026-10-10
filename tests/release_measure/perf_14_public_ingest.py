@@ -80,6 +80,7 @@ COMPONENT_SCOPE = {
     "native_compile": "Combined resident acquisition/allocation/upload/planning; no fabricated internal split.",
     "artifact_analyze": "Combined numerical execution, significance and report construction.",
     "inclusive_stage_times": "Nested component times are inclusive, non-additive and instrumented.",
+    "stage_memory": "Instrumented process RSS/HWM at entry/exit; cumulative, non-additive, not isolated allocation peaks.",
     "copy_counts": "Source-backed ledger, not allocator-measured byte totals.",
 }
 COPY_LEDGER = {
@@ -95,7 +96,9 @@ COPY_LEDGER = {
     ],
     "native_arrow": [
         "foreign chunks retained until native import/copy completes",
+        "loader-only foreign frames can then be released before resident construction; allocators may retain freed pages",
         "checked row-major resident acquisition requires owned storage",
+        "known frame height permits one checked capacity reservation, not per-batch exact reallocations",
         "additional family expansion/device storage is execution-dependent",
     ],
     "resident_execution": [
@@ -395,6 +398,37 @@ def build_config(case: dict[str, Any]) -> Any:
     return EngineConfig(**shared)
 
 
+def observe_boundary(
+    owner: Any, name: str, events: dict[str, Any], label: str | None = None
+) -> None:
+    """Instrument a coarse call boundary without retaining inputs/outputs."""
+    function = getattr(owner, name, None)
+    if not callable(function):
+        return
+    key = label or name
+
+    @functools.wraps(function)
+    def observed(*args: Any, **kwargs: Any) -> Any:
+        entry_memory = memory_now()
+        start = time.perf_counter_ns()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            elapsed = time.perf_counter_ns() - start
+            exit_memory = memory_now()
+            event = events.setdefault(
+                key,
+                {"calls": 0, "inclusive_nanoseconds": 0, "memory_observations": []},
+            )
+            event["calls"] += 1
+            event["inclusive_nanoseconds"] += elapsed
+            event["memory_observations"].append(
+                {"entry": entry_memory, "exit": exit_memory}
+            )
+
+    setattr(owner, name, observed)
+
+
 def install_observers(case: dict[str, Any]) -> dict[str, Any]:
     """Optional component observation only; no per-scalar instrumentation."""
     import gafime.dataloader as loader
@@ -404,22 +438,7 @@ def install_observers(case: dict[str, Any]) -> dict[str, Any]:
     events: dict[str, Any] = {}
 
     def observe(owner: Any, name: str, label: str | None = None) -> None:
-        function = getattr(owner, name, None)
-        if not callable(function):
-            return
-        key = label or name
-
-        @functools.wraps(function)
-        def observed(*args: Any, **kwargs: Any) -> Any:
-            start = time.perf_counter_ns()
-            try:
-                return function(*args, **kwargs)
-            finally:
-                event = events.setdefault(key, {"calls": 0, "inclusive_nanoseconds": 0})
-                event["calls"] += 1
-                event["inclusive_nanoseconds"] += time.perf_counter_ns() - start
-
-        setattr(owner, name, observed)
+        observe_boundary(owner, name, events, label)
 
     observe(loader, "_read_frame", "read_parse")
     for name in ("select", "cast", "rechunk"):

@@ -55,6 +55,7 @@ Polars read/project, preserving source numeric values
     -> Arrow C Stream import with explicit foreign-owner lifetime
     -> Rust schema/shape/null/range validation and checked dtype conversion
     -> Rust-owned profile-typed input and content identity
+    -> release loader-owned foreign frames/views before resident construction
     -> existing full-config resident acquisition/cache or one-shot execution
     -> existing planner, backend route, significance and report construction
 ```
@@ -76,6 +77,8 @@ The private acquisition boundary must:
   values beyond `f32::MAX` before narrowing, while fp64 never stages through f32;
 - retain the foreign owner until import/conversion completes, transfer each
   capsule exactly once, and release imported owners on success and error;
+- reserve known frame capacity once with checked counts, validate that hint
+  against actual batches/EOS, and release loader-only frames before execution;
 - finish a stable Rust-owned input snapshot before content fingerprinting or
   execution, rather than retaining mutable caller aliases as resident storage;
 - reuse full-config continuous, time-series and decision-path state construction,

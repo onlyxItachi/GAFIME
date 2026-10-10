@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import struct
 import sys
+import weakref
 
 import pytest
 
@@ -148,6 +149,107 @@ def test_public_files_use_native_acquisition_with_full_config(
     assert _snapshot(loaded) == _snapshot(direct)
 
 
+@pytest.mark.parametrize("scalar_fallback", [False, True])
+@pytest.mark.parametrize(
+    "workflow", ["resident", "uncached", "time_series", "decision_path"]
+)
+def test_loader_releases_foreign_frames_before_native_resident_allocation(
+    native, monkeypatch, tmp_path, workflow, scalar_fallback
+):
+    import gafime.dataloader as loader
+
+    pl, boundary = native
+    source = _frame(pl)
+    if scalar_fallback:
+        source = source.cast(pl.String)
+    path = tmp_path / "ownership.parquet"
+    source.write_parquet(path)
+    config = gafime.EngineConfig(
+        backend="core",
+        metric_names=("pearson",),
+        permutation_tests=3,
+        num_repeats=2,
+        significance_top_n=4,
+        enable_time_series_functions=workflow == "time_series",
+        enable_decision_path_functions=workflow == "decision_path",
+        time_series_lags=(1,),
+        time_series_windows=(3,),
+        decision_path_max_paths=4,
+        decision_path_top_k_features=2,
+        budget=gafime.ComputeBudget(
+            max_comb_size=2,
+            max_combinations_per_k=4,
+            keep_in_vram=workflow != "uncached",
+            top_k_features_for_time_series=2,
+            max_time_series_candidates=6,
+        ),
+    )
+    direct = _direct(source, config)
+    v1_adapter._clear_analyze_cache_for_tests()
+    owners = []
+    read_frame = loader._read_frame
+    select = pl.DataFrame.select
+
+    def observed_read(*args, **kwargs):
+        frame = read_frame(*args, **kwargs)
+        owners.append(weakref.ref(frame))
+        return frame
+
+    def observed_select(frame, *args, **kwargs):
+        selected = select(frame, *args, **kwargs)
+        if any(owner() is frame for owner in owners):
+            owners.append(weakref.ref(selected))
+        return selected
+
+    compile_calls = []
+    entrypoint = (
+        "_compile_acquired_time_series"
+        if workflow == "time_series"
+        else "_compile_acquired_decision_path"
+        if workflow == "decision_path"
+        else "_compile_acquired_continuous"
+    )
+    compile_input = getattr(boundary, entrypoint)
+
+    def observed_compile(*args, **kwargs):
+        # Every loader-owned frame/view is dead before resident allocation.
+        # The returned input cannot retain a Python iterator or foreign frame.
+        assert len(owners) == 3
+        assert all(owner() is None for owner in owners)
+        compile_calls.append(True)
+        return compile_input(*args, **kwargs)
+
+    execute = v1_adapter._analyze_prepared_frame_acquisition
+    executions = []
+
+    def observed_execution(*args, **kwargs):
+        assert len(owners) % 3 == 0
+        assert all(owner() is None for owner in owners)
+        executions.append(True)
+        return execute(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "_read_frame", observed_read)
+    monkeypatch.setattr(pl.DataFrame, "select", observed_select)
+    monkeypatch.setattr(boundary, entrypoint, observed_compile)
+    monkeypatch.setattr(
+        v1_adapter, "_analyze_prepared_frame_acquisition", observed_execution
+    )
+    loaded = gafime.dataload(path, "target", config=config)
+    assert compile_calls == [True]
+    assert _snapshot(loaded) == _snapshot(direct)
+    if workflow == "resident":
+        hit = gafime.dataload(path, "target", config=config)
+        assert _snapshot(hit) == _snapshot(direct)
+        changed = source.with_columns(pl.col("target").reverse())
+        changed.write_parquet(path)
+        updated = gafime.dataload(path, "target", config=config)
+        assert _snapshot(updated) == _snapshot(_direct(changed, config))
+        assert compile_calls == [True]
+        assert len(executions) == 3
+    else:
+        assert executions == [True]
+
+
 @pytest.mark.parametrize("precision", ["fp32", "mixed", "fp64"])
 def test_acquired_fingerprints_bind_the_selected_owned_values(native, precision):
     pl, boundary = native
@@ -227,8 +329,9 @@ def test_cache_reuses_feature_owner_and_moves_only_changed_target(
 
 
 @pytest.mark.parametrize("precision", ["fp32", "mixed", "fp64"])
+@pytest.mark.parametrize("expected_rows", [None, 9])
 def test_native_multibatch_input_has_independent_feature_target_chunking(
-    native, precision
+    native, precision, expected_rows
 ):
     pl, boundary = native
     frame = _frame(pl, rows=9, cols=3)
@@ -240,7 +343,10 @@ def test_native_multibatch_input_has_independent_feature_target_chunking(
         backend="core", precision=precision, permutation_tests=0, num_repeats=1
     )
     acquired = boundary._acquire_arrow_input(
-        v1_adapter._config_payload(config), features, target
+        v1_adapter._config_payload(config),
+        features,
+        target,
+        expected_rows=expected_rows,
     )
     expected = v1_adapter._coerce_row_major_f32_for_cache(
         frame.select(frame.columns[:-1]).to_numpy(),
@@ -398,6 +504,53 @@ def test_native_target_alignment_and_empty_input_fail_closed(native):
             pl.DataFrame({"x": []}, schema={"x": pl.Float64}),
             pl.DataFrame({"target": []}, schema={"target": pl.Float64}),
         )
+
+
+@pytest.mark.parametrize(
+    "feature_rows,target_rows,expected_rows,label",
+    [(3, 3, 2, "X"), (3, 3, 4, "X"), (3, 2, 3, "y"), (3, 4, 3, "y")],
+)
+def test_native_expected_rows_is_checked_not_trusted(
+    native, feature_rows, target_rows, expected_rows, label
+):
+    pl, boundary = native
+    config = v1_adapter._config_payload(gafime.EngineConfig(backend="core"))
+    with pytest.raises(ValueError, match=f"Arrow {label} row count.*expected_rows"):
+        boundary._acquire_arrow_input(
+            config,
+            pl.DataFrame({"x": [1.0] * feature_rows}),
+            pl.DataFrame({"target": [1.0] * target_rows}),
+            expected_rows=expected_rows,
+        )
+
+
+def test_native_expected_rows_size_overflow_fails_closed(native):
+    pl, boundary = native
+    config = v1_adapter._config_payload(gafime.EngineConfig(backend="core"))
+    with pytest.raises(ValueError, match="rows\\*cols"):
+        boundary._acquire_arrow_input(
+            config,
+            pl.DataFrame({"x": [1.0], "z": [2.0]}),
+            pl.DataFrame({"target": [1.0]}),
+            expected_rows=(1 << 64) - 1,
+        )
+
+
+def test_public_dataload_forwards_known_frame_height(native, monkeypatch, tmp_path):
+    pl, boundary = native
+    frame = _frame(pl, rows=9, cols=3)
+    path = tmp_path / "known-rows.parquet"
+    frame.write_parquet(path)
+    original = boundary._acquire_arrow_input
+    calls = []
+
+    def record_hint(*args, **kwargs):
+        calls.append(kwargs.get("expected_rows"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(boundary, "_acquire_arrow_input", record_hint)
+    gafime.dataload(path, "target", config=gafime.EngineConfig(backend="core"))
+    assert calls == [9]
 
 
 def test_arrow_export_receives_explicit_no_schema_request(native, monkeypatch):

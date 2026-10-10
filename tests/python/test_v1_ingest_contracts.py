@@ -91,6 +91,9 @@ def test_loader_preserves_wide_source_before_ingest(
         return sentinel
 
     monkeypatch.setattr(v1_adapter, "analyze_arrow_with_v1_boundary", capture)
+    # Observe the preserved custom-boundary route independently of the current
+    # native preparation path, which must reject these finite overflows.
+    monkeypatch.setattr(v1_adapter, "_load_boundary_for_backend", lambda _: object())
     assert gafime.dataload(path, "target", config=_config(precision)) is sentinel
 
 

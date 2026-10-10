@@ -78,6 +78,14 @@ to the same selected, Rust-owned snapshot; mutable foreign buffers are not kept
 as resident storage. Callers must still prevent mutation during acquisition;
 this does not provide an atomic snapshot against concurrent external writers.
 
+When Polars provides its frame height, Rust uses it for one checked capacity
+reservation and still verifies every batch and the final row count. This avoids
+chunk-dependent geometric spare capacity; unknown-length streams retain amortized
+growth, not repeated exact-size reallocations. The loader releases its original
+frame and both projected views after acquisition, before resident construction.
+The prepared input contains no foreign frame or iterator. These releases do not
+promise that the source allocator immediately returns freed pages to the OS.
+
 The acquisition buffer is row-major. The existing Core constructor copies it
 into column-major compute storage; both may coexist during construction. GPU
 upload, adaptive-family originals/expansion and host significance storage can

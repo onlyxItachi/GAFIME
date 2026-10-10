@@ -341,6 +341,14 @@ def test_cli_preserves_failed_verdict_and_refuses_to_overwrite(tmp_path):
     verdict = json.loads(output.read_text())
     assert verdict["status"] == "failed" and verdict["release_ready"] is False
     assert "parity" in verdict["reason"]
+    summary = json.loads(result.stdout)
+    assert summary == {
+        "status": "failed",
+        "reason": verdict["reason"],
+        "checked_cells": 0,
+        "failed_cells": [],
+        "release_ready": False,
+    }
     assert (
         verdict["inputs"]["report"]["sha256"]
         == hashlib.sha256(report_path.read_bytes()).hexdigest()
@@ -377,4 +385,46 @@ def test_cli_invalid_json_retains_failure_without_touching_collector(tmp_path):
     )
     assert result.returncode == 1
     assert json.loads(output.read_text())["status"] == "failed"
+    assert json.loads(result.stdout)["reason"]
     assert report_path.read_text() == "{invalid"
+
+
+@pytest.mark.parametrize("fail_memory", [False, True])
+def test_cli_prints_cost_failures_without_changing_limits(tmp_path, fail_memory):
+    report, budget = evidence()
+    if fail_memory:
+        for result in loaded_wide(report):
+            result["memory"]["after_call_before_snapshot"] = memory(100_000)
+    report_path, budget_path, output = (
+        tmp_path / "report.json",
+        tmp_path / "budget.json",
+        tmp_path / "verdict.json",
+    )
+    report_path.write_text(json.dumps(report))
+    budget_path.write_text(json.dumps(budget))
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(gate.__file__),
+            "--report",
+            str(report_path),
+            "--budget",
+            str(budget_path),
+            "--variant",
+            "candidate",
+            "--output",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    verdict, summary = json.loads(output.read_text()), json.loads(result.stdout)
+    assert result.returncode == int(fail_memory)
+    assert summary["status"] == verdict["status"]
+    assert summary["checked_cells"] == len(verdict["cells"])
+    assert summary["failed_cells"] == [
+        cell for cell in verdict["cells"] if cell["failures"]
+    ]
+    assert summary["release_ready"] is False
+    assert budget_path.read_text() == json.dumps(budget)

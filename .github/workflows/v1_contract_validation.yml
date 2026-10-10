@@ -136,7 +136,7 @@ jobs:
             --expected-version candidate="$version" --source-sha candidate="$source_sha" \
             --shape 100000x20 --shape 100000x100 --format csv,parquet,ipc \
             --precision fp32,mixed,fp64 --workflow light --cache-state miss \
-            --repeats 3 --max-time-seconds 240 \
+            --repeats 3 --instrument --max-time-seconds 240 \
             --output "$RUNNER_TEMP/gafime-ingest-evidence/reference"
           python tests/release_measure/perf_14_ingest_budget.py \
             --report "$RUNNER_TEMP/gafime-ingest-evidence/reference/report.json" \

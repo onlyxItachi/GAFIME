@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
+import weakref
 import zipfile
 
 import pytest
@@ -79,6 +80,7 @@ def test_v1_ci_keeps_installed_wheel_cost_and_default_workflow_gates() -> None:
         '--source-sha candidate="$source_sha"',
         "--shape 100000x20 --shape 100000x100 --format csv,parquet,ipc",
         "--precision fp32,mixed,fp64 --workflow light --cache-state miss",
+        "--repeats 3 --instrument --max-time-seconds 240",
         "tests/release_measure/perf_14_ingest_budget.py",
         "--budget tests/release_measure/ingest_cost_budget.json",
         "--workflow default --cache-state miss,hit",
@@ -92,6 +94,49 @@ def test_proc_peak_uses_exec_image_high_water_mark() -> None:
     assert perf14.linux_memory(
         "Name:\tpython\nVmHWM:\t12000 kB\nVmRSS:\t8000 kB\n"
     ) == {"VmHWM_kib": 12000, "VmRSS_kib": 8000}
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_component_observer_records_cumulative_memory_without_retaining_values(
+    monkeypatch, fails
+):
+    class Value:
+        pass
+
+    def boundary(value):
+        if fails:
+            raise ValueError("preserved failure")
+        return value
+
+    owner = SimpleNamespace(call=boundary)
+    events = {}
+    memories = iter(
+        [
+            {"source": "fixture", "VmRSS_kib": 10, "VmHWM_kib": 20},
+            {"source": "fixture", "VmRSS_kib": 12, "VmHWM_kib": 22},
+        ]
+    )
+    monkeypatch.setattr(perf14, "memory_now", lambda: next(memories))
+    perf14.observe_boundary(owner, "call", events, "native_call")
+    value = Value()
+    retained = weakref.ref(value)
+    if fails:
+        with pytest.raises(ValueError, match="preserved failure"):
+            owner.call(value)
+    else:
+        assert owner.call(value) is value
+    del value
+    assert retained() is None
+    event = events["native_call"]
+    assert event["calls"] == 1
+    assert event["inclusive_nanoseconds"] >= 0
+    assert event["memory_observations"] == [
+        {
+            "entry": {"source": "fixture", "VmRSS_kib": 10, "VmHWM_kib": 20},
+            "exit": {"source": "fixture", "VmRSS_kib": 12, "VmHWM_kib": 22},
+        }
+    ]
+    json.dumps(events, allow_nan=False)
 
 
 @pytest.mark.parametrize(

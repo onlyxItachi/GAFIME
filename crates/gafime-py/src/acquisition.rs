@@ -309,6 +309,17 @@ impl NumericStorage {
         }
     }
 
+    fn reserve_exact_count(&mut self, count: usize) -> PyResult<()> {
+        let additional = count.checked_sub(self.len()).ok_or_else(|| {
+            PyValueError::new_err("Arrow acquisition size does not advance monotonically")
+        })?;
+        match self {
+            Self::F32(values) => values.try_reserve_exact(additional),
+            Self::F64(values) => values.try_reserve_exact(additional),
+        }
+        .map_err(|error| PyValueError::new_err(format!("numeric input allocation failed: {error}")))
+    }
+
     fn resize(&mut self, count: usize) -> PyResult<()> {
         let additional = count.checked_sub(self.len()).ok_or_else(|| {
             PyValueError::new_err("Arrow acquisition size does not advance monotonically")
@@ -469,6 +480,7 @@ fn read_stream(
     mut reader: AcquisitionStreamReader,
     profile: PrecisionProfile,
     label: &str,
+    expected_rows: Option<usize>,
 ) -> PyResult<(usize, usize, NumericStorage)> {
     let schema = reader.schema();
     let cols = schema.fields().len();
@@ -492,12 +504,33 @@ fn read_stream(
     }
     let mut rows = 0;
     let mut storage = NumericStorage::empty(profile);
+    if let Some(expected_rows) = expected_rows {
+        let count = expected_rows
+            .checked_mul(cols)
+            .ok_or_else(|| PyValueError::new_err("rows*cols exceed host address space"))?;
+        // A materialized Polars frame knows its height. Reserve its logical
+        // storage once, rather than retaining geometric surplus that depends on
+        // Arrow chunking. This is allocation metadata, not a trusted row count:
+        // each batch and EOS must still agree. Unknown-length streams retain
+        // amortized growth; per-batch exact growth would cause quadratic copying.
+        storage.reserve_exact_count(count)?;
+    }
     for batch in &mut reader {
         let batch =
             batch.map_err(|error| PyValueError::new_err(format!("arrow batch: {error}")))?;
+        if expected_rows.is_some_and(|expected| batch.num_rows() > expected - rows) {
+            return Err(PyValueError::new_err(format!(
+                "Arrow {label} row count exceeds expected_rows"
+            )));
+        }
         append_batch(&mut storage, &batch, &mut rows, cols, label)?;
         // The previous batch's foreign owner is released here, while attached;
         // do not retain every chunk or concatenate/rechunk the Arrow source.
+    }
+    if expected_rows.is_some_and(|expected| rows != expected) {
+        return Err(PyValueError::new_err(format!(
+            "Arrow {label} row count does not match expected_rows"
+        )));
     }
     Ok((rows, cols, storage))
 }
@@ -521,14 +554,26 @@ fn owned_input(
 }
 
 #[pyfunction(name = "_acquire_arrow_input")]
+#[pyo3(signature = (config, features, target, expected_rows=None))]
 pub(crate) fn acquire_arrow_input(
     config: &Bound<'_, PyDict>,
     features: &Bound<'_, PyAny>,
     target: &Bound<'_, PyAny>,
+    expected_rows: Option<u64>,
 ) -> PyResult<PyAcquiredNumericInput> {
     let config = parse_engine_config(config)?;
-    let (rows, cols, features) = read_stream(import_stream(features)?, config.precision, "X")?;
-    let (target_rows, _, target) = read_stream(import_stream(target)?, config.precision, "y")?;
+    let expected_rows = expected_rows
+        .map(usize::try_from)
+        .transpose()
+        .map_err(|_| PyValueError::new_err("expected_rows exceeds host address space"))?;
+    let (rows, cols, features) = read_stream(
+        import_stream(features)?,
+        config.precision,
+        "X",
+        expected_rows,
+    )?;
+    let (target_rows, _, target) =
+        read_stream(import_stream(target)?, config.precision, "y", expected_rows)?;
     if target_rows != rows {
         return Err(PyValueError::new_err(
             "target length must match feature rows",
@@ -818,7 +863,7 @@ mod tests {
             batch(vec![("x", x.slice(2, 3)), ("z", z.slice(2, 3))]),
         ];
         let (rows, cols, storage) =
-            read_stream(reader(batches), PrecisionProfile::Mixed, "X").unwrap();
+            read_stream(reader(batches), PrecisionProfile::Mixed, "X", None).unwrap();
         assert_eq!((rows, cols), (4, 2));
         let NumericStorage::F32(values) = storage else {
             panic!("wrong profile")
@@ -830,7 +875,7 @@ mod tests {
             batch(vec![("y", y.slice(3, 2))]),
         ];
         let (target_rows, target_cols, target) =
-            read_stream(reader(batches), PrecisionProfile::Mixed, "y").unwrap();
+            read_stream(reader(batches), PrecisionProfile::Mixed, "y", None).unwrap();
         assert_eq!((target_rows, target_cols), (4, 1));
         let NumericStorage::F32(target) = target else {
             panic!("wrong profile")
@@ -838,6 +883,41 @@ mod tests {
         let input = OwnedNumericInput::from_f32(PrecisionProfile::Mixed, values, target).unwrap();
         PyAcquiredNumericInput::new(PrecisionProfile::Mixed, rows as u64, cols as u32, input)
             .unwrap();
+    }
+
+    #[test]
+    fn known_rows_avoid_chunk_dependent_geometric_surplus_without_changing_values() {
+        let capacity = |storage: &NumericStorage| match storage {
+            NumericStorage::F32(values) => values.capacity(),
+            NumericStorage::F64(values) => values.capacity(),
+        };
+        for profile in [
+            PrecisionProfile::Fp32,
+            PrecisionProfile::Mixed,
+            PrecisionProfile::Fp64,
+        ] {
+            let values =
+                Arc::new(Float64Array::from_iter_values((0..10).map(f64::from))) as ArrayRef;
+            let batches = vec![
+                batch(vec![("x", values.slice(0, 6)), ("z", values.slice(0, 6))]),
+                batch(vec![("x", values.slice(6, 4)), ("z", values.slice(6, 4))]),
+            ];
+            let (_, _, grown) = read_stream(reader(batches.clone()), profile, "X", None).unwrap();
+            let (_, _, reserved) = read_stream(reader(batches), profile, "X", Some(10)).unwrap();
+            assert_eq!(grown.len(), 20);
+            assert_eq!(reserved.len(), 20);
+            assert_eq!(capacity(&reserved), 20);
+            assert!(capacity(&grown) > capacity(&reserved));
+            match (grown, reserved) {
+                (NumericStorage::F32(grown), NumericStorage::F32(reserved)) => {
+                    assert_eq!(grown, reserved);
+                }
+                (NumericStorage::F64(grown), NumericStorage::F64(reserved)) => {
+                    assert_eq!(grown, reserved);
+                }
+                _ => panic!("selected profile changed"),
+            }
+        }
     }
 
     #[test]
@@ -849,6 +929,7 @@ mod tests {
             reader(vec![batch(vec![("x", values)])]),
             PrecisionProfile::Fp64,
             "X",
+            None,
         )
         .unwrap();
         let NumericStorage::F64(values) = storage else {
@@ -867,6 +948,7 @@ mod tests {
             reader(vec![batch(vec![("x", values)])]),
             PrecisionProfile::Fp32,
             "X",
+            None,
         )
         .unwrap();
         let NumericStorage::F32(values) = storage else {
@@ -888,7 +970,8 @@ mod tests {
             assert!(read_stream(
                 reader(vec![batch(vec![("x", column)])]),
                 PrecisionProfile::Mixed,
-                label
+                label,
+                None,
             )
             .is_err());
         }
@@ -896,7 +979,8 @@ mod tests {
         assert!(read_stream(
             reader(vec![batch(vec![("x", column)])]),
             PrecisionProfile::Mixed,
-            "X"
+            "X",
+            None,
         )
         .is_err());
         assert!(usize::MAX.checked_mul(2).is_none());
@@ -921,6 +1005,7 @@ mod tests {
             reader(vec![batch(vec![("x", integers), ("b", booleans)])]),
             PrecisionProfile::Mixed,
             "X",
+            None,
         )
         .unwrap();
         let NumericStorage::F32(values) = storage else {
@@ -1199,7 +1284,7 @@ mod tests {
                 mode == 2,
             );
             let result = AcquisitionStreamReader::try_new(stream)
-                .and_then(|reader| read_stream(reader, PrecisionProfile::Mixed, "X"));
+                .and_then(|reader| read_stream(reader, PrecisionProfile::Mixed, "X", None));
             assert_eq!(result.is_ok(), mode == 0);
             assert_eq!(drops.load(Ordering::SeqCst), 1);
             assert_eq!(schema_releases.load(Ordering::SeqCst), 1);
@@ -1217,6 +1302,57 @@ mod tests {
                         assert!(text.contains("without a detailed description"));
                     }
                 });
+            }
+        }
+    }
+
+    #[test]
+    fn expected_row_count_errors_release_foreign_owners_once() {
+        Python::initialize();
+        for expected in [0, 2, 4, usize::MAX] {
+            let batch = batch(vec![
+                (
+                    "x",
+                    Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])) as ArrayRef,
+                ),
+                (
+                    "z",
+                    Arc::new(Float64Array::from(vec![4.0, 5.0, 6.0])) as ArrayRef,
+                ),
+            ]);
+            let schema = batch.schema();
+            let reads = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let schema_releases = Arc::new(AtomicUsize::new(0));
+            let array_releases = Arc::new(AtomicUsize::new(0));
+            let source = CountedReader {
+                inner: RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+                reads: reads.clone(),
+                drops: drops.clone(),
+            };
+            let reader = AcquisitionStreamReader::try_new(tracked_stream(
+                source,
+                schema_releases.clone(),
+                array_releases.clone(),
+                false,
+                false,
+            ))
+            .unwrap();
+            let error = read_stream(reader, PrecisionProfile::Fp64, "X", Some(expected))
+                .err()
+                .expect("inexact or overflowing count must fail");
+            Python::attach(|py| assert!(error.is_instance_of::<PyValueError>(py)));
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(schema_releases.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                array_releases.load(Ordering::SeqCst),
+                usize::from(expected != usize::MAX)
+            );
+            if expected == usize::MAX {
+                assert_eq!(reads.load(Ordering::SeqCst), 0);
+                assert!(error.to_string().contains("rows*cols"));
+            } else {
+                assert!(error.to_string().contains("expected_rows"));
             }
         }
     }
@@ -1244,7 +1380,7 @@ mod tests {
         stream.get_last_error = Some(no_stream_error_detail);
         let reader = AcquisitionStreamReader::try_new(stream).unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            read_stream(reader, PrecisionProfile::Mixed, "X")
+            read_stream(reader, PrecisionProfile::Mixed, "X", None)
         }));
         assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -1289,7 +1425,7 @@ mod tests {
             let reader =
                 AcquisitionStreamReader::try_new(FFI_ArrowArrayStream::new(Box::new(source)))
                     .unwrap();
-            let result = read_stream(reader, PrecisionProfile::Mixed, "X");
+            let result = read_stream(reader, PrecisionProfile::Mixed, "X", None);
             assert_eq!(result.is_ok(), mode == 0);
             assert_eq!(drops.load(Ordering::SeqCst), 1);
             if mode == 1 {

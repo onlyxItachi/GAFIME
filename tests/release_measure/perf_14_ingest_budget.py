@@ -314,6 +314,23 @@ def main():
     }
     with output.open("x", encoding="utf-8") as stream:
         json.dump(verdict, stream, indent=2, allow_nan=False)
+    # The retained JSON remains the evidence record; expose the assessment in
+    # CI too, so a failed budget is not just an unexplained exit after workers.
+    print(
+        json.dumps(
+            {
+                "status": verdict["status"],
+                "reason": verdict.get("reason"),
+                "checked_cells": len(verdict.get("cells", [])),
+                "failed_cells": [
+                    cell for cell in verdict.get("cells", []) if cell["failures"]
+                ],
+                "release_ready": False,
+            },
+            sort_keys=True,
+            allow_nan=False,
+        )
+    )
     return 0 if verdict["status"] == "passed" else 1
 
 

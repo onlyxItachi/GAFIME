@@ -101,7 +101,13 @@ def dataload(
     unsupported suffixes, impossible precision/backend requests, and ordinary
     engine input failures are rejected rather than silently changing policy.
     """
-    from .v1_adapter import _validate_precision_config, analyze_arrow_with_v1_boundary
+    from .v1_adapter import (
+        _analyze_prepared_frame_acquisition,
+        _load_boundary_for_backend,
+        _prepare_frames_with_native_acquisition,
+        _validate_precision_config,
+        analyze_arrow_with_v1_boundary,
+    )
 
     effective_config = config or EngineConfig()
     # Validate the complete request before importing Polars, reading a file, or
@@ -118,6 +124,18 @@ def dataload(
     # incrementally, so a full-frame rechunk copy is not required here.
     feature_frame = frame.select(feature_cols)
     target_frame = frame.select(target)
+
+    boundary = _load_boundary_for_backend(effective_config.backend)
+    if callable(getattr(boundary, "_acquire_arrow_input", None)):
+        prepared = _prepare_frames_with_native_acquisition(
+            effective_config, boundary, feature_frame, target_frame, feature_cols
+        )
+        # Native acquisition has finished and released its Arrow callbacks.
+        # Nothing in preparation borrows these loader-owned frames. Drop every
+        # local foreign owner before Core transpose / GPU upload / family
+        # expansion so parsed input does not remain live throughout execution.
+        del frame, feature_frame, target_frame
+        return _analyze_prepared_frame_acquisition(effective_config, boundary, prepared)
 
     # Acquisition does not choose a separate CPU/no-significance execution policy.
     return analyze_arrow_with_v1_boundary(

@@ -1071,13 +1071,21 @@ def analyze_arrow_with_v1_boundary(
     return analyze_with_v1_boundary(config, rows, target, feature_names)
 
 
-def _analyze_frames_with_native_acquisition(
+@dataclass
+class _PreparedFrameAcquisition:
+    payload: dict[str, object]
+    acquired: object
+    names: List[str]
+    legacy_arrow_report: bool
+
+
+def _prepare_frames_with_native_acquisition(
     config: EngineConfig,
     boundary: ModuleType,
     feature_frame: object,
     target_frame: object,
     feature_names: Sequence[str],
-) -> DiagnosticReport:
+) -> _PreparedFrameAcquisition:
     if config.enable_decision_path_functions:
         _validate_decision_path_config(config)
     # Existing family entrypoints receive the continuous execution config and
@@ -1096,7 +1104,12 @@ def _analyze_frames_with_native_acquisition(
         execution_config = replace(config, enable_decision_path_functions=False)
     payload = _config_payload(execution_config)
     if _native_arrow_dtypes_supported(feature_frame, target_frame):
-        acquired = boundary._acquire_arrow_input(payload, feature_frame, target_frame)
+        # Frame height is allocation metadata only; Rust still validates the
+        # complete stream counts before publishing the owned acquisition.
+        expected_rows = getattr(feature_frame, "height", None)
+        acquired = boundary._acquire_arrow_input(
+            payload, feature_frame, target_frame, expected_rows=expected_rows
+        )
     else:
         # Compatibility conversion is deliberately row-bounded in Rust. Never
         # send this iterator through _sequence(), which collects the whole file.
@@ -1108,11 +1121,27 @@ def _analyze_frames_with_native_acquisition(
                 "this frame requires bounded native scalar acquisition support."
             )
         acquired = acquire_rows(payload, iter_rows(), iter(target))
-    rows, cols = int(acquired.rows), int(acquired.cols)
+    cols = int(acquired.cols)
     names = _coerce_feature_names(feature_names, cols)
     legacy_arrow_report = _raw_arrow_config_supported(
         config
     ) and _raw_arrow_dtypes_supported(config.precision, feature_frame, target_frame)
+    return _PreparedFrameAcquisition(payload, acquired, names, legacy_arrow_report)
+
+
+def _analyze_prepared_frame_acquisition(
+    config: EngineConfig,
+    boundary: ModuleType,
+    prepared: _PreparedFrameAcquisition,
+) -> DiagnosticReport:
+    # Preparation retains only the checked Rust-owned snapshot and metadata.
+    # File callers can release foreign frames before resident allocation/plan
+    # creation, rather than overlap a parsed file with two native layouts.
+    payload = prepared.payload
+    acquired = prepared.acquired
+    names = prepared.names
+    legacy_arrow_report = prepared.legacy_arrow_report
+    rows, cols = int(acquired.rows), int(acquired.cols)
     if _continuous_analyze_cache_enabled(config) and not legacy_arrow_report:
         coerced = _CachedAcquiredInput(
             native_input=acquired,
@@ -1180,6 +1209,19 @@ def _analyze_frames_with_native_acquisition(
         return report
     finally:
         handle.close()
+
+
+def _analyze_frames_with_native_acquisition(
+    config: EngineConfig,
+    boundary: ModuleType,
+    feature_frame: object,
+    target_frame: object,
+    feature_names: Sequence[str],
+) -> DiagnosticReport:
+    prepared = _prepare_frames_with_native_acquisition(
+        config, boundary, feature_frame, target_frame, feature_names
+    )
+    return _analyze_prepared_frame_acquisition(config, boundary, prepared)
 
 
 @dataclass

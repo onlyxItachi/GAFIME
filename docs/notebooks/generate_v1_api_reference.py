@@ -1157,7 +1157,9 @@ def _cells() -> list:
             per-analysis execution stream and reseeding policy. Compatible unusual
             scalar schemas use a bounded, slower
             row iterator. The acquired values are Rust-owned, not resident zero-copy:
-            dtype/layout conversion, Core's column-major copy and GPU upload can
+            the loader releases its foreign frames before resident construction,
+            though allocators can retain freed pages.
+            Dtype/layout conversion, Core's column-major copy and GPU upload can
             require additional storage. See
             [ingest validation](../ingest-validation.md) for ownership and cache rules.
             A raw Arrow table/stream is

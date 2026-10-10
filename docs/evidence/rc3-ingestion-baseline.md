@@ -209,3 +209,51 @@ identity, independent numerical gates and applicable accelerator/artifact
 qualification are still required before RC3 readiness is asserted. A failed
 budget is investigated; it is not fixed by silently raising the limits or
 substituting resident throughput for public-workflow timing.
+
+## First exact-head hosted cost result and bounded follow-up
+
+[V1 run 38083112934](https://github.com/onlyxItachi/GAFIME/actions/runs/38083112934)
+tested PR head `4d4e7e254ff0b627716a1c8e9c9790e3c91b041d` through merge source
+`2b2baf4698ae8e27cebe4f3899d0a78f9af26be7`. Its 108 workers and every matched
+numeric comparison passed in 48.36 seconds. All 18 latency cells passed; one
+of 18 memory cells failed. The 100k x 20 Parquet/fp64/light/cache-miss cell
+peaked at 186,916,864 bytes against a 186,656,256-byte limit: an overage of
+260,608 bytes (254.5 KiB). All three samples exceeded the limit slightly.
+This is a retained failed gate, not a timeout or a numerical failure, and is
+not silently reclassified as passing.
+
+The original report SHA-256 is
+`0678d50a5036f40133fb9f1be671642bff13dee90dc9c2d568bcd5957d829a61`;
+the original verdict SHA-256 is
+`0b9966b6f6863e9f7f56e441b41778ade93bd212030911073ddf4258e74e878d`.
+They are retained in the run's `public-ingestion-evidence` artifact. The
+tested wheel SHA-256 is
+`13b8e5d477dee932ef37d6821d20eaa159950dc681200fae158a3e11558b4779`.
+
+Investigation identified two independently justified allocation/lifetime
+improvements: checked one-time reservation for known frame height avoids
+chunk-dependent geometric Vec surplus, and an acquisition/execution split
+releases loader-owned foreign frames before resident construction. Counted
+foreign-owner tests and installed cache/family parity tests cover both. The
+retained failing-shape fixture exports one batch, so its capacity is unchanged
+by the reservation fix. Releasing Python owners also does not require a source
+allocator to return pages immediately.
+
+A bounded local, three-repeat attribution probe compared the earlier
+development wheel, capacity-only wheel and capacity-plus-lifetime wheel on
+that one cell. All nine matched direct/file comparisons passed. It did **not**
+reproduce the hosted peak or establish an RSS improvement from these fixes.
+A separate four-worker diagnostic (process-local Polars/Rayon overrides, not
+production throughput evidence) likewise passed eight route comparisons,
+including separately instrumented samples, without reproducing the peak.
+Their report hashes are, respectively,
+`0cf6d78fce763fe8a84fbecbcc16bacd56e6600706945f4b3cc0054ea123b05f`
+and `67e4a5fd1af3eb411891b7e6d66f9a938a847db764ab76a554e31fa4f3af5aad`.
+These are uncommitted development measurements, not frozen-source approval.
+
+The limits remain unchanged. The validator now prints actual/allowed failed
+cell values, and separately instrumented component probes retain entry/exit
+process RSS/HWM in CI. These are cumulative, non-additive observations—not
+isolated allocation peaks—and cannot substitute for the uninstrumented budget
+samples. The next exact-head CI result must be assessed on its own evidence;
+neither follow-up is claimed to have resolved the hosted overage.
