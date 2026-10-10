@@ -1349,7 +1349,7 @@ def _run_configured_file_ingest_cases(
                     acquisition_calls = 0
 
                     def checked_acquire(
-                        payload: Mapping[str, object], *args: Any
+                        payload: Mapping[str, object], *args: Any, **kwargs: Any
                     ) -> Any:
                         nonlocal acquisition_calls
                         _assert_equal(
@@ -1367,8 +1367,13 @@ def _run_configured_file_ingest_cases(
                             ALL_METRICS,
                             f"{label}/metrics",
                         )
+                        _assert_equal(
+                            kwargs.get("expected_rows"),
+                            parsed.height,
+                            f"{label}/row-reservation",
+                        )
                         acquisition_calls += 1
-                        return acquire(payload, *args)
+                        return acquire(payload, *args, **kwargs)
 
                     def forbidden_materialization(*_args: Any, **_kwargs: Any) -> Any:
                         raise AssertionError(
