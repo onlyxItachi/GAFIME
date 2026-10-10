@@ -1153,8 +1153,9 @@ def _cells() -> list:
             or target values outside the
             selected storage range raise `ValueError`; existing NaN/inf values keep
             their native semantics. Acquisition preserves the configured seed,
-            including arbitrary-size integers; `None` resolves fresh entropy once
-            per analysis. Compatible unusual scalar schemas use a bounded, slower
+            including arbitrary-size integers; `None` preserves the existing fresh
+            per-analysis execution stream and reseeding policy. Compatible unusual
+            scalar schemas use a bounded, slower
             row iterator. The acquired values are Rust-owned, not resident zero-copy:
             dtype/layout conversion, Core's column-major copy and GPU upload can
             require additional storage. See
