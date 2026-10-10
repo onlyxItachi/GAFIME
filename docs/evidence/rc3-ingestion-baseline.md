@@ -257,3 +257,36 @@ process RSS/HWM in CI. These are cumulative, non-additive observations—not
 isolated allocation peaks—and cannot substitute for the uninstrumented budget
 samples. The next exact-head CI result must be assessed on its own evidence;
 neither follow-up is claimed to have resolved the hosted overage.
+
+## Retained second hosted result and literal-name correction
+
+[V1 run 38085627022](https://github.com/onlyxItachi/GAFIME/actions/runs/38085627022)
+tested head `59f7d34a68dc6b5fe644a6c9813bb4fdbd3c0f15` through merge source
+`759883e4b9d00b55f315afc21764c2b163e632c6`. All 144 workers, 72 numeric route
+comparisons and 18 latency budgets passed; two RSS budgets failed. The 100k x20
+Parquet/fp32 peak was 178,569,216 bytes against 174,228,992 allowed; fp64 was
+190,046,208 against 186,820,096. Original report/verdict SHA-256 values are
+`ffd6412ae4f5f57185cd7491a091b9335e1e8621ac22dc99a68b52c6142b1ae7`
+and `de9c3050f7239661af238c1ecccc972b40dc6ce625246c7f7976da6af32d3ce4`.
+The raw run artifact retains those failures. Its separate instrumented samples
+reached their high-water marks during Core compilation, after foreign-owner
+finalization; cumulative process RSS does not prove a retained frame or explain
+every uninstrumented outlier. The existing row-major/column-major overlap and
+source allocator retention remain disclosed. No limits were relaxed.
+
+This investigation independently exposed literal-name projection misuse:
+`DataFrame.select` treats names such as `*` and `^x$` as expressions. On the
+installed CI wheel, a requested `^x$` feature silently selected a different `x`
+column, yielding Pearson -0.06567096840572134 instead of the direct API's 1.0.
+Literal name-list indexing preserves the requested columns, order and chunks
+without expression planning; both Polars 1.3 and 1.44.2 were checked. Focused
+file/profile/feature/target-name regressions compare independently parsed values.
+
+A private monkeypatched, instrumented 18-process attribution probe on the
+existing local 100k x20 fixture preserved all nine profile/repeat numeric
+comparisons. It showed only small local RSS differences and did not reproduce
+the hosted peak or prove that projection resolves the failed budgets. Its
+summary SHA-256 is
+`24db0c99f878105e63c0dd8f53f15f5aed78083c91b09d8cd590cdfae5623a94`.
+This is a correctness fix with a smaller implementation boundary, not a claimed
+performance remediation or permission to waive the next exact-head cost gate.

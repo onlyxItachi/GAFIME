@@ -149,6 +149,64 @@ def test_public_files_use_native_acquisition_with_full_config(
     assert _snapshot(loaded) == _snapshot(direct)
 
 
+@pytest.mark.parametrize("precision", ["fp32", "mixed", "fp64"])
+@pytest.mark.parametrize("file_kind", ["parquet", "csv", "ipc"])
+@pytest.mark.parametrize(
+    ("feature_name", "target_name"),
+    [
+        ("^x$", "target"),
+        ("^x$", "^target$"),
+        ("^x$", "*"),
+        ("*", "target"),
+        ("ordinary", "^target$"),
+    ],
+)
+def test_public_file_projection_uses_literal_column_names(
+    native, monkeypatch, tmp_path, precision, file_kind, feature_name, target_name
+):
+    """Real '*' and regex-like names must not become expression selectors."""
+    import numpy as np
+
+    pl, _ = native
+    values = [float(row) for row in range(48)]
+    columns = {
+        "x": [math.sin(row) for row in range(48)],
+        "target": [math.cos(row) for row in range(48)],
+        "normal": [math.sin(row * 0.37) for row in range(48)],
+    }
+    columns[feature_name] = values
+    columns[target_name] = values
+    frame = pl.DataFrame(columns)
+    path = tmp_path / f"literal-columns.{file_kind}"
+    getattr(frame, f"write_{file_kind}")(path)
+    parsed = getattr(pl, f"read_{file_kind}")(path)
+    names = ["normal", feature_name]
+    config = gafime.EngineConfig(
+        backend="core",
+        precision=precision,
+        metric_names=("pearson", "r2"),
+        permutation_tests=3,
+        num_repeats=2,
+        random_seed=123,
+        budget=gafime.ComputeBudget(max_comb_size=1),
+    )
+    # Independent name-by-name parsed-value oracle, not the projection under test.
+    direct = gafime.GafimeEngine(config).analyze(
+        np.column_stack([parsed[name].to_numpy() for name in names]),
+        parsed[target_name].to_numpy(),
+        names,
+    )
+    v1_adapter._clear_analyze_cache_for_tests()
+    _forbid_materialization(monkeypatch, pl)
+
+    def forbidden_expression_projection(*args, **kwargs):
+        raise AssertionError("literal column selection reached expression projection")
+
+    monkeypatch.setattr(pl.DataFrame, "select", forbidden_expression_projection)
+    loaded = gafime.dataload(path, target_name, features=names, config=config)
+    assert _snapshot(loaded) == _snapshot(direct)
+
+
 @pytest.mark.parametrize("scalar_fallback", [False, True])
 @pytest.mark.parametrize(
     "workflow", ["resident", "uncached", "time_series", "decision_path"]
@@ -188,15 +246,15 @@ def test_loader_releases_foreign_frames_before_native_resident_allocation(
     v1_adapter._clear_analyze_cache_for_tests()
     owners = []
     read_frame = loader._read_frame
-    select = pl.DataFrame.select
+    select_names = pl.DataFrame.__getitem__
 
     def observed_read(*args, **kwargs):
         frame = read_frame(*args, **kwargs)
         owners.append(weakref.ref(frame))
         return frame
 
-    def observed_select(frame, *args, **kwargs):
-        selected = select(frame, *args, **kwargs)
+    def observed_select_names(frame, *args, **kwargs):
+        selected = select_names(frame, *args, **kwargs)
         if any(owner() is frame for owner in owners):
             owners.append(weakref.ref(selected))
         return selected
@@ -229,7 +287,7 @@ def test_loader_releases_foreign_frames_before_native_resident_allocation(
         return execute(*args, **kwargs)
 
     monkeypatch.setattr(loader, "_read_frame", observed_read)
-    monkeypatch.setattr(pl.DataFrame, "select", observed_select)
+    monkeypatch.setattr(pl.DataFrame, "__getitem__", observed_select_names)
     monkeypatch.setattr(boundary, entrypoint, observed_compile)
     monkeypatch.setattr(
         v1_adapter, "_analyze_prepared_frame_acquisition", observed_execution

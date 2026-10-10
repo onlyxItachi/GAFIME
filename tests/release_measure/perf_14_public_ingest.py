@@ -441,6 +441,7 @@ def install_observers(case: dict[str, Any]) -> dict[str, Any]:
         observe_boundary(owner, name, events, label)
 
     observe(loader, "_read_frame", "read_parse")
+    observe(pl.DataFrame, "__getitem__", "polars_named_projection")
     for name in ("select", "cast", "rechunk"):
         observe(pl.DataFrame, name, "polars_" + name)
     for name in (

@@ -122,8 +122,11 @@ def dataload(
     # here would erase finite overflow by turning it into an allowed source
     # infinity. Preserve source chunks too: native acquisition consumes batches
     # incrementally, so a full-frame rechunk copy is not required here.
-    feature_frame = frame.select(feature_cols)
-    target_frame = frame.select(target)
+    # These are resolved literal names, not Polars expressions. ``select`` can
+    # expand '*' / regex-like names and score the wrong columns; name indexing
+    # preserves their order/chunks without starting an expression query planner.
+    feature_frame = frame[feature_cols]
+    target_frame = frame[[target]]
 
     boundary = _load_boundary_for_backend(effective_config.backend)
     if callable(getattr(boundary, "_acquire_arrow_input", None)):

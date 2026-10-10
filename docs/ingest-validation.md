@@ -13,6 +13,11 @@ into infinity before the configured ingest path can reject it. That loses the
 distinction between disallowed finite overflow and allowed source NaN/Inf.
 The same rule applies to both features and the target.
 
+Resolved feature and target names are literal names, including `*` and names
+such as `^x$`. Name-list projection preserves their order and source chunks;
+it must not interpret them as Polars expressions, wildcards or regex selectors.
+The existing resolver rejects an empty feature selection before projection.
+
 Numeric Polars frames now use private Arrow acquisition independently of the
 execution configuration. Rust imports the Arrow C Stream incrementally, checks
 schema, nulls, dimensions, counts and numeric range, and writes profile-typed
