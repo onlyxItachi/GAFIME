@@ -78,7 +78,11 @@ jobs:
           rustup default 1.97.1
           python -m pip install --upgrade pip
           python -m pip install nbformat numpy scikit-learn "polars>=1.3,<2" pytest
-          python -m pip install --no-deps .
+          python -m pip wheel --no-deps . --wheel-dir "$RUNNER_TEMP/gafime-ingest-wheelhouse"
+          shopt -s nullglob
+          core_wheels=("$RUNNER_TEMP/gafime-ingest-wheelhouse"/gafime-*.whl)
+          test "${#core_wheels[@]}" -eq 1
+          python -m pip install --no-deps "${core_wheels[0]}"
 
       - name: Verify contract policy files
         shell: bash
@@ -113,6 +117,48 @@ jobs:
           cd /tmp
           GAFIME_TEST_INSTALLED_PACKAGE=1 python -m pytest -q --rootdir=/tmp \
             "$GITHUB_WORKSPACE/tests/python"
+
+      - name: Verify public ingestion evidence and cost budgets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pytest -q \
+            tests/release_measure/test_perf_14_public_ingest.py \
+            tests/release_measure/test_perf_14_ingest_budget.py
+          shopt -s nullglob
+          core_wheels=("$RUNNER_TEMP/gafime-ingest-wheelhouse"/gafime-*.whl)
+          test "${#core_wheels[@]}" -eq 1
+          version=$(python .github/scripts/release_version.py --check-project | python -c 'import json,sys; print(json.load(sys.stdin)["pep440"])')
+          source_sha=$(git rev-parse HEAD)
+          python tests/release_measure/perf_14_public_ingest.py \
+            --python candidate="$(command -v python)" \
+            --wheel candidate="${core_wheels[0]}" \
+            --expected-version candidate="$version" --source-sha candidate="$source_sha" \
+            --shape 100000x20 --shape 100000x100 --format csv,parquet,ipc \
+            --precision fp32,mixed,fp64 --workflow light --cache-state miss \
+            --repeats 3 --max-time-seconds 240 \
+            --output "$RUNNER_TEMP/gafime-ingest-evidence/reference"
+          python tests/release_measure/perf_14_ingest_budget.py \
+            --report "$RUNNER_TEMP/gafime-ingest-evidence/reference/report.json" \
+            --budget tests/release_measure/ingest_cost_budget.json --variant candidate \
+            --output "$RUNNER_TEMP/gafime-ingest-evidence/cost-verdict.json"
+          python tests/release_measure/perf_14_public_ingest.py \
+            --python candidate="$(command -v python)" \
+            --wheel candidate="${core_wheels[0]}" \
+            --expected-version candidate="$version" --source-sha candidate="$source_sha" \
+            --shape 256x8 --format csv,parquet,ipc --precision mixed \
+            --workflow default --cache-state miss,hit --repeats 1 \
+            --max-time-seconds 120 \
+            --output "$RUNNER_TEMP/gafime-ingest-evidence/default"
+
+      - name: Preserve public ingestion evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: public-ingestion-evidence
+          path: ${{ runner.temp }}/gafime-ingest-evidence/
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Verify compiled plan and eager value parity
         shell: bash

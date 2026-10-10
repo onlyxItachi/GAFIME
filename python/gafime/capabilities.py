@@ -229,7 +229,7 @@ def backend_capabilities(
         arrow_ingest_mode=CapabilityValue(
             {
                 "protocol": "Arrow C stream",
-                "record_batches": "exactly one required",
+                "record_batches": "incremental multiple batches for public file acquisition",
                 "compute_buffer": (
                     "native row-major f64 copy"
                     if precision == "fp64"
@@ -238,8 +238,11 @@ def backend_capabilities(
                 "zero_copy_into_compute": False,
             },
             "static",
-            "The Arrow boundary avoids Python-object materialization but owns a "
-            "row-major compute buffer after validation.",
+            "Public numeric file acquisition consumes Arrow batches without "
+            "Python-object materialization and owns validated row-major input. "
+            "Core then creates its column-major compute storage; device upload "
+            "and adaptive-family retention can require further copies. The "
+            "legacy low-level Arrow convenience function still requires one batch.",
         ),
         generated_family_graph_limit=CapabilityValue(
             {

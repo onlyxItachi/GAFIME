@@ -188,6 +188,14 @@ def test_unprobed_gpu_fields_are_unknown_not_invented(monkeypatch):
     assert value.device.source == "unknown"
     assert value.mi_bin_ceiling.source == "static"
     assert value.arrow_ingest_mode.value["zero_copy_into_compute"] is False
+    assert value.arrow_ingest_mode.value["record_batches"] == (
+        "incremental multiple batches for public file acquisition"
+    )
+    assert (
+        "convenience function still requires one batch"
+        in value.arrow_ingest_mode.detail
+    )
+    assert "column-major" in value.arrow_ingest_mode.detail
     assert value.precision_contract.value["effective"] is None
     assert value.precision_contract.value["accumulators"]["mutual_info"] == "float64"
     assert value.precision_contract.value["interaction_overflow_diagnostics"] is False

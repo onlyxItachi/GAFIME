@@ -93,6 +93,69 @@ Telemetry helpers write schema `gafime.telemetry.v0.5.0-rc1` records until the
 next telemetry schema bump. That schema name is historical; the runtime being
 measured here is v1.
 
+## Public Workflow And Boundary Evidence
+
+> Every kernel must earn its performance claim. Every boundary must earn its cost. Every public workflow must pass end-to-end validation.
+
+Classify each affected workflow before selecting a benchmark. Kernel/leaf,
+resident production, boundary/component, and public end-to-end evidence remain
+separate. A prepared resident executor excludes costs paid before residency;
+its throughput cannot approve an unmeasured public loader. Test correctness
+against an independent oracle before timing, and use an installed package
+outside the checkout import path for release evidence.
+
+For file workflows, retain CSV, Parquet and IPC coverage, fp32/mixed/fp64,
+default and realistic configured analysis, small/medium/wide inputs, and cold
+acquisition/cache miss versus repeat/cache hit. Reference ingestion shapes are
+100k x 20 and 100k x 100; larger/adversarial cases must remain bounded by the
+qualification host's resources. Exercise affected generated families, metrics,
+significance, target updates and backend routing without inventing a new
+execution policy merely to fit a convenience entry point.
+
+Record raw wall time, relevant CPU usage, fresh-process peak RSS with its
+baseline and scope, and a copy/materialization ledger. Generate datasets before
+the measured child starts. Fresh-process measurements do not imply a cold OS
+page cache. Cumulative process high-water RSS is not an exact allocation count;
+native allocations cannot be inferred from Python-only allocation tracing.
+Label measured bytes separately from source-derived estimates. Arrow import
+may borrow foreign buffers while validated compute storage still requires an
+owned dtype/layout copy.
+
+Component records must distinguish observed, combined and not-observable
+stages: file reading/parsing, projection, numeric validation, Arrow import,
+ownership/layout conversion, cache/resident acquisition, planning, execution,
+and report construction. Do not manufacture sub-times by subtraction. Preserve
+input/configuration hashes, installed wheel/native identities, exact
+base/candidate source, toolchain/environment, ordering and all raw samples.
+Derive practical latency/memory regression limits from matched measurements;
+do not copy an unrelated kernel threshold into an ingestion gate.
+
+Ordinary V1 CI enforces installed independent-parity and structural
+no-whole-dataset-Python-materialization tests, plus the bounded 18-cell
+`perf_14_public_ingest.py` fresh-process cost tripwire. Dedicated ingestion
+qualification extends to larger/configured/family/cache comparisons. This does not replace existing
+Core production or physical backend correctness gates, and does not require
+unrelated giant campaigns for a documentation-only change.
+
+The [RC3 ingestion plan](../../docs/rc3-ingestion-hardening.md) records the
+initial gap and planned qualification. Existing dataload cases in
+`contract_02_feature_generation_reference.py`,
+`precision_01_end_to_end_profiles.py`, and
+`tests/python/test_v1_ingest_contracts.py` establish important correctness
+contracts, but their tiny inputs and absence of ingestion latency/RSS budgets
+do not establish this new performance gate. Proposed evidence is not a passed
+gate or an RC3-readiness claim.
+
+The collector authenticates supplied installed wheel members, retains fixtures,
+configuration/result hashes, wall/CPU/RSS and observed cache identities, and
+compares file results with the actual parsed direct input. It distinguishes
+inclusive instrumented stages from uninstrumented samples; full lazy report
+export follows the measured public call. `perf_14_ingest_budget.py` evaluates
+`ingest_cost_budget.json` separately and never sets release readiness. See the
+[matched baseline and cost rationale](../../docs/evidence/rc3-ingestion-baseline.md)
+for source/artifact limits, negative controls, reproduction commands and budget
+formulas. A declared source SHA is not frozen-bundle provenance.
+
 ## Active Scripts
 
 ### contract
@@ -151,6 +214,8 @@ measured here is v1.
 | `perf_01_residency_session_benefit.py` | resident compile/session reuse vs fresh analyze | CPU/GPU |
 | `perf_02_metric_cache_benefit.py` | metric-cache hit rate and counters | GPU |
 | `perf_04_cpu_native_kernels.py` | CPU SIMD dispatch, column layout, and scratch-reuse guardrails | CPU |
+| `perf_14_public_ingest.py` | authenticated installed-wheel CSV/Parquet/IPC wall/CPU/fresh RSS, default/configured/generated workflows, cache identity, parsed-input numeric parity and inclusive component observations | supplied Core wheels/environments; bounded serial CPU trials |
+| `perf_14_ingest_budget.py` | reviewed exact-cell latency/RSS tripwire; rejects missing evidence, inconsistent identities and numeric mismatches; not a speedup or release-readiness claim | collector report and explicit budget JSON |
 | `gpu_static_kernel_report.py` | CUDA SASS and HIP code-object size, register, shared/LDS, spill, exact fp32/mixed/fp64 device specialization, hash-bound exact-wheel evidence, and top-k topology checks | CUDA/HIP toolchains, no GPU |
 | `perf_06_gpu_mi_specializations.py` | resident MI throughput by candidate count, candidate-sample pairs, and bins | CUDA/HIP GPU |
 | `perf_07_rocm_mi_wave_ab.py` | provenance-checked, numerically guarded interleaved HIP high-bin A/B with control normalization and JSON output | HIP GPU and two payload builds |

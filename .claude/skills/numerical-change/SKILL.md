@@ -34,6 +34,15 @@ difference, and fast-math or reassociation behavior must not be introduced
 through a compiler flag, intrinsic, or convenience refactor without the
 required contract decision.
 
+Apply the contract's performance evidence and boundary-cost rule when numerical
+acquisition or execution changes. Preserve independent parity while measuring
+the affected components and installed public workflow, including default and
+realistic configs, cold/hit behavior, latency/CPU, fresh-process peak RSS and
+justified copies. Do not move checked narrowing into Python, lose source NaN/Inf
+distinctions, or stage fp64 through fp32 to improve a benchmark. Exact artifact
+and input/configuration identities, and combined/not-observable phase labels,
+keep cost evidence separate from numerical guarantees.
+
 Report which profiles, metrics, backends, data shapes, and public fields were
 validated, along with the oracle and tolerance rationale. If a proposed change
 needs a new precision meaning, public selector, ABI route, or fallback policy,

@@ -1,0 +1,28 @@
+{
+  "schema": "gafime.public-ingestion-budget.v1",
+  "min_samples": 3,
+  "require_source_sha": true,
+  "source_dtype": "float64",
+  "purpose": "Loose same-host catastrophic public-ingestion regression tripwire, not release readiness or a universal latency promise.",
+  "evidence": "docs/evidence/rc3-ingestion-baseline.md; paired reference-matrix development observations (three fresh processes per route/cell).",
+  "cells": [
+    {"case": {"rows": 100000, "cols": 20, "format": "csv", "precision": "fp32", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 20, "format": "csv", "precision": "mixed", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 20, "format": "csv", "precision": "fp64", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 20, "format": "parquet", "precision": "fp32", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 20, "format": "parquet", "precision": "mixed", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 20, "format": "parquet", "precision": "fp64", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 20, "format": "ipc", "precision": "fp32", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 20, "format": "ipc", "precision": "mixed", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 20, "format": "ipc", "precision": "fp64", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 100, "format": "csv", "precision": "fp32", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 100, "format": "csv", "precision": "mixed", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 100, "format": "csv", "precision": "fp64", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 100, "format": "parquet", "precision": "fp32", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 100, "format": "parquet", "precision": "mixed", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 100, "format": "parquet", "precision": "fp64", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 100, "format": "ipc", "precision": "fp32", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 100, "format": "ipc", "precision": "mixed", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12},
+    {"case": {"rows": 100000, "cols": 100, "format": "ipc", "precision": "fp64", "workflow": "light", "cache_state": "miss", "backend": "auto-core"}, "fixed_startup_ns": 250000000, "direct_multiplier": 4, "fixed_format_allowance_bytes": 20971520, "extra_bytes_per_cell": 12}
+  ]
+}

@@ -1,7 +1,6 @@
 use std::ffi::CString;
 
 use arrow::array::{Array, Float32Array, Float64Array, StructArray};
-use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use gafime_cpu::precision::CpuPrecisionValues;
 use gafime_types::PrecisionProfile;
 use pyo3::{
@@ -10,6 +9,7 @@ use pyo3::{
     types::{PyAny, PyBytes, PyCapsule, PyDict},
 };
 
+use crate::acquisition::import_stream;
 use crate::artifact::{compile_continuous_input, PyCompiledContinuousArtifact};
 use crate::common::{
     combo_from_table, decode_precision_input, flatten_continuous_rows, flatten_continuous_rows_f64,
@@ -664,11 +664,58 @@ mod tests {
     use arrow::{
         array::{ArrayRef, Float32Array, StructArray},
         datatypes::{DataType, Field, Fields},
+        ffi_stream::FFI_ArrowArrayStream,
+        record_batch::{RecordBatch, RecordBatchIterator},
     };
     use gafime_types::GAFIME_METRIC_PEARSON;
 
     use crate::common::MetricValuesRef;
     use crate::continuous::analyze_continuous_cpu_rows;
+
+    #[test]
+    fn convenience_arrow_import_passes_schema_request_and_keeps_single_batch_policy() {
+        Python::initialize();
+        Python::attach(|py| {
+            for batch_count in 0..3 {
+                let batch = RecordBatch::try_from_iter(vec![(
+                    "x",
+                    Arc::new(Float32Array::from(vec![1.0, 2.0])) as ArrayRef,
+                )])
+                .unwrap();
+                let batches = (0..batch_count)
+                    .map(|_| Ok(batch.clone()))
+                    .collect::<Vec<_>>();
+                let source = RecordBatchIterator::new(batches.into_iter(), batch.schema());
+                let capsule = PyCapsule::new(
+                    py,
+                    FFI_ArrowArrayStream::new(Box::new(source)),
+                    Some(CString::new("arrow_array_stream").unwrap()),
+                )
+                .unwrap();
+                let scope = PyDict::new(py);
+                scope.set_item("_capsule", capsule).unwrap();
+                py.run(
+                    c"class ArrowSource:\n    def __arrow_c_stream__(self, requested_schema):\n        assert requested_schema is None\n        return _capsule\nsource = ArrowSource()",
+                    Some(&scope),
+                    Some(&scope),
+                )
+                .unwrap();
+                let source = scope.get_item("source").unwrap().unwrap();
+                let result = import_arrow_struct(&source);
+                if batch_count == 1 {
+                    assert_eq!(result.unwrap().len(), 2);
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(error.is_instance_of::<PyValueError>(py));
+                    assert!(error.to_string().contains(if batch_count == 0 {
+                        "empty Arrow stream"
+                    } else {
+                        "multi-chunk Arrow input"
+                    }));
+                }
+            }
+        });
+    }
 
     #[test]
     fn arrow_struct_imports_to_row_major_f32() {
@@ -746,23 +793,13 @@ mod tests {
 
 /// Import a Python object exposing the Arrow C stream interface
 /// (`__arrow_c_stream__`, e.g. a Polars DataFrame) into a single Arrow
-/// `StructArray`, zero-copy. We move the stream out of the capsule and leave an
-/// empty no-op stream so the capsule destructor doesn't double-release; arrow-rs
-/// owns the rest of the FFI lifecycle. Callers should `.rechunk()` so the frame
-/// arrives as one record batch.
+/// `StructArray` borrowing the producer's column buffers through arrow-rs release
+/// owners. The shared importer consumes the capsule exactly once, keeps foreign
+/// callbacks attached, and normalizes optional error detail. This convenience
+/// route remains single-batch; callers should `.rechunk()` before ingest. The
+/// following layout conversion copies into independently owned row-major data.
 fn import_arrow_struct(obj: &Bound<'_, PyAny>) -> PyResult<StructArray> {
-    let capsule = obj.call_method0("__arrow_c_stream__")?;
-    let cap: Bound<'_, PyCapsule> = capsule.extract()?;
-    let ptr = cap
-        .pointer_checked(Some(c"arrow_array_stream"))?
-        .cast::<FFI_ArrowArrayStream>()
-        .as_ptr();
-    // SAFETY: PyCapsule::pointer returned a non-null Arrow C stream pointer
-    // created by __arrow_c_stream__. Replacing it moves ownership exactly once
-    // into arrow-rs and leaves an empty stream for the capsule destructor.
-    let stream = unsafe { std::ptr::replace(ptr, FFI_ArrowArrayStream::empty()) };
-    let reader = ArrowArrayStreamReader::try_new(stream)
-        .map_err(|err| PyValueError::new_err(format!("arrow stream import failed: {err}")))?;
+    let reader = import_stream(obj)?;
     let mut batches = Vec::new();
     for batch in reader {
         batches.push(batch.map_err(|err| PyValueError::new_err(format!("arrow batch: {err}")))?);
@@ -779,8 +816,9 @@ fn import_arrow_struct(obj: &Bound<'_, PyAny>) -> PyResult<StructArray> {
 }
 
 /// Transpose an Arrow struct of Float32 columns into a row-major f32 buffer in
-/// Rust (one pass, no Python-object materialization). This is the zero-copy
-/// ingest twin of the Arrow result export.
+/// Rust (one pass, no Python-object materialization). Arrow column import borrows
+/// foreign buffers, but this transpose deliberately creates an owned snapshot;
+/// it is not zero-copy resident ingest or the twin of Arrow result export.
 fn struct_to_row_major_f32(sa: &StructArray) -> PyResult<(u64, u32, Vec<f32>)> {
     let rows = sa.len();
     let cols = sa.num_columns();

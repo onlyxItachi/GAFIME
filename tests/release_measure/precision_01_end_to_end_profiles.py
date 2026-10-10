@@ -12,7 +12,7 @@ The bounded workloads cover the four public arithmetic domains through all
 four v1 metrics, all v1 families, eager/resident/compiled execution, graph
 replay where advertised, target replacement, significance, deterministic
 candidate identity, visible-score ranking, profile-keyed caching, NumPy
-ingest, and the Polars/Arrow dataload path.
+ingest, and full-config CSV/Parquet/IPC acquisition through public dataload.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 from array import array
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 import json
 import math
@@ -29,6 +30,7 @@ import struct
 import tempfile
 import time
 from typing import Any
+from unittest.mock import patch
 
 import gafime
 import polars as pl
@@ -78,12 +80,16 @@ class GateStats:
     cache_profile_entries: int = 0
     numpy_ingest_cases: int = 0
     arrow_dataload_cases: int = 0
+    configured_arrow_dataload_cases: int = 0
+    csv_parsed_oracle_cases: int = 0
+    native_acquisition_calls: int = 0
     cross_backend_comparisons: int = 0
     mi_boundary_cases: int = 0
     filtered_spearman_cases: int = 0
     covariance_nonfinite_cases: int = 0
     overflow_ratio_cases: int = 0
     timings: list[dict[str, object]] = field(default_factory=list)
+    ingest_observations: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1289,6 +1295,157 @@ def _run_ingest_cases(backend: str, profiles: Sequence[str], stats: GateStats) -
             stats.arrow_dataload_cases += 1
 
 
+def _run_configured_file_ingest_cases(
+    backend: str, profiles: Sequence[str], stats: GateStats
+) -> None:
+    """Exercise transport with the ordinary full-config execution semantics.
+
+    Each oracle analyzes the independently parsed file values, not the values
+    before CSV formatting/parsing. These small correctness cases measure no
+    ingestion speed or peak-memory claim; the public-performance harness owns
+    those separately. Family lifecycle/graphs remain covered by the existing
+    compiled gate above, not inferred from successful file loading here.
+    """
+    from gafime import v1_adapter
+
+    boundary = v1_adapter._load_boundary_for_backend(backend)
+    acquire = getattr(boundary, "_acquire_arrow_input", None)
+    if not callable(acquire):
+        raise AssertionError(
+            f"{backend}: installed wheel lacks native Arrow acquisition"
+        )
+    with tempfile.TemporaryDirectory(prefix="gafime-configured-ingest-") as directory:
+        for case in (_continuous_case(), _time_series_case(), _decision_path_case()):
+            frame = pl.DataFrame(
+                {
+                    **{
+                        name: case.features[:, index]
+                        for index, name in enumerate(case.feature_names)
+                    },
+                    "target": case.target,
+                }
+            )
+            for file_format, writer, reader in (
+                ("csv", frame.write_csv, pl.read_csv),
+                ("parquet", frame.write_parquet, pl.read_parquet),
+                ("ipc", frame.write_ipc, pl.read_ipc),
+            ):
+                path = Path(directory) / f"{case.name}.{file_format}"
+                writer(path)
+                parsed = reader(path)
+                features = parsed.select(list(case.feature_names)).to_numpy()
+                target = parsed["target"].to_numpy()
+                for precision in profiles:
+                    label = f"{backend}/{precision}/{case.name}/{file_format}/ingest"
+                    config = _family_config(backend, precision, case)
+                    direct = gafime.GafimeEngine(config).analyze(
+                        features, target, feature_names=case.feature_names
+                    )
+                    stats.eager_analyses += 1
+                    stats.numpy_ingest_cases += 1
+                    _validate_report(
+                        direct, backend, precision, case, f"{label}/direct"
+                    )
+                    acquisition_calls = 0
+
+                    def checked_acquire(
+                        payload: Mapping[str, object], *args: Any
+                    ) -> Any:
+                        nonlocal acquisition_calls
+                        _assert_equal(
+                            payload["backend"], backend, f"{label}/request-backend"
+                        )
+                        _assert_equal(
+                            payload["precision"], precision, f"{label}/request-profile"
+                        )
+                        _assert_equal(
+                            payload["permutation_tests"], 3, f"{label}/permutations"
+                        )
+                        _assert_equal(payload["num_repeats"], 2, f"{label}/bootstrap")
+                        _assert_equal(
+                            tuple(payload["metric_names"]),
+                            ALL_METRICS,
+                            f"{label}/metrics",
+                        )
+                        acquisition_calls += 1
+                        return acquire(payload, *args)
+
+                    def forbidden_materialization(*_args: Any, **_kwargs: Any) -> Any:
+                        raise AssertionError(
+                            f"{label}: numeric input reached Python row/byte staging"
+                        )
+
+                    # Guard the transport boundary, not the reference direct API.
+                    # A numerical match alone would also pass on the slow legacy
+                    # Python-row fallback and therefore prove no acquisition route.
+                    with ExitStack() as guards:
+                        guards.enter_context(
+                            patch.object(
+                                boundary, "_acquire_arrow_input", checked_acquire
+                            )
+                        )
+                        for name in ("iter_rows", "rows", "to_dicts", "rechunk"):
+                            guards.enter_context(
+                                patch.object(
+                                    pl.DataFrame, name, forbidden_materialization
+                                )
+                            )
+                        guards.enter_context(
+                            patch.object(
+                                pl.Series, "to_list", forbidden_materialization
+                            )
+                        )
+                        for name in (
+                            "_coerce_row_major_f32",
+                            "_coerce_row_major_f32_for_cache",
+                            "_numeric_storage_to_le_bytes",
+                            "_sequence",
+                        ):
+                            guards.enter_context(
+                                patch.object(
+                                    v1_adapter, name, forbidden_materialization
+                                )
+                            )
+                        loaded = gafime.dataload(path, target="target", config=config)
+                    _assert_equal(acquisition_calls, 1, f"{label}/native-acquisition")
+                    stats.eager_analyses += 1
+                    stats.arrow_dataload_cases += 1
+                    stats.configured_arrow_dataload_cases += 1
+                    stats.native_acquisition_calls += acquisition_calls
+                    if file_format == "csv":
+                        stats.csv_parsed_oracle_cases += 1
+                    _validate_report(
+                        loaded, backend, precision, case, f"{label}/loaded"
+                    )
+                    _assert_report_equivalent(
+                        loaded, direct, precision, f"{label}/parsed-oracle"
+                    )
+                    stats.permutation_reports += 2
+                    stats.stability_reports += 2
+                    # Retain actual result placement/profile, rather than call
+                    # the requested backend hardware evidence by assumption.
+                    stats.ingest_observations.append(
+                        {
+                            "scope": "configured file-ingestion correctness (not timing evidence)",
+                            "case": case.name,
+                            "format": file_format,
+                            "backend": loaded.backend.selected_backend,
+                            "execution_placement": loaded.backend.execution_placement,
+                            "requested_backend": backend,
+                            "precision": loaded.backend.effective_precision,
+                            "requested_precision": loaded.backend.requested_precision,
+                            "domains": {
+                                name: getattr(loaded.backend, name)
+                                for name in EXPECTED_DOMAINS[precision]
+                            },
+                            "rows": int(parsed.height),
+                            "native_acquisition_calls": acquisition_calls,
+                            "permutation_rows": len(loaded.permutations),
+                            "stability_rows": len(loaded.stability),
+                        }
+                    )
+
+
 def _run_cache_separation(
     backend: str, profiles: Sequence[str], stats: GateStats
 ) -> None:
@@ -1396,6 +1553,7 @@ def main() -> None:
                         )
                         stats.cross_backend_comparisons += 1
         _run_ingest_cases(backend, profiles, stats)
+        _run_configured_file_ingest_cases(backend, profiles, stats)
         _run_cache_separation(backend, profiles, stats)
 
     elapsed = time.perf_counter() - started
@@ -1406,9 +1564,12 @@ def main() -> None:
             backend: list(_expected_profiles(backend)) for backend in backends
         },
         "counts": {
-            key: value for key, value in vars(stats).items() if key != "timings"
+            key: value
+            for key, value in vars(stats).items()
+            if key not in {"timings", "ingest_observations"}
         },
         "timings": stats.timings,
+        "configured_file_ingestion": stats.ingest_observations,
         "total_seconds": round(elapsed, 6),
     }
     print(json.dumps(summary, indent=2, sort_keys=True))

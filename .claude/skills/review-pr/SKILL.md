@@ -20,6 +20,18 @@ numerics, physical execution for hardware runtime claims, and frozen provenance
 for release artifacts. A green narrow test does not excuse an uncovered
 contract boundary.
 
+> Every kernel must earn its performance claim. Every boundary must earn its cost. Every public workflow must pass end-to-end validation.
+
+For affected execution boundaries, require the performance evidence matrix
+from the active contract: independent parity, component cost and installed public
+end-to-end behavior under default/realistic configurations, cold/hit cache
+states, latency/CPU, fresh-process peak RSS, justified copy accounting, exact
+artifact identities, and honest combined/not-observable stages. A kernel or
+resident result cannot approve an unmeasured file loader or ownership boundary.
+Check structural guards against whole-dataset Python materialization. Evidence
+is proportionate to affected critical paths, not a reason to demand unrelated
+hardware campaigns for documentation changes.
+
 Classify findings clearly:
 
 - a blocking finding identifies a correctness, safety, compatibility,
