@@ -147,6 +147,88 @@ def memory_now() -> dict[str, Any]:
     }
 
 
+def initial_allocator_policy() -> dict[str, str | None]:
+    """Record inherited policy before imports; do not configure an allocator."""
+    return {
+        name: os.getenv(name)
+        for name in (
+            "_RJEM_MALLOC_CONF",
+            "POLARS_THP",
+            "POLARS_MAX_THREADS",
+            "RAYON_NUM_THREADS",
+            "MALLOC_CONF",
+            "MALLOC_ARENA_MAX",
+            "LD_PRELOAD",
+        )
+    }
+
+
+def measurement_context(initial_policy: dict[str, str | None]) -> dict[str, Any]:
+    """Post-measurement same-host receipt, not observer initialization overhead."""
+    thp = Path("/sys/kernel/mm/transparent_hugepage")
+    boot = Path("/proc/sys/kernel/random/boot_id")
+    return {
+        "host": {
+            "hostname": platform.node(),
+            "boot_id": boot.read_text().strip() if boot.is_file() else None,
+            "github_run_id": os.getenv("GITHUB_RUN_ID"),
+            "github_run_attempt": os.getenv("GITHUB_RUN_ATTEMPT"),
+        },
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "libc": list(platform.libc_ver()),
+        "affinity": sorted(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else None,
+        "cpu_count": os.cpu_count(),
+        "initial_allocator_policy": initial_policy,
+        "thp": {
+            name: (thp / name).read_text().strip() if (thp / name).is_file() else None
+            for name in ("enabled", "defrag", "hpage_pmd_size")
+        },
+    }
+
+
+def runtime_dependencies() -> dict[str, Any]:
+    """Fingerprint installed dependency binaries only after freezing measures."""
+    import importlib.metadata as metadata
+
+    members = []
+    for name in ("polars", "polars-runtime-32"):
+        try:
+            distribution = metadata.distribution(name)
+        except metadata.PackageNotFoundError:
+            continue
+        for relative in distribution.files or ():
+            if str(relative).endswith(".so"):
+                identity = file_identity(Path(distribution.locate_file(relative)))
+                members.append(
+                    {
+                        "distribution": name,
+                        "member": str(relative),
+                        "sha256": identity["sha256"],
+                        "size_bytes": identity["size_bytes"],
+                    }
+                )
+    if not members:
+        raise ValueError("installed Polars native binary identity unavailable")
+    numpy_dist = metadata.distribution("numpy")
+    numpy_native = [
+        item
+        for item in numpy_dist.files or ()
+        if "_multiarray_umath" in str(item) and str(item).endswith(".so")
+    ]
+    if len(numpy_native) != 1:
+        raise ValueError("installed NumPy core binary identity unavailable")
+    numpy_identity = file_identity(Path(numpy_dist.locate_file(numpy_native[0])))
+    return {
+        "numpy": metadata.version("numpy"),
+        "polars": metadata.version("polars"),
+        "polars_native_members": sorted(members, key=lambda x: x["member"]),
+        "numpy_native_sha256": numpy_identity["sha256"],
+    }
+
+
 def bits_snapshot(value: Any) -> Any:
     """Preserve IEEE result bits, including signed zero and NaN representation."""
     if is_dataclass(value):
@@ -538,6 +620,7 @@ def observed_cache_state(
 
 
 def worker(spec: dict[str, Any]) -> dict[str, Any]:
+    initial_policy = initial_allocator_policy()
     # CPU-only control is declared explicitly, not a silent fallback. Both
     # versions get identical process-local overrides for ranked auto selection.
     for name in ("GAFIME_CUDA_V1_LIB", "GAFIME_ROCM_V1_LIB", "GAFIME_METAL_V1_LIB"):
@@ -612,7 +695,7 @@ def worker(spec: dict[str, Any]) -> dict[str, Any]:
         "identity": authenticated,
         "native": file_identity(Path(native.__file__)),
         "python": {"executable": sys.executable, "version": sys.version},
-        "dependencies": {name: metadata.version(name) for name in ("numpy", "polars")},
+        "dependencies": runtime_dependencies(),
         "harness": file_identity(Path(__file__)),
         "fixture": spec["fixture"],
         "changed_fixture": spec["changed_fixture"],
@@ -660,6 +743,7 @@ def worker(spec: dict[str, Any]) -> dict[str, Any]:
             else None,
         },
         "source_sha_binding": "supplied source SHA is an attestation; frozen provenance is independently required",
+        "measurement_context": measurement_context(initial_policy),
     }
 
 
