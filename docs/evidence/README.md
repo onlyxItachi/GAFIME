@@ -3,7 +3,8 @@
 `rt-firsthit-sm89-65536x8192-final.ncu-rep` is the exact Nsight Compute 2026.2.1
 full-set capture used by the RT decision-path paper. It was captured from the
 superseded bounded-2D triangle prototype on an NVIDIA GeForce RTX 4060 Laptop
-GPU (`sm_89`) and is intentionally excluded from Python distribution archives.
+GPU (`sm_89`). The raw capture was removed from the current source tree and
+archived in immutable historical Git commit `cce2839c2aa9c4c7120b40c47f8303945369c09c`.
 It is not performance evidence for the current safe-triangle/custom-AABB
 dispatch.
 
@@ -11,6 +12,20 @@ dispatch.
 size:    31,848,275 bytes
 sha256:  5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331
 ```
+
+Restore this historic report when needed from a full-history checkout. The
+restored file is Git-ignored and must not be committed or bundled into releases:
+
+```bash
+historical_commit=cce2839c2aa9c4c7120b40c47f8303945369c09c
+profiler_path=docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep
+if [ ! -f "$profiler_path" ]; then
+  git show "$historical_commit:$profiler_path" > "$profiler_path"
+fi
+printf '%s  %s\n' 5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331 "$profiler_path" | sha256sum --check
+```
+
+[Original captured blob](https://github.com/onlyxItachi/GAFIME/blob/cce2839c2aa9c4c7120b40c47f8303945369c09c/docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep) is a pinned historical reference, not current hybrid-implementation evidence.
 
 Use PerfDigest to inspect the report without expanding the raw vendor metrics
 into an agent or review context. The reproduction commands and bounded digest

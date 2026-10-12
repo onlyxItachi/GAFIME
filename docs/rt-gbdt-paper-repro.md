@@ -92,11 +92,19 @@ proof of the timing measurement or a byte-identical capture binary. The timing
 values are provisional development observations. The commands below are the
 replay path; do not silently replace the preserved transcript with a later run.
 
-Verify the manifest identity and the immutable evidence artifacts. Historical
+Verify the manifest identity and the immutable evidence artifacts. The large raw
+NCU capture is no longer tracked on current `main`; retrieve it from historical
+commit `cce2839c2aa9c4c7120b40c47f8303945369c09c` with a full-history checkout. The retrieved file is
+Git-ignored, and the existing PerfDigest commands remain valid. Historical
 source entries can be compared with the committed triangle source; do not run a
 blanket `sha256sum --check` against the redesigned worktree:
 
 ```bash
+historical_commit=cce2839c2aa9c4c7120b40c47f8303945369c09c
+profiler_path=docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep
+if [ ! -f "$profiler_path" ]; then
+  git show "$historical_commit:$profiler_path" > "$profiler_path"
+fi
 printf '%s  %s\n' \
   1eb2db483b5ad2881e99dbaf711af192ad6bfbfb294db443d3c5e6745f2ed429 \
   docs/evidence/rt-gbdt-paper-source-evidence.sha256 \
@@ -110,7 +118,6 @@ printf '%s  %s\n' \
   docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep \
   | sha256sum --check
 
-historical_commit=cce2839c2aa9c4c7120b40c47f8303945369c09c
 while read -r expected path; do
   case "$expected" in ''|'#'*) continue ;; esac
   case "$path" in

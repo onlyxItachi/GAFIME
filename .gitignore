@@ -85,3 +85,6 @@ kernel_fixed.cu
 
 # Logs
 log*.txt
+
+# Historical vendor profiler captures are not source-tree artifacts
+*.ncu-rep

@@ -434,9 +434,8 @@ us`, with 24.932% compute-pipe peak, 10.878% DRAM peak, 54.223% achieved
 occupancy, 53.408% L1 hit, 96.864% L2 hit, and 72 registers/thread. That combined
 launch included traversal, triangle intersection, programmable guards, and
 atomic accumulation, so its counters did not isolate an RT-core saturation
-percentage and must not be transferred to the current binary. The exact
-historical report is checked in at
-`docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep`, SHA-256
+percentage and must not be transferred to the current binary. The exact historical report is archived in Git commit `cce2839c2aa9c4c7120b40c47f8303945369c09c`
+(original path `docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep`, absent from current `main`), SHA-256
 `5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331`.
 The captured timing transcript and implementation-source manifest are also in
 `docs/evidence/`; full commands and the cold/warm methodology are in

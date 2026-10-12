@@ -1770,14 +1770,24 @@ def check_native_kernel_structure() -> None:
         "SOURCE_DATE_EPOCH=1784592000",
     ):
         assert repro_token in cuda_rt_paper_repro
-    profiler_evidence = (
-        ROOT / "docs" / "evidence" / "rt-firsthit-sm89-65536x8192-final.ncu-rep"
-    )
-    assert profiler_evidence.stat().st_size == 31_848_275
-    assert (
-        hashlib.sha256(profiler_evidence.read_bytes()).hexdigest()
-        == "5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331"
-    )
+    # Historical 31.8 MB vendor report is hash-bound in Git, not shipped in HEAD.
+    profiler_path = "docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep"
+    profiler_sha = "5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331"
+    profiler_manifest = (
+        ROOT / "docs" / "evidence" / "rt-gbdt-paper-source-evidence.sha256"
+    ).read_text()
+    profiler_readme = (ROOT / "docs" / "evidence" / "README.md").read_text()
+    assert f"{profiler_sha}  {profiler_path}" in profiler_manifest
+    assert profiler_sha in profiler_readme
+    assert "31,848,275 bytes" in profiler_readme
+    assert "historical_commit=cce2839c2aa9c4c7120b40c47f8303945369c09c" in cuda_rt_paper_repro
+    assert 'git show "$historical_commit:$profiler_path"' in cuda_rt_paper_repro
+    if (ROOT / ".git").exists():
+        tracked_profiler = subprocess.run(
+            ["git", "ls-files", "--", profiler_path],
+            cwd=ROOT, capture_output=True, text=True, check=True,
+        )
+        assert not tracked_profiler.stdout.strip(), "large NCU report must remain untracked"
     assert (
         "perf_05_cuda_rt_firsthit_scale.py"
         in (ROOT / "tests" / "release_measure" / "run_gpu_suite.sh").read_text()
