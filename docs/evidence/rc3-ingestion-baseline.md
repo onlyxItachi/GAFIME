@@ -181,9 +181,9 @@ Its collector SHA-256 is
 `2abc392c831c5c90746daac666ba23578932504bc29db9472ef09b006f90a51e`;
 later collector documentation fields do not retroactively alter those samples.
 
-## Permanent coarse cost tripwire
+## Historical direct-baseline cost tripwire
 
-`ingest_cost_budget.json` covers all 18 reference cells above. It deliberately
+The original `direct-v1` policy covered all 18 reference cells above. It deliberately
 allows startup/parser/host variation while rejecting the reproduced Python
 object amplification, not promising attractive benchmark numbers:
 
@@ -193,7 +193,7 @@ max file peak RSS <= max(file import peak, max direct peak)
                      + 20 MiB + 12 bytes * rows * columns
 ```
 
-The committed policy requires at least three matched samples and a declared
+That policy required at least three matched samples and a declared
 source SHA. For this uncommitted development comparison only, a scratch policy
 explicitly permitted a null source SHA: the candidate passed all 18 cells;
 public RC2 failed both latency and memory limits in all 18 negative-control
@@ -201,6 +201,11 @@ cells. This is a regression tripwire, not frozen provenance or release readiness
 Its validator rejects incomplete coverage, missing repeats, mismatched artifact/
 fixture/config identities, numerical inequality and unavailable fresh-process
 RSS. Synthetic rejection tests exercise those failures independently.
+
+These formulas and verdicts describe the original evidence and remain unchanged.
+The current `ingest_cost_budget.json` selects the independently bounded parser
+baseline described in [the current RSS policy](../ingestion-rss-policy.md); do
+not use this historical formula as the current policy's reproduction command.
 
 V1 CI builds and installs a specific wheel, runs the same reference collector
 and reviewed budget, exercises a small literal-default workflow separately,

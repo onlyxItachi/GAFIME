@@ -160,8 +160,16 @@ inclusive instrumented stages from uninstrumented samples; full lazy report
 export follows the measured public call. `perf_14_ingest_budget.py` evaluates
 `ingest_cost_budget.json` separately and never sets release readiness. See the
 [matched baseline and cost rationale](../../docs/evidence/rc3-ingestion-baseline.md)
-for source/artifact limits, negative controls, reproduction commands and budget
-formulas. A declared source SHA is not frozen-bundle provenance.
+for source/artifact limits, negative controls, reproduction commands and the
+historical direct-baseline formulas. A declared source SHA is not frozen-bundle
+provenance.
+
+The current parser-aware model additionally requires independent producer
+controls from `perf_14_parser_control.py` across all six shape/format cells.
+Producer RSS and latency must pass the original ceilings before a measured
+parser floor can supply a baseline; existing allowances and public latency
+limits are unchanged. See [the current RSS policy](../../docs/ingestion-rss-policy.md)
+for provenance, anti-self-normalization guards and historical verdicts.
 
 ## Active Scripts
 
@@ -223,6 +231,7 @@ formulas. A declared source SHA is not frozen-bundle provenance.
 | `perf_04_cpu_native_kernels.py` | CPU SIMD dispatch, column layout, and scratch-reuse guardrails | CPU |
 | `perf_14_public_ingest.py` | authenticated installed-wheel CSV/Parquet/IPC wall/CPU/fresh RSS, default/configured/generated workflows, cache identity, parsed-input numeric parity and inclusive component observations | supplied Core wheels/environments; bounded serial CPU trials |
 | `perf_14_ingest_budget.py` | reviewed exact-cell latency/RSS tripwire; rejects missing evidence, inconsistent identities and numeric mismatches; not a speedup or release-readiness claim | collector report and explicit budget JSON |
+| `perf_14_parser_control.py` | independent fresh-process CSV/Parquet/IPC parser/projection floor with separate RSS/latency guards; never product acquisition/execution | same installed wheels and exact public-collector fixtures |
 | `gpu_static_kernel_report.py` | CUDA SASS and HIP code-object size, register, shared/LDS, spill, exact fp32/mixed/fp64 device specialization, hash-bound exact-wheel evidence, and top-k topology checks | CUDA/HIP toolchains, no GPU |
 | `perf_06_gpu_mi_specializations.py` | resident MI throughput by candidate count, candidate-sample pairs, and bins | CUDA/HIP GPU |
 | `perf_07_rocm_mi_wave_ab.py` | provenance-checked, numerically guarded interleaved HIP high-bin A/B with control normalization and JSON output | HIP GPU and two payload builds |

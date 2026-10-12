@@ -124,7 +124,8 @@ jobs:
           set -euo pipefail
           python -m pytest -q \
             tests/release_measure/test_perf_14_public_ingest.py \
-            tests/release_measure/test_perf_14_ingest_budget.py
+            tests/release_measure/test_perf_14_ingest_budget.py \
+            tests/release_measure/test_perf_14_parser_control.py
           shopt -s nullglob
           core_wheels=("$RUNNER_TEMP/gafime-ingest-wheelhouse"/gafime-*.whl)
           test "${#core_wheels[@]}" -eq 1
@@ -138,8 +139,12 @@ jobs:
             --precision fp32,mixed,fp64 --workflow light --cache-state miss \
             --repeats 3 --instrument --max-time-seconds 240 \
             --output "$RUNNER_TEMP/gafime-ingest-evidence/reference"
+          python tests/release_measure/perf_14_parser_control.py \
+            --public-report "$RUNNER_TEMP/gafime-ingest-evidence/reference/report.json" \
+            --repeats 3 --output "$RUNNER_TEMP/gafime-ingest-evidence/parser"
           python tests/release_measure/perf_14_ingest_budget.py \
             --report "$RUNNER_TEMP/gafime-ingest-evidence/reference/report.json" \
+            --parser-report "$RUNNER_TEMP/gafime-ingest-evidence/parser/report.json" \
             --budget tests/release_measure/ingest_cost_budget.json --variant candidate \
             --output "$RUNNER_TEMP/gafime-ingest-evidence/cost-verdict.json"
           python tests/release_measure/perf_14_public_ingest.py \

@@ -494,3 +494,75 @@ def test_driver_rejects_unbound_wheel_and_harness_before_generating_files(
     args.harness_sha = "0" * 64
     with pytest.raises(ValueError, match="harness source digest"):
         perf14.driver(args)
+
+
+def test_all_prior_environment_fields_remain_in_public_worker():
+    import ast
+
+    tree = ast.parse(Path(perf14.__file__).read_text())
+    worker = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "worker"
+    )
+    result = next(
+        n.value
+        for n in ast.walk(worker)
+        if isinstance(n, ast.Return) and isinstance(n.value, ast.Dict)
+    )
+    environment = next(
+        v
+        for k, v in zip(result.keys, result.values)
+        if isinstance(k, ast.Constant) and k.value == "environment"
+    )
+    assert {k.value for k in environment.keys} == {
+        "platform",
+        "affinity",
+        "cpu_count",
+        "RAYON_NUM_THREADS",
+        "POLARS_MAX_THREADS",
+        "auto_gpu_payloads_explicitly_disabled",
+        "load_average",
+    }
+
+
+def test_allocator_receipt_preserves_full_diagnostic_variable_set(monkeypatch):
+    names = {
+        "MALLOC_CONF",
+        "_RJEM_MALLOC_CONF",
+        "JEMALLOC_CONF",
+        "MALLOC_ARENA_MAX",
+        "MALLOC_TRIM_THRESHOLD_",
+        "MALLOC_MMAP_THRESHOLD_",
+        "LD_PRELOAD",
+        "POLARS_MAX_THREADS",
+        "POLARS_THP",
+        "RAYON_NUM_THREADS",
+    }
+    for name in names:
+        monkeypatch.setenv(name, "observed-" + name)
+    assert perf14.initial_allocator_policy() == {
+        name: "observed-" + name for name in names
+    }
+
+
+def test_post_measurement_probe_does_not_import_polars_when_unused(monkeypatch):
+    monkeypatch.delitem(sys.modules, "polars", raising=False)
+    observed = perf14.runtime_observation()
+    assert observed["polars_loaded"] is False
+    assert observed["polars_thread_pool_size"] is None
+    assert "polars" not in sys.modules
+    assert observed["scope"].startswith("post-measurement")
+
+
+def test_effective_allocator_receipt_is_frozen_before_pool_probe(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("_RJEM_MALLOC_CONF", "dirty_decay_ms:500")
+
+    def pool():
+        monkeypatch.setenv("_RJEM_MALLOC_CONF", "later-probe")
+        return 4
+
+    monkeypatch.setitem(sys.modules, "polars", SimpleNamespace(thread_pool_size=pool))
+    observed = perf14.runtime_observation()
+    assert observed["allocator_policy"]["_RJEM_MALLOC_CONF"] == "dirty_decay_ms:500"
+    assert observed["polars_thread_pool_size"] == 4

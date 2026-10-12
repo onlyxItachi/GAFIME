@@ -222,6 +222,14 @@ the new exact-source frozen bundle, normal provenance/checksum/composition and
 release gates. No source-tree-only test can substitute for installed-wheel
 evidence. Tagging/publication remains a separately authorized release action.
 
+## Parser-aware RSS qualification
+
+The coarse RSS gate uses independently capped parser controls rather than
+treating all producer/runtime pages as extra engine buffers. See
+[the current ingestion RSS policy](ingestion-rss-policy.md). Original failed
+verdicts remain historical evidence; no allocator trim or ownership weakening
+is used to make a measurement pass.
+
 ## Scope exclusions
 
 No GIL detachment, thread-affinity redesign, cooperative cancellation, new public
