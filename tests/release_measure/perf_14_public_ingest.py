@@ -157,7 +157,10 @@ def initial_allocator_policy() -> dict[str, str | None]:
             "POLARS_MAX_THREADS",
             "RAYON_NUM_THREADS",
             "MALLOC_CONF",
+            "JEMALLOC_CONF",
             "MALLOC_ARENA_MAX",
+            "MALLOC_TRIM_THRESHOLD_",
+            "MALLOC_MMAP_THRESHOLD_",
             "LD_PRELOAD",
         )
     }
@@ -184,8 +187,36 @@ def measurement_context(initial_policy: dict[str, str | None]) -> dict[str, Any]
         "initial_allocator_policy": initial_policy,
         "thp": {
             name: (thp / name).read_text().strip() if (thp / name).is_file() else None
-            for name in ("enabled", "defrag", "hpage_pmd_size")
+            for name in ("enabled", "defrag", "shmem_enabled", "hpage_pmd_size")
         },
+    }
+
+
+def runtime_observation() -> dict[str, Any]:
+    """Observe effective import policy after the frozen timing/RSS interval."""
+    policy = initial_allocator_policy()
+    polars = sys.modules.get("polars")
+    return {
+        "allocator_policy": policy,
+        "polars_loaded": polars is not None,
+        "polars_thread_pool_size": polars.thread_pool_size()
+        if polars is not None
+        else None,
+        "scope": "post-measurement: allocator env captured before pool probe; no forced import or policy override",
+    }
+
+
+def host_observation() -> dict[str, Any]:
+    """Retain volatile facts without using them as an equality identity."""
+    return {
+        "cpu_info": Path("/proc/cpuinfo").read_text()
+        if Path("/proc/cpuinfo").is_file()
+        else None,
+        "system_memory": Path("/proc/meminfo").read_text()
+        if Path("/proc/meminfo").is_file()
+        else None,
+        "kernel": platform.uname()._asdict(),
+        "scope": "post-measurement snapshots; free memory, frequency and load need not be identical",
     }
 
 
@@ -200,7 +231,7 @@ def runtime_dependencies() -> dict[str, Any]:
         except metadata.PackageNotFoundError:
             continue
         for relative in distribution.files or ():
-            if str(relative).endswith(".so"):
+            if str(relative).endswith((".so", ".pyd")):
                 identity = file_identity(Path(distribution.locate_file(relative)))
                 members.append(
                     {
@@ -216,7 +247,7 @@ def runtime_dependencies() -> dict[str, Any]:
     numpy_native = [
         item
         for item in numpy_dist.files or ()
-        if "_multiarray_umath" in str(item) and str(item).endswith(".so")
+        if "_multiarray_umath" in str(item) and str(item).endswith((".so", ".pyd"))
     ]
     if len(numpy_native) != 1:
         raise ValueError("installed NumPy core binary identity unavailable")
@@ -744,6 +775,8 @@ def worker(spec: dict[str, Any]) -> dict[str, Any]:
         },
         "source_sha_binding": "supplied source SHA is an attestation; frozen provenance is independently required",
         "measurement_context": measurement_context(initial_policy),
+        "runtime_observation": runtime_observation(),
+        "host_observation": host_observation(),
     }
 
 

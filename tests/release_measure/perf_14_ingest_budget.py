@@ -35,7 +35,10 @@ ALLOCATOR_POLICY_KEYS = {
     "POLARS_MAX_THREADS",
     "RAYON_NUM_THREADS",
     "MALLOC_CONF",
+    "JEMALLOC_CONF",
     "MALLOC_ARENA_MAX",
+    "MALLOC_TRIM_THRESHOLD_",
+    "MALLOC_MMAP_THRESHOLD_",
     "LD_PRELOAD",
 }
 CASE_KEYS = {
@@ -170,7 +173,7 @@ def measurement_context(value):
     thp = value["thp"]
     require(
         isinstance(thp, dict)
-        and set(thp) == {"enabled", "defrag", "hpage_pmd_size"}
+        and set(thp) == {"enabled", "defrag", "shmem_enabled", "hpage_pmd_size"}
         and all(isinstance(item, str) and bool(item) for item in thp.values()),
         "missing THP context",
     )
@@ -179,6 +182,52 @@ def measurement_context(value):
         "invalid THP page size",
     )
     return value
+
+
+def runtime_observation(value, *, require_polars):
+    """Check post-call facts without requiring an otherwise unused import."""
+    require(
+        isinstance(value, dict)
+        and set(value)
+        == {
+            "allocator_policy",
+            "polars_loaded",
+            "polars_thread_pool_size",
+            "scope",
+        },
+        "invalid runtime observation",
+    )
+    policy = value["allocator_policy"]
+    require(
+        isinstance(policy, dict)
+        and set(policy) == ALLOCATOR_POLICY_KEYS
+        and all(item is None or isinstance(item, str) for item in policy.values()),
+        "invalid effective allocator policy",
+    )
+    loaded = value["polars_loaded"]
+    require(type(loaded) is bool, "invalid Polars loaded observation")
+    require(not require_polars or loaded, "parser/dataload Polars observation required")
+    if loaded:
+        number(
+            value["polars_thread_pool_size"],
+            "Polars pool size",
+            positive=True,
+            integer=True,
+        )
+    else:
+        require(
+            value["polars_thread_pool_size"] is None,
+            "unloaded Polars cannot report a pool",
+        )
+    require(
+        isinstance(value["scope"], str)
+        and value["scope"].startswith("post-measurement"),
+        "runtime observation must follow measurement",
+    )
+    return {
+        "allocator_policy": policy,
+        "polars_thread_pool_size": value["polars_thread_pool_size"],
+    }
 
 
 def parser_baselines(parser_report, selected, public_harness, cells, minimum):
@@ -216,6 +265,7 @@ def parser_baselines(parser_report, selected, public_harness, cells, minimum):
     # Sharing a producer between profile cells is allowed only when every
     # artifact, input, runtime and initial allocator policy agrees exactly.
     anchors = {}
+    runtime_anchors = {}
     public_context = None
     for repeats in cells.values():
         for pair in repeats.values():
@@ -249,6 +299,16 @@ def parser_baselines(parser_report, selected, public_harness, cells, minimum):
                     "mixed public producer identity",
                 )
                 anchors[key] = anchor
+                dataload = result["case"]["route"] == "dataload"
+                runtime = runtime_observation(
+                    result["runtime_observation"], require_polars=dataload
+                )
+                if dataload:
+                    require(
+                        key not in runtime_anchors or runtime_anchors[key] == runtime,
+                        "mixed dataload effective allocator/pool observation",
+                    )
+                    runtime_anchors[key] = runtime
     producer_records = {}
     for record in records:
         if record["variant"] != selected["label"]:
@@ -280,6 +340,11 @@ def parser_baselines(parser_report, selected, public_harness, cells, minimum):
         for field, value in anchor.items():
             require(result[field] == value, f"unmatched parser {field}")
         measurement_context(result["measurement_context"])
+        require(
+            runtime_observation(result["runtime_observation"], require_polars=True)
+            == runtime_anchors.get(key),
+            "unmatched parser/dataload effective allocator/pool observation",
+        )
         fixture = result["fixture"]
         require(
             result["reader"]

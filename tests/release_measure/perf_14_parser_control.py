@@ -125,6 +125,8 @@ def worker(spec: dict) -> dict:
         "harness": harness.file_identity(Path(__file__)),
         "public_harness": harness.file_identity(Path(harness.__file__)),
         "measurement_context": harness.measurement_context(initial_policy),
+        "runtime_observation": harness.runtime_observation(),
+        "host_observation": harness.host_observation(),
         "timing": {
             "wall_nanoseconds": wall_ns,
             "process_cpu_nanoseconds": cpu_ns,
