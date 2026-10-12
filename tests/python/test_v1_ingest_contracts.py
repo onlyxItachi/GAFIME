@@ -3,6 +3,7 @@
 Set GAFIME_TEST_INSTALLED_PACKAGE=1 outside the checkout import path to require
 the installed native boundary; missing native dependencies then fail, not skip.
 """
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -29,6 +30,7 @@ _F32_MAX = float.fromhex("0x1.fffffep+127")
 def polars():
     if _INSTALLED:
         import polars as pl
+
         return pl
     return pytest.importorskip("polars")
 
@@ -67,10 +69,7 @@ def _direct(frame, config):
 
 
 def _records(report):
-    return [
-        (row.candidate_id, row.combo, row.metrics)
-        for row in report.interactions
-    ]
+    return [(row.candidate_id, row.combo, row.metrics) for row in report.interactions]
 
 
 @pytest.mark.parametrize("precision", ["fp32", "mixed", "fp64"])
@@ -92,6 +91,9 @@ def test_loader_preserves_wide_source_before_ingest(
         return sentinel
 
     monkeypatch.setattr(v1_adapter, "analyze_arrow_with_v1_boundary", capture)
+    # Observe the preserved custom-boundary route independently of the current
+    # native preparation path, which must reject these finite overflows.
+    monkeypatch.setattr(v1_adapter, "_load_boundary_for_backend", lambda _: object())
     assert gafime.dataload(path, "target", config=_config(precision)) is sentinel
 
 
@@ -157,13 +159,19 @@ def test_dataload_shortcut_matches_direct_cap_warnings_and_metric_bits(
 
     monkeypatch.setenv("GAFIME_V1_ANALYZE_CACHE_SIZE", "0")
     arrow_calls = []
-    raw_analyze = boundary.analyze_continuous_arrow
+    acquire_arrow = getattr(boundary, "_acquire_arrow_input", None)
+    arrow_entrypoint = (
+        "_acquire_arrow_input"
+        if callable(acquire_arrow)
+        else "analyze_continuous_arrow"
+    )
+    raw_analyze = getattr(boundary, arrow_entrypoint)
 
     def record_arrow_call(*args, **kwargs):
         arrow_calls.append(True)
         return raw_analyze(*args, **kwargs)
 
-    monkeypatch.setattr(boundary, "analyze_continuous_arrow", record_arrow_call)
+    monkeypatch.setattr(boundary, arrow_entrypoint, record_arrow_call)
     columns = 16 if capped else 4
     data = {
         f"x{col}": [
@@ -207,7 +215,10 @@ def test_dataload_shortcut_matches_direct_cap_warnings_and_metric_bits(
     assert arrow_calls == [True]
     assert loaded.warnings == direct.warnings == expected_warnings
     assert loaded.feature_names == direct.feature_names
-    assert len(loaded.interactions) == len(direct.interactions) == (12 if capped else 14)
+    assert (
+        len(loaded.interactions) == len(direct.interactions) == (12 if capped else 14)
+    )
+
     def bit_records(report):
         return [
             (
@@ -235,14 +246,18 @@ def test_dataload_shortcut_matches_direct_cap_warnings_and_metric_bits(
 
 def test_dataload_preserves_ineligible_feature_caps(native, tmp_path):
     frame = native.DataFrame(
-        {f"x{col}": [float((row * (col + 1)) % 17) for row in range(32)]
-         for col in range(12)}
+        {
+            f"x{col}": [float((row * (col + 1)) % 17) for row in range(32)]
+            for col in range(12)
+        }
         | {"target": [float(row % 11) for row in range(32)]}
     ).cast(native.Float32)
     path = tmp_path / "feature_caps.parquet"
     frame.write_parquet(path)
     config = _config(
-        max_comb_size=3, max_feature_candidate=6, top_features_for_higher_k=3,
+        max_comb_size=3,
+        max_feature_candidate=6,
+        top_features_for_higher_k=3,
         seed=(1 << 129) + 123,
     )
 
@@ -297,8 +312,11 @@ def test_dataload_preserves_f32_limits_and_source_nonfinite_semantics(
 
 @pytest.mark.parametrize(
     "precision,source_dtype,expected_dtype",
-    [("fp32", "Float64", "Float32"), ("mixed", "Float64", "Float32"),
-     ("fp64", "Float32", "Float64")],
+    [
+        ("fp32", "Float64", "Float32"),
+        ("mixed", "Float64", "Float32"),
+        ("fp64", "Float32", "Float64"),
+    ],
 )
 def test_raw_arrow_still_rejects_mismatched_dtype(
     native, precision, source_dtype, expected_dtype
@@ -306,7 +324,9 @@ def test_raw_arrow_still_rejects_mismatched_dtype(
     from gafime import gafime_py as boundary
 
     features = native.DataFrame({"x": [1.0, 2.0]}).cast(getattr(native, source_dtype))
-    target = native.DataFrame({"target": [2.0, 1.0]}).cast(getattr(native, source_dtype))
+    target = native.DataFrame({"target": [2.0, 1.0]}).cast(
+        getattr(native, source_dtype)
+    )
 
     with pytest.raises(ValueError, match=expected_dtype):
         boundary.analyze_continuous_arrow(features, target, precision=precision)
@@ -315,7 +335,9 @@ def test_raw_arrow_still_rejects_mismatched_dtype(
 @pytest.mark.parametrize("shortcut", [True, False])
 @pytest.mark.parametrize("column", ["x", "target"])
 @pytest.mark.parametrize("value", [1e39, 1e100, _F32_MAX])
-def test_dataload_fp64_keeps_wide_finite_values(native, tmp_path, shortcut, column, value):
+def test_dataload_fp64_keeps_wide_finite_values(
+    native, tmp_path, shortcut, column, value
+):
     data = {"x": [1.0, 2.0, 3.0, 4.0], "target": [4.0, 1.0, 3.0, 2.0]}
     data[column][1] = value
     frame = native.DataFrame(data)
@@ -365,9 +387,18 @@ def test_dataload_fp64_has_no_f32_intermediate(native, tmp_path, shortcut):
         ({"budget": gafime.ComputeBudget(max_comb_size=-1)}, "max_comb_size"),
         ({"budget": gafime.ComputeBudget(max_comb_size=0)}, "max_comb_size"),
         ({"budget": gafime.ComputeBudget(max_comb_size=1 << 32)}, "max_comb_size"),
-        ({"budget": gafime.ComputeBudget(max_combinations_per_k=-1)}, "max_combinations_per_k"),
-        ({"budget": gafime.ComputeBudget(max_combinations_per_k=0)}, "max_combinations_per_k"),
-        ({"budget": gafime.ComputeBudget(max_combinations_per_k=1 << 64)}, "max_combinations_per_k"),
+        (
+            {"budget": gafime.ComputeBudget(max_combinations_per_k=-1)},
+            "max_combinations_per_k",
+        ),
+        (
+            {"budget": gafime.ComputeBudget(max_combinations_per_k=0)},
+            "max_combinations_per_k",
+        ),
+        (
+            {"budget": gafime.ComputeBudget(max_combinations_per_k=1 << 64)},
+            "max_combinations_per_k",
+        ),
     ],
 )
 def test_integrated_dataload_uses_configured_rust_rejections(
@@ -395,7 +426,9 @@ def test_integrated_dataload_uses_configured_rust_rejections(
     not _INSTALLED,
     reason="requires the installed combined ingest and Rust config-validation fixes",
 )
-@pytest.mark.parametrize("field", ["stability_std_threshold", "permutation_p_threshold"])
+@pytest.mark.parametrize(
+    "field", ["stability_std_threshold", "permutation_p_threshold"]
+)
 @pytest.mark.parametrize("precision", ["fp32", "mixed", "fp64"])
 def test_integrated_dataload_threshold_range_follows_result_lane(
     native, tmp_path, field, precision
@@ -420,14 +453,18 @@ def test_integrated_dataload_threshold_range_follows_result_lane(
     reason="requires the installed combined ingest and Rust config-validation fixes",
 )
 @pytest.mark.parametrize("value", [-0.0, 2.0])
-def test_integrated_dataload_accepts_nondefault_valid_thresholds(native, tmp_path, value):
+def test_integrated_dataload_accepts_nondefault_valid_thresholds(
+    native, tmp_path, value
+):
     frame = native.DataFrame(
         {"x": [1.0, 2.0, 3.0, 4.0], "target": [4.0, 1.0, 3.0, 2.0]}
     ).cast(native.Float32)
     path = tmp_path / "valid_threshold.parquet"
     frame.write_parquet(path)
     config = replace(
-        _config(), stability_std_threshold=value, permutation_p_threshold=value,
+        _config(),
+        stability_std_threshold=value,
+        permutation_p_threshold=value,
     )
 
     loaded = gafime.dataload(path, "target", config=config)

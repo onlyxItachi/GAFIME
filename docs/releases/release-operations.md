@@ -186,6 +186,33 @@ base/candidate CPU sets identical. Single-core leaf-kernel measurements may be
 retained for code-generation and arithmetic diagnostics, but they are
 supplemental and cannot satisfy the Core product-throughput prerequisite.
 
+## Public Workflow Cost Qualification
+
+> Every kernel must earn its performance claim. Every boundary must earn its cost. Every public workflow must pass end-to-end validation.
+
+Resident Core throughput and physical backend correctness remain required, but
+neither establishes public acquisition cost. Before accepting a release with an
+affected ingestion or execution boundary, retain installed-wheel component and
+public end-to-end evidence for that boundary. Include default and realistic
+configured workflows, supported file formats and precision profiles, cold/miss
+and repeat/hit behavior, independent numerical/error parity, raw latency/CPU
+samples, and fresh-process peak RSS. Bind input/configuration, source SHA, exact
+wheel/native hashes, environment and measurement scope to the evidence.
+
+Account explicitly for validation, dtype/layout conversion, owned resident
+storage and intermediate copies. Source-derived byte estimates must not be
+presented as allocation measurements or resident zero-copy. Keep inseparable
+stages combined and unavailable stages not observable. A correctness-only tiny
+file smoke is not an ingestion performance gate; a fast kernel or prepared
+resident run cannot stand in for a public file workflow.
+
+Qualification is proportionate to affected critical paths, not a requirement
+to restart unrelated GPU timing campaigns. Preserve the existing physical
+backend routing/correctness requirements. The initial RC3 plan and coverage
+gaps are in [RC3 ingestion hardening](../rc3-ingestion-hardening.md); its proposed
+gates must not be reported as completed evidence. Any tracked fix changes the
+candidate source and invalidates older-source frozen bundles normally.
+
 ## Pre-RC Security Baseline
 
 Before tagging a release candidate:

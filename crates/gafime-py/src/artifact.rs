@@ -11,6 +11,7 @@ use pyo3::{
     types::{PyAny, PyBytes},
 };
 
+use crate::acquisition::PyAcquiredNumericInput;
 use crate::common::{
     decode_f32_le, decode_f64_le, validate_shape, ContinuousReport, DecisionPathResultParams,
     OwnedNumericInput, PyBoundaryError,
@@ -614,6 +615,25 @@ impl PyCompiledContinuousArtifact {
 
     fn update_target_buffer(&mut self, target: &Bound<'_, PyBytes>) -> PyResult<()> {
         let target = PrecisionTarget::decode(self.config.precision, target.as_bytes())?;
+        self.replace_target(target)
+    }
+
+    /// Consume the target from the same validated acquisition whose fingerprint
+    /// the resident cache checked. Keep the existing operation-specific commit
+    /// and retirement rules; only the input transport changes.
+    fn _update_target_acquired(
+        &mut self,
+        mut input: PyRefMut<'_, PyAcquiredNumericInput>,
+    ) -> PyResult<()> {
+        if input.rows != self.rows {
+            return Err(PyValueError::new_err(
+                "target length must match the compiled matrix rows",
+            ));
+        }
+        let target = match input.take_input(self.config.precision)? {
+            OwnedNumericInput::F32 { target, .. } => PrecisionTarget::F32(target),
+            OwnedNumericInput::F64 { target, .. } => PrecisionTarget::F64(target),
+        };
         self.replace_target(target)
     }
 

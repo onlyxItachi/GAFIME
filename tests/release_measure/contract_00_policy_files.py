@@ -20,7 +20,26 @@ REQUIRED_CONTRACT_SECTIONS = (
     "## Release Version Policy",
     "## PR, Main, And Release Gates",
     "## Regression Policy",
+    "## Performance Evidence And Boundary Costs",
     "## Migration Rules",
+)
+PERFORMANCE_EVIDENCE_PRINCIPLE = (
+    "Every kernel must earn its performance claim. "
+    "Every boundary must earn its cost. "
+    "Every public workflow must pass end-to-end validation."
+)
+PERFORMANCE_EVIDENCE_MARKERS = (
+    "## Performance Evidence And Boundary Costs",
+    "affected public workflows",
+    "default and realistic configurations",
+    "independent correctness oracle",
+    "latency, peak RSS, allocation/copy accounting",
+    "A fast kernel or resident executor is not proof of a fast public API.",
+    "fresh processes for peak-memory comparisons",
+    "whole-dataset Python row/scalar materialization",
+    "not_observable",
+    "installed package outside the checkout import path",
+    "unrelated hardware campaign",
 )
 AGENT_ONLY_SECTION = "## Delegated Agent Coordination"
 HANDOFF_ROUTING_SECTION = "## Context And Handoff Routing"
@@ -69,6 +88,16 @@ def normalized_agent_text(path: Path) -> str:
         while start < len(lines) and not lines[start].strip():
             del lines[start]
     return "\n".join(lines)
+
+
+def _validate_performance_evidence_policy(path: Path, text: str) -> None:
+    """Guard the small cross-cutting evidence rule, not benchmark outcomes."""
+    normalized = " ".join(text.split())
+    for phrase in (PERFORMANCE_EVIDENCE_PRINCIPLE, *PERFORMANCE_EVIDENCE_MARKERS):
+        if phrase not in normalized:
+            raise AssertionError(
+                f"{path.relative_to(ROOT)} missing performance evidence rule: {phrase}"
+            )
 
 
 def _validate_protected_branch_triggers(path: Path) -> None:
@@ -173,6 +202,10 @@ def main() -> None:
     build_doc = ROOT / "BUILD.md"
     release_branches = ROOT / "docs" / "releases" / "release-branches.md"
     release_operations = ROOT / "docs" / "releases" / "release-operations.md"
+    ingestion_plan = ROOT / "docs" / "rc3-ingestion-hardening.md"
+    measurement_doc = ROOT / "tests" / "release_measure" / "README.md"
+    performance_skill = ROOT / ".claude" / "skills" / "performance-change" / "SKILL.md"
+    review_skill = ROOT / ".claude" / "skills" / "review-pr" / "SKILL.md"
     release_status = ROOT / "docs" / "releases" / "STATUS.md"
     workflow = ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
     release_workflow = ROOT / ".github" / "workflows" / "build_wheels.yml"
@@ -195,6 +228,10 @@ def main() -> None:
         build_doc,
         release_branches,
         release_operations,
+        ingestion_plan,
+        measurement_doc,
+        performance_skill,
+        review_skill,
         release_status,
         gitignore,
         workflow,
@@ -268,6 +305,26 @@ def main() -> None:
     agent_text = agent.read_text(encoding="utf-8")
     claude_text = claude.read_text(encoding="utf-8")
     contributing_text = contributing.read_text(encoding="utf-8")
+    for path, text in (
+        (contract, contract_text),
+        (agent, agent_text),
+        (claude, claude_text),
+    ):
+        _validate_performance_evidence_policy(path, text)
+    for path in (
+        contributing,
+        release_operations,
+        measurement_doc,
+        performance_skill,
+        review_skill,
+        ingestion_plan,
+    ):
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        if PERFORMANCE_EVIDENCE_PRINCIPLE not in text:
+            raise AssertionError(
+                f"{path.relative_to(ROOT)} must preserve the public workflow "
+                "performance principle"
+            )
     governance_phrases = (
         "`main` remains protected",
         "accepts tracked changes only through a pull request",

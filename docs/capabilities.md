@@ -138,10 +138,14 @@ The capability result includes the following facts:
   payload may truthfully report `false` while remaining loadable. Safe selected
   candidates use upload-time bounds and do not launch a row scan. See
   [precision-contract.md](precision-contract.md).
-- Arrow C stream ingest. One record batch is required. Validated columns become
-  a GAFIME-owned row-major `f32` compute buffer for `fp32`/`mixed` or an `f64`
-  buffer for `fp64`, with no fp32 intermediate. The interface avoids Python
-  object materialization but is not zero-copy into compute memory.
+- Arrow C stream acquisition. Public numeric file ingest consumes multiple
+  batches incrementally and writes validated, owned row-major `f32` input for
+  `fp32`/`mixed` or `f64` input for `fp64`, without an fp32 intermediate. The
+  existing Core constructor then creates column-major compute storage; GPU
+  upload/family retention can require further copies. This avoids whole-dataset
+  Python object materialization, not every copy. The legacy low-level Arrow
+  convenience function retains its strict single-batch contract. See
+  [ingest validation](ingest-validation.md).
 ## Payload Discovery Seam
 
 The public native endpoint is `gafime.gafime_py.runtime_capabilities(backend="auto", device_id=0, probe=False, *, precision="mixed")`.

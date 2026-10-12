@@ -157,10 +157,12 @@ The requested profile and backend/profile compatibility are validated before
 conversion. `fp32` and `mixed` intentionally own fp32 input storage; `fp64`
 preserves fp64 input without an fp32 intermediate. File ingest retains the
 source Polars dtypes until checked configured ingest; it must not cast a finite
-out-of-range source value to infinity before validation. The strict raw Arrow
-shortcut is used only when every column already matches the selected storage
-domain. Low-level Arrow input still fails closed on a mismatched dtype rather
-than silently converting through fp32. See [ingest validation](ingest-validation.md).
+out-of-range source value to infinity before validation. Public file acquisition
+validates and converts primitive Arrow columns in Rust before the normal
+full-config planner. The legacy low-level Arrow convenience function remains
+strict about matching float dtypes; its restrictions do not select the public
+loader's execution policy. No fp64 route silently converts through fp32. See
+[ingest validation](ingest-validation.md).
 
 ## ABI And Resident Identity
 

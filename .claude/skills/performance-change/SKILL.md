@@ -12,6 +12,20 @@ Read the active checkout's regression and numerical policy in `AGENT.md` or
 `tests/release_measure/README.md`. Treat historical measurements as context,
 not current-head proof.
 
+> Every kernel must earn its performance claim. Every boundary must earn its cost. Every public workflow must pass end-to-end validation.
+
+Apply the active contract's affected-surface evidence matrix. Cover the real
+entry point with default and realistic configurations, not only a prepared
+resident or no-significance shortcut. For affected acquisition/conversion paths,
+measure component and installed public end-to-end latency, relevant CPU usage,
+fresh-process peak RSS, and a justified allocation/copy ledger; distinguish
+cold/cache misses from repeat/cache hits. File workflows include reading and
+parsing. Guard optimized paths against whole-dataset Python row/scalar
+materialization. Keep measured counters separate from estimates, inseparable
+stages combined, and unavailable phases not observable. Arrow import does not
+prove resident zero-copy. Independent numerical/error parity and exact
+wheel/native/input/configuration provenance precede any performance claim.
+
 Match evidence to the claim:
 
 - semantic and numerical tests establish correctness, not speed;

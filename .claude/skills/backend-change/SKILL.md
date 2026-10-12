@@ -39,6 +39,16 @@ static architecture targets do not prove runtime execution. Test the public API,
 the native boundary, affected lifecycle paths, numerical parity, error
 propagation, and artifact/package composition proportionately.
 
+Apply the contract's performance evidence and boundary-cost rule to every
+affected public workflow. Keep kernel, resident production, boundary/component
+and installed end-to-end evidence distinct. Cover default/realistic configs and
+cold/hit lifecycle where affected; account for latency, CPU, fresh-process peak
+RSS, owned copies and transfers without claiming resident zero-copy from Arrow
+import alone. Preserve exact wheel/native and input/configuration provenance,
+independent numerical/error parity, and honest unobservable/combined phase
+labels. Do not let a fast native executor hide costly Python materialization at
+its input boundary or require unrelated comparative GPU campaigns.
+
 Check the live release manifest before making distribution claims. Experimental
 or local-only paths must remain isolated unless the task explicitly authorizes
 a reviewed promotion. A change that needs another ownership model, public ABI,
