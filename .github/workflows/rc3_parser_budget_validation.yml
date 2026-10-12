@@ -1,0 +1,81 @@
+name: RC3 independent parser budget validation
+
+on:
+  push:
+    branches: [diagnostic/rc3-parser-budget-validation]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11.17'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rc3-rss-attribution
+          run-id: 38093562411
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/prior
+      - name: Reuse exact candidate and public RC2 bytes with identical dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'a15feea6a510c7ceb95d88e3aa5dead325bf431a38de6ad917e5c670260dcbb1' "$RUNNER_TEMP/prior/wheels/gafime-1.0.0rc2-cp311-cp311-linux_x86_64.whl" | sha256sum --check
+          echo 'a816fdde6d9836228474fb8d152679c8fba5e5bb6c198f3b522c0e9b69810790' "$RUNNER_TEMP/prior/rc2/gafime-1.0.0rc2-cp311-cp311-manylinux_2_28_x86_64.whl" | sha256sum --check
+          for label in candidate rc2; do
+            python -m venv "$RUNNER_TEMP/env-$label"
+            "$RUNNER_TEMP/env-$label/bin/python" -m pip install -r tests/release_measure/diag_15_requirements.txt
+          done
+          "$RUNNER_TEMP/env-candidate/bin/python" -m pip install --no-deps "$RUNNER_TEMP/prior/wheels/gafime-1.0.0rc2-cp311-cp311-linux_x86_64.whl"
+          "$RUNNER_TEMP/env-rc2/bin/python" -m pip install --no-deps "$RUNNER_TEMP/prior/rc2/gafime-1.0.0rc2-cp311-cp311-manylinux_2_28_x86_64.whl"
+      - name: Collect unchanged public and independently capped producer controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tests/release_measure/perf_14_public_ingest.py \
+            --python candidate="$RUNNER_TEMP/env-candidate/bin/python" \
+            --wheel candidate="$RUNNER_TEMP/prior/wheels/gafime-1.0.0rc2-cp311-cp311-linux_x86_64.whl" \
+            --expected-version candidate=1.0.0rc2 --source-sha candidate=509d68a99a70182d117dad84eb905dae04764ec1 \
+            --python rc2="$RUNNER_TEMP/env-rc2/bin/python" \
+            --wheel rc2="$RUNNER_TEMP/prior/rc2/gafime-1.0.0rc2-cp311-cp311-manylinux_2_28_x86_64.whl" \
+            --expected-version rc2=1.0.0rc2 --source-sha rc2=69a45631df7e6df41702e75d77feb947543d344a \
+            --shape 100000x20 --shape 100000x100 --format csv,parquet,ipc \
+            --precision fp32,mixed,fp64 --repeats 3 --max-time-seconds 900 \
+            --output "$RUNNER_TEMP/evidence/public"
+          python tests/release_measure/perf_14_parser_control.py \
+            --public-report "$RUNNER_TEMP/evidence/public/report.json" \
+            --repeats 3 --output "$RUNNER_TEMP/evidence/parser"
+          python tests/release_measure/perf_14_ingest_budget.py \
+            --report "$RUNNER_TEMP/evidence/public/report.json" \
+            --parser-report "$RUNNER_TEMP/evidence/parser/report.json" \
+            --budget tests/release_measure/ingest_cost_budget.json --variant candidate \
+            --output "$RUNNER_TEMP/evidence/candidate-verdict.json"
+          set +e
+          python tests/release_measure/perf_14_ingest_budget.py \
+            --report "$RUNNER_TEMP/evidence/public/report.json" \
+            --parser-report "$RUNNER_TEMP/evidence/parser/report.json" \
+            --budget tests/release_measure/ingest_cost_budget.json --variant rc2 \
+            --output "$RUNNER_TEMP/evidence/rc2-verdict.json"
+          code=$?
+          set -e
+          test "$code" -eq 1
+          python -c 'import json,os; from pathlib import Path; d=json.loads((Path(os.environ["RUNNER_TEMP"])/"evidence/rc2-verdict.json").read_text()); assert "reason" not in d and len(d["cells"]) == 18 and all("latency" in c["failures"] and "memory" in c["failures"] for c in d["cells"]), d'
+      - name: Retain raw controls and both outcomes, not duplicate fixtures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rc3-parser-budget-validation
+          path: |
+            ${{ runner.temp }}/evidence/public/*.json
+            ${{ runner.temp }}/evidence/public/*.log
+            ${{ runner.temp }}/evidence/parser/
+            ${{ runner.temp }}/evidence/*verdict.json
+          retention-days: 30
+          if-no-files-found: error

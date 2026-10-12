@@ -1,5 +1,6 @@
 {
   "schema": "gafime.public-ingestion-budget.v1",
+  "memory_baseline_model": "independent-parser-v1",
   "min_samples": 3,
   "require_source_sha": true,
   "source_dtype": "float64",

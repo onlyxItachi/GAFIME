@@ -17,6 +17,27 @@ import statistics
 
 REPORT_SCHEMA = "gafime.public-ingestion-performance.v1"
 BUDGET_SCHEMA = "gafime.public-ingestion-budget.v1"
+PARSER_SCHEMA = "gafime.public-ingestion-parser.v1"
+PARSER_CASE_KEYS = {"rows", "cols", "format"}
+CONTEXT_KEYS = {
+    "host",
+    "python_version",
+    "platform",
+    "libc",
+    "affinity",
+    "cpu_count",
+    "initial_allocator_policy",
+    "thp",
+}
+ALLOCATOR_POLICY_KEYS = {
+    "_RJEM_MALLOC_CONF",
+    "POLARS_THP",
+    "POLARS_MAX_THREADS",
+    "RAYON_NUM_THREADS",
+    "MALLOC_CONF",
+    "MALLOC_ARENA_MAX",
+    "LD_PRELOAD",
+}
 CASE_KEYS = {
     "rows",
     "cols",
@@ -84,7 +105,222 @@ def peak(memory):
     return high * 1024
 
 
-def validate(report, budget, variant):
+def producer_key(case):
+    require(set(case) == PARSER_CASE_KEYS, "invalid parser case fields")
+    for field in ("rows", "cols"):
+        number(case[field], field, positive=True, integer=True)
+    require(case["format"] in ("csv", "parquet", "ipc"), "invalid parser format")
+    return json.dumps(case, sort_keys=True)
+
+
+def measurement_context(value):
+    """Require stable matching facts, not changing load or free-memory samples."""
+    require(
+        isinstance(value, dict) and set(value) == CONTEXT_KEYS,
+        "invalid measurement context",
+    )
+    host = value["host"]
+    require(
+        isinstance(host, dict)
+        and set(host) == {"hostname", "boot_id", "github_run_id", "github_run_attempt"},
+        "invalid host context",
+    )
+    for field in ("hostname", "boot_id"):
+        require(
+            isinstance(host[field], str) and bool(host[field]), "missing host identity"
+        )
+    for field in ("github_run_id", "github_run_attempt"):
+        require(
+            host[field] is None or (isinstance(host[field], str) and bool(host[field])),
+            "invalid Actions identity",
+        )
+    require(
+        (host["github_run_id"] is None) == (host["github_run_attempt"] is None),
+        "incomplete Actions identity",
+    )
+    require(
+        isinstance(value["python_version"], str)
+        and bool(value["python_version"])
+        and isinstance(value["platform"], str)
+        and value["platform"].startswith("Linux"),
+        "invalid runtime context",
+    )
+    require(
+        isinstance(value["libc"], list)
+        and len(value["libc"]) == 2
+        and all(isinstance(part, str) and bool(part) for part in value["libc"]),
+        "invalid libc context",
+    )
+    number(value["cpu_count"], "cpu_count", positive=True, integer=True)
+    affinity = value["affinity"]
+    require(
+        isinstance(affinity, list)
+        and bool(affinity)
+        and all(type(cpu) is int and cpu >= 0 for cpu in affinity)
+        and affinity == sorted(set(affinity)),
+        "invalid CPU affinity",
+    )
+    policy = value["initial_allocator_policy"]
+    require(
+        isinstance(policy, dict)
+        and set(policy) == ALLOCATOR_POLICY_KEYS
+        and all(item is None or isinstance(item, str) for item in policy.values()),
+        "invalid initial allocator policy",
+    )
+    thp = value["thp"]
+    require(
+        isinstance(thp, dict)
+        and set(thp) == {"enabled", "defrag", "hpage_pmd_size"}
+        and all(isinstance(item, str) and bool(item) for item in thp.values()),
+        "missing THP context",
+    )
+    require(
+        thp["hpage_pmd_size"].isdigit() and int(thp["hpage_pmd_size"]) > 0,
+        "invalid THP page size",
+    )
+    return value
+
+
+def parser_baselines(parser_report, selected, public_harness, cells, minimum):
+    """Validate independent producer evidence before permitting any RSS baseline."""
+    require(parser_report is not None, "independent parser report required")
+    require(
+        parser_report["schema"] == PARSER_SCHEMA, "unsupported parser report schema"
+    )
+    require(
+        parser_report["status"] == "collected"
+        and parser_report["collector_status"] == "passed",
+        "incomplete parser collection",
+    )
+    records = parser_report["records"]
+    number(
+        parser_report["requested_jobs"],
+        "parser requested_jobs",
+        positive=True,
+        integer=True,
+    )
+    require(
+        len(records) == parser_report["requested_jobs"]
+        and all(record["status"] == "passed" for record in records),
+        "missing or failed parser samples",
+    )
+    variants = [v for v in parser_report["variants"] if v["label"] == selected["label"]]
+    require(variants == [selected], "unmatched parser variant/source")
+    require(
+        digest(parser_report["public_harness"]["sha256"]) == public_harness,
+        "unmatched parser public harness",
+    )
+    parser_harness = digest(parser_report["harness"]["sha256"])
+    require(parser_harness != public_harness, "parser must use its independent worker")
+    # Precision changes the native storage, not this Float64 file producer.
+    # Sharing a producer between profile cells is allowed only when every
+    # artifact, input, runtime and initial allocator policy agrees exactly.
+    anchors = {}
+    public_context = None
+    for repeats in cells.values():
+        for pair in repeats.values():
+            for result in pair.values():
+                key = producer_key(
+                    {field: result["case"][field] for field in PARSER_CASE_KEYS}
+                )
+                context = measurement_context(result["measurement_context"])
+                require(
+                    public_context is None or public_context == context,
+                    "mixed public measurement environment",
+                )
+                public_context = context
+                require(
+                    result["python"]["version"] == context["python_version"],
+                    "contradictory Python context",
+                )
+                anchor = {
+                    field: result[field]
+                    for field in (
+                        "identity",
+                        "native",
+                        "python",
+                        "dependencies",
+                        "fixture",
+                        "measurement_context",
+                    )
+                }
+                require(
+                    key not in anchors or anchors[key] == anchor,
+                    "mixed public producer identity",
+                )
+                anchors[key] = anchor
+    producer_records = {}
+    for record in records:
+        if record["variant"] != selected["label"]:
+            continue
+        result = record["result"]
+        require(
+            result["schema"] == PARSER_SCHEMA + ".worker",
+            "unsupported parser worker schema",
+        )
+        require(
+            result["variant"] == selected and result["case"] == record["case"],
+            "parser sample identity disagreement",
+        )
+        key = producer_key(record["case"])
+        require(key in anchors, "unbudgeted parser cell")
+        require(
+            result["instrumented"] is False
+            and result["treatment"] == "normal"
+            and result["numerical_acquisition"] is False
+            and result["frames_retained_until_snapshot"] is True,
+            "invalid independent parser measurement scope",
+        )
+        require(
+            digest(result["harness"]["sha256"]) == parser_harness
+            and digest(result["public_harness"]["sha256"]) == public_harness,
+            "mixed parser harness identity",
+        )
+        anchor = anchors[key]
+        for field, value in anchor.items():
+            require(result[field] == value, f"unmatched parser {field}")
+        measurement_context(result["measurement_context"])
+        fixture = result["fixture"]
+        require(
+            result["reader"]
+            == {
+                "name": "read_" + result["case"]["format"],
+                "kwargs": {},
+                "features": fixture["feature_names"],
+                "target": "target",
+            },
+            "unmatched parser reader/projection",
+        )
+        number(
+            result["timing"]["wall_nanoseconds"],
+            "parser wall time",
+            positive=True,
+            integer=True,
+        )
+        for field in ("after_import", "after_call_before_snapshot"):
+            peak(result["memory"][field])
+        require(
+            peak(result["memory"]["after_call_before_snapshot"])
+            >= peak(result["memory"]["after_import"])
+            and result["memory"]["inherited_resource_ru_maxrss_used"] is False,
+            "invalid parser RSS measurement",
+        )
+        repeat = number(record["repeat"], "parser repeat", integer=True)
+        repeats = producer_records.setdefault(key, {})
+        require(repeat not in repeats, "duplicate parser sample")
+        repeats[repeat] = result
+    require(
+        set(producer_records) == set(anchors), "missing declared parser cell coverage"
+    )
+    for repeats in producer_records.values():
+        require(
+            len(repeats) >= minimum and set(repeats) == set(range(len(repeats))),
+            "missing parser repeat coverage",
+        )
+    return producer_records, parser_harness
+
+
+def validate(report, budget, variant, parser_report=None):
     require(report["schema"] == REPORT_SCHEMA, "unsupported report schema")
     require(
         report["status"] == "collected" and report["collector_status"] == "passed",
@@ -101,7 +337,17 @@ def validate(report, budget, variant):
         "missing or failed samples",
     )
     require(budget["schema"] == BUDGET_SCHEMA, "unsupported budget schema")
+    model = budget.get("memory_baseline_model", "direct-v1")
+    require(
+        model in ("direct-v1", "independent-parser-v1"),
+        "unsupported memory baseline model",
+    )
     require(budget["source_dtype"] in ("float32", "float64"), "invalid source dtype")
+    if model == "independent-parser-v1":
+        require(
+            budget["source_dtype"] == "float64",
+            "parser model requires reviewed Float64 source",
+        )
     minimum = number(budget["min_samples"], "min_samples", positive=True, integer=True)
     policies = {}
     for policy in budget["cells"]:
@@ -207,6 +453,11 @@ def validate(report, budget, variant):
         group[route] = result
     require(len(identities) == 1, "mixed or missing installed/source identities")
     require(set(cells) == set(policies), "missing declared cell coverage")
+    producer_records, parser_harness = ({}, None)
+    if model == "independent-parser-v1":
+        producer_records, parser_harness = parser_baselines(
+            parser_report, selected, harness, cells, minimum
+        )
     comparisons = []
     for key, policy in policies.items():
         repeats = cells[key]
@@ -239,14 +490,53 @@ def validate(report, budget, variant):
             max(peak(r["memory"]["after_call_before_snapshot"]) for r in direct),
         )
         case = policy["case"]
-        memory_limit = number(
-            baseline_peak
-            + policy["fixed_format_allowance_bytes"]
+        allowance = number(
+            policy["fixed_format_allowance_bytes"]
             + policy["extra_bytes_per_cell"] * case["rows"] * case["cols"],
+            "computed RSS allowance",
+        )
+        old_memory_limit = number(
+            baseline_peak + allowance,
             "computed RSS limit",
         )
+        memory_limit = old_memory_limit
+        producer_costs = {}
+        producer_failures = []
+        if model == "independent-parser-v1":
+            producer = producer_records[
+                producer_key({field: case[field] for field in PARSER_CASE_KEYS})
+            ].values()
+            parser_peak = max(
+                peak(r["memory"]["after_call_before_snapshot"]) for r in producer
+            )
+            parser_time = statistics.median(
+                r["timing"]["wall_nanoseconds"] for r in producer
+            )
+            producer_failures = [
+                name
+                for name, actual, limit in (
+                    ("parser_memory", parser_peak, old_memory_limit),
+                    ("parser_latency", parser_time, wall_limit),
+                )
+                if actual > limit
+            ]
+            # A producer cannot normalize away its own cost. A failed control
+            # never enlarges the public limit; both failures remain visible.
+            if not producer_failures:
+                memory_limit = number(
+                    max(baseline_peak, parser_peak) + allowance,
+                    "computed parser-aware RSS limit",
+                )
+            producer_costs = {
+                "parser_samples": len(producer),
+                "parser_peak_bytes": parser_peak,
+                "parser_rss_limit_bytes": old_memory_limit,
+                "median_parser_ns": parser_time,
+                "parser_wall_limit_ns": wall_limit,
+                "parser_baseline_applied": not producer_failures,
+            }
         load_peak = max(peak(r["memory"]["after_call_before_snapshot"]) for r in loaded)
-        failures = [
+        failures = producer_failures + [
             name
             for name, actual, limit in (
                 ("latency", load_time, wall_limit),
@@ -262,7 +552,9 @@ def validate(report, budget, variant):
                 "median_dataload_ns": load_time,
                 "wall_limit_ns": wall_limit,
                 "max_dataload_peak_bytes": load_peak,
+                "old_rss_limit_bytes": old_memory_limit,
                 "rss_limit_bytes": memory_limit,
+                **producer_costs,
                 "failures": failures,
             }
         )
@@ -276,6 +568,8 @@ def validate(report, budget, variant):
         else "uncommitted_development_only",
         "authenticated_identity": list(next(iter(identities))),
         "harness_sha256": harness,
+        "parser_harness_sha256": parser_harness,
+        "memory_baseline_model": model,
         "cells": comparisons,
         "scope": "Same-host coarse public-call cost gate; not a universal speedup, independent numerical oracle, exact allocation count, or frozen-source provenance proof.",
     }
@@ -285,6 +579,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for field in ("report", "budget", "variant", "output"):
         parser.add_argument("--" + field, required=True)
+    parser.add_argument("--parser-report")
     args = parser.parse_args()
     output = Path(args.output)
     if output.exists():
@@ -300,8 +595,13 @@ def main():
             name: Path(getattr(args, name)).read_bytes()
             for name in ("report", "budget")
         }
+        if args.parser_report:
+            inputs["parser_report"] = Path(args.parser_report).read_bytes()
         verdict = validate(
-            json.loads(inputs["report"]), json.loads(inputs["budget"]), args.variant
+            json.loads(inputs["report"]),
+            json.loads(inputs["budget"]),
+            args.variant,
+            json.loads(inputs["parser_report"]) if "parser_report" in inputs else None,
         )
     except (KeyError, TypeError, ValueError, OSError, OverflowError) as error:
         verdict["reason"] = str(error)
