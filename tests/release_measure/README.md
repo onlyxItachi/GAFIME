@@ -643,6 +643,10 @@ the complete canonical matrix. Aggregate records preserve the identical CPU
 identity reported by every fresh child and omit environment variables that
 were genuinely absent instead of encoding them as truthy placeholders.
 
+See [Core benchmark calibration](../../docs/core-benchmark-calibration.md) for
+the loop-selection rationale, bounded RC3 diagnostic evidence and the separate
+exact-harness/product pinning required for recovery.
+
 Metal event evidence is produced by the test-only
 `gafime_metal_precision_native_timing` CMake target. It records allocation,
 unified-memory/host upload, descriptor planning, Pearson, R2, MI, cached-rank
