@@ -45,6 +45,11 @@ const MIN_RELEASE_WARMUPS: usize = 10;
 const MIN_RELEASE_REPETITIONS: usize = 30;
 const TARGET_REGION_NS: u128 = 100_000_000;
 const CALIBRATION_TARGET_REGION_NS: u128 = 200_000_000;
+// Selection and acceptance are deliberately different. Targeting exactly the
+// acceptance boundary can chase small warming/jitter changes through all four
+// refinements. A fixed 10% planning margin leaves the hard 200 ms requirement,
+// bounded retries, raw floor, and immutable recorded loop count unchanged.
+const CALIBRATION_LOOP_SELECTION_REGION_NS: u128 = 220_000_000;
 const CALIBRATION_PREFLIGHT_SAMPLES: usize = 3;
 const MAX_CALIBRATION_REFINEMENTS: usize = 4;
 const MAX_LOOP_COUNT: usize = 1_048_576;
@@ -904,7 +909,7 @@ struct Calibration {
 
 fn loop_count_for_calibration_target(current: usize, observed_ns: u128) -> Option<usize> {
     let required = (current as u128)
-        .checked_mul(CALIBRATION_TARGET_REGION_NS)?
+        .checked_mul(CALIBRATION_LOOP_SELECTION_REGION_NS)?
         .div_ceil(observed_ns.max(1));
     let required = usize::try_from(required).ok()?.max(current);
     (required <= MAX_LOOP_COUNT).then_some(required)
@@ -1502,7 +1507,7 @@ fn main() {
         .map(|value| value.to_string())
         .unwrap_or_else(|| "null".to_owned());
     let report = format!(
-        "{{\"schema\":\"gafime.core-production-executor.child.v1\",\"status\":\"{}\",\"claim_ready\":{},\"backend\":\"core\",\"profile\":{},\"metric\":{},\"operation\":\"production_executor_metric\",\"execution_surface\":\"planner_protocol_resident_precision_compute_backend_ranked_result\",\"measurement_scope\":\"production_precision_compute_backend\",\"candidate_family_scope\":\"ranked_unary_candidates_only\",\"measurement_mode\":{},\"input_policy\":{},\"workload\":{{\"name\":{},\"class\":\"production_core_executor\",\"rows\":{},\"features\":{},\"candidates\":{},\"arity\":1,\"top_k\":{},\"mi_bins\":{},\"mi_approximate\":true,\"metric_set\":[{}]}},\"warmups\":{},\"repetitions\":{},\"loop_count_per_sample\":{},\"target_region_ns\":{},\"calibration_target_region_ns\":{},\"calibration\":{{\"policy\":\"fixed_loop_count_selected_before_recording_no_recorded_sample_rescaling_or_filtering\",\"initial_probe_median_ns\":{},\"refinement_rounds\":{},\"preflight_samples_ns\":[{}],\"preflight_min_observed_ns\":{},\"loop_count_limit\":{}}},\"sample_region_min_observed_ns\":{},\"sample_region_target_met\":{},\"samples_ns\":[{}],\"raw_samples_ns\":[{}],\"setup\":{{\"planner_protocol_ns\":{},\"resident_matrix_ns\":{},\"timed_region\":\"real ranked PrecisionComputeBackend execution plus typed result table allocation/materialization; input generation, resident matrix construction, planner/protocol setup, and the complete result snapshot are outside the timed region\",\"untimed_post_measurement_snapshot\":true}},\"execution_topology\":{{\"candidate_parallelism\":{},\"worker_mode\":{},\"measurement_role\":{},\"requested_rayon_workers\":{},\"effective_rayon_workers\":{},\"allowed_parallelism\":{},\"allowed_parallelism_source\":\"std::thread::available_parallelism\",\"process_affinity\":{},\"process_affinity_cardinality\":{},\"affinity_matches_allowed_parallelism\":{},\"pool_start_worker_ids\":[{}],\"pool_start_worker_count\":{},\"pool_start_evidence_scope\":\"dedicated_pool_construction_only_not_candidate_work_participation\",\"worker_os_cpu_ticks\":[{}],\"worker_cpu_tick_status\":{},\"worker_cpu_ticks_observable\":{},\"every_effective_worker_positive_work_ticks\":{},\"worker_participation_evidence_scope\":\"per_worker_linux_os_tid_cpu_ticks_around_real_production_measurement\",\"semantic_candidate_participation_guard\":{}}},\"result\":{{\"rows_written\":{},\"visible_score_bits\":{},\"candidate_digest\":{},\"digest_scope\":\"all_visible_result_metadata_structural_arrays_and_metric_bits\",\"untimed_snapshot\":{{\"result_dtype\":{},\"row_count\":{},\"max_arity\":{},\"metric_count\":{},\"result_flags\":{},\"metric_ids\":[{}],\"combo_indices\":[{}],\"ranks\":[{}],\"families\":[{}],\"candidate_ids\":[{}],\"row_flags\":[{}],\"metric_value_bits\":[{}],\"metric_value_text\":{},\"metric_value_classes\":{}}}}},\"variant\":{},\"ab_block\":{},\"variant_sequence\":{},\"cell_schedule\":{{\"index\":{},\"seed\":{},\"sha256\":{},\"profile_order\":{}}},\"runner_pid\":{},\"process_id\":{},\"runner_invocation_id\":{},\"process_isolation\":\"fresh_helper_process_per_variant_trial\",\"source_commit\":{},\"product_source_commit\":{},\"product_source_tree\":{},\"product_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source_commit\":{},\"harness_source_tree\":{},\"harness_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source_blob\":{{\"relative_path\":{},\"source_sha256\":{},\"current_git_blob\":{},\"head_git_blob\":{}}},\"harness_runner_blob\":{{\"relative_path\":{},\"source_sha256\":{},\"current_git_blob\":{},\"head_git_blob\":{}}},\"compiled_harness\":{{\"product_rlib_sha256\":{},\"orchestrator_rlib_sha256\":{},\"types_rlib_sha256\":{},\"rayon_rlib_sha256\":{},\"command_sha256\":{}}},\"input_identity\":{{\"generator\":\"gafime-core-production-executor-v1\",\"byte_order\":\"native\",\"fp32_matrix_sha256\":{},\"fp32_target_sha256\":{},\"fp64_matrix_sha256\":{},\"fp64_target_sha256\":{}}},\"provenance\":{{\"product_source_root\":{},\"harness_source_root\":{},\"product_rlib\":{},\"orchestrator_rlib\":{},\"types_rlib\":{},\"rayon_rlib\":{},\"benchmark_binary\":{},\"wheel\":{}}},\"device\":{{\"kind\":\"cpu\",\"identity\":{},\"logical_cpu_count\":{},\"physical_cpu_count\":{}}},\"process_affinity\":{},\"environment\":{},\"command_line\":{},\"clock\":\"std::time::Instant monotonic clock\",\"clock_and_power_capture_point\":\"before and after all timed benchmark regions\",\"clock_and_power_state\":{{\"before\":{},\"after\":{}}}}}",
+        "{{\"schema\":\"gafime.core-production-executor.child.v1\",\"status\":\"{}\",\"claim_ready\":{},\"backend\":\"core\",\"profile\":{},\"metric\":{},\"operation\":\"production_executor_metric\",\"execution_surface\":\"planner_protocol_resident_precision_compute_backend_ranked_result\",\"measurement_scope\":\"production_precision_compute_backend\",\"candidate_family_scope\":\"ranked_unary_candidates_only\",\"measurement_mode\":{},\"input_policy\":{},\"workload\":{{\"name\":{},\"class\":\"production_core_executor\",\"rows\":{},\"features\":{},\"candidates\":{},\"arity\":1,\"top_k\":{},\"mi_bins\":{},\"mi_approximate\":true,\"metric_set\":[{}]}},\"warmups\":{},\"repetitions\":{},\"loop_count_per_sample\":{},\"target_region_ns\":{},\"calibration_target_region_ns\":{},\"calibration\":{{\"policy\":\"fixed_loop_count_selected_before_recording_no_recorded_sample_rescaling_or_filtering\",\"initial_probe_median_ns\":{},\"refinement_rounds\":{},\"preflight_samples_ns\":[{}],\"preflight_min_observed_ns\":{},\"loop_count_limit\":{},\"loop_selection_target_region_ns\":{}}},\"sample_region_min_observed_ns\":{},\"sample_region_target_met\":{},\"samples_ns\":[{}],\"raw_samples_ns\":[{}],\"setup\":{{\"planner_protocol_ns\":{},\"resident_matrix_ns\":{},\"timed_region\":\"real ranked PrecisionComputeBackend execution plus typed result table allocation/materialization; input generation, resident matrix construction, planner/protocol setup, and the complete result snapshot are outside the timed region\",\"untimed_post_measurement_snapshot\":true}},\"execution_topology\":{{\"candidate_parallelism\":{},\"worker_mode\":{},\"measurement_role\":{},\"requested_rayon_workers\":{},\"effective_rayon_workers\":{},\"allowed_parallelism\":{},\"allowed_parallelism_source\":\"std::thread::available_parallelism\",\"process_affinity\":{},\"process_affinity_cardinality\":{},\"affinity_matches_allowed_parallelism\":{},\"pool_start_worker_ids\":[{}],\"pool_start_worker_count\":{},\"pool_start_evidence_scope\":\"dedicated_pool_construction_only_not_candidate_work_participation\",\"worker_os_cpu_ticks\":[{}],\"worker_cpu_tick_status\":{},\"worker_cpu_ticks_observable\":{},\"every_effective_worker_positive_work_ticks\":{},\"worker_participation_evidence_scope\":\"per_worker_linux_os_tid_cpu_ticks_around_real_production_measurement\",\"semantic_candidate_participation_guard\":{}}},\"result\":{{\"rows_written\":{},\"visible_score_bits\":{},\"candidate_digest\":{},\"digest_scope\":\"all_visible_result_metadata_structural_arrays_and_metric_bits\",\"untimed_snapshot\":{{\"result_dtype\":{},\"row_count\":{},\"max_arity\":{},\"metric_count\":{},\"result_flags\":{},\"metric_ids\":[{}],\"combo_indices\":[{}],\"ranks\":[{}],\"families\":[{}],\"candidate_ids\":[{}],\"row_flags\":[{}],\"metric_value_bits\":[{}],\"metric_value_text\":{},\"metric_value_classes\":{}}}}},\"variant\":{},\"ab_block\":{},\"variant_sequence\":{},\"cell_schedule\":{{\"index\":{},\"seed\":{},\"sha256\":{},\"profile_order\":{}}},\"runner_pid\":{},\"process_id\":{},\"runner_invocation_id\":{},\"process_isolation\":\"fresh_helper_process_per_variant_trial\",\"source_commit\":{},\"product_source_commit\":{},\"product_source_tree\":{},\"product_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source_commit\":{},\"harness_source_tree\":{},\"harness_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source_blob\":{{\"relative_path\":{},\"source_sha256\":{},\"current_git_blob\":{},\"head_git_blob\":{}}},\"harness_runner_blob\":{{\"relative_path\":{},\"source_sha256\":{},\"current_git_blob\":{},\"head_git_blob\":{}}},\"compiled_harness\":{{\"product_rlib_sha256\":{},\"orchestrator_rlib_sha256\":{},\"types_rlib_sha256\":{},\"rayon_rlib_sha256\":{},\"command_sha256\":{}}},\"input_identity\":{{\"generator\":\"gafime-core-production-executor-v1\",\"byte_order\":\"native\",\"fp32_matrix_sha256\":{},\"fp32_target_sha256\":{},\"fp64_matrix_sha256\":{},\"fp64_target_sha256\":{}}},\"provenance\":{{\"product_source_root\":{},\"harness_source_root\":{},\"product_rlib\":{},\"orchestrator_rlib\":{},\"types_rlib\":{},\"rayon_rlib\":{},\"benchmark_binary\":{},\"wheel\":{}}},\"device\":{{\"kind\":\"cpu\",\"identity\":{},\"logical_cpu_count\":{},\"physical_cpu_count\":{}}},\"process_affinity\":{},\"environment\":{},\"command_line\":{},\"clock\":\"std::time::Instant monotonic clock\",\"clock_and_power_capture_point\":\"before and after all timed benchmark regions\",\"clock_and_power_state\":{{\"before\":{},\"after\":{}}}}}",
         if claim_ready { "pass" } else { "informational" },
         claim_ready,
         json_string(profile.name()),
@@ -1536,6 +1541,7 @@ fn main() {
             .min()
             .expect("calibration preflight samples"),
         MAX_LOOP_COUNT,
+        CALIBRATION_LOOP_SELECTION_REGION_NS,
         raw_minimum,
         raw_minimum >= TARGET_REGION_NS,
         normalized_json,
@@ -1683,9 +1689,63 @@ mod tests {
     #[test]
     fn calibration_is_fixed_after_headroom_and_fails_closed_at_the_bound() {
         assert_eq!(
-            loop_count_for_calibration_target(8_192, CALIBRATION_TARGET_REGION_NS),
+            loop_count_for_calibration_target(8_192, CALIBRATION_LOOP_SELECTION_REGION_NS),
             Some(8_192)
         );
         assert_eq!(loop_count_for_calibration_target(MAX_LOOP_COUNT, 1), None);
+    }
+
+    #[test]
+    fn loop_selection_margin_is_not_an_acceptance_threshold_or_a_clamped_cap() {
+        assert_eq!(CALIBRATION_TARGET_REGION_NS, 200_000_000);
+        assert_eq!(TARGET_REGION_NS, 100_000_000);
+        assert_eq!(MAX_CALIBRATION_REFINEMENTS, 4);
+        assert_eq!(CALIBRATION_PREFLIGHT_SAMPLES, 3);
+        assert_eq!(loop_count_for_calibration_target(1, 250_000), Some(880));
+        assert_eq!(
+            loop_count_for_calibration_target(8_192, CALIBRATION_TARGET_REGION_NS),
+            Some(9_012)
+        );
+        assert_eq!(
+            loop_count_for_calibration_target(MAX_LOOP_COUNT, CALIBRATION_LOOP_SELECTION_REGION_NS),
+            Some(MAX_LOOP_COUNT)
+        );
+        assert_eq!(
+            loop_count_for_calibration_target(MAX_LOOP_COUNT, CALIBRATION_TARGET_REGION_NS),
+            None
+        );
+        assert_eq!(loop_count_for_calibration_target(usize::MAX, 1), None);
+        assert_eq!(loop_count_for_calibration_target(1, 0), None);
+    }
+
+    #[test]
+    fn selection_margin_escapes_the_observed_boundary_chasing_trace() {
+        // Actual diagnostic minima, not invented product timing. Replaying
+        // per-loop costs is a deterministic arithmetic regression only; live
+        // validation remains separate and no samples are rescaled in a run.
+        let observations = [
+            (481_u128, 131_128_161_u128),
+            (734, 198_850_181),
+            (739, 199_970_333),
+            (740, 199_208_499),
+            (743, 199_546_447),
+        ];
+        let replay = |selection_target: u128| {
+            let mut loops = selection_target.div_ceil(416_487);
+            for (round, (old_loops, duration)) in observations.iter().enumerate() {
+                let observed = (duration * loops).div_ceil(*old_loops);
+                if observed >= CALIBRATION_TARGET_REGION_NS {
+                    return Some(round);
+                }
+                if round == MAX_CALIBRATION_REFINEMENTS {
+                    return None;
+                }
+                loops = (loops * selection_target).div_ceil(observed);
+                assert!(loops <= MAX_LOOP_COUNT as u128);
+            }
+            None
+        };
+        assert_eq!(replay(CALIBRATION_TARGET_REGION_NS), None);
+        assert_eq!(replay(CALIBRATION_LOOP_SELECTION_REGION_NS), Some(1));
     }
 }
