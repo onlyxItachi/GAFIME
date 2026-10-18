@@ -14,6 +14,8 @@ pub mod matrix;
 pub mod precision;
 pub mod rank;
 pub mod result;
+#[doc(hidden)]
+pub mod semantic;
 pub mod significance;
 pub mod simd;
 pub mod time_series;

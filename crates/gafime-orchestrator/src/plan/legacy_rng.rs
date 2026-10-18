@@ -1,15 +1,15 @@
-//! Minimal CPython-compatible MT19937 stream for legacy candidate planning.
+//! Minimal CPython-compatible MT19937 stream for legacy-compatible scheduling.
 //!
 //! GAFIME v0.4.7 and v0.5.0-legacy used `random.Random(seed).shuffle` to cap
-//! unary candidates and order higher-arity descriptors. Keeping this small,
-//! private implementation avoids making candidate identity depend on a new RNG
-//! crate or on Python-side planning.
+//! unary candidates and order higher-arity descriptors. Keeping this small
+//! crate-private primitive avoids making candidate identity depend on a new RNG
+//! crate or on Python-side planning; semantic policy owns the latter ordering.
 
 const STATE_LEN: usize = 624;
 const STATE_PERIOD: usize = 397;
 
 #[derive(Clone, Debug)]
-pub(super) struct PythonRandom {
+pub(crate) struct PythonRandom {
     state: [u32; STATE_LEN],
     index: usize,
 }
@@ -25,7 +25,7 @@ impl PythonRandom {
         Self::from_seed_words(&key)
     }
 
-    pub(super) fn from_seed_words(seed_words: &[u32]) -> Self {
+    pub(crate) fn from_seed_words(seed_words: &[u32]) -> Self {
         let zero = [0u32];
         let key = if seed_words.is_empty() {
             &zero[..]
@@ -40,7 +40,7 @@ impl PythonRandom {
         random
     }
 
-    pub(super) fn shuffle<T>(&mut self, values: &mut [T]) {
+    pub(crate) fn shuffle<T>(&mut self, values: &mut [T]) {
         for index in (1..values.len()).rev() {
             let swap_index = self.rand_below(index + 1);
             values.swap(index, swap_index);

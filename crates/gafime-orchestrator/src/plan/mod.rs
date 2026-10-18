@@ -1,5 +1,5 @@
 pub mod combos;
-mod legacy_rng;
+pub(crate) mod legacy_rng;
 pub mod shapes;
 pub mod spine;
 
