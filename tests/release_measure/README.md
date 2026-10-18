@@ -595,6 +595,15 @@ benchmark binaries differ. The 100 ms hard raw-region floor and 200 ms
 calibration target are reported as `target_region_ns` and
 `calibration_target_region_ns`; they are independently validated from perf13's
 public sample-region gate. Calibration is completed before recording: a
+fixed 220 ms **loop-selection** target adds a 10% planning margin above the
+unchanged 200 ms **acceptance** requirement. This tolerates up to a 9.09%
+decrease in per-loop duration after an observation, ignoring integer rounding;
+it is not a convergence guarantee. The selection target is retained separately
+as `calibration.loop_selection_target_region_ns`. It does not lower either
+hard timing floor, increase the refinement limit, clamp an excessive loop
+request, or adapt any recorded sample. A changed common harness requires fresh
+complete baseline and candidate evidence under that identical revision; partial
+records and older-harness baseline timings cannot be spliced into a new run. A
 bounded production-only loop ceiling permits fast cells beyond the former
 4,096-loop limit, three full-region preflight probes must each reach 200 ms,
 and an under-target preflight increases the one fixed loop count before the
@@ -633,6 +642,10 @@ public release/comparative-claim booleans remain false; stable mode requires
 the complete canonical matrix. Aggregate records preserve the identical CPU
 identity reported by every fresh child and omit environment variables that
 were genuinely absent instead of encoding them as truthy placeholders.
+
+See [Core benchmark calibration](../../docs/core-benchmark-calibration.md) for
+the loop-selection rationale, bounded RC3 diagnostic evidence and the separate
+exact-harness/product pinning required for recovery.
 
 Metal event evidence is produced by the test-only
 `gafime_metal_precision_native_timing` CMake target. It records allocation,
