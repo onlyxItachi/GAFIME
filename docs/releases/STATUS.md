@@ -2,17 +2,20 @@
 
 This file tracks the current development/release train on `main`. It is mutable
 operational status, not an immutable historical release record.
+On a candidate branch it tracks that branch's preparation; candidate identity
+does not assert that independently advancing `main` has adopted it before admission.
 
 ## Current Target
 
-- Repository/Cargo next candidate target: `1.0.0-rc.3`
-- Python/PyPI next candidate target: `1.0.0rc3`
+- Repository/Cargo candidate identity: `1.0.0-rc.3`
+- Python/PyPI candidate identity: `1.0.0rc3`
 - Canonical next tag target: `v1.0.0-rc.3`
-- Phase: release-blocking public ingestion hardening; stable postponed
+- Phase: RC3 identity preparation and bounded stabilization; final qualification pending
 
-The source tree still carries the RC2 identity while focused fixes are reviewed.
-RC3 identity, branch preparation and exact-wheel qualification follow separately;
-this target does not authorize tagging or publication. The unpublished stable
+This candidate source carries the RC3 identity on `release/v1.0.0-rc.3`, cut
+directly from reviewed green `main`. The initial fork is not a settled candidate;
+identity preparation and exact-wheel qualification remain distinct. No final
+release freeze, tag or publication follows from this preparation. The unpublished stable
 candidate is an earlier checkpoint, not the source to publish as stable now.
 Live publication state is authoritative on
 [GitHub Releases](https://github.com/onlyxItachi/GAFIME/releases) and
@@ -34,31 +37,42 @@ moment-in-time commit, workflow, or package-presence result.
 - The three bounded input-validation defects are fixed, the public repository
   and documentation routers are established, and the bounded compiler/codegen
   audit found no evidence-backed product change to apply.
-- Repository, Cargo, and Python metadata use the canonical RC2 identities.
+- The candidate's repository, Cargo and Python metadata use canonical RC3
+  identities; published RC2 metadata and artifacts remain unchanged.
 - RC1 was built from frozen, verified artifacts and is publicly available as a
   prerelease.
 - RC2 is also publicly available from its immutable qualified artifacts. Its
   resident/kernel evidence does not establish public file-ingestion performance.
+- Native full-config ingestion hardening has landed through reviewed mainline
+  work with installed-wheel numerical/error and latency/RSS gates. Independent
+  parser controls preserve complete environment identity and reject the original
+  RC2 materialization regression. This is source-hardening evidence, not final
+  RC3 frozen-artifact qualification.
 
-## RC3 Required Boundary Work
+## RC3 Boundary Contract And Evidence
 
 The [ingestion hardening plan](../rc3-ingestion-hardening.md) records the defect,
 minimal owned native acquisition boundary, copy ledger and acceptance matrix.
-Default `dataload` must preserve full configuration without whole-dataset Python
-row/scalar materialization. Independent numerical parity, installed-wheel tests,
-matched latency/fresh-process memory samples and applicable backend routing are
-required before readiness. Every kernel, boundary and affected public workflow
-must carry its own evidence; resident throughput is not an end-to-end claim.
+Default numeric `dataload` uses checked native acquisition without whole-dataset
+Python row/scalar materialization and preserves full configuration. Independent
+numerical parity, installed-wheel tests, matched latency/fresh-process memory
+samples and applicable backend routing remain required for final candidate
+qualification. Every kernel, boundary and affected public workflow must carry
+its own evidence; resident throughput is not an end-to-end claim. The
+[parser-aware RSS policy](../ingestion-rss-policy.md) preserves independent
+producer caps and all existing numeric allowances and latency limits.
 
-Cut the next candidate only from a green reviewed `main` and prepare canonical
-RC3 identity through normal PR governance. No old RC2 or stable frozen bundle
+The new RC3 branch was cut from green reviewed `main`; canonical identity is
+prepared through its focused PR. No old RC2 or stable frozen bundle
 qualifies changed RC3 source. Issue #71 stays open; broader Polars 2/combined
 streaming and borrowed-memory architecture remain post-v1 work.
 
 ## Candidate Branch Preparation
 
-- Cut the planned `release/v1.0.0-rc.3` branch only from a green `main`, under
-  the [candidate release-branch policy](release-branches.md).
+- `release/v1.0.0-rc.3` was cut directly from green `main` under the
+  [candidate release-branch policy](release-branches.md). Active protection
+  requires merge-commit PRs, strict checks and resolved threads, and prevents
+  force-push and deletion without a bypass.
 - Keep stabilization bounded. Use focused pull requests, merge commits,
   current-head AI review, strict required checks, and resolved review threads.
 - Land durable fixes on `main` first where practical. An urgent release-first
@@ -82,7 +96,7 @@ streaming and borrowed-memory architecture remain post-v1 work.
   remote release tip, tag, dispatch/workflow SHA, downstream checkouts, and
   build SHA exactly, with job-local ref rechecks before irreversible uploads.
 
-## RC2 Hardening
+## Historical RC2 Hardening
 
 The [RC2 release note](v1.0.0-rc.2.md) records the bounded validation,
 guidance, and artifact-identity changes. Local tests and patch review do not
@@ -97,16 +111,25 @@ against external writers; coherent datasets still require synchronization
 during acquisition. Broader retained/borrowed and low-copy ingestion belongs to
 future issue #100, not RC2.
 
-## RC2 Release Gates
+## Remaining RC3 Qualification
 
-The accepted candidate requires current-head PR review and configured checks,
-an exact-candidate standard security record, and a complete frozen release
-bundle. Required Core/CUDA/ROCm/Metal execution evidence must identify the actual
-artifact hashes. The release tip is locked and admitted unchanged to `main`
-before canonical tagging; collision and publisher prerequisites are checked
-before the official frozen publisher runs. Live workflow and public-channel
-results establish completion rather than this source document forecasting it.
+- Merge the focused identity preparation and any bounded stabilization through
+  exact-head review and strict current head/base checks; settle the candidate tip.
+- Record the standard security scan against that exact RC3 source, with no
+  unresolved Critical/High or release-blocking Medium finding. Earlier security
+  checkpoints do not replace it.
+- Retain installed public-workflow, numerical/ownership and Core production
+  evidence, including defaults, realistic configuration and cache states.
+- After separate final-phase authorization, build the exact release tip and
+  independently verify its frozen bundle, provenance, checksums, manifest
+  composition, dependency/profile identities and RT exclusion. Normal CI
+  validation bundles are not an accepted release freeze.
+- Qualify the actual artifacts on Core/CUDA/ROCm/Metal as required by the
+  runbook, with exact hashes; hosted CUDA/ROCm builds are not physical execution.
+- Only after acceptance, lock the tip and admit it unchanged to `main`, then
+  recheck collision, publisher, abandoned-beta resolver safety and ref identity
+  prerequisites before authorized canonical tagging and official publication.
 
-No RC2 tag, GitHub Release, or PyPI publication follows merely from branch
-preparation. Stable qualification and the permanent performance
-architecture tracked by issue #71 remain later work.
+Live evidence establishes completion; this status does not forecast it.
+Published RC2 stays immutable. Stable qualification, GIL detachment and the
+permanent benchmark architecture tracked by issue #71 remain later work.
