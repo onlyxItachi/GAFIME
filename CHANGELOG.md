@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## v1.0.0-rc.3
+
+- Acquire ordinary numeric files through incremental Arrow C Streams into
+  checked Rust-owned input and the existing full-config planner/executor,
+  avoiding whole-dataset Python row/scalar and byte materialization.
+- Preserve multibatch/sliced target alignment, exactly-once foreign-owner
+  release, checked capacity hints and owned resident lifetime; literal column
+  names cannot be interpreted as wildcard or regular expressions.
+- Preserve file-input seeds and candidate-cap warnings; reject finite fp32
+  overflow before narrowing without conflating it with source NaN/Inf.
+- Rediscover target-dependent time-series sources for permutations and
+  compiled target/reseed changes; keep adaptive rebuild failures fail closed.
+- Serialize ordinary CUDA/HIP exported ABI calls per loaded payload instance,
+  including cleanup and caller-device restoration, without changing GIL behavior
+  or caller-owned handle-lifetime responsibilities.
+- Harden threshold/count/backend-name and mutually exclusive family validation
+  while preserving documented compatibility behavior.
+- Require component and public end-to-end cost evidence, independent parser
+  controls, complete allocator/THP/thread provenance and installed-wheel parity.
+  Retain historical failures and reject the original RC2 materialization
+  regression under the bounded parser-aware RSS model.
+- Prepare canonical repository/Cargo `1.0.0-rc.3`, Python/PyPI `1.0.0rc3` and
+  planned Git/GitHub `v1.0.0-rc.3` identity. Preparation does not authorize a
+  release freeze, tag, publication or stable promotion.
+
 ## v1.0.0-rc.2
 
 - Bind resident NumPy cache fingerprints and execution to the same privately
