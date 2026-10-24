@@ -39,7 +39,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip wheel
-          if ! command -v rustup >/dev/null 2>&1; then
+          # Later steps require the home-owned proxies, not any system rustup.
+          if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
             curl https://sh.rustup.rs -sSf \
               | sh -s -- -y --profile minimal --default-toolchain 1.97.1
           fi
