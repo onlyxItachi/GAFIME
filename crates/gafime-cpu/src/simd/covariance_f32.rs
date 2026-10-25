@@ -48,6 +48,32 @@ impl PearsonMomentsF32 {
             f32::NAN
         }
     }
+
+    /// Preserve the reduction's numeric result while exposing whether its
+    /// binary32 normalization is defined. None means zero or underflowed
+    /// normalization; Some(NaN) preserves an arithmetic failure.
+    #[inline]
+    fn finish_checked(self) -> Option<f32> {
+        if self.n == 0 {
+            return None;
+        }
+        if !self.variance_x.is_finite()
+            || !self.variance_y.is_finite()
+            || !self.covariance.is_finite()
+            || self.variance_x < 0.0
+            || self.variance_y < 0.0
+        {
+            return Some(self.finish());
+        }
+        if self.variance_x == 0.0 || self.variance_y == 0.0 {
+            return None;
+        }
+        let product = self.variance_x * self.variance_y;
+        if product == 0.0 {
+            return None;
+        }
+        Some(self.finish())
+    }
 }
 
 /// Computes Pearson correlation entirely in binary32 arithmetic.
@@ -58,6 +84,14 @@ impl PearsonMomentsF32 {
 #[inline]
 pub fn pearson_corr_f32(x: &[f32], y: &[f32]) -> f32 {
     pearson_moments_f32(x, y).finish()
+}
+
+/// Crate-internal Pearson result preserving definedness from the same f32
+/// moments used by pearson_corr_f32. Public callers retain legacy zero
+/// behavior for a zero variance.
+#[inline]
+pub(crate) fn pearson_corr_f32_checked(x: &[f32], y: &[f32]) -> Option<f32> {
+    pearson_moments_f32(x, y).finish_checked()
 }
 
 #[inline]
