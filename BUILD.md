@@ -127,6 +127,11 @@ not tracked binaries. Staging defaults `MACOSX_DEPLOYMENT_TARGET` to `11.0`,
 matching the arm64 wheel tag; set the environment variable explicitly only when
 building a deliberately newer macOS target.
 
+Native macOS CI provisions the exact Rust 1.97.1 toolchain through the executable
+at `$HOME/.cargo/bin/rustup`, which its later build steps use. A separate
+system/Homebrew `rustup` on `PATH` does not prove that this home-owned executable
+exists; a missing home installation must be bootstrapped before validation.
+
 ## Developer Docker Images
 
 Docker files in this repository are source-build development environments, not
