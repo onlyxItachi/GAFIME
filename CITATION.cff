@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: >-
+  If you use GAFIME in research or publications, please cite this software.
+  If you use a GAFIME-based research method, please also cite the
+  corresponding method paper where applicable.
+type: software
+title: "GAFIME: GPU-Accelerated Feature Interaction Mining Engine"
+authors:
+  - family-names: Usta
+    given-names: Hamza
+repository-code: "https://github.com/onlyxItachi/GAFIME"
+url: "https://github.com/onlyxItachi/GAFIME"
+license: Apache-2.0
+abstract: >-
+  GAFIME is a native heterogeneous feature-interaction mining engine for
+  tabular and structured machine-learning workflows, with Rust CPU/SIMD,
+  CUDA, ROCm/HIP, and Metal execution backends.
+keywords:
+  - feature interaction mining
+  - feature engineering
+  - tabular machine learning
+  - heterogeneous computing
+  - GPU acceleration
