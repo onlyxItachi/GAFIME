@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import os
 from array import array
 from pathlib import Path
@@ -552,22 +553,41 @@ def test_native_arrow_boundary_rejects_invalid_target(target_data, message):
         )
 
 
-def test_compile_plan_flag_controls_scenario_plan(monkeypatch):
+def test_removed_plan_flag_and_projection_rejected(monkeypatch):
     boundary = _boundary()
     monkeypatch.setattr(v1_adapter, "_load_boundary", lambda: boundary)
     config = EngineConfig(backend="cpu", permutation_tests=0, num_repeats=1)
 
-    hidden = GafimeEngine(config).compile(
-        [[1.0], [2.0]], [1.0, 2.0], ["x"], flags=CompileFlags(plan=False)
-    )
-    exposed = GafimeEngine(config).compile(
-        [[1.0], [2.0]], [1.0, 2.0], ["x"], flags=CompileFlags(plan=True)
-    )
+    with pytest.raises(TypeError, match="plan"):
+        CompileFlags(plan=False)
+    with pytest.raises(TypeError):
+        CompileFlags(True)
+    with pytest.raises(TypeError):
+        v1_adapter.NativeCompiledGafime(config, [], object(), "custom", False)
 
-    assert hidden.scenario_plan is None
-    assert exposed.scenario_plan is boundary.artifacts[1]
-    assert boundary.configured_calls[0]["config"]["compile_flags"]["plan"] is False
-    assert boundary.configured_calls[1]["config"]["compile_flags"]["plan"] is True
+    class LegacyFlags:
+        plan = True
+
+    with pytest.raises(TypeError, match="plan.*removed"):
+        GafimeEngine(config).compile(
+            [[1.0], [2.0]], [1.0, 2.0], ["x"], flags=LegacyFlags()
+        )
+    artifact = GafimeEngine(config).compile([[1.0], [2.0]], [1.0, 2.0], ["x"])
+    try:
+        with pytest.raises(AttributeError):
+            _ = artifact.scenario_plan
+        assert boundary.configured_calls[0]["config"]["compile_flags"] == {
+            "graph": False,
+            "export": False,
+        }
+    finally:
+        artifact.close()
+
+
+@pytest.mark.parametrize("module", ["gafime.compile.scenario", "gafime.compile.exports"])
+def test_removed_compiled_compatibility_modules_are_not_importable(module):
+    with pytest.raises(ModuleNotFoundError, match=module.replace(".", r"\.")):
+        importlib.import_module(module)
 
 
 @pytest.mark.parametrize("backend_name", ["cpu", "metal"])

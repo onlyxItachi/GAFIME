@@ -129,12 +129,6 @@ def test_time_series_compile_returns_expanded_resident_artifact(monkeypatch):
     )
     try:
         assert artifact.feature_names == ["a", "b", "a_lag1", "b_lag1"]
-        plan = artifact.scenario_plan
-        assert plan.n_features == 2
-        assert plan.feature_candidate_count == 2
-        assert plan.planned_count == 11
-        assert plan.time_series is not None
-        assert plan.time_series.feature_stop == 2
         report = artifact.analyze()
         assert report.feature_names == artifact.feature_names
         assert "time_series expanded" in report.warnings[0]
