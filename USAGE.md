@@ -53,9 +53,9 @@ Core, CUDA, and ROCm support all three profiles in the existing distribution
 families. Metal supports `fp32` only. Explicit `backend="metal"` mixed/fp64
 requests fail before input coercion, payload discovery, or allocation;
 `backend="auto"` may exclude Metal and select Core for those profiles.
-Deprecated `storage_dtype`/`compute_policy` pairs are accepted only for the
-unambiguous mappings `float32+fast -> fp32`, `float32+stable -> mixed`, and
-`float64+exact -> fp64`; every other or contradictory pair is rejected.
+Historical `storage_dtype`/`compute_policy` keywords are no longer accepted,
+even as a pair. Use `precision="fp32"`, `"mixed"`, or `"fp64"`; reported storage
+and result dtypes remain capability metadata, not independent controls.
 
 `mi_bins` is a ceiling. GAFIME selects the largest sample-safe histogram shape
 from `2, 4, 8, 12, 16, 24, 32, 48, 64, 96` using the v0.4.1 density rule
@@ -85,18 +85,16 @@ Available public backend names are `"auto"`, `"core"`, `"cpu"`, `"cuda"`,
 `"rocm"`, `"hip"`, and `"metal"`. `backend="gpu"` is rejected because it is
 ambiguous in v1; request a vendor backend explicitly.
 
-For v0.4.7 migration, the first ten positional `EngineConfig` arguments remain
-stable through `device_id`. Generated-family options are keyword-only. In
-particular, positional argument 11 was formerly `enable_discrete_functions`;
-v1 accepts only the exactly compatible disabled value (`False`) with a
-`DeprecationWarning`. An enabled or otherwise ambiguous legacy value is rejected
-with migration guidance instead of being treated as
-`enable_time_series_functions`.
+The canonical constructor accepts the first ten `EngineConfig` fields
+positionally through `device_id`; precision, `mi_approximate` and generated-family
+controls are keyword-only. `ComputeBudget` accepts only its first six fields
+positionally. Removed v0.x keywords, including `enable_discrete_functions=False`,
+raise `TypeError`; historical positional layouts are not reinterpreted.
 
 ## Compile Artifacts
 
 `gafime.compile` creates an in-memory compiled artifact that owns the coerced
-native data, compact scenario plan, backend session, and optional export handles.
+native data, Rust-owned plan, backend session, and optional result-export state.
 Repeated `artifact.analyze()` calls reuse resident backend state where the
 selected backend supports it.
 
@@ -142,7 +140,7 @@ artifact = gafime.compile(
     y,
     feature_names=feature_names,
     config=config,
-    flags=CompileFlags(plan=True, export=True),
+    flags=CompileFlags(export=True),
 )
 try:
     report = artifact.analyze()
@@ -157,12 +155,9 @@ finally:
 result table. Backend graph capture/replay is owned by the selected native
 payload and must not change result semantics or introduce silent fallback.
 
-`artifact.flags` remains an exact `CompileFlags` view for v0.5 compatibility.
-The legacy `artifact.exports` property remains available with a
-`DeprecationWarning`; it exposes the owning native artifact as
-`feature_matrix_handle` and the last native report as `result_table_handle`.
-The current boundary has no independent candidate-table handle, so
-`candidate_table_handle` is `None`. New code should use `export_arrow()`.
+`artifact.flags` provides the effective `CompileFlags` view. Native planning
+remains Rust-owned; use `export_arrow()` to export the compact result table.
+Arrow result export is distinct from Arrow input ingestion.
 
 ## Decision Paths and Time-Series Candidates
 

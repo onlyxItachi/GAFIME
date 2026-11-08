@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -19,6 +20,7 @@ FORBIDDEN_RUNTIME_MODULES = {
     "gafime.backends.native_cuda_backend",
     "gafime.backends.native_rocm_backend",
     "gafime.compile.scenario",
+    "gafime.compile.exports",
     "gafime.compile.sessions",
     "gafime.engine",
     "gafime.native_data",
@@ -662,6 +664,8 @@ def check_packaging() -> None:
         "gafime/backends",
         "gafime/native_data.py",
         "gafime/compile/sessions.py",
+        "gafime/compile/scenario.py",
+        "gafime/compile/exports.py",
     }
     for forbidden in forbidden_paths:
         assert all(not item.startswith(forbidden) for item in packaged_files), forbidden
@@ -673,41 +677,26 @@ def check_packaging() -> None:
         assert forbidden not in package_text, forbidden
 
 
-def check_compatibility_scenario_metadata() -> None:
-    source = (ROOT / "python/gafime/compile/scenario.py").read_text()
-    for forbidden in (
-        "itertools",
-        "numpy",
-        "gafime_py",
-        "compile_continuous",
-        "execute_continuous",
-        "candidate_indices",
-        "for row in",
-        "for combo in",
+def check_compiled_surface_without_projection() -> None:
+    from gafime import CompileFlags, CompiledGafime, NativeCompiledGafime
+
+    assert CompiledGafime is NativeCompiledGafime
+    assert importlib.util.find_spec("gafime.compile.scenario") is None
+    assert importlib.util.find_spec("gafime.compile.exports") is None
+    assert not hasattr(NativeCompiledGafime, "scenario_plan")
+    assert not hasattr(NativeCompiledGafime, "exports")
+    for name in (
+        "from_engine", "analyze", "update_target", "close", "export_arrow", "__arrow_c_array__"
     ):
-        assert forbidden not in source, forbidden
-
-    from gafime import CompileFlags, ComputeBudget, EngineConfig
-    from gafime.compile.scenario import build_scenario_plan_from_shape
-
-    plan = build_scenario_plan_from_shape(
-        n_samples=1_000_000_000,
-        n_features=1_000_000,
-        config=EngineConfig(
-            budget=ComputeBudget(
-                max_comb_size=5,
-                max_combinations_per_k=100,
-                top_features_for_higher_k=50,
-            )
-        ),
-        flags=CompileFlags(plan=True),
-    )
-    assert plan.n_samples == 1_000_000_000
-    assert plan.n_features == 1_000_000
-    assert len(plan.continuous) == 5
-    assert plan.planned_count == 500
-    assert all(item.planned_count == 100 for item in plan.continuous)
-    assert all(not hasattr(item, "candidate_indices") for item in plan.continuous)
+        assert callable(getattr(NativeCompiledGafime, name))
+    try:
+        CompileFlags(plan=True)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("removed plan flag must not be accepted")
+    rust_source = (ROOT / "crates/gafime-py/src/runtime.rs").read_text()
+    assert 'get_bool(&flags, "graph", false)?' in rust_source
 
 
 def check_no_local_legacy_runtime_artifacts() -> None:
@@ -2672,7 +2661,9 @@ def check_native_kernel_structure() -> None:
     assert "storage_dtype: str" not in python_config
     assert "compute_policy: str" not in python_config
     assert 'SUPPORTED_PRECISIONS = ("fp32", "mixed", "fp64")' in python_precision
-    assert "precision_from_legacy_pair" in python_precision
+    assert "precision_from_legacy_pair" not in python_precision
+    assert "_compatible_engine_config_init" not in python_config
+    assert "_compatible_compute_budget_init" not in python_config
     assert "backend_precision_error" in python_adapter
     assert "precision_contract: CapabilityValue" in python_capabilities
     assert 'get_string(config, "precision", "mixed")' in rust_runtime
@@ -3694,7 +3685,7 @@ def main() -> None:
     check_pyo3_compact_report_and_cuda_surface()
     check_runtime_surface()
     check_report_scale_view()
-    check_compatibility_scenario_metadata()
+    check_compiled_surface_without_projection()
     if not args.skip_cargo:
         run_cargo(args.include_gpu)
     print("v1 architecture gate passed")

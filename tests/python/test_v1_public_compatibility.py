@@ -355,7 +355,7 @@ def test_compile_artifact_module_path_is_import_compatible():
     assert callable(compile_package)
 
 
-def test_v05_compiled_classmethod_and_scenario_plan_contract():
+def test_compiled_classmethod_preserves_native_lifecycle():
     engine = GafimeEngine(
         EngineConfig(
             backend="cpu",
@@ -372,19 +372,15 @@ def test_v05_compiled_classmethod_and_scenario_plan_contract():
         ["a", "b"],
     )
     try:
-        plan = artifact.scenario_plan
-        assert plan.n_features == 2
-        assert plan.rows == 3
-        assert plan.cols == 2
-        assert plan.max_arity == 2
-        assert plan.metric_ids == (1,)
-        assert plan.feature_candidate_count == 2
-        assert plan.planned_count == 3
-        assert [descriptor.arity for descriptor in plan.continuous] == [1, 2]
-        assert isinstance(plan.warnings, tuple)
-        assert len(artifact.analyze().interactions) == plan.planned_count
+        assert len(artifact.analyze().interactions) == 3
+        assert artifact.update_target([2.0, 1.0, 0.0]) is artifact
+        assert len(artifact.analyze().interactions) == 3
+        with pytest.raises(AttributeError):
+            _ = artifact.scenario_plan
     finally:
         artifact.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        artifact.analyze()
 
 
 def test_max_feature_candidate_bounds_the_native_candidate_family():

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Remove the legacy Python compiled scenario-plan projection, `CompileFlags.plan`,
+  and deprecated export-handle view. Rust-owned planning, graph behavior, and
+  Arrow compact-result export remain available.
+- Remove v0.x precision-pair/discrete configuration compatibility and positional
+  layout translation before stable v1.0.0. Keep canonical positional prefixes,
+  keyword-only controls and fp32/mixed/fp64 numerical behavior unchanged.
+  See [stable pruning preparation](docs/releases/v1.0.0.md).
+
 ## v1.0.0-rc.3
 
 - Acquire ordinary numeric files through incremental Arrow C Streams into

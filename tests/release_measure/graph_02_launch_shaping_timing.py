@@ -32,7 +32,7 @@ def timed(Xl, yl, names, backend, graph):
                 num_repeats=1,
                 permutation_tests=50,
             ),
-            flags=CompileFlags(plan=True, graph=graph),
+            flags=CompileFlags(graph=graph),
         )
         try:
             t0 = tel.monotonic_ns()
