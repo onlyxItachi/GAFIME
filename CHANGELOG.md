@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Rename the active native planner RNG module to `cpython_mt19937` without
+  changing its implementation, seed handling, shuffle stream or candidate IDs.
+  Retain existing planning goldens and add a wide-seed successive-shuffle oracle.
+
 - Retain the explicit lazy subfunctions namespace and unchanged OTS encoder;
   remove retired native scheduler utilities and obsolete module lookup paths.
   Deprecate DataQualityAnalyzer on construction while preserving behavior;
