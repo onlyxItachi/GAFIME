@@ -93,7 +93,7 @@ DOCUMENTED_DATACLASS_FIELDS = {
         "significance_top_n",
         "mi_approximate",
     ),
-    "CompileFlags": ("plan", "graph", "export"),
+    "CompileFlags": ("graph", "export"),
     "CapabilityValue": ("value", "source", "detail"),
     "BackendCapabilities": (
         "configured_backend",
@@ -204,44 +204,6 @@ DOCUMENTED_DATACLASS_FIELDS = {
         "native_compact_scoring",
         "significance_support",
     ),
-    "ExportHandles": (
-        "backend_name",
-        "feature_matrix_handle",
-        "result_table_handle",
-        "candidate_table_handle",
-    ),
-    "ChunkRange": ("first_chunk_id", "chunk_count", "chunk_size"),
-    "ContinuousArityDescriptor": (
-        "arity",
-        "feature_start",
-        "feature_stop",
-        "universe_count",
-        "planned_count",
-        "offset",
-        "chunk_range",
-        "saturated",
-    ),
-    "TimeSeriesDescriptor": (
-        "feature_start",
-        "feature_stop",
-        "lag_count",
-        "window_count",
-        "template_count",
-        "universe_count",
-        "planned_count",
-        "offset",
-        "saturated",
-    ),
-    "ScenarioPlan": (
-        "n_samples",
-        "n_features",
-        "feature_candidate_count",
-        "precision",
-        "continuous",
-        "time_series",
-        "warnings",
-        "metric_ids",
-    ),
 }
 
 PUBLIC_METHOD_COVERAGE = {
@@ -249,13 +211,11 @@ PUBLIC_METHOD_COVERAGE = {
     "NativeCompiledGafime": (
         "flags",
         "backend",
-        "scenario_plan",
         "from_engine",
         "graph_replayed",
         "continuous_metric_cache_hits",
         "continuous_metric_cache_builds",
         "candidate_table_cache_hits",
-        "exports",
         "analyze",
         "update_target",
         "__arrow_c_array__",
@@ -303,7 +263,7 @@ def _top_level_index() -> str:
         "BackendCapabilities": "structured capability snapshot",
         "CapabilityValue": "capability value plus evidence source",
         "CompiledGafime": "compatibility alias of `NativeCompiledGafime`",
-        "CompileFlags": "compiled-plan, graph, and export requests",
+        "CompileFlags": "compiled graph and result export requests",
         "ComputeBudget": "candidate and resident-memory bounds",
         "Decision": "report-level threshold decision",
         "DecisionPathCandidate": "portable v0.5 compatibility descriptor",
@@ -834,13 +794,13 @@ def _cells() -> list:
                 y,
                 feature_names,
                 config=first_config,
-                flags=CompileFlags(plan=True, graph=False, export=False),
+                flags=CompileFlags(graph=False, export=False),
             )
             try:
                 compiled_report = artifact.analyze()
                 artifact.update_target([value + 0.01 for value in y])
                 updated_report = artifact.analyze()
-                print(artifact.backend.selected_backend, artifact.scenario_plan)
+                print(artifact.backend.selected_backend, len(updated_report.interactions))
             finally:
                 artifact.close()
             """,
@@ -870,13 +830,12 @@ def _cells() -> list:
         ),
         _md(
             """
-            `CompileFlags(plan=True)` exposes bounded compatibility plan metadata.
+            Planning remains Rust-owned and has no Python scenario-plan projection.
             `graph=True` requires the selected GPU payload to confirm real graph
             replay; it never silently degrades. `export=True` enables
             `export_arrow()` for the compact result table. `__arrow_c_array__()` is
             the corresponding supported Arrow C Data protocol; ordinary application
-            code can use the explicit alias. The deprecated `.exports` compatibility
-            view is not a new candidate-table API. Metrics and
+            code can use the explicit alias. Metrics and
             candidate identity remain unchanged across one-shot, resident, and
             compiled paths for a fixed seed and configuration.
             """
@@ -1476,17 +1435,15 @@ def _cells() -> list:
             - `gafime.io`: `GafimeStreamer`, compatibility `create_streamer`, and
               bounded diagnostic helper `benchmark_streaming`. Its `n_batches`
               argument must be positive and is validated before the file is opened.
-            - `gafime.compile`: callable compile module, flags, and compiled aliases;
-              `gafime.compile.scenario` exposes bounded compatibility plan metadata;
-              `gafime.compile.exports` exposes deprecated handle compatibility.
+            - `gafime.compile`: callable compile module, flags, and compiled aliases.
             - `gafime.subfunctions`: the advanced native compatibility proxy. Prefer
               the top-level safe engine/capability APIs for new application code.
 
             Public method/property index: `GafimeEngine.analyze()` and `compile()`;
-            `NativeCompiledGafime.flags`, `backend`, `scenario_plan`, `from_engine()`,
+            `NativeCompiledGafime.flags`, `backend`, `from_engine()`,
             `graph_replayed`, `continuous_metric_cache_hits`,
-            `continuous_metric_cache_builds`, `candidate_table_cache_hits`, deprecated
-            `exports`, `analyze()`, `update_target()`, `__arrow_c_array__()`,
+            `continuous_metric_cache_builds`, `candidate_table_cache_hits`,
+            `analyze()`, `update_target()`, `__arrow_c_array__()`,
             `export_arrow()`, and `close()`; `BackendCapabilities.to_dict()`;
             `DiagnosticReport.configured_backend` and deprecated `to_dict()`;
             `GafimeSelector.fit()`, `transform()`, `fit_transform()`, `get_params()`,

@@ -66,7 +66,7 @@ The reference and signature tests cover all fields of:
   `permutation_p_threshold`, `mi_bins`, `backend`, `device_id`, `precision`,
   all time-series and decision-path controls, `significance_top_n`, and
   `mi_approximate`;
-- `CompileFlags`: `plan`, `graph`, `export`.
+- `CompileFlags`: `graph`, `export` (both keyword-only).
 
 Canonical configuration preserves the first six `ComputeBudget` fields and
 first ten `EngineConfig` fields positionally; remaining fields are keyword-only.
@@ -80,7 +80,7 @@ The reference describes the fields of `BackendInfo`, `InteractionResult`,
 `StabilityResult`, `PermutationResult`, `Decision`, and `DiagnosticReport`.
 It covers result-sequence iteration/indexing plus `ranked()` and `top_k()`, and
 the complete supported lifecycle of `NativeCompiledGafime`: `flags`, `backend`,
-`scenario_plan`, `from_engine`, graph/cache diagnostics, deprecated `exports`,
+`from_engine`, graph/cache diagnostics,
 `analyze()`, `update_target()`, `__arrow_c_array__()`, `export_arrow()`, and
 `close()`. `__arrow_c_array__()` is the supported Arrow C Data protocol;
 application code normally calls `export_arrow()` explicitly.
@@ -131,19 +131,6 @@ unexplained import accident.
 | `gafime.decision_path` | `DecisionPathCandidate`, `decision_path_candidate_from_record`, `decision_path_candidate_from_result`, `decision_path_feature_names`, `describe_decision_path_candidate`, `evaluate_decision_path_candidate`, `score_decision_path_candidates` | portable descriptor compatibility helpers; not a second planner/executor |
 | `gafime.io` | `GafimeStreamer`, `benchmark_streaming`, `create_streamer` | streamer is supported integration; functions are compatibility/diagnostic helpers |
 | `gafime.compile` | `compile`, `CompileFlags`, `CompiledGafime`, `NativeCompiledGafime` | callable module and top-level aliases |
-| `gafime.compile.exports` | `ExportHandles`, `unsupported_export` | deprecated handle compatibility |
-| `gafime.compile.scenario` | `ChunkRange`, `ContinuousArityDescriptor`, `DEFAULT_CHUNK_SIZE`, `DEFAULT_UNKNOWN_POWER_USER_FEATURE_CAP`, `ScenarioPlan`, `TimeSeriesDescriptor`, `UINT32_MAX`, `UINT64_MAX`, `UINT128_MAX`, `build_scenario_plan`, `build_scenario_plan_from_shape` | bounded compatibility metadata; Rust plans remain authoritative |
-
-Compatibility record fields are also explicit: `ExportHandles` has
-`backend_name`, `feature_matrix_handle`, `result_table_handle`, and
-`candidate_table_handle`; `ChunkRange` has `first_chunk_id`, `chunk_count`, and
-`chunk_size`; `ContinuousArityDescriptor` has `arity`, `feature_start`,
-`feature_stop`, `universe_count`, `planned_count`, `offset`, `chunk_range`, and
-`saturated`; `TimeSeriesDescriptor` has `feature_start`, `feature_stop`,
-`lag_count`, `window_count`, `template_count`, `universe_count`, `planned_count`,
-`offset`, and `saturated`; `ScenarioPlan` has `n_samples`, `n_features`,
-`feature_candidate_count`, `precision`, `continuous`, `time_series`, `warnings`,
-and `metric_ids`.
 
 `gafime.subfunctions` dynamically proxies the installed native boundary. The
 current exact package exposes `BOUNDARY_NAME`, `BatchScheduler`,
