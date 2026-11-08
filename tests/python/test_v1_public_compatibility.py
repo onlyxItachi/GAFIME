@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import types
+import warnings
 
 import pytest
 
@@ -46,11 +47,16 @@ def test_history_backed_symbols_are_exported_at_top_level():
 
 
 def test_subfunctions_import_is_lazy_and_public():
-    proxy = importlib.reload(importlib.import_module("gafime.subfunctions"))
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        proxy = importlib.reload(importlib.import_module("gafime.subfunctions"))
+        assert "DataQualityAnalyzer" in dir(proxy)
+        assert "OTSEncoder" in proxy.__all__
 
     assert gafime.subfunctions is proxy
     assert "subfunctions" in gafime.__all__
     assert proxy._rust_helpers is None
+    assert seen == []
 
 
 def test_subfunctions_dir_and_known_helper_forward_to_current_native_module():
@@ -58,8 +64,9 @@ def test_subfunctions_dir_and_known_helper_forward_to_current_native_module():
     native = pytest.importorskip("gafime.gafime_py")
 
     assert "native_version" in dir(proxy)
-    assert proxy._rust_helpers is native
+    assert proxy._rust_helpers is None
     assert proxy.native_version is native.native_version
+    assert proxy._rust_helpers is native
     assert proxy.native_version() == native.native_version()
 
 
@@ -111,53 +118,98 @@ def test_native_cpu_convenience_boundary_routes_all_precision_profiles():
         function([[CoercionTrap()]], [CoercionTrap()], precision="binary128")
 
 
-def test_subfunctions_falls_back_to_legacy_helper_names(monkeypatch):
+def test_subfunctions_forwards_only_explicit_names_to_current_boundary(monkeypatch):
     proxy = importlib.reload(importlib.import_module("gafime.subfunctions"))
-    legacy = types.SimpleNamespace(known_legacy_helper=lambda: "legacy")
+    native = types.SimpleNamespace(native_version=lambda: "native", FutureClass=object)
     attempted = []
 
     def import_helper(module_name):
         attempted.append(module_name)
-        if module_name == "gafime_cpu":
-            return legacy
-        raise ImportError(f"missing {module_name}")
+        return native
 
     monkeypatch.setattr(proxy, "import_module", import_helper)
 
-    assert "known_legacy_helper" in dir(proxy)
-    assert proxy.known_legacy_helper() == "legacy"
-    assert attempted == ["gafime.gafime_py", "gafime.gafime_cpu", "gafime_cpu"]
+    assert "FutureClass" not in proxy.__all__
+    with pytest.raises(AttributeError):
+        proxy.FutureClass
+    for name in ("BatchScheduler", "CacheAwareScheduler", "SmartScheduler"):
+        assert name not in proxy.__all__
+        assert name not in dir(proxy)
+        with pytest.raises(AttributeError):
+            getattr(proxy, name)
+    assert attempted == []
+    assert proxy.native_version() == "native"
+    assert attempted == ["gafime.gafime_py"]
 
 
-def test_subfunctions_exports_and_runs_published_v047_helpers():
+def test_subfunctions_missing_native_does_not_try_obsolete_fallbacks(monkeypatch):
     proxy = importlib.reload(importlib.import_module("gafime.subfunctions"))
-    pytest.importorskip("gafime.gafime_py")
+    attempted = []
 
-    scheduler = proxy.BatchScheduler(max_blocks=96)
-    assert scheduler.max_blocks() == 96
-    assert scheduler.optimal_batch_size() == 96
+    def import_helper(module_name):
+        attempted.append(module_name)
+        raise ImportError("missing current boundary")
 
-    with pytest.raises(ValueError, match="max_blocks must be positive"):
-        proxy.BatchScheduler(max_blocks=0)
+    monkeypatch.setattr(proxy, "import_module", import_helper)
+    with pytest.raises(ImportError, match="missing current boundary"):
+        proxy.native_version
+    assert attempted == ["gafime.gafime_py"]
 
-    cache = proxy.CacheAwareScheduler(
-        4, window_size=2, ops=[0, 1], interaction_types=[0], arity=2
-    )
-    assert cache.window_size() >= 1
-    assert cache.total_interactions() >= 1
+
+def test_subfunctions_retains_ots_and_deprecates_data_quality():
+    proxy = importlib.reload(importlib.import_module("gafime.subfunctions"))
+    native = pytest.importorskip("gafime.gafime_py")
+    for name in ("BatchScheduler", "CacheAwareScheduler", "SmartScheduler"):
+        assert not hasattr(native, name)
+        assert not hasattr(gafime, name)
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        assert all(
+            getattr(proxy, name) is getattr(native, name) for name in proxy.__all__
+        )
+    assert seen == []
 
     encoder = proxy.OTSEncoder(prior=0.25, n_permutations=1)
     encoded = encoder.fit_transform([0, 0, 1], [1.0, 0.0, 1.0])
     assert len(encoded) == 3
     assert encoder.n_categories() == 2
 
-    quality = proxy.DataQualityAnalyzer()
+    with pytest.warns(
+        DeprecationWarning, match="DataQualityAnalyzer is deprecated"
+    ) as seen:
+        quality = proxy.DataQualityAnalyzer()
+    assert Path(seen[0].filename) == Path(__file__)
     assert quality.check_alignment([[1.0, 2.0], [3.0, 4.0]]) == 2
 
-    smart = proxy.SmartScheduler(3, 2, 2)
-    batch = smart.generate_batch(4)
-    assert len(batch) == 5
-    assert len(batch[0]) == 4
+    with pytest.warns(DeprecationWarning, match="DataQualityAnalyzer is deprecated"):
+        native.DataQualityAnalyzer()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        with pytest.raises(DeprecationWarning):
+            native.DataQualityAnalyzer()
+
+
+def test_data_quality_retains_explicit_analysis_and_cleaning_behavior():
+    proxy = importlib.reload(importlib.import_module("gafime.subfunctions"))
+    pytest.importorskip("gafime.gafime_py")
+    with pytest.warns(DeprecationWarning):
+        quality = proxy.DataQualityAnalyzer()
+
+    data = [[1.0, float("nan"), float("inf"), float("-inf")], [2.0] * 4]
+    assert quality.analyze_nan_inf(data) == (8, 1, 1, 1)
+    assert quality.analyze_missing(data) == (True, 1, 3, 1, [0], [1])
+    assert quality.clean_nan_inf(data, -1.0, 9.0) == [[1.0, -1.0, 9.0, 9.0], [2.0] * 4]
+    assert quality.clean_nan_inf_mean(data) == [[1.0] * 4, [2.0] * 4]
+    assert data[0][1] != data[0][1]  # explicit cleaning returns a copy
+    assert data[0][2] == float("inf")
+    entropy = quality.analyze_entropy([[1.0] * 4, [0.0, 1.0, 2.0, 3.0]])
+    assert entropy[0][1:5] == (0.0, 1, 0.25, "constant")
+    assert entropy[1][1:5] == (1.0, 4, 1.0, "unique_id")
+    assert quality.get_features_to_drop([[1.0] * 4]) == [0]
+    assert quality.get_id_features([[0.0, 1.0, 2.0, 3.0]]) == [0]
+    assert "NaN count: 1" in quality.full_report(data)
+    with pytest.raises(ValueError, match="Misaligned features"):
+        quality.check_alignment([[1.0], [1.0, 2.0]])
 
 
 def test_decision_path_candidate_preserves_v05_data_contract():

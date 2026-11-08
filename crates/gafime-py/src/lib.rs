@@ -8,9 +8,9 @@ mod artifact;
 mod common;
 mod continuous;
 mod generated;
-mod legacy_helpers;
 mod py_api;
 mod runtime;
+mod subfunctions;
 
 use pyo3::prelude::*;
 
@@ -23,15 +23,13 @@ use common::native_version;
 use generated::{
     analyze_decision_path, analyze_time_series, compile_decision_path, compile_time_series,
 };
-use legacy_helpers::{
-    PyBatchScheduler, PyCacheAwareScheduler, PyDataQualityAnalyzer, PyOTSEncoder, PySmartScheduler,
-};
 use py_api::{
     analyze_continuous, analyze_continuous_arrow, analyze_continuous_buffers,
     analyze_continuous_cpu, analyze_continuous_nested, compile_continuous,
     compile_continuous_buffers, compile_continuous_nested, PyContinuousRecord, PyContinuousReport,
 };
 use runtime::runtime_capabilities;
+use subfunctions::{PyDataQualityAnalyzer, PyOTSEncoder};
 
 pub use common::{
     boundary_name, public_package_version, result_table_to_arrow, ContinuousRecord,
@@ -51,10 +49,7 @@ fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyContinuousRecord>()?;
     m.add_class::<PyContinuousReport>()?;
     m.add_class::<PyOTSEncoder>()?;
-    m.add_class::<PyBatchScheduler>()?;
-    m.add_class::<PyCacheAwareScheduler>()?;
     m.add_class::<PyDataQualityAnalyzer>()?;
-    m.add_class::<PySmartScheduler>()?;
     m.add_function(wrap_pyfunction!(compile_continuous, m)?)?;
     m.add_function(wrap_pyfunction!(compile_continuous_nested, m)?)?;
     m.add_function(wrap_pyfunction!(compile_continuous_buffers, m)?)?;
