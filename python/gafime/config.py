@@ -1,33 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import KW_ONLY, dataclass, field
-from functools import wraps
 from typing import Optional, Tuple
-import warnings
 
 
 DEFAULT_METRICS: Tuple[str, ...] = ("pearson", "spearman", "mutual_info", "r2")
-_AMBIGUOUS_COMPUTE_BUDGET_POSITIONAL_MESSAGE = (
-    "ComputeBudget accepts only its first six fields positionally. Positional "
-    "argument 7 and later are ambiguous across v0.4.7 and v0.5: v0.4.7 used "
-    "max_discrete_candidates in slot 7, while v0.5 uses "
-    "max_time_series_candidates. Pass all later fields by keyword."
-)
-_REMOVED_DISCRETE_CONFIG_MESSAGE = (
-    "EngineConfig positional argument 11 was enable_discrete_functions in v0.4.7, "
-    "but the discrete family is not part of the v1 runtime. It is never mapped to "
-    "enable_time_series_functions. Remove the legacy discrete option or pass "
-    "enable_time_series_functions=... explicitly by keyword."
-)
-_DISABLED_DISCRETE_CONFIG_WARNING = (
-    "enable_discrete_functions=False is a deprecated v0.4.7 option and is "
-    "ignored by the v1 runtime. Remove it from EngineConfig."
-)
-_LEGACY_PRECISION_WARNING = (
-    "storage_dtype and compute_policy are deprecated; use the single keyword-only "
-    "precision profile instead."
-)
-_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -80,19 +57,6 @@ class ComputeBudget:
     max_feature_candidate: Optional[int] = None
 
 
-_generated_compute_budget_init = ComputeBudget.__init__
-
-
-@wraps(_generated_compute_budget_init)
-def _compatible_compute_budget_init(self, *args, **kwargs) -> None:
-    if len(args) > 6:
-        raise TypeError(_AMBIGUOUS_COMPUTE_BUDGET_POSITIONAL_MESSAGE)
-    _generated_compute_budget_init(self, *args, **kwargs)
-
-
-ComputeBudget.__init__ = _compatible_compute_budget_init
-
-
 @dataclass(frozen=True)
 class EngineConfig:
     """Immutable declaration of one GAFIME analysis contract.
@@ -126,10 +90,6 @@ class EngineConfig:
     decision but do not replace holdout or out-of-fold validation. Both must
     be finite, non-negative, and representable in the public result precision.
 
-    Deprecated ``storage_dtype``/``compute_policy`` keyword pairs are accepted
-    only when they map unambiguously to one precision profile and emit a
-    :class:`DeprecationWarning`.  The removed discrete-family switch cannot
-    enable a v1 family.
     """
 
     budget: ComputeBudget = field(default_factory=ComputeBudget)
@@ -159,69 +119,11 @@ class EngineConfig:
     significance_top_n: int = 50
     mi_approximate: bool = False
 
+    def __post_init__(self) -> None:
+        from ._precision import normalize_precision
 
-_generated_engine_config_init = EngineConfig.__init__
-
-
-@wraps(_generated_engine_config_init)
-def _compatible_engine_config_init(self, *args, **kwargs) -> None:
-    legacy_storage = kwargs.pop("storage_dtype", _MISSING)
-    legacy_policy = kwargs.pop("compute_policy", _MISSING)
-    if legacy_storage is not _MISSING or legacy_policy is not _MISSING:
-        if legacy_storage is _MISSING or legacy_policy is _MISSING:
-            raise TypeError(
-                "deprecated storage_dtype and compute_policy must be supplied together."
-            )
-        if "precision" in kwargs:
-            raise TypeError(
-                "precision cannot be combined with deprecated storage_dtype/compute_policy."
-            )
-        from ._precision import precision_from_legacy_pair
-
-        kwargs["precision"] = precision_from_legacy_pair(legacy_storage, legacy_policy)
-        warnings.warn(_LEGACY_PRECISION_WARNING, DeprecationWarning, stacklevel=2)
-
-    positional_mi_approximate = _MISSING
-    origin_main_layout = len(args) >= 9 and isinstance(args[8], bool)
-    if origin_main_layout:
-        if len(args) > 11:
-            raise TypeError(
-                "EngineConfig family switches after device_id are keyword-only."
-            )
-        positional_mi_approximate = args[8]
-        args = (*args[:8], *args[9:])
-    elif len(args) > 11:
-        raise TypeError(_REMOVED_DISCRETE_CONFIG_MESSAGE)
-
-    if positional_mi_approximate is not _MISSING:
-        if "mi_approximate" in kwargs:
-            raise TypeError(
-                "mi_approximate was provided both positionally and by keyword."
-            )
-        kwargs["mi_approximate"] = positional_mi_approximate
-
-    legacy_discrete = _MISSING
-    if not origin_main_layout and len(args) == 11:
-        legacy_discrete = args[-1]
-        args = args[:10]
-    if "enable_discrete_functions" in kwargs:
-        if legacy_discrete is not _MISSING:
-            raise TypeError(
-                "enable_discrete_functions was provided both positionally and by keyword."
-            )
-        legacy_discrete = kwargs.pop("enable_discrete_functions")
-    if legacy_discrete is not _MISSING:
-        if legacy_discrete is not False:
-            raise TypeError(_REMOVED_DISCRETE_CONFIG_MESSAGE)
-        warnings.warn(
-            _DISABLED_DISCRETE_CONFIG_WARNING,
-            DeprecationWarning,
-            stacklevel=2,
-        )
-    _generated_engine_config_init(self, *args, **kwargs)
-    from ._precision import normalize_precision
-
-    object.__setattr__(self, "precision", normalize_precision(self.precision))
-
-
-EngineConfig.__init__ = _compatible_engine_config_init
+        # A boolean in this slot was formerly positional mi_approximate, not a
+        # backend. Reject it instead of silently accepting the obsolete layout.
+        if isinstance(self.backend, bool):
+            raise TypeError("backend must be a string, not a boolean.")
+        object.__setattr__(self, "precision", normalize_precision(self.precision))
