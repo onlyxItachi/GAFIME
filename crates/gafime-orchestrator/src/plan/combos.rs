@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::backend::{OrchestratorError, OrchestratorResult};
 
-use super::{legacy_rng::PythonRandom, shapes, CompiledPlan, DEFAULT_DESCRIPTOR_BATCH_WORDS};
+use super::{cpython_mt19937::PythonRandom, shapes, CompiledPlan, DEFAULT_DESCRIPTOR_BATCH_WORDS};
 
 pub const MI_TEMPLATE_BIN_LEVELS: &[u32] = &[2, 4, 8, 12, 16, 24, 32, 48, 64, 96];
 pub const MI_SAMPLES_PER_JOINT_BIN: u64 = 8;
