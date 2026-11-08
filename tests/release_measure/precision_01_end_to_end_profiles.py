@@ -734,9 +734,7 @@ def _run_filtered_spearman_adversary(
                 features,
                 target,
                 feature_names=("left", "right"),
-                flags=gafime.CompileFlags(
-                    graph=bool(graph_support[backend])
-                ),
+                flags=gafime.CompileFlags(graph=bool(graph_support[backend])),
             )
             try:
                 compiled = artifact.analyze()

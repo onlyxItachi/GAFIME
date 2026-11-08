@@ -350,22 +350,30 @@ def _assert_cpu_backend(gafime: object, precision: str) -> None:
                         f"{eager_value!r} != {compiled_value!r}"
                     )
         if compiled.update_target(y) is not compiled:
-            raise AssertionError("installed wheel target update did not retain artifact")
+            raise AssertionError(
+                "installed wheel target update did not retain artifact"
+            )
         replay_by_id = {
             item.candidate_id: item for item in compiled.analyze().interactions
         }
         if replay_by_id.keys() != eager_by_id.keys():
-            raise AssertionError("installed wheel target update changed candidate identities")
+            raise AssertionError(
+                "installed wheel target update changed candidate identities"
+            )
         for candidate_id, eager_item in eager_by_id.items():
             replay_item = replay_by_id[candidate_id]
             if replay_item.metrics.keys() != eager_item.metrics.keys():
                 raise AssertionError("installed wheel replay changed metric names")
             for name, value in eager_item.metrics.items():
                 if not math.isclose(
-                    float(value), float(replay_item.metrics[name]),
-                    rel_tol=0.0, abs_tol=1.0e-7,
+                    float(value),
+                    float(replay_item.metrics[name]),
+                    rel_tol=0.0,
+                    abs_tol=1.0e-7,
                 ):
-                    raise AssertionError("installed wheel target-update replay changed metrics")
+                    raise AssertionError(
+                        "installed wheel target-update replay changed metrics"
+                    )
     finally:
         compiled.close()
     if len(compiled_report.interactions) != len(interactions):
