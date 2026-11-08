@@ -183,6 +183,19 @@ def test_subfunctions_retains_ots_and_deprecates_data_quality():
 
     with pytest.warns(DeprecationWarning, match="DataQualityAnalyzer is deprecated"):
         native.DataQualityAnalyzer()
+    parameters = inspect.signature(proxy.DataQualityAnalyzer).parameters
+    assert tuple(parameters) == (
+        "low_entropy_threshold",
+        "high_cardinality_ratio",
+        "categorical_max",
+    )
+    with pytest.warns(DeprecationWarning):
+        configured = proxy.DataQualityAnalyzer(
+            low_entropy_threshold=0.25,
+            high_cardinality_ratio=0.75,
+            categorical_max=10,
+        )
+    assert configured.analyze_nan_inf([[1.0, float("nan")]]) == (2, 1, 0, 0)
     with warnings.catch_warnings():
         warnings.simplefilter("error", DeprecationWarning)
         with pytest.raises(DeprecationWarning):
