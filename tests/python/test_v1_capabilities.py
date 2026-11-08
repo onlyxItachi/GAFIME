@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 from pathlib import Path
 import sys
@@ -333,16 +334,10 @@ def test_report_backend_info_uses_native_selection_and_placement():
 
 
 @pytest.mark.parametrize(
-    ("storage_dtype", "compute_policy", "expected"),
-    [
-        ("float32", "fast", "fp32"),
-        ("float32", "stable", "mixed"),
-        ("float64", "exact", "fp64"),
-    ],
+    "precision",
+    ["fp32", "mixed", "fp64"],
 )
-def test_precision_capability_legacy_pairs_map_to_profiles(
-    storage_dtype, compute_policy, expected, monkeypatch
-):
+def test_precision_capability_profiles(precision, monkeypatch):
     snapshot = {
         "configured_backend": "core",
         "selected_backend": "core",
@@ -356,26 +351,21 @@ def test_precision_capability_legacy_pairs_map_to_profiles(
         capabilities, "_load_boundary", lambda _backend: _boundary(snapshot)
     )
 
-    with pytest.warns(DeprecationWarning, match="precision profile"):
-        value = gafime.backend_capabilities(
-            "core",
-            storage_dtype=storage_dtype,
-            compute_policy=compute_policy,
-        ).precision_contract.value
+    value = gafime.backend_capabilities(
+        "core", precision=precision
+    ).precision_contract.value
 
-    assert value["requested"] == expected
+    assert value["requested"] == precision
     assert value["request_supported"] is True
-    assert value["effective"] == expected
+    assert value["effective"] == precision
 
 
 @pytest.mark.parametrize(
     ("storage_dtype", "compute_policy"),
-    [("float32", "exact"), ("float64", "stable"), ("float64", "fast")],
+    [("float32", "fast"), ("float32", "stable"), ("float64", "exact")],
 )
-def test_precision_capability_rejects_unsupported_legacy_pairs(
-    storage_dtype, compute_policy
-):
-    with pytest.raises(ValueError, match="unsupported legacy precision pair"):
+def test_precision_capability_rejects_legacy_pairs(storage_dtype, compute_policy):
+    with pytest.raises(TypeError, match="storage_dtype"):
         gafime.backend_capabilities(
             "core",
             storage_dtype=storage_dtype,
@@ -383,19 +373,27 @@ def test_precision_capability_rejects_unsupported_legacy_pairs(
         )
 
 
-def test_precision_capability_rejects_unknown_names():
-    with pytest.raises(ValueError, match="storage_dtype"):
-        gafime.backend_capabilities(
-            "core", storage_dtype="binary128", compute_policy="stable"
-        )
-    with pytest.raises(ValueError, match="compute_policy"):
-        gafime.backend_capabilities(
-            "core", storage_dtype="float32", compute_policy="magic"
-        )
+def test_precision_capability_signature_has_only_canonical_arguments():
+    parameters = inspect.signature(gafime.backend_capabilities).parameters
+    assert list(parameters) == [
+        "backend",
+        "device_id",
+        "probe",
+        "mi_bins",
+        "mi_approximate",
+        "precision",
+    ]
+    assert parameters["precision"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["precision"].default == "mixed"
+
+
+def test_precision_capability_rejects_removed_single_keyword():
+    with pytest.raises(TypeError, match="compute_policy"):
+        gafime.backend_capabilities("core", compute_policy="fast")
 
 
 def test_precision_capability_rejects_explicit_profile_with_legacy_pair():
-    with pytest.raises(TypeError, match="precision cannot be combined"):
+    with pytest.raises(TypeError, match="storage_dtype"):
         gafime.backend_capabilities(
             "core",
             precision="mixed",

@@ -16,16 +16,11 @@ EngineConfig(precision="fp64")
 
 The public configuration, capability report, diagnostic report, compiled
 artifact, and CLI expose `precision`. They do not expose storage and compute as
-independently configurable choices. A deprecated compatibility parser may
-accept both old fields together only for these unambiguous mappings:
-
-| Deprecated pair | Profile |
-|---|---|
-| `float32 + fast` | `fp32` |
-| `float32 + stable` | `mixed` |
-| `float64 + exact` | `fp64` |
-
-Missing, contradictory, or unsupported legacy combinations fail closed.
+independently configurable choices. Historical `storage_dtype` and
+`compute_policy` constructor/probe keywords are removed and raise `TypeError`,
+including combinations previously mapped by the compatibility parser. Use the
+single keyword-only `precision` selector; native capability/result dtype fields
+remain observational metadata, not configuration knobs.
 
 ## Four Numeric Domains
 

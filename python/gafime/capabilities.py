@@ -2,16 +2,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import importlib
-import warnings
 from typing import Any, Mapping
 
 from ._precision import (
     SUPPORTED_PRECISIONS,
     backend_precision_error,
     normalize_precision,
-    precision_from_legacy_pair,
 )
-from .config import _LEGACY_PRECISION_WARNING
 from ._payloads import installed_payload_build_policy
 from .families import BOOTSTRAP_STABILITY_SCOPE, FamilyCapability, available_families
 
@@ -28,13 +25,6 @@ _BACKEND_ALIASES = {
     "metal": "metal",
 }
 _MI_TEMPLATE_LEVELS = (2, 4, 8, 12, 16, 24, 32, 48, 64, 96)
-
-
-class _DefaultPrecision(str):
-    """String-compatible sentinel that distinguishes an omitted default."""
-
-
-_DEFAULT_PRECISION = _DefaultPrecision("mixed")
 
 
 @dataclass(frozen=True)
@@ -101,8 +91,7 @@ def backend_capabilities(
     probe: bool = False,
     mi_bins: int = 96,
     mi_approximate: bool = False,
-    precision: str = _DEFAULT_PRECISION,
-    **legacy_precision: object,
+    precision: str = "mixed",
 ) -> BackendCapabilities:
     """Return truthful static and, when requested, runtime backend facts.
 
@@ -118,8 +107,6 @@ def backend_capabilities(
     two; and ``precision`` accepts ``fp32``, ``mixed``, or ``fp64``.  A static
     unsupported Metal precision is represented as a rejected capability when
     unprobed and raises :class:`ValueError` when a runtime probe is requested.
-    Deprecated precision pairs follow the same compatibility rules as
-    :class:`EngineConfig`.
     """
 
     configured = _normalize_backend(backend)
@@ -127,24 +114,6 @@ def backend_capabilities(
         raise ValueError("device_id must be a non-negative integer.")
     if not isinstance(mi_bins, int) or isinstance(mi_bins, bool) or mi_bins < 2:
         raise ValueError("mi_bins must be an integer greater than or equal to 2.")
-    if legacy_precision:
-        unexpected = set(legacy_precision) - {"storage_dtype", "compute_policy"}
-        if unexpected:
-            raise TypeError(
-                f"unexpected precision keyword(s): {', '.join(sorted(unexpected))}"
-            )
-        if set(legacy_precision) != {"storage_dtype", "compute_policy"}:
-            raise TypeError(
-                "deprecated storage_dtype and compute_policy must be supplied together."
-            )
-        if precision is not _DEFAULT_PRECISION:
-            raise TypeError(
-                "precision cannot be combined with deprecated storage_dtype/compute_policy."
-            )
-        precision = precision_from_legacy_pair(
-            legacy_precision["storage_dtype"], legacy_precision["compute_policy"]
-        )
-        warnings.warn(_LEGACY_PRECISION_WARNING, DeprecationWarning, stacklevel=2)
     precision = normalize_precision(precision)
     unsupported_reason = backend_precision_error(configured, precision)
     if unsupported_reason is not None and probe:

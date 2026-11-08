@@ -464,9 +464,12 @@ preserves fp64 across all four domains with no intermediate fp32 quantization.
 The profile applies to all metrics, continuous/time-series/decision-path
 families, significance, ranking, eager/resident/compiled execution, graph
 replay, target replacement, and cache identity. Structural planner metadata
-retains its integer/control types. The narrow deprecated pair parser accepts
-only `float32+fast -> fp32`, `float32+stable -> mixed`, and
-`float64+exact -> fp64`; the old fields are not an independent public surface.
+retains its integer/control types. Legacy `storage_dtype`/`compute_policy`
+configuration keywords are removed, not mapped into a profile. The removed
+`enable_discrete_functions` option is rejected even when false. The canonical
+constructors retain the first ten `EngineConfig` and first six `ComputeBudget`
+positional fields; all later fields remain keyword-only. Historical positional
+layout reinterpretation is not supported.
 
 ABI 1.0 float layouts and entry points remain byte-for-byte compatible through
 thin adapters and never reinterpret a float pointer as double. The additive ABI

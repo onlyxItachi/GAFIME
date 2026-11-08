@@ -2672,7 +2672,9 @@ def check_native_kernel_structure() -> None:
     assert "storage_dtype: str" not in python_config
     assert "compute_policy: str" not in python_config
     assert 'SUPPORTED_PRECISIONS = ("fp32", "mixed", "fp64")' in python_precision
-    assert "precision_from_legacy_pair" in python_precision
+    assert "precision_from_legacy_pair" not in python_precision
+    assert "_compatible_engine_config_init" not in python_config
+    assert "_compatible_compute_budget_init" not in python_config
     assert "backend_precision_error" in python_adapter
     assert "precision_contract: CapabilityValue" in python_capabilities
     assert 'get_string(config, "precision", "mixed")' in rust_runtime

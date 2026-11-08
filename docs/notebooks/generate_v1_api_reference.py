@@ -517,10 +517,11 @@ def _cells() -> list:
             | `significance_top_n` | `50` | positive maximum of surfaced candidates evaluated/reported for significance |
             | `mi_approximate` | `False` | Core uses adaptive quantile MI unless fixed-width approximation is requested |
 
-            The first ten historical parameters remain positional through
-            `device_id`; current family and precision controls are keyword-only.
-            Deprecated `storage_dtype`/`compute_policy` pairs are compatibility-only
-            and should not be used in new code.
+            The canonical first ten parameters remain positional through
+            `device_id`; precision, family controls and `mi_approximate` are
+            keyword-only. Historical positional layouts and removed
+            `storage_dtype`, `compute_policy`, and `enable_discrete_functions`
+            keywords (even false) raise `TypeError`; no migration mapping runs.
             """
         ),
         _code(

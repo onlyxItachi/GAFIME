@@ -493,10 +493,19 @@ def _validate_release_docs() -> None:
         "`fp32`: fp32 ingest/storage",
         "`mixed` (default)",
         "`fp64`: fp64 ingest/storage",
-        "float32+fast -> fp32",
         'backend="metal"',
     ):
         _require(token in usage, f"USAGE is missing precision guidance: {token}")
+    normalized_usage = " ".join(usage.split())
+    for token in (
+        "Historical `storage_dtype`/`compute_policy` keywords are no longer accepted, even as a pair.",
+        'Use `precision="fp32"`, `"mixed"`, or `"fp64"`',
+        "reported storage and result dtypes remain capability metadata, not independent controls",
+    ):
+        _require(
+            token in normalized_usage,
+            f"USAGE is missing canonical precision guidance: {token}",
+        )
     build_guide = (ROOT / "BUILD.md").read_text(encoding="utf-8")
     for token in (
         "Windows ARM64 uses an ARM64 Python 3.11",
