@@ -11,6 +11,7 @@ import re
 import sys
 from types import ModuleType
 
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON_SRC = ROOT / "python"
@@ -117,7 +118,7 @@ def test_subfunctions_explicit_exports_are_documented_without_loading_native() -
         assert f"`{name}`" in coverage
     for removed in ("BatchScheduler", "CacheAwareScheduler", "SmartScheduler"):
         assert removed not in proxy.__all__
-        with __import__("pytest").raises(AttributeError):
+        with pytest.raises(AttributeError):
             getattr(proxy, removed)
     assert proxy._rust_helpers is None
     assert "DataQualityAnalyzer" in reference and "OTSEncoder" in reference
