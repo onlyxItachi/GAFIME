@@ -104,6 +104,26 @@ def test_reference_inventory_matches_top_level_exports_and_coverage() -> None:
         assert f"`gafime.{name}`" in coverage
 
 
+def test_subfunctions_explicit_exports_are_documented_without_loading_native() -> None:
+    import importlib
+
+    proxy = importlib.reload(importlib.import_module("gafime.subfunctions"))
+    coverage = COVERAGE_PATH.read_text(encoding="utf-8")
+    reference = _source_text(_notebook())
+    assert proxy._rust_helpers is None
+    assert isinstance(proxy.__all__, list)
+    assert len(proxy.__all__) == len(set(proxy.__all__))
+    for name in proxy.__all__:
+        assert f"`{name}`" in coverage
+    for removed in ("BatchScheduler", "CacheAwareScheduler", "SmartScheduler"):
+        assert removed not in proxy.__all__
+        with __import__("pytest").raises(AttributeError):
+            getattr(proxy, removed)
+    assert proxy._rust_helpers is None
+    assert "DataQualityAnalyzer" in reference and "OTSEncoder" in reference
+    assert "issue #119" in reference and "issue #87" in reference
+
+
 def test_reference_covers_all_configuration_and_result_fields() -> None:
     generator = _load_generator()
     from gafime.reporting import PermutationResult, StabilityResult

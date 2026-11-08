@@ -91,6 +91,15 @@ controls are keyword-only. `ComputeBudget` accepts only its first six fields
 positionally. Removed v0.x keywords, including `enable_discrete_functions=False`,
 raise `TypeError`; historical positional layouts are not reinterpreted.
 
+## Maintained Native Helpers
+
+`gafime.subfunctions` remains a lazy, explicitly exported native helper
+namespace. `DataQualityAnalyzer` retains its behavior but warns on construction;
+its future Polars replacement (#87, v1.1/v1.2) will be caller-opt-in, never silent
+cleaning or deletion. `OTSEncoder` stays unchanged; backend-neutral OTS work is
+deferred to #119. The three retired scheduler helpers and obsolete extension
+lookup paths are not supported. See [the pruning disposition](docs/legacy-pruning.md).
+
 ## Compile Artifacts
 
 `gafime.compile` creates an in-memory compiled artifact that owns the coerced
