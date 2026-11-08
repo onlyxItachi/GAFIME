@@ -1,4 +1,4 @@
-//! Minimal CPython-compatible MT19937 stream for legacy candidate planning.
+//! CPython-compatible MT19937 stream used by the native candidate planner.
 //!
 //! GAFIME v0.4.7 and v0.5.0-legacy used `random.Random(seed).shuffle` to cap
 //! unary candidates and order higher-arity descriptors. Keeping this small,
@@ -155,5 +155,18 @@ mod tests {
             PythonRandom::from_u64(seed).shuffle(&mut values);
             assert_eq!(values, expected, "seed {seed}");
         }
+    }
+
+    #[test]
+    fn wide_seed_words_and_repeated_shuffle_match_cpython() {
+        // Independent oracle: random.Random((1 << 130) + 5), then shuffle
+        // range(8) and range(12) on that same CPython stream, in that order.
+        let mut random = PythonRandom::from_seed_words(&[5, 0, 0, 0, 4]);
+        let mut first: Vec<_> = (0..8).collect();
+        random.shuffle(&mut first);
+        assert_eq!(first, [2, 4, 7, 0, 1, 5, 6, 3]);
+        let mut second: Vec<_> = (0..12).collect();
+        random.shuffle(&mut second);
+        assert_eq!(second, [5, 11, 10, 8, 2, 1, 4, 6, 0, 3, 7, 9]);
     }
 }

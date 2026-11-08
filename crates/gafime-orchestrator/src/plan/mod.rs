@@ -1,5 +1,5 @@
 pub mod combos;
-mod legacy_rng;
+mod cpython_mt19937;
 pub mod shapes;
 pub mod spine;
 
