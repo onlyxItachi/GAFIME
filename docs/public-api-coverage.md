@@ -68,6 +68,12 @@ The reference and signature tests cover all fields of:
   `mi_approximate`;
 - `CompileFlags`: `plan`, `graph`, `export`.
 
+Canonical configuration preserves the first six `ComputeBudget` fields and
+first ten `EngineConfig` fields positionally; remaining fields are keyword-only.
+Historical positional layouts and `storage_dtype`, `compute_policy`, and
+`enable_discrete_functions` keywords (including false) are rejected, not remapped.
+`backend_capabilities` accepts only the canonical keyword-only precision selector.
+
 ## Returned Objects and Public Methods
 
 The reference describes the fields of `BackendInfo`, `InteractionResult`,

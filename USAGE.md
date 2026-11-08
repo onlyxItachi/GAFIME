@@ -53,9 +53,9 @@ Core, CUDA, and ROCm support all three profiles in the existing distribution
 families. Metal supports `fp32` only. Explicit `backend="metal"` mixed/fp64
 requests fail before input coercion, payload discovery, or allocation;
 `backend="auto"` may exclude Metal and select Core for those profiles.
-Deprecated `storage_dtype`/`compute_policy` pairs are accepted only for the
-unambiguous mappings `float32+fast -> fp32`, `float32+stable -> mixed`, and
-`float64+exact -> fp64`; every other or contradictory pair is rejected.
+Historical `storage_dtype`/`compute_policy` keywords are no longer accepted,
+even as a pair. Use `precision="fp32"`, `"mixed"`, or `"fp64"`; reported storage
+and result dtypes remain capability metadata, not independent controls.
 
 `mi_bins` is a ceiling. GAFIME selects the largest sample-safe histogram shape
 from `2, 4, 8, 12, 16, 24, 32, 48, 64, 96` using the v0.4.1 density rule
@@ -85,13 +85,11 @@ Available public backend names are `"auto"`, `"core"`, `"cpu"`, `"cuda"`,
 `"rocm"`, `"hip"`, and `"metal"`. `backend="gpu"` is rejected because it is
 ambiguous in v1; request a vendor backend explicitly.
 
-For v0.4.7 migration, the first ten positional `EngineConfig` arguments remain
-stable through `device_id`. Generated-family options are keyword-only. In
-particular, positional argument 11 was formerly `enable_discrete_functions`;
-v1 accepts only the exactly compatible disabled value (`False`) with a
-`DeprecationWarning`. An enabled or otherwise ambiguous legacy value is rejected
-with migration guidance instead of being treated as
-`enable_time_series_functions`.
+The canonical constructor accepts the first ten `EngineConfig` fields
+positionally through `device_id`; precision, `mi_approximate` and generated-family
+controls are keyword-only. `ComputeBudget` accepts only its first six fields
+positionally. Removed v0.x keywords, including `enable_discrete_functions=False`,
+raise `TypeError`; historical positional layouts are not reinterpreted.
 
 ## Compile Artifacts
 
