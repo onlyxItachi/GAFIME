@@ -94,7 +94,7 @@ raise `TypeError`; historical positional layouts are not reinterpreted.
 ## Compile Artifacts
 
 `gafime.compile` creates an in-memory compiled artifact that owns the coerced
-native data, compact scenario plan, backend session, and optional export handles.
+native data, Rust-owned plan, backend session, and optional result-export state.
 Repeated `artifact.analyze()` calls reuse resident backend state where the
 selected backend supports it.
 
@@ -140,7 +140,7 @@ artifact = gafime.compile(
     y,
     feature_names=feature_names,
     config=config,
-    flags=CompileFlags(plan=True, export=True),
+    flags=CompileFlags(export=True),
 )
 try:
     report = artifact.analyze()
@@ -155,12 +155,9 @@ finally:
 result table. Backend graph capture/replay is owned by the selected native
 payload and must not change result semantics or introduce silent fallback.
 
-`artifact.flags` remains an exact `CompileFlags` view for v0.5 compatibility.
-The legacy `artifact.exports` property remains available with a
-`DeprecationWarning`; it exposes the owning native artifact as
-`feature_matrix_handle` and the last native report as `result_table_handle`.
-The current boundary has no independent candidate-table handle, so
-`candidate_table_handle` is `None`. New code should use `export_arrow()`.
+`artifact.flags` provides the effective `CompileFlags` view. Native planning
+remains Rust-owned; use `export_arrow()` to export the compact result table.
+Arrow result export is distinct from Arrow input ingestion.
 
 ## Decision Paths and Time-Series Candidates
 

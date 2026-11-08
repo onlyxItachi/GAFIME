@@ -56,7 +56,6 @@ class _CommittedHandle:
         assert self.commits == 1
         assert self.wrapper._native_report is None
         assert self.wrapper._last_report is None
-        assert self.wrapper._scenario_plan is None
         assert self.wrapper._generated_feature_start is None
         assert self.wrapper._graph_replayed is False
 
@@ -121,7 +120,6 @@ def test_committed_generated_metadata_failure_retires_artifact(
     stale = _StaleReport()
     artifact._native_report = stale
     artifact._last_report = object()
-    artifact._scenario_plan = object()
     artifact._generated_feature_start = 1
     artifact._graph_replayed = True
     monkeypatch.setattr(adapter, "_fresh_random_seed", lambda: 23)
@@ -140,7 +138,6 @@ def test_committed_generated_metadata_failure_retires_artifact(
     assert artifact._closed
     assert artifact._native_report is None
     assert artifact._last_report is None
-    assert artifact._scenario_plan is None
     assert artifact._generated_feature_start is None
     assert artifact._graph_replayed is False
     # New names are committed only after all metadata reads/conversions succeed.

@@ -23,7 +23,7 @@ def main():
 
     compiled = gafime.compile(Xl, yl, names,
                               config=EngineConfig(backend=backend, permutation_tests=50),
-                              flags=CompileFlags(plan=True))
+                              flags=CompileFlags())
     t0 = tel.monotonic_ns()
     compiled.analyze()
     dt = tel.monotonic_ns() - t0

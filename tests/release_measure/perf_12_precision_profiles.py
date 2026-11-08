@@ -773,7 +773,7 @@ def _measure_compiled(
         target,
         names,
         config=config,
-        flags=CompileFlags(plan=True, graph=graph),
+        flags=CompileFlags(graph=graph),
     )
     compile_ns = perf_counter_ns() - compile_start
     memory_after_compile = _rss_snapshot()

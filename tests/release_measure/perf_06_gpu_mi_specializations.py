@@ -91,7 +91,7 @@ def measure(
         target,
         names,
         config=config,
-        flags=CompileFlags(plan=True, graph=False),
+        flags=CompileFlags(graph=False),
     )
     try:
         for _ in range(warmups):

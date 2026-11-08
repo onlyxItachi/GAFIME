@@ -265,7 +265,7 @@ def main():
 
         t1 = tel.monotonic_ns()
         compiled = gafime.compile(
-            Xl, yl, names, config=cfg, flags=CompileFlags(plan=True)
+            Xl, yl, names, config=cfg, flags=CompileFlags()
         )
         try:
             compiled_first = compiled.analyze()

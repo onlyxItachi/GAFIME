@@ -877,7 +877,7 @@ def test_lower_positive_cache_capacity_is_enforced_on_hit(monkeypatch):
     assert len(boundary.compile_buffer_calls) == 2
 
 
-def test_compiled_artifact_restores_v05_flags_and_exports(monkeypatch):
+def test_compiled_artifact_flags_and_removed_exports(monkeypatch):
     boundary = _fake_boundary(buffers=True)
     monkeypatch.setattr(
         v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
@@ -886,25 +886,21 @@ def test_compiled_artifact_restores_v05_flags_and_exports(monkeypatch):
         [[1.0], [2.0]],
         [0.0, 1.0],
         ["a"],
-        flags=CompileFlags(plan=False, export=True),
+        flags=CompileFlags(export=True),
     )
 
-    assert artifact.flags == CompileFlags(plan=False, export=True)
-    with pytest.warns(DeprecationWarning, match="export_arrow"):
-        before = artifact.exports
-    assert before.backend_name == "core"
-    assert before.feature_matrix_handle is boundary.handles[0]
-    assert before.result_table_handle is None
-    assert before.candidate_table_handle is None
-
-    artifact.analyze()
-    with pytest.warns(DeprecationWarning, match="export_arrow"):
-        after = artifact.exports
-    assert after.result_table_handle is not None
-    artifact.close()
+    try:
+        assert artifact.flags == CompileFlags(export=True)
+        with pytest.raises(AttributeError):
+            _ = artifact.exports
+        artifact.analyze()
+        with pytest.raises(AttributeError):
+            _ = artifact.exports
+    finally:
+        artifact.close()
 
 
-def test_compiled_artifact_legacy_exports_require_export_flag(monkeypatch):
+def test_compiled_artifact_result_export_requires_export_flag(monkeypatch):
     boundary = _fake_boundary(buffers=True)
     monkeypatch.setattr(
         v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
@@ -913,11 +909,8 @@ def test_compiled_artifact_legacy_exports_require_export_flag(monkeypatch):
         [[1.0], [2.0]], [0.0, 1.0], ["a"]
     )
     try:
-        with pytest.warns(DeprecationWarning, match="export_arrow"):
-            with pytest.raises(
-                V1UnsupportedError, match="export handles are not available"
-            ):
-                _ = artifact.exports
+        with pytest.raises(V1UnsupportedError, match="result export requires"):
+            artifact.export_arrow()
     finally:
         artifact.close()
 

@@ -313,14 +313,11 @@ def _assert_cpu_backend(gafime: object, precision: str) -> None:
         y,
         names,
         config=config,
-        flags=gafime.CompileFlags(plan=True),
+        flags=gafime.CompileFlags(),
     )
     try:
-        plan = compiled.scenario_plan
-        if plan is None or int(plan.rows) != len(X) or int(plan.cols) != len(names):
-            raise AssertionError(
-                "installed wheel compile did not expose the expected plan"
-            )
+        if compiled.feature_names != names:
+            raise AssertionError("installed wheel compile changed feature identities")
         compiled_report = compiled.analyze()
         if compiled_report.backend.name != "v1-rust-cpu":
             raise AssertionError(
@@ -352,8 +349,42 @@ def _assert_cpu_backend(gafime: object, precision: str) -> None:
                         f"installed wheel eager/compiled {candidate_id} {name} differs: "
                         f"{eager_value!r} != {compiled_value!r}"
                     )
+        if compiled.update_target(y) is not compiled:
+            raise AssertionError(
+                "installed wheel target update did not retain artifact"
+            )
+        replay_by_id = {
+            item.candidate_id: item for item in compiled.analyze().interactions
+        }
+        if replay_by_id.keys() != eager_by_id.keys():
+            raise AssertionError(
+                "installed wheel target update changed candidate identities"
+            )
+        for candidate_id, eager_item in eager_by_id.items():
+            replay_item = replay_by_id[candidate_id]
+            if replay_item.metrics.keys() != eager_item.metrics.keys():
+                raise AssertionError("installed wheel replay changed metric names")
+            for name, value in eager_item.metrics.items():
+                if not math.isclose(
+                    float(value),
+                    float(replay_item.metrics[name]),
+                    rel_tol=0.0,
+                    abs_tol=1.0e-7,
+                ):
+                    raise AssertionError(
+                        "installed wheel target-update replay changed metrics"
+                    )
     finally:
         compiled.close()
+    if len(compiled_report.interactions) != len(interactions):
+        raise AssertionError("installed wheel report became unreadable after close")
+    try:
+        compiled.analyze()
+    except RuntimeError as exc:
+        if "closed" not in str(exc):
+            raise
+    else:
+        raise AssertionError("installed wheel closed artifact accepted analyze")
 
 
 def _assert_fp64_ingest_never_rounds_through_fp32(gafime: object) -> None:

@@ -63,7 +63,7 @@ def main():
         cached = (tel.monotonic_ns() - t_cache) / REPS
 
     # resident: compile once, reuse session
-    compiled = gafime.compile(Xl, yl, names, config=cfg, flags=CompileFlags(plan=True))
+    compiled = gafime.compile(Xl, yl, names, config=cfg, flags=CompileFlags())
     t1 = tel.monotonic_ns()
     for _ in range(REPS):
         compiled.analyze()

@@ -106,13 +106,6 @@ def test_reference_inventory_matches_top_level_exports_and_coverage() -> None:
 
 def test_reference_covers_all_configuration_and_result_fields() -> None:
     generator = _load_generator()
-    from gafime.compile.exports import ExportHandles
-    from gafime.compile.scenario import (
-        ChunkRange,
-        ContinuousArityDescriptor,
-        ScenarioPlan,
-        TimeSeriesDescriptor,
-    )
     from gafime.reporting import PermutationResult, StabilityResult
 
     models = {
@@ -130,11 +123,6 @@ def test_reference_covers_all_configuration_and_result_fields() -> None:
         "DecisionPathCandidate": gafime.DecisionPathCandidate,
         "FamilySignificanceSupport": gafime.FamilySignificanceSupport,
         "FamilyCapability": gafime.FamilyCapability,
-        "ExportHandles": ExportHandles,
-        "ChunkRange": ChunkRange,
-        "ContinuousArityDescriptor": ContinuousArityDescriptor,
-        "TimeSeriesDescriptor": TimeSeriesDescriptor,
-        "ScenarioPlan": ScenarioPlan,
     }
     documented_source = (
         _source_text(_notebook()) + "\n" + COVERAGE_PATH.read_text(encoding="utf-8")
@@ -246,15 +234,6 @@ def test_public_python_symbols_have_authored_source_docstrings() -> None:
         ),
         "python/gafime/compile/flags.py": ("CompileFlags",),
         "python/gafime/compile/api.py": ("compile",),
-        "python/gafime/compile/exports.py": ("ExportHandles", "unsupported_export"),
-        "python/gafime/compile/scenario.py": (
-            "ChunkRange",
-            "ContinuousArityDescriptor",
-            "ScenarioPlan",
-            "TimeSeriesDescriptor",
-            "build_scenario_plan",
-            "build_scenario_plan_from_shape",
-        ),
         "python/gafime/config.py": ("ComputeBudget", "EngineConfig"),
         "python/gafime/dataloader.py": ("dataload",),
         "python/gafime/decision_path.py": (

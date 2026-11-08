@@ -4,13 +4,17 @@ Verifies that enabling time_series routes analyze() to the native
 analyze_time_series expand+mine path and surfaces the expanded feature names.
 """
 
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
 _PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
-if str(_PYTHON_SRC) not in sys.path:
+if (
+    os.environ.get("GAFIME_TEST_INSTALLED_PACKAGE") != "1"
+    and str(_PYTHON_SRC) not in sys.path
+):
     sys.path.insert(0, str(_PYTHON_SRC))
 
 import gafime.v1_adapter as adapter  # noqa: E402
@@ -129,12 +133,6 @@ def test_time_series_compile_returns_expanded_resident_artifact(monkeypatch):
     )
     try:
         assert artifact.feature_names == ["a", "b", "a_lag1", "b_lag1"]
-        plan = artifact.scenario_plan
-        assert plan.n_features == 2
-        assert plan.feature_candidate_count == 2
-        assert plan.planned_count == 11
-        assert plan.time_series is not None
-        assert plan.time_series.feature_stop == 2
         report = artifact.analyze()
         assert report.feature_names == artifact.feature_names
         assert "time_series expanded" in report.warnings[0]

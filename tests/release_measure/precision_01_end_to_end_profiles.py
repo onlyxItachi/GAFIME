@@ -734,9 +734,7 @@ def _run_filtered_spearman_adversary(
                 features,
                 target,
                 feature_names=("left", "right"),
-                flags=gafime.CompileFlags(
-                    plan=True, graph=bool(graph_support[backend])
-                ),
+                flags=gafime.CompileFlags(graph=bool(graph_support[backend])),
             )
             try:
                 compiled = artifact.analyze()
@@ -1122,7 +1120,7 @@ def _run_family_case(
         case.features,
         case.target,
         feature_names=case.feature_names,
-        flags=gafime.CompileFlags(plan=True, graph=False),
+        flags=gafime.CompileFlags(graph=False),
     )
     graph = None
     try:
@@ -1146,7 +1144,7 @@ def _run_family_case(
                 case.features,
                 case.target,
                 feature_names=case.feature_names,
-                flags=gafime.CompileFlags(plan=True, graph=True),
+                flags=gafime.CompileFlags(graph=True),
             )
             if not graph.graph_requested:
                 raise AssertionError(f"{label}: graph artifact lost graph request")

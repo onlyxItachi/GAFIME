@@ -2622,7 +2622,7 @@ def _interleaved_operations(
                         target,
                         names,
                         config=config,
-                        flags=gafime.CompileFlags(plan=True, graph=surface == "graph"),
+                        flags=gafime.CompileFlags(graph=surface == "graph"),
                     )
                     artifacts.append(artifact)
                     artifact_for_validation[0] = artifact
@@ -2847,7 +2847,7 @@ def _measure_surface(
             target,
             names,
             config=config,
-            flags=gafime.CompileFlags(plan=True, graph=surface == "graph"),
+            flags=gafime.CompileFlags(graph=surface == "graph"),
         )
         operation = artifact.analyze
     try:
@@ -3020,7 +3020,7 @@ def _cold_worker(job: Mapping[str, object], process_start_ns: int) -> dict[str, 
         target,
         names,
         config=config,
-        flags=gafime.CompileFlags(plan=True, graph=False),
+        flags=gafime.CompileFlags(graph=False),
     )
     compile_ns = perf_counter_ns() - compile_start
     for name in ("first_allocation", "first_upload", "planning"):

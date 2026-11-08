@@ -204,7 +204,7 @@ for provenance, anti-self-normalization guards and historical verdicts.
 
 | script | validates | needs |
 |---|---|---|
-| `compile_01_plan_correctness.py` | native compile artifact and plan shape | CPU |
+| `compile_01_plan_correctness.py` | compiled candidates, eager parity, target update, and lifecycle | CPU |
 | `compile_02_compiled_vs_eager.py` | one-shot, resident-cache, and explicit-compiled parity across first/repeat/target-update runs, including non-finite inputs, large seeds, warnings, significance, and final decisions; timing is context only | CPU/GPU |
 
 ### graph
