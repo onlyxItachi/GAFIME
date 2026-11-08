@@ -1436,8 +1436,28 @@ def _cells() -> list:
               bounded diagnostic helper `benchmark_streaming`. Its `n_batches`
               argument must be positive and is validated before the file is opened.
             - `gafime.compile`: callable compile module, flags, and compiled aliases.
-            - `gafime.subfunctions`: the advanced native compatibility proxy. Prefer
-              the top-level safe engine/capability APIs for new application code.
+            - `gafime.subfunctions`: an explicit lazy native helper namespace,
+              not an unrestricted proxy. Import/`dir`/`__all__` do not load the
+              extension. Use top-level safe engine/capability APIs for analysis.
+
+            `subfunctions.DataQualityAnalyzer(low_entropy_threshold=0.1,
+            high_cardinality_ratio=0.95, categorical_max=50)` retains its existing
+            f32 column-oriented functionality but emits `DeprecationWarning` on
+            construction, not lookup. Methods include `analyze_nan_inf`,
+            `clean_nan_inf`, `clean_nan_inf_mean`, `analyze_missing`,
+            `check_alignment`, `analyze_entropy`, `get_features_to_drop`,
+            `get_id_features`, `get_categorical_features`, and `full_report`.
+            Cleaning and feature deletion are never automatic. A future
+            caller-opt-in Polars replacement belongs to issue #87 (v1.1/v1.2).
+
+            `subfunctions.OTSEncoder(prior=0.5, prior_weight=1.0, seed=42,
+            n_permutations=4)` remains unchanged. `fit_transform(categories,
+            targets)` accepts u32 category IDs and f32 targets; `transform`,
+            `n_categories`, and `get_prior` retain their existing fitted-state
+            behavior. Backend-neutral integration is deferred to issue #119,
+            not part of v1.0.0. The explicit native-function allowlist is indexed
+            in the public coverage document. The three obsolete helper
+            schedulers and old module-lookup paths are removed.
 
             Public method/property index: `GafimeEngine.analyze()` and `compile()`;
             `NativeCompiledGafime.flags`, `backend`, `from_engine()`,

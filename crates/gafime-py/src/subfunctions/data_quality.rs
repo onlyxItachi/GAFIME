@@ -476,17 +476,24 @@ impl PyDataQualityAnalyzer {
     #[new]
     #[pyo3(signature = (low_entropy_threshold=0.1, high_cardinality_ratio=0.95, categorical_max=50))]
     fn new(
+        py: Python<'_>,
         low_entropy_threshold: f32,
         high_cardinality_ratio: f32,
         categorical_max: usize,
-    ) -> Self {
-        Self {
+    ) -> PyResult<Self> {
+        PyErr::warn(
+            py,
+            &py.get_type::<pyo3::exceptions::PyDeprecationWarning>(),
+            pyo3::ffi::c_str!("DataQualityAnalyzer is deprecated; its existing behavior remains available while a future caller-opt-in replacement is developed."),
+            1,
+        )?;
+        Ok(Self {
             entropy_analyzer: EntropyAnalyzer::with_thresholds(
                 low_entropy_threshold,
                 high_cardinality_ratio,
                 categorical_max,
             ),
-        }
+        })
     }
 
     /// Analyze NaN/Inf in data

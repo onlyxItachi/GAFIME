@@ -47,7 +47,7 @@ Coverage classes:
 | `gafime.family_capability` | primary | lookup/failure semantics | family sections | family smoke | exact-name lookup |
 | `gafime.generate_tutorial` | integration | generator contract | documentation hierarchy | deterministic tutorial parity test | generates the compact practice notebook only |
 | `gafime.require_family_supported` | primary | lookup/failure semantics | family sections | family smoke | fail-closed family admission |
-| `gafime.subfunctions` | advanced compatibility | proxy and compatibility boundary | compatibility/API-index section | existing compatibility tests | prefer top-level safe APIs for new code |
+| `gafime.subfunctions` | maintained advanced namespace | explicit lazy export contract | helper/API-index section | lazy/import/native helper tests | DQA deprecated on use; OTS retained; prefer top-level safe analysis APIs |
 
 The table covers every name in `gafime.__all__` plus the public runtime version
 attribute. CI fails if either side changes without updating this record and the
@@ -132,17 +132,26 @@ unexplained import accident.
 | `gafime.io` | `GafimeStreamer`, `benchmark_streaming`, `create_streamer` | streamer is supported integration; functions are compatibility/diagnostic helpers |
 | `gafime.compile` | `compile`, `CompileFlags`, `CompiledGafime`, `NativeCompiledGafime` | callable module and top-level aliases |
 
-`gafime.subfunctions` dynamically proxies the installed native boundary. The
-current exact package exposes `BOUNDARY_NAME`, `BatchScheduler`,
-`CacheAwareScheduler`, `CompiledContinuousArtifact`, `ContinuousRecord`,
-`ContinuousReport`, `DataQualityAnalyzer`, `OTSEncoder`, `SmartScheduler`,
+`gafime.subfunctions` lazily forwards this explicit allowlist from
+`gafime.gafime_py`: `BOUNDARY_NAME`, `CompiledContinuousArtifact`,
+`ContinuousRecord`, `ContinuousReport`, `DataQualityAnalyzer`, `OTSEncoder`,
 `analyze_continuous`, `analyze_continuous_arrow`, `analyze_continuous_buffers`,
 `analyze_continuous_cpu`, `analyze_continuous_rows`, `analyze_decision_path`,
 `analyze_time_series`, `compile_continuous`, `compile_continuous_buffers`,
 `compile_continuous_rows`, `compile_decision_path`, `compile_time_series`,
 `native_version`, and `runtime_capabilities`. These are advanced compatibility
-exports. New application code should use `GafimeEngine`, `compile`,
+exports. Import, `dir` and `__all__` do not load the extension; removed schedulers
+and unlisted native/private names are not forwarded. Obsolete `gafime_cpu`
+module lookup paths are removed. New analysis code should use `GafimeEngine`, `compile`,
 `backend_capabilities`, `dataload`, and structured reports.
+
+DataQualityAnalyzer retains its current f32 column-oriented methods and
+constructor parameters; construction emits `DeprecationWarning`, while import
+and attribute lookup do not. The future caller-opt-in Polars replacement is
+tracked under #87 for v1.1/v1.2; there is no silent cleaning/deletion/mutation.
+OTSEncoder retains its current constructor and `fit_transform`, `transform`,
+`n_categories`, `get_prior` behavior unchanged. Backend-neutral integration is
+deferred to #119. See [the pruning disposition](legacy-pruning.md).
 
 The supported CLI entry points are `gafime` and `python -m gafime`, with
 `--version` and `--check --backend ... --device-id ... --precision ...`.
@@ -161,9 +170,10 @@ values at construction and assignment. Streamer batch sizes and the bounded
 `benchmark_streaming(..., n_batches=...)` diagnostic reject non-positive values
 before reading input.
 
-The advanced compatibility `BatchScheduler(max_blocks=...)` requires a positive
-capacity and raises `ValueError` for zero before scheduling work. Its size hints
-are calculated without overflow when a large positive capacity is supplied.
+Removed scheduler classes are asserted absent from both the helper namespace
+and installed native module; unknown names cannot cause fallback module loads.
+Retained native helper tests cover DQA warning/category/location, missing and
+non-finite values, entropy/feature quality, and unchanged OTS outputs.
 
 Resident NumPy input ownership is covered by deterministic external-writer
 regressions across all three profiles, for arrays and memmaps. Fingerprints,

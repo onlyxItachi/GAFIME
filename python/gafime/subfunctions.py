@@ -1,74 +1,63 @@
-"""Lazy compatibility proxy for published native helper surfaces.
+"""Explicit, lazy access to selected native helper and boundary exports.
 
-Ordinary analysis should use :class:`gafime.GafimeEngine`.  This module keeps
-v0.4.7 helper classes and advanced native-boundary functions importable without
-loading the extension merely by importing :mod:`gafime`.  Its dynamic
-``__all__`` reflects public names exported by the installed compatible native
-module, so availability may differ for an older third-party boundary.  The
-low-level ``analyze_*``/``compile_*`` functions accept native protocol-shaped
-inputs and are not an alternative Python-owned production data plane.
+``DataQualityAnalyzer`` is deprecated on construction; its existing behavior
+is retained and it never cleans or removes data without the caller requesting
+it. ``OTSEncoder`` remains available. The listed report/artifact types and
+low-level functions preserve the advanced native boundary; their inputs are
+native protocol-shaped, not an alternative Python-owned production data plane.
+Ordinary analysis should use :class:`gafime.GafimeEngine` instead.
+
+Importing this module, inspecting ``__all__``, or calling ``dir`` does not
+load the extension. Only the names listed below are forwarded; other native
+implementation details are not implicitly part of this namespace.
 """
 
 from __future__ import annotations
 
+# These exports are resolved lazily by the module-level __getattr__.
+# ruff: noqa: F822
 from importlib import import_module
 from types import ModuleType
 
 
-_HELPER_MODULE_NAMES = (
-    "gafime.gafime_py",
-    "gafime.gafime_cpu",
-    "gafime_cpu",
-)
+__all__ = [
+    "BOUNDARY_NAME",
+    "CompiledContinuousArtifact",
+    "ContinuousRecord",
+    "ContinuousReport",
+    "DataQualityAnalyzer",
+    "OTSEncoder",
+    "analyze_continuous",
+    "analyze_continuous_arrow",
+    "analyze_continuous_buffers",
+    "analyze_continuous_cpu",
+    "analyze_continuous_rows",
+    "analyze_decision_path",
+    "analyze_time_series",
+    "compile_continuous",
+    "compile_continuous_buffers",
+    "compile_continuous_rows",
+    "compile_decision_path",
+    "compile_time_series",
+    "native_version",
+    "runtime_capabilities",
+]
+
 _rust_helpers: ModuleType | None = None
-_rust_helper_modules: tuple[ModuleType, ...] | None = None
 
 
-def _load_rust_helpers() -> tuple[ModuleType, ...]:
-    global _rust_helper_modules, _rust_helpers
-    if _rust_helper_modules is not None:
-        return _rust_helper_modules
-
-    import_errors: list[ImportError] = []
-    modules: list[ModuleType] = []
-    for module_name in _HELPER_MODULE_NAMES:
-        try:
-            modules.append(import_module(module_name))
-        except ImportError as exc:
-            import_errors.append(exc)
-
-    if not modules:
-        raise ImportError(
-            "Unable to load GAFIME's native helper module; tried "
-            + ", ".join(_HELPER_MODULE_NAMES)
-        ) from import_errors[0]
-
-    _rust_helper_modules = tuple(modules)
-    _rust_helpers = modules[0]
-    return _rust_helper_modules
-
-
-def _public_names() -> list[str]:
-    return sorted(
-        {
-            name
-            for module in _load_rust_helpers()
-            for name in dir(module)
-            if not name.startswith("_")
-        }
-    )
+def _load_rust_helpers() -> ModuleType:
+    global _rust_helpers
+    if _rust_helpers is None:
+        _rust_helpers = import_module("gafime.gafime_py")
+    return _rust_helpers
 
 
 def __getattr__(name: str):
-    if name == "__all__":
-        return _public_names()
-    for module in _load_rust_helpers():
-        try:
-            return getattr(module, name)
-        except AttributeError:
-            continue
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(_load_rust_helpers(), name)
 
 
 def __dir__() -> list[str]:
-    return sorted(_public_names())
+    return sorted(set(globals()) | set(__all__))

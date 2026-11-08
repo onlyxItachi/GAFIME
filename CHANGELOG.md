@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Retain the explicit lazy subfunctions namespace and unchanged OTS encoder;
+  remove retired native scheduler utilities and obsolete module lookup paths.
+  Deprecate DataQualityAnalyzer on construction while preserving behavior;
+  caller-opt-in Polars preprocessing and OTS modernization remain post-v1 work.
+
 - Remove the legacy Python compiled scenario-plan projection, `CompileFlags.plan`,
   and deprecated export-handle view. Rust-owned planning, graph behavior, and
   Arrow compact-result export remain available.
