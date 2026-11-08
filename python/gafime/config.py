@@ -40,9 +40,8 @@ class ComputeBudget:
         1024-feature guard; changing an explicit candidate limit removes that
         implicit guard. Values below ``-1`` fail.
 
-    The first six fields retain their historical positional order.  Later
-    fields are keyword-only because their v0.4.7/v0.5 positional meanings were
-    ambiguous.
+    The first six fields are positional in the canonical v1 constructor. Later
+    fields are keyword-only; historical positional layouts are not translated.
     """
 
     max_comb_size: int = 2
@@ -90,6 +89,9 @@ class EngineConfig:
     decision but do not replace holdout or out-of-fold validation. Both must
     be finite, non-negative, and representable in the public result precision.
 
+    The first ten fields through ``device_id`` may be positional; later fields
+    are keyword-only. Removed legacy precision/discrete keywords and obsolete
+    positional layouts raise :class:`TypeError` instead of being translated.
     """
 
     budget: ComputeBudget = field(default_factory=ComputeBudget)

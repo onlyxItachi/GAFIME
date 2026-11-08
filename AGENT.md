@@ -405,6 +405,11 @@ identity. The legacy MI device flag describes ABI 1.0 only and must not become
 a second precision policy. The full contract is documented in
 `docs/precision-contract.md`.
 
+The canonical Python constructors do not translate v0.x precision pairs,
+discrete switches (including false), or historical positional layouts.
+Preserve the first ten EngineConfig and first six ComputeBudget positional
+fields; later controls remain keyword-only. Removed keyword inputs fail clearly.
+
 `EngineConfig.mi_bins` is an adaptive maximum, not a fixed histogram request.
 Continuous MI planning selects the largest template in
 `2,4,8,12,16,24,32,48,64,96` for which `8 * bins^2 <= n_samples`; Metal
