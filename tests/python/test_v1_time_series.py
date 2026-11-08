@@ -4,13 +4,17 @@ Verifies that enabling time_series routes analyze() to the native
 analyze_time_series expand+mine path and surfaces the expanded feature names.
 """
 
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
 _PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
-if str(_PYTHON_SRC) not in sys.path:
+if (
+    os.environ.get("GAFIME_TEST_INSTALLED_PACKAGE") != "1"
+    and str(_PYTHON_SRC) not in sys.path
+):
     sys.path.insert(0, str(_PYTHON_SRC))
 
 import gafime.v1_adapter as adapter  # noqa: E402
