@@ -3,7 +3,7 @@ from __future__ import annotations
 import atexit
 from array import array
 from collections import OrderedDict
-from dataclasses import dataclass, field, replace
+from dataclasses import KW_ONLY, dataclass, field, replace
 import hashlib
 import importlib
 import math
@@ -12,7 +12,6 @@ import sys
 import threading
 from types import ModuleType
 from typing import Any, Iterable, List, Sequence
-import warnings
 
 from ._payloads import discover_payloads
 from ._precision import (
@@ -353,7 +352,6 @@ def _analyze_continuous_resident_input(
         boundary_name=str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
         export=False,
         warnings=_continuous_cap_warnings(config, coerced.cols),
-        _scenario_feature_count=coerced.cols,
     )
     try:
         report = artifact.analyze()
@@ -658,12 +656,11 @@ def compile_with_v1_boundary(
     flags=None,
 ) -> "NativeCompiledGafime":
     _validate_precision_config(config)
-    plan, graph, export = _compile_flag_values(flags)
+    graph, export = _compile_flag_values(flags)
     _validate_graph_request(config, graph)
     if config.enable_decision_path_functions:
         _validate_decision_path_config(config)
     compile_flags = {
-        "plan": plan,
         "graph": graph,
         "export": export,
     }
@@ -694,11 +691,9 @@ def compile_with_v1_boundary(
                 feature_names=coerced.feature_names,
                 native_handle=handle,
                 boundary_name=str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
-                plan_enabled=plan,
                 graph_requested=graph,
                 export=export,
                 warnings=_continuous_cap_warnings(config, coerced.cols),
-                _scenario_feature_count=coerced.cols,
             )
         nested_shape = _native_nested_shape(
             X, y, feature_names, precision=config.precision
@@ -721,11 +716,9 @@ def compile_with_v1_boundary(
                 feature_names=names,
                 native_handle=handle,
                 boundary_name=str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
-                plan_enabled=plan,
                 graph_requested=graph,
                 export=export,
                 warnings=_continuous_cap_warnings(config, cols),
-                _scenario_feature_count=cols,
             )
 
     features, target, rows, cols, names = _coerce_row_major_f32(
@@ -801,11 +794,9 @@ def compile_with_v1_boundary(
         feature_names=names,
         native_handle=handle,
         boundary_name=str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
-        plan_enabled=plan,
         graph_requested=graph,
         export=export,
         warnings=warnings,
-        _scenario_feature_count=cols,
         _generated_feature_start=generated_feature_start,
     )
 
@@ -1241,17 +1232,15 @@ class NativeCompiledGafime:
     feature_names: List[str]
     native_handle: object
     boundary_name: str
-    plan_enabled: bool = True
+    _: KW_ONLY
     graph_requested: bool = False
     export: bool = False
     warnings: List[str] = field(default_factory=list)
-    _scenario_feature_count: int | None = field(default=None, repr=False)
     _generated_feature_start: int | None = field(default=None, repr=False)
     _closed: bool = False
     _last_report: DiagnosticReport | None = None
     _native_report: Any = None
     _graph_replayed: bool = False
-    _scenario_plan: Any = field(default=None, init=False, repr=False)
     _owner_thread: threading.Thread = field(
         default_factory=threading.current_thread, init=False, repr=False
     )
@@ -1266,7 +1255,6 @@ class NativeCompiledGafime:
         from .compile.flags import CompileFlags
 
         return CompileFlags(
-            plan=self.plan_enabled,
             graph=self.graph_requested,
             export=self.export,
         )
@@ -1277,37 +1265,6 @@ class NativeCompiledGafime:
 
         self._ensure_open()
         return _backend_info(self.native_handle, self.config)
-
-    @property
-    def scenario_plan(self) -> object | None:
-        """Return bounded compatibility plan metadata when ``plan=True``.
-
-        The projection does not drive native execution.  ``plan=False`` returns
-        ``None``; custom compatible boundaries may expose their own plan object.
-        """
-
-        self._ensure_open()
-        if not self.plan_enabled:
-            return None
-        if self.boundary_name != "gafime-py":
-            # Custom v1 boundaries historically exposed their own compiled
-            # artifact as the plan object. Preserve that identity contract.
-            return self.native_handle
-        if self._scenario_plan is None:
-            from .compile.scenario import build_scenario_plan_from_shape
-
-            feature_count = (
-                len(self.feature_names)
-                if self._scenario_feature_count is None
-                else self._scenario_feature_count
-            )
-            self._scenario_plan = build_scenario_plan_from_shape(
-                n_samples=int(getattr(self.native_handle, "rows", 0)),
-                n_features=feature_count,
-                config=self.config,
-                flags=self.flags,
-            )
-        return self._scenario_plan
 
     @classmethod
     def from_engine(
@@ -1350,35 +1307,6 @@ class NativeCompiledGafime:
 
         self._ensure_open()
         return int(getattr(self.native_handle, "candidate_table_cache_hits", 0))
-
-    @property
-    def exports(self):
-        """Compatibility view of the v0.5 compiled export handles.
-
-        The v1 boundary exposes the owning compiled artifact and compact native
-        result report, but no independent candidate-table handle.
-        """
-        self._ensure_open()
-        warnings.warn(
-            "NativeCompiledGafime.exports is deprecated; use export_arrow() for "
-            "the compact result table.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if not self.export:
-            raise V1UnsupportedError(
-                "Compiled export handles are not available unless "
-                "CompileFlags(export=True) is set."
-            )
-        from .compile.exports import ExportHandles
-
-        backend = self.backend
-        return ExportHandles(
-            backend_name=str(backend.selected_backend or backend.name),
-            feature_matrix_handle=self.native_handle,
-            result_table_handle=self._native_report,
-            candidate_table_handle=None,
-        )
 
     def analyze(self) -> DiagnosticReport:
         """Execute the prepared analysis and return a new report.
@@ -1462,12 +1390,11 @@ class NativeCompiledGafime:
         self._refresh_generated_feature_names()
 
     def _refresh_generated_feature_names(self) -> None:
-        # The native update/reseed has committed. No old report or plan may be
+        # The native update/reseed has committed. No old report may be
         # exported if obtaining the new generated identities fails afterwards.
         self._native_report = None
         self._last_report = None
         self._graph_replayed = False
-        self._scenario_plan = None
         if (
             self.config.enable_decision_path_functions
             or self.config.enable_time_series_functions
@@ -1545,7 +1472,6 @@ class NativeCompiledGafime:
         self._native_report = None
         self._last_report = None
         self._graph_replayed = False
-        self._scenario_plan = None
         close = getattr(self.native_handle, "close", None)
         if close is not None:
             close()
@@ -2044,19 +1970,22 @@ def _config_payload(config: EngineConfig) -> dict[str, object]:
     }
 
 
-def _compile_flag_values(flags: object | None) -> tuple[bool, bool, bool]:
+def _compile_flag_values(flags: object | None) -> tuple[bool, bool]:
     if flags is None:
-        return True, False, False
+        return False, False
+    if hasattr(flags, "plan"):
+        raise TypeError(
+            "compile flag 'plan' was removed; native planning is always owned by Rust"
+        )
     values = tuple(
         getattr(flags, name, default)
         for name, default in (
-            ("plan", True),
             ("graph", False),
             ("export", False),
         )
     )
     if not all(isinstance(value, bool) for value in values):
-        raise TypeError("compile flags plan, graph, and export must be bool values")
+        raise TypeError("compile flags graph and export must be bool values")
     return values  # type: ignore[return-value]
 
 

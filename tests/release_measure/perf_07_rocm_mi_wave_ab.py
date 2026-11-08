@@ -71,7 +71,7 @@ def compile_artifact(
             target,
             names,
             config=config,
-            flags=CompileFlags(plan=True, graph=False),
+            flags=CompileFlags(graph=False),
         )
 
 

@@ -238,13 +238,10 @@ def test_time_series_update_reselects_sources_and_matches_fresh_compile(
     artifact = GafimeEngine(config).compile(X, first)
     try:
         before = artifact.analyze()
-        old_plan = artifact.scenario_plan
         assert artifact.update_target(second) is artifact
         fresh = GafimeEngine(config).analyze(X, second)
         assert artifact.feature_names == fresh.feature_names
         assert artifact.feature_names != before.feature_names
-        assert artifact.scenario_plan is not old_plan
-        assert artifact.scenario_plan.n_features == len(X[0])
         _assert_same_report(artifact.analyze(), fresh)
         _assert_same_report(artifact.analyze(), fresh)
     finally:

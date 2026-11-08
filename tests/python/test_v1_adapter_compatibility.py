@@ -241,10 +241,7 @@ def test_compute_budget_preserves_first_six_positional_fields():
 def test_compute_budget_rejects_ambiguous_later_positional_fields(ambiguous_tail):
     shared_prefix = (2, 5_000, 50, 0, True, 6_144)
 
-    with pytest.raises(
-        TypeError,
-        match=r"argument 7 and later are ambiguous across v0\.4\.7 and v0\.5",
-    ):
+    with pytest.raises(TypeError, match="positional argument"):
         ComputeBudget(*shared_prefix, *ambiguous_tail)
 
 
@@ -291,29 +288,9 @@ def test_engine_config_preserves_shared_v047_positional_prefix():
     assert config.device_id == 2
 
 
-def test_engine_config_preserves_origin_main_positional_mi_approximate_layout():
-    config = EngineConfig(
-        ComputeBudget(max_comb_size=3),
-        ("pearson",),
-        4,
-        12,
-        99,
-        0.2,
-        0.01,
-        48,
-        True,
-        "cuda",
-        2,
-    )
-
-    assert config.mi_bins == 48
-    assert config.mi_approximate is True
-    assert config.backend == "cuda"
-    assert config.device_id == 2
-
-
-def test_engine_config_rejects_duplicate_positional_mi_approximate():
-    with pytest.raises(TypeError, match="provided both positionally and by keyword"):
+@pytest.mark.parametrize("old_mi", [True, False])
+def test_engine_config_rejects_old_positional_mi_layout(old_mi):
+    with pytest.raises(TypeError, match="backend.*boolean"):
         EngineConfig(
             ComputeBudget(),
             ("pearson",),
@@ -323,12 +300,16 @@ def test_engine_config_rejects_duplicate_positional_mi_approximate():
             0.10,
             0.05,
             96,
-            True,
-            mi_approximate=False,
+            old_mi,
+        )
+    with pytest.raises(TypeError):
+        EngineConfig(
+            ComputeBudget(), ("pearson",), 3, 25, 7, 0.1, 0.05, 96, old_mi, "cuda", 2
         )
 
 
-def test_engine_config_rejects_legacy_discrete_positional_slot_with_migration():
+@pytest.mark.parametrize("old_discrete", [True, False])
+def test_engine_config_rejects_legacy_discrete_option(old_discrete):
     shared_prefix = (
         ComputeBudget(),
         ("pearson",),
@@ -342,56 +323,39 @@ def test_engine_config_rejects_legacy_discrete_positional_slot_with_migration():
         0,
     )
 
-    with pytest.raises(
-        TypeError,
-        match="positional argument 11 was enable_discrete_functions",
-    ):
-        EngineConfig(*shared_prefix, True)
+    with pytest.raises(TypeError, match="positional argument"):
+        EngineConfig(*shared_prefix, old_discrete)
 
-    with pytest.raises(
-        TypeError, match="discrete family is not part of the v1 runtime"
-    ):
-        EngineConfig(enable_discrete_functions=True)
-
-
-def test_engine_config_migrates_disabled_legacy_discrete_option_with_warning():
-    shared_prefix = (
-        ComputeBudget(),
-        ("pearson",),
-        3,
-        25,
-        7,
-        0.10,
-        0.05,
-        96,
-        "core",
-        0,
-    )
-
-    with pytest.warns(DeprecationWarning, match="ignored by the v1 runtime"):
-        positional = EngineConfig(*shared_prefix, False)
-    with pytest.warns(DeprecationWarning, match="ignored by the v1 runtime"):
-        keyword = EngineConfig(enable_discrete_functions=False)
-
-    assert positional.enable_time_series_functions is False
-    assert positional.enable_decision_path_functions is False
-    assert keyword.enable_time_series_functions is False
-    assert keyword.enable_decision_path_functions is False
+    with pytest.raises(TypeError, match="enable_discrete_functions"):
+        EngineConfig(enable_discrete_functions=old_discrete)
 
 
 def test_current_family_switches_are_keyword_only():
     signature = inspect.signature(EngineConfig)
 
-    assert (
-        signature.parameters["enable_time_series_functions"].kind
-        is inspect.Parameter.KEYWORD_ONLY
+    fields = list(signature.parameters.values())
+    assert [p.name for p in fields[:10]] == [
+        "budget",
+        "metric_names",
+        "num_repeats",
+        "permutation_tests",
+        "random_seed",
+        "stability_std_threshold",
+        "permutation_p_threshold",
+        "mi_bins",
+        "backend",
+        "device_id",
+    ]
+    assert all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in fields[:10])
+    assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in fields[10:])
+    budget_fields = list(inspect.signature(ComputeBudget).parameters.values())
+    assert all(
+        p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in budget_fields[:6]
     )
-    assert (
-        signature.parameters["enable_decision_path_functions"].kind
-        is inspect.Parameter.KEYWORD_ONLY
-    )
+    assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in budget_fields[6:])
     config = EngineConfig(enable_time_series_functions=True)
     assert config.enable_time_series_functions is True
+    assert EngineConfig(mi_approximate=True).mi_approximate is True
 
 
 def test_engine_config_precision_contract_is_keyword_only_and_truthful():
@@ -404,39 +368,27 @@ def test_engine_config_precision_contract_is_keyword_only_and_truthful():
     assert config.precision == "mixed"
     assert EngineConfig(precision="fp32").precision == "fp32"
     assert EngineConfig(precision="fp64").precision == "fp64"
+    assert EngineConfig(precision=" FP32 ").precision == "fp32"
+    with pytest.raises(TypeError, match="precision must be a string"):
+        EngineConfig(precision=None)
     for alias in ("float32", "f32", "float64", "f64"):
         with pytest.raises(ValueError, match="fp32, mixed, fp64"):
             EngineConfig(precision=alias)
 
 
 @pytest.mark.parametrize(
-    ("storage_dtype", "compute_policy", "expected"),
+    ("storage_dtype", "compute_policy"),
     [
-        ("float32", "fast", "fp32"),
-        ("float32", "stable", "mixed"),
-        ("float64", "exact", "fp64"),
+        ("float32", "fast"),
+        ("float32", "stable"),
+        ("float64", "exact"),
     ],
 )
-def test_legacy_precision_pair_has_only_unambiguous_deprecated_mappings(
-    storage_dtype, compute_policy, expected
-):
-    with pytest.warns(DeprecationWarning, match="precision profile"):
-        config = EngineConfig(
-            storage_dtype=storage_dtype,
-            compute_policy=compute_policy,
-        )
-    assert config.precision == expected
-
-
-@pytest.mark.parametrize(
-    ("storage_dtype", "compute_policy"),
-    [("float64", "stable"), ("float32", "exact"), ("float64", "fast")],
-)
-def test_legacy_precision_pair_rejects_contradictory_combinations(
-    storage_dtype, compute_policy
-):
-    with pytest.raises(ValueError, match="unsupported legacy precision pair"):
+def test_legacy_precision_pairs_are_rejected(storage_dtype, compute_policy):
+    with pytest.raises(TypeError, match="storage_dtype"):
         EngineConfig(storage_dtype=storage_dtype, compute_policy=compute_policy)
+    with pytest.raises(TypeError, match="compute_policy"):
+        EngineConfig(compute_policy=compute_policy)
 
 
 def test_fp64_numpy_overflow_diagnostics_name_selected_storage_range():
@@ -925,7 +877,7 @@ def test_lower_positive_cache_capacity_is_enforced_on_hit(monkeypatch):
     assert len(boundary.compile_buffer_calls) == 2
 
 
-def test_compiled_artifact_restores_v05_flags_and_exports(monkeypatch):
+def test_compiled_artifact_flags_and_removed_exports(monkeypatch):
     boundary = _fake_boundary(buffers=True)
     monkeypatch.setattr(
         v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
@@ -934,25 +886,21 @@ def test_compiled_artifact_restores_v05_flags_and_exports(monkeypatch):
         [[1.0], [2.0]],
         [0.0, 1.0],
         ["a"],
-        flags=CompileFlags(plan=False, export=True),
+        flags=CompileFlags(export=True),
     )
 
-    assert artifact.flags == CompileFlags(plan=False, export=True)
-    with pytest.warns(DeprecationWarning, match="export_arrow"):
-        before = artifact.exports
-    assert before.backend_name == "core"
-    assert before.feature_matrix_handle is boundary.handles[0]
-    assert before.result_table_handle is None
-    assert before.candidate_table_handle is None
-
-    artifact.analyze()
-    with pytest.warns(DeprecationWarning, match="export_arrow"):
-        after = artifact.exports
-    assert after.result_table_handle is not None
-    artifact.close()
+    try:
+        assert artifact.flags == CompileFlags(export=True)
+        with pytest.raises(AttributeError):
+            _ = artifact.exports
+        artifact.analyze()
+        with pytest.raises(AttributeError):
+            _ = artifact.exports
+    finally:
+        artifact.close()
 
 
-def test_compiled_artifact_legacy_exports_require_export_flag(monkeypatch):
+def test_compiled_artifact_result_export_requires_export_flag(monkeypatch):
     boundary = _fake_boundary(buffers=True)
     monkeypatch.setattr(
         v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
@@ -961,11 +909,8 @@ def test_compiled_artifact_legacy_exports_require_export_flag(monkeypatch):
         [[1.0], [2.0]], [0.0, 1.0], ["a"]
     )
     try:
-        with pytest.warns(DeprecationWarning, match="export_arrow"):
-            with pytest.raises(
-                V1UnsupportedError, match="export handles are not available"
-            ):
-                _ = artifact.exports
+        with pytest.raises(V1UnsupportedError, match="result export requires"):
+            artifact.export_arrow()
     finally:
         artifact.close()
 

@@ -464,9 +464,12 @@ preserves fp64 across all four domains with no intermediate fp32 quantization.
 The profile applies to all metrics, continuous/time-series/decision-path
 families, significance, ranking, eager/resident/compiled execution, graph
 replay, target replacement, and cache identity. Structural planner metadata
-retains its integer/control types. The narrow deprecated pair parser accepts
-only `float32+fast -> fp32`, `float32+stable -> mixed`, and
-`float64+exact -> fp64`; the old fields are not an independent public surface.
+retains its integer/control types. Legacy `storage_dtype`/`compute_policy`
+configuration keywords are removed, not mapped into a profile. The removed
+`enable_discrete_functions` option is rejected even when false. The canonical
+constructors retain the first ten `EngineConfig` and first six `ComputeBudget`
+positional fields; all later fields remain keyword-only. Historical positional
+layout reinterpretation is not supported.
 
 ABI 1.0 float layouts and entry points remain byte-for-byte compatible through
 thin adapters and never reinterpret a float pointer as double. The additive ABI
@@ -711,4 +714,4 @@ Do not treat placeholder GPU files as real runtime sources. Do not delete legacy
 
 Move or split real device-side code into the contracted backend layout before old backend connections are cut. Preserve roadmap, release notes, design docs, and agent contract files unless the maintainer explicitly asks for removal.
 
-The v1 direction is Python -> PyO3/Rust -> Rust CPU / GPU C ABI. Python must not own continuous backend execution planning loops or GPU permutation loops. Rust owns candidate specs, compact result state, scheduling, and native backend dispatch. The packaged `gafime.compile.scenario` module is a bounded v0.5 compatibility projection only: it emits at most one metadata descriptor per configured arity, never materializes candidates, and is never passed to native execution. GPU backends expose explicit C ABI launcher surfaces to Rust and keep backend-specific kernel orchestration inside their contracted source trees.
+The v1 direction is Python -> PyO3/Rust -> Rust CPU / GPU C ABI. Python must not own continuous backend execution planning loops or GPU permutation loops. Rust owns candidate specs, compact result state, scheduling, and native backend dispatch. GPU backends expose explicit C ABI launcher surfaces to Rust and keep backend-specific kernel orchestration inside their contracted source trees.

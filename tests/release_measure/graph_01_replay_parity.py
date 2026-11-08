@@ -57,7 +57,7 @@ def run(backend):
         yl,
         names,
         config=EngineConfig(**cfg),
-        flags=CompileFlags(plan=True, graph=False),
+        flags=CompileFlags(graph=False),
     )
     try:
         graph = gafime.compile(
@@ -65,7 +65,7 @@ def run(backend):
             yl,
             names,
             config=EngineConfig(**cfg),
-            flags=CompileFlags(plan=True, graph=True),
+            flags=CompileFlags(graph=True),
         )
         try:
             rb, rg = base.analyze(), graph.analyze()

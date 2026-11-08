@@ -47,7 +47,7 @@ Coverage classes:
 | `gafime.family_capability` | primary | lookup/failure semantics | family sections | family smoke | exact-name lookup |
 | `gafime.generate_tutorial` | integration | generator contract | documentation hierarchy | deterministic tutorial parity test | generates the compact practice notebook only |
 | `gafime.require_family_supported` | primary | lookup/failure semantics | family sections | family smoke | fail-closed family admission |
-| `gafime.subfunctions` | advanced compatibility | proxy and compatibility boundary | compatibility/API-index section | existing compatibility tests | prefer top-level safe APIs for new code |
+| `gafime.subfunctions` | maintained advanced namespace | explicit lazy export contract | helper/API-index section | lazy/import/native helper tests | DQA deprecated on use; OTS retained; prefer top-level safe analysis APIs |
 
 The table covers every name in `gafime.__all__` plus the public runtime version
 attribute. CI fails if either side changes without updating this record and the
@@ -66,7 +66,13 @@ The reference and signature tests cover all fields of:
   `permutation_p_threshold`, `mi_bins`, `backend`, `device_id`, `precision`,
   all time-series and decision-path controls, `significance_top_n`, and
   `mi_approximate`;
-- `CompileFlags`: `plan`, `graph`, `export`.
+- `CompileFlags`: `graph`, `export` (both keyword-only).
+
+Canonical configuration preserves the first six `ComputeBudget` fields and
+first ten `EngineConfig` fields positionally; remaining fields are keyword-only.
+Historical positional layouts and `storage_dtype`, `compute_policy`, and
+`enable_discrete_functions` keywords (including false) are rejected, not remapped.
+`backend_capabilities` accepts only the canonical keyword-only precision selector.
 
 ## Returned Objects and Public Methods
 
@@ -74,7 +80,7 @@ The reference describes the fields of `BackendInfo`, `InteractionResult`,
 `StabilityResult`, `PermutationResult`, `Decision`, and `DiagnosticReport`.
 It covers result-sequence iteration/indexing plus `ranked()` and `top_k()`, and
 the complete supported lifecycle of `NativeCompiledGafime`: `flags`, `backend`,
-`scenario_plan`, `from_engine`, graph/cache diagnostics, deprecated `exports`,
+`from_engine`, graph/cache diagnostics,
 `analyze()`, `update_target()`, `__arrow_c_array__()`, `export_arrow()`, and
 `close()`. `__arrow_c_array__()` is the supported Arrow C Data protocol;
 application code normally calls `export_arrow()` explicitly.
@@ -125,31 +131,27 @@ unexplained import accident.
 | `gafime.decision_path` | `DecisionPathCandidate`, `decision_path_candidate_from_record`, `decision_path_candidate_from_result`, `decision_path_feature_names`, `describe_decision_path_candidate`, `evaluate_decision_path_candidate`, `score_decision_path_candidates` | portable descriptor compatibility helpers; not a second planner/executor |
 | `gafime.io` | `GafimeStreamer`, `benchmark_streaming`, `create_streamer` | streamer is supported integration; functions are compatibility/diagnostic helpers |
 | `gafime.compile` | `compile`, `CompileFlags`, `CompiledGafime`, `NativeCompiledGafime` | callable module and top-level aliases |
-| `gafime.compile.exports` | `ExportHandles`, `unsupported_export` | deprecated handle compatibility |
-| `gafime.compile.scenario` | `ChunkRange`, `ContinuousArityDescriptor`, `DEFAULT_CHUNK_SIZE`, `DEFAULT_UNKNOWN_POWER_USER_FEATURE_CAP`, `ScenarioPlan`, `TimeSeriesDescriptor`, `UINT32_MAX`, `UINT64_MAX`, `UINT128_MAX`, `build_scenario_plan`, `build_scenario_plan_from_shape` | bounded compatibility metadata; Rust plans remain authoritative |
 
-Compatibility record fields are also explicit: `ExportHandles` has
-`backend_name`, `feature_matrix_handle`, `result_table_handle`, and
-`candidate_table_handle`; `ChunkRange` has `first_chunk_id`, `chunk_count`, and
-`chunk_size`; `ContinuousArityDescriptor` has `arity`, `feature_start`,
-`feature_stop`, `universe_count`, `planned_count`, `offset`, `chunk_range`, and
-`saturated`; `TimeSeriesDescriptor` has `feature_start`, `feature_stop`,
-`lag_count`, `window_count`, `template_count`, `universe_count`, `planned_count`,
-`offset`, and `saturated`; `ScenarioPlan` has `n_samples`, `n_features`,
-`feature_candidate_count`, `precision`, `continuous`, `time_series`, `warnings`,
-and `metric_ids`.
-
-`gafime.subfunctions` dynamically proxies the installed native boundary. The
-current exact package exposes `BOUNDARY_NAME`, `BatchScheduler`,
-`CacheAwareScheduler`, `CompiledContinuousArtifact`, `ContinuousRecord`,
-`ContinuousReport`, `DataQualityAnalyzer`, `OTSEncoder`, `SmartScheduler`,
+`gafime.subfunctions` lazily forwards this explicit allowlist from
+`gafime.gafime_py`: `BOUNDARY_NAME`, `CompiledContinuousArtifact`,
+`ContinuousRecord`, `ContinuousReport`, `DataQualityAnalyzer`, `OTSEncoder`,
 `analyze_continuous`, `analyze_continuous_arrow`, `analyze_continuous_buffers`,
 `analyze_continuous_cpu`, `analyze_continuous_rows`, `analyze_decision_path`,
 `analyze_time_series`, `compile_continuous`, `compile_continuous_buffers`,
 `compile_continuous_rows`, `compile_decision_path`, `compile_time_series`,
 `native_version`, and `runtime_capabilities`. These are advanced compatibility
-exports. New application code should use `GafimeEngine`, `compile`,
+exports. Import, `dir` and `__all__` do not load the extension; removed schedulers
+and unlisted native/private names are not forwarded. Obsolete `gafime_cpu`
+module lookup paths are removed. New analysis code should use `GafimeEngine`, `compile`,
 `backend_capabilities`, `dataload`, and structured reports.
+
+DataQualityAnalyzer retains its current f32 column-oriented methods and
+constructor parameters; construction emits `DeprecationWarning`, while import
+and attribute lookup do not. The future caller-opt-in Polars replacement is
+tracked under #87 for v1.1/v1.2; there is no silent cleaning/deletion/mutation.
+OTSEncoder retains its current constructor and `fit_transform`, `transform`,
+`n_categories`, `get_prior` behavior unchanged. Backend-neutral integration is
+deferred to #119. See [the pruning disposition](legacy-pruning.md).
 
 The supported CLI entry points are `gafime` and `python -m gafime`, with
 `--version` and `--check --backend ... --device-id ... --precision ...`.
@@ -168,9 +170,10 @@ values at construction and assignment. Streamer batch sizes and the bounded
 `benchmark_streaming(..., n_batches=...)` diagnostic reject non-positive values
 before reading input.
 
-The advanced compatibility `BatchScheduler(max_blocks=...)` requires a positive
-capacity and raises `ValueError` for zero before scheduling work. Its size hints
-are calculated without overflow when a large positive capacity is supplied.
+Removed scheduler classes are asserted absent from both the helper namespace
+and installed native module; unknown names cannot cause fallback module loads.
+Retained native helper tests cover DQA warning/category/location, missing and
+non-finite values, entropy/feature quality, and unchanged OTS outputs.
 
 Resident NumPy input ownership is covered by deterministic external-writer
 regressions across all three profiles, for arrays and memmaps. Fingerprints,

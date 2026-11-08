@@ -93,7 +93,7 @@ DOCUMENTED_DATACLASS_FIELDS = {
         "significance_top_n",
         "mi_approximate",
     ),
-    "CompileFlags": ("plan", "graph", "export"),
+    "CompileFlags": ("graph", "export"),
     "CapabilityValue": ("value", "source", "detail"),
     "BackendCapabilities": (
         "configured_backend",
@@ -204,44 +204,6 @@ DOCUMENTED_DATACLASS_FIELDS = {
         "native_compact_scoring",
         "significance_support",
     ),
-    "ExportHandles": (
-        "backend_name",
-        "feature_matrix_handle",
-        "result_table_handle",
-        "candidate_table_handle",
-    ),
-    "ChunkRange": ("first_chunk_id", "chunk_count", "chunk_size"),
-    "ContinuousArityDescriptor": (
-        "arity",
-        "feature_start",
-        "feature_stop",
-        "universe_count",
-        "planned_count",
-        "offset",
-        "chunk_range",
-        "saturated",
-    ),
-    "TimeSeriesDescriptor": (
-        "feature_start",
-        "feature_stop",
-        "lag_count",
-        "window_count",
-        "template_count",
-        "universe_count",
-        "planned_count",
-        "offset",
-        "saturated",
-    ),
-    "ScenarioPlan": (
-        "n_samples",
-        "n_features",
-        "feature_candidate_count",
-        "precision",
-        "continuous",
-        "time_series",
-        "warnings",
-        "metric_ids",
-    ),
 }
 
 PUBLIC_METHOD_COVERAGE = {
@@ -249,13 +211,11 @@ PUBLIC_METHOD_COVERAGE = {
     "NativeCompiledGafime": (
         "flags",
         "backend",
-        "scenario_plan",
         "from_engine",
         "graph_replayed",
         "continuous_metric_cache_hits",
         "continuous_metric_cache_builds",
         "candidate_table_cache_hits",
-        "exports",
         "analyze",
         "update_target",
         "__arrow_c_array__",
@@ -303,7 +263,7 @@ def _top_level_index() -> str:
         "BackendCapabilities": "structured capability snapshot",
         "CapabilityValue": "capability value plus evidence source",
         "CompiledGafime": "compatibility alias of `NativeCompiledGafime`",
-        "CompileFlags": "compiled-plan, graph, and export requests",
+        "CompileFlags": "compiled graph and result export requests",
         "ComputeBudget": "candidate and resident-memory bounds",
         "Decision": "report-level threshold decision",
         "DecisionPathCandidate": "portable v0.5 compatibility descriptor",
@@ -517,10 +477,11 @@ def _cells() -> list:
             | `significance_top_n` | `50` | positive maximum of surfaced candidates evaluated/reported for significance |
             | `mi_approximate` | `False` | Core uses adaptive quantile MI unless fixed-width approximation is requested |
 
-            The first ten historical parameters remain positional through
-            `device_id`; current family and precision controls are keyword-only.
-            Deprecated `storage_dtype`/`compute_policy` pairs are compatibility-only
-            and should not be used in new code.
+            The canonical first ten parameters remain positional through
+            `device_id`; precision, family controls and `mi_approximate` are
+            keyword-only. Historical positional layouts and removed
+            `storage_dtype`, `compute_policy`, and `enable_discrete_functions`
+            keywords (even false) raise `TypeError`; no migration mapping runs.
             """
         ),
         _code(
@@ -833,13 +794,13 @@ def _cells() -> list:
                 y,
                 feature_names,
                 config=first_config,
-                flags=CompileFlags(plan=True, graph=False, export=False),
+                flags=CompileFlags(graph=False, export=False),
             )
             try:
                 compiled_report = artifact.analyze()
                 artifact.update_target([value + 0.01 for value in y])
                 updated_report = artifact.analyze()
-                print(artifact.backend.selected_backend, artifact.scenario_plan)
+                print(artifact.backend.selected_backend, len(updated_report.interactions))
             finally:
                 artifact.close()
             """,
@@ -869,13 +830,12 @@ def _cells() -> list:
         ),
         _md(
             """
-            `CompileFlags(plan=True)` exposes bounded compatibility plan metadata.
+            Planning remains Rust-owned and has no Python scenario-plan projection.
             `graph=True` requires the selected GPU payload to confirm real graph
             replay; it never silently degrades. `export=True` enables
             `export_arrow()` for the compact result table. `__arrow_c_array__()` is
             the corresponding supported Arrow C Data protocol; ordinary application
-            code can use the explicit alias. The deprecated `.exports` compatibility
-            view is not a new candidate-table API. Metrics and
+            code can use the explicit alias. Metrics and
             candidate identity remain unchanged across one-shot, resident, and
             compiled paths for a fixed seed and configuration.
             """
@@ -1475,17 +1435,35 @@ def _cells() -> list:
             - `gafime.io`: `GafimeStreamer`, compatibility `create_streamer`, and
               bounded diagnostic helper `benchmark_streaming`. Its `n_batches`
               argument must be positive and is validated before the file is opened.
-            - `gafime.compile`: callable compile module, flags, and compiled aliases;
-              `gafime.compile.scenario` exposes bounded compatibility plan metadata;
-              `gafime.compile.exports` exposes deprecated handle compatibility.
-            - `gafime.subfunctions`: the advanced native compatibility proxy. Prefer
-              the top-level safe engine/capability APIs for new application code.
+            - `gafime.compile`: callable compile module, flags, and compiled aliases.
+            - `gafime.subfunctions`: an explicit lazy native helper namespace,
+              not an unrestricted proxy. Import/`dir`/`__all__` do not load the
+              extension. Use top-level safe engine/capability APIs for analysis.
+
+            `subfunctions.DataQualityAnalyzer(low_entropy_threshold=0.1,
+            high_cardinality_ratio=0.95, categorical_max=50)` retains its existing
+            f32 column-oriented functionality but emits `DeprecationWarning` on
+            construction, not lookup. Methods include `analyze_nan_inf`,
+            `clean_nan_inf`, `clean_nan_inf_mean`, `analyze_missing`,
+            `check_alignment`, `analyze_entropy`, `get_features_to_drop`,
+            `get_id_features`, `get_categorical_features`, and `full_report`.
+            Cleaning and feature deletion are never automatic. A future
+            caller-opt-in Polars replacement belongs to issue #87 (v1.1/v1.2).
+
+            `subfunctions.OTSEncoder(prior=0.5, prior_weight=1.0, seed=42,
+            n_permutations=4)` remains unchanged. `fit_transform(categories,
+            targets)` accepts u32 category IDs and f32 targets; `transform`,
+            `n_categories`, and `get_prior` retain their existing fitted-state
+            behavior. Backend-neutral integration is deferred to issue #119,
+            not part of v1.0.0. The explicit native-function allowlist is indexed
+            in the public coverage document. The three obsolete helper
+            schedulers and old module-lookup paths are removed.
 
             Public method/property index: `GafimeEngine.analyze()` and `compile()`;
-            `NativeCompiledGafime.flags`, `backend`, `scenario_plan`, `from_engine()`,
+            `NativeCompiledGafime.flags`, `backend`, `from_engine()`,
             `graph_replayed`, `continuous_metric_cache_hits`,
-            `continuous_metric_cache_builds`, `candidate_table_cache_hits`, deprecated
-            `exports`, `analyze()`, `update_target()`, `__arrow_c_array__()`,
+            `continuous_metric_cache_builds`, `candidate_table_cache_hits`,
+            `analyze()`, `update_target()`, `__arrow_c_array__()`,
             `export_arrow()`, and `close()`; `BackendCapabilities.to_dict()`;
             `DiagnosticReport.configured_backend` and deprecated `to_dict()`;
             `GafimeSelector.fit()`, `transform()`, `fit_transform()`, `get_params()`,

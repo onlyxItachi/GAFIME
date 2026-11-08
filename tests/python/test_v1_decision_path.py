@@ -163,8 +163,6 @@ def test_decision_path_compile_returns_expanded_resident_artifact():
     X, y = _and_dataset()
     artifact = GafimeEngine(_config()).compile(X, y, feature_names=["f0", "f1"])
     try:
-        assert artifact.scenario_plan.n_features == 2
-        assert artifact.scenario_plan.feature_candidate_count == 2
         report = artifact.analyze()
         assert report.feature_names == artifact.feature_names
         assert any(name.startswith("path[") for name in artifact.feature_names)
