@@ -30,21 +30,23 @@ runtime binaries rather than relying on hardware-dependent wheel selection.
 
 ## Install Commands
 
-The commands below select the current published prerelease. Consult the
-[release status](releases/STATUS.md), GitHub Releases, and PyPI when an exact
-version pin is required.
+The commands below prefer published stable versions. Add `--pre` to permit a
+beta or release candidate. This source targets `1.0.0`, but source identity is
+not evidence of publication or final qualification. Consult the
+[release status](releases/STATUS.md), GitHub Releases, and PyPI before selecting
+an exact version.
 
 Core/native CPU install:
 
 ```bash
-python -m pip install --pre gafime
+python -m pip install gafime
 ```
 
 NVIDIA CUDA install on Linux x86_64 or Windows AMD64 with a compatible system
 CUDA 13 runtime:
 
 ```bash
-python -m pip install --pre gafime gafime-cuda
+python -m pip install gafime gafime-cuda
 ```
 
 The CUDA wheel contains only GAFIME binaries. It dynamically resolves
@@ -56,7 +58,7 @@ AMD ROCm/HIP source install on Linux x86_64 with a compatible ROCm 7.2.x
 development toolchain:
 
 ```bash
-python -m pip install --pre gafime gafime-rocm
+python -m pip install gafime gafime-rocm
 ```
 
 The prebuilt thin ROCm wheel is attached to the matching GitHub Release because
@@ -66,8 +68,11 @@ PyPI rejects its truthful raw Linux platform tag. It requires a system-visible
 Apple Silicon Metal:
 
 ```bash
-python -m pip install --pre gafime
+python -m pip install gafime
 ```
+
+For a beta or RC, add `--pre` to the corresponding command. Keep Core and any
+payload on exactly matching versions.
 
 The distribution target is:
 

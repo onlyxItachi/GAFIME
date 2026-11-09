@@ -135,6 +135,24 @@ exact release tip (now ancestor of main) -> immutable tag -> publish frozen byte
 
 ## Retention
 
+### Retiring An Unpublished Attempt
+
+An obsolete, unpublished candidate may be retired only with explicit maintainer
+authorization, after checking tag/package/release collisions, PR dependencies
+and its exact source history. Preserve that history under a separately protected
+archive reference, preferably through GitHub's supported branch rename. Verify
+the archive's exact original commit and protection, and verify the canonical
+name is free before any replacement. Do not force-push or weaken unrelated
+rules. If permissions prevent a safe operation, stop for the required
+administrative action rather than bypassing protection.
+
+Any replacement must still be cut from the newly approved, green `main` under
+the normal creation policy; an archive is not a release source or publication
+authority. This exception does not apply to a published release branch, tag or
+artifact. See the [previous stable attempt's retirement record](stable-integration.md).
+
+### Published Release Provenance
+
 Retain the pre-publication exact-ref lock after publication so the release
 branch remains a read-only provenance record. Do not reuse it for another
 version, resume development on it, move its history, or delete it as routine

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Prepare repository/Cargo, Python and exact Core/payload dependency identity
+  `1.0.0`, with canonical future tag `v1.0.0`. Stable classification describes
+  the target source, not completed security/artifact qualification or publication.
+- Retain RC3 native Arrow ingestion, runtime/ABI/precision contracts, parser-aware
+  resource gates, reviewed Core calibration and macOS CI repair. Correct stable
+  tag-test expectations without accepting compact prerelease Git tags.
+- Archive the earlier unpublished stable attempt without rewriting its history;
+  the replacement candidate must be cut from approved, green stable-prepared
+  `main`. See [stable source integration](docs/releases/stable-integration.md).
+
 - Rename the active native planner RNG module to `cpython_mt19937` without
   changing its implementation, seed handling, shuffle stream or candidate IDs.
   Retain existing planning goldens and add a wide-seed successive-shuffle oracle.

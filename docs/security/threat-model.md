@@ -134,6 +134,16 @@ memory, and safe-API construction of invalid native layouts. Existing controls
 include exact dtype and dimensionality checks, checked multiplication, owned or
 borrowed-lifetime discipline, and fail-closed configuration validation.
 
+Numeric file ingestion uses incremental Arrow C Streams independently of the
+execution configuration. `acquire_arrow_input` in
+`crates/gafime-py/src/acquisition.rs` validates schemas, nulls, dimensions,
+numeric range and feature/target row alignment before producing profile-typed
+Rust-owned storage. Foreign owners are released after acquisition; the same
+owned bytes supply cache identity and execution. Finite fp32 overflow must be
+rejected before narrowing without rejecting source NaN/Inf merely for being
+non-finite. This is not resident zero-copy or an atomic snapshot against an
+external writer. See [ingest validation](../ingest-validation.md).
+
 A realistic high-impact story is an attacker-controlled array shape or Arrow
 descriptor reaching a slice construction or transpose with a smaller backing
 allocation, causing host out-of-bounds access. A mere Python exception or
@@ -176,6 +186,16 @@ bind resources to a device/profile/generation, synchronize borrowed data before
 return, and fail closed on unsupported routes. Metal intentionally exposes only
 fp32.
 
+Independent native callers may enter supported ABI exports concurrently,
+including across ABI generations. Ordinary CUDA/HIP payloads coordinate complete
+calls through one nonrecursive gate per loaded payload instance, including
+device selection, cleanup and caller-device restoration. That gate does not
+own caller handles or coordinate separately loaded payloads and foreign
+frameworks; Metal and local experimental RT entry points are outside it. See
+`src/common/gpu_execution_gate.hpp` and
+[execution coordination](../gpu-execution-coordination.md). Supported concurrent
+calls with valid buffers remain part of the review surface, not caller misuse.
+
 A realistic high finding would require malformed supported input to cause a
 device out-of-bounds access, cross-device resource confusion, or asynchronous
 use after host memory was released. A missing driver, unsupported precision, or
@@ -189,6 +209,15 @@ rejects ambiguous candidates. Explicit environment paths and boundary modules
 deliberately load operator-selected executable code. Resident caches must not
 reuse analysis or device state across incompatible payload, backend, profile,
 device, content, or generation identities.
+
+Generated-family target updates and reseeding must keep retained inputs, native
+plans, feature identities and reports coherent. Preparation failures preserve
+the previous artifact only where rollback is proven; failures after committed
+mutation must retire inconsistent state rather than expose stale reports.
+Relevant boundaries include `apply_decision_path_rebuild` in
+`crates/gafime-py/src/artifact.rs`, `_refresh_generated_feature_names` in
+`python/gafime/v1_adapter.py`, and the acquired-input target update path. See
+[adaptive time-series lifecycle](../adaptive-time-series.md).
 
 An unintended library selected despite automatic-discovery controls, a package
 path escape, or an under-keyed cache that exposes stale memory could be

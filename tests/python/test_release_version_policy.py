@@ -119,13 +119,39 @@ def test_unsupported_pep440_identifiers_fail_closed(value: str) -> None:
 def test_current_project_metadata_agrees_through_authoritative_parser() -> None:
     release = release_version.validate_project_versions(ROOT)
 
-    assert release.semver == "1.0.0-rc.3"
-    assert release.pep440 == "1.0.0rc3"
-    assert release.tag == "v1.0.0-rc.3"
+    assert release.semver == "1.0.0"
+    assert release.pep440 == "1.0.0"
+    assert release.tag == "v1.0.0"
+    assert release.prerelease is False
+    project_text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert "Development Status :: 5 - Production/Stable" in project_text
+    assert "Development Status :: 4 - Beta" not in project_text
     release_version.validate_github_ref(release, f"refs/tags/{release.tag}")
     release_version.validate_github_ref(release, "refs/heads/release-candidate")
     with pytest.raises(VersionPolicyError, match="canonical SemVer tag"):
         release_version.validate_github_ref(release, "refs/tags/v1.0.0rc3")
+
+
+@pytest.mark.parametrize("kind", ("cuda", "rocm"))
+def test_staged_payload_metadata_uses_exact_current_core_version(
+    tmp_path: Path, kind: str
+) -> None:
+    path = ROOT / ".github" / "scripts" / "stage_gpu_payload.py"
+    spec = importlib.util.spec_from_file_location("gafime_stage_payload", path)
+    assert spec is not None and spec.loader is not None
+    stage = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(stage)
+    stage.stage_payload(kind, tmp_path)
+
+    release = release_version.validate_project_versions(ROOT)
+    project = stage.tomllib.loads(
+        (tmp_path / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    assert project["name"] == f"gafime-{kind}"
+    assert project["version"] == release.pep440
+    assert project["dependencies"] == [f"gafime=={release.pep440}"]
+    package = tmp_path / f"gafime_{kind}" / "__init__.py"
+    assert f'__version__ = "{release.pep440}"' in package.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -156,7 +182,7 @@ def test_cli_exports_parsed_release_outputs(tmp_path: Path) -> None:
             "--project-root",
             str(ROOT),
             "--github-ref",
-            "refs/tags/v1.0.0-rc.3",
+            "refs/tags/v1.0.0",
             "--github-output",
             str(output),
         ],
@@ -166,11 +192,11 @@ def test_cli_exports_parsed_release_outputs(tmp_path: Path) -> None:
     )
 
     assert json.loads(result.stdout) == {
-        "pep440": "1.0.0rc3",
-        "prerelease": "true",
-        "release_note": "docs/releases/v1.0.0-rc.3.md",
-        "semver": "1.0.0-rc.3",
-        "tag": "v1.0.0-rc.3",
+        "pep440": "1.0.0",
+        "prerelease": "false",
+        "release_note": "docs/releases/v1.0.0.md",
+        "semver": "1.0.0",
+        "tag": "v1.0.0",
     }
     assert dict(
         line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines()

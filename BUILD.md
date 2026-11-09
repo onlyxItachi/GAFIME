@@ -17,8 +17,15 @@ Distribution target for v1:
   `gafime/_metal/libgafime_metal_v1.dylib` and its paired
   `gafime/_metal/gafime_metal_v1.metallib`.
 
-Install the current published prerelease of Core and the selected payload as
-separate projects. Payload metadata enforces exact Core alignment:
+Install published stable Core and the selected payload as separate projects.
+Payload metadata enforces exact Core alignment:
+
+```bash
+python -m pip install gafime gafime-cuda
+python -m pip install gafime gafime-rocm
+```
+
+Use `--pre` to permit beta or release-candidate versions:
 
 ```bash
 python -m pip install --pre gafime gafime-cuda
@@ -33,9 +40,10 @@ x86_64 and dynamically requires the system ROCm runtime; Windows ROCm is not a
 release target. Apple Silicon Metal is built from `src/metal` and bundled in the
 macOS arm64 Core wheel, not a fourth vendor package.
 
-Consult the mutable [release status](docs/releases/STATUS.md), GitHub Releases,
-and PyPI for the current exact public version. Build the checked-out source as
-described below when qualifying repository changes.
+This source targets `1.0.0`; source identity does not establish publication or
+final qualification. Consult the mutable [release status](docs/releases/STATUS.md),
+GitHub Releases, and PyPI for the current exact public version. Build the
+checked-out source as described below when qualifying repository changes.
 
 Core and payload distributions build dedicated CPython wheels for each
 supported minor version. Python's Stable ABI and `abi3` are not used.

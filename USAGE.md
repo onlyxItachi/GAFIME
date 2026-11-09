@@ -11,6 +11,10 @@ compatibility surface. Maintainer architecture remains normative in
 [historical full API notebook](docs/notebooks/gafime_full_api_reference_notebook.ipynb)
 is pre-v1 evidence rather than current guidance.
 
+This guide describes the `1.0.0` source target, not proof that this version
+has been published or finally qualified. Check [release status](docs/releases/STATUS.md),
+GitHub Releases, and PyPI before installing an exact public version.
+
 ## The Engine Configuration
 
 When you instantiate GAFIME, you can pass a configuration object to strictly define its boundaries, random deterministic states, and validation thresholds.
