@@ -365,6 +365,8 @@ def test_reference_distinguishes_source_target_from_publication() -> None:
         "not proof of publication or final qualification",
         "python -m pip install gafime",
         "python -m pip install --pre gafime",
+        "Until v1 stable is published, use the prerelease commands",
+        "python -m pip install --pre 'gafime[sklearn]'",
         "check release status, GitHub Releases, and PyPI",
     ):
         assert required in source
@@ -373,6 +375,7 @@ def test_reference_distinguishes_source_target_from_publication() -> None:
     assert "gafime==1.0.0" in readme
     assert "gafime-cuda==1.0.0" in readme
     assert "gafime-rocm==1.0.0" in readme
+    assert "Until v1 stable is published, use these prerelease commands" in readme
 
 
 def test_reference_records_current_non_api_boundaries() -> None:

@@ -17,8 +17,9 @@ Distribution target for v1:
   `gafime/_metal/libgafime_metal_v1.dylib` and its paired
   `gafime/_metal/gafime_metal_v1.metallib`.
 
-Install published stable Core and the selected payload as separate projects.
-Payload metadata enforces exact Core alignment:
+After v1 stable publication, install stable Core and the selected payload as
+separate projects. Until then, use the prerelease commands below for the v1 API;
+plain installation can select legacy v0.x. Payload metadata enforces exact Core alignment:
 
 ```bash
 python -m pip install gafime gafime-cuda

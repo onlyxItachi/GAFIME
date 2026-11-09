@@ -17,13 +17,16 @@ owns its device-local execution.
 
 ## Installation
 
-Stable releases:
+Stable releases (for v1, only after v1 stable publication):
 
 ```bash
 python -m pip install gafime
 python -m pip install gafime gafime-cuda  # Linux/Windows x86_64 + CUDA
 python -m pip install gafime gafime-rocm  # Linux x86_64 + system ROCm
 ```
+
+Until v1 stable is published, use these prerelease commands for the v1 API;
+plain installation can select the legacy v0.x stable line instead.
 
 Beta and release-candidate versions:
 

@@ -328,8 +328,10 @@ def _cells() -> list:
             ## 1. Installation and package topology
 
             GAFIME supports CPython 3.10–3.14 with dedicated interpreter-specific
-            wheels rather than `abi3`. Stable installs prefer published stable
-            versions; payload metadata enforces exact Core alignment:
+            wheels rather than `abi3`. After v1 stable publication, these stable
+            commands select that release line. Until v1 stable is published, use
+            the prerelease commands below for the v1 API; plain installation can
+            select legacy v0.x instead. Payload metadata enforces exact Core alignment:
 
             ```bash
             python -m pip install gafime
@@ -337,7 +339,7 @@ def _cells() -> list:
             python -m pip install gafime gafime-rocm
             ```
 
-            Use `--pre` to permit beta and release-candidate versions:
+            Until v1 stable is published, use the prerelease commands with `--pre`:
 
             ```bash
             python -m pip install --pre gafime
@@ -1375,10 +1377,10 @@ def _cells() -> list:
             """
             ### scikit-learn
 
-            Install the published stable `sklearn` extra with
-            `python -m pip install 'gafime[sklearn]'`; add `--pre` to permit a
-            beta or RC. Place `GafimeSelector` inside the pipeline, and let each
-            fold run its own fit.
+            Before v1 stable publication, install the v1 `sklearn` extra with
+            `python -m pip install --pre 'gafime[sklearn]'`. After v1 stable is
+            published, omit `--pre` to prefer that stable line. Place
+            `GafimeSelector` inside the pipeline, and let each fold run its own fit.
             See section 18 for the executable bounded example.
             """
         ),
