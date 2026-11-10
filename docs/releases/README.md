@@ -7,17 +7,21 @@ the historical record for that release or checkpoint.
 
 ## Current Release Train
 
-The current candidate source targets `v1.0.0-rc.3` on the protected
-`release/v1.0.0-rc.3` stabilization branch cut from green `main`. The initial
-fork is not a settled, qualified or frozen candidate. Publication requires
-the later exact qualified tip, verified frozen artifacts and final admission
-of that unchanged tip into `main`.
-Source version preparation does not itself create a tag or release. Follow the mutable
+Current source prepares stable `v1.0.0` from post-RC3, post-pruning mainline.
+Stable identity is not completed qualification or publication. The obsolete
+unpublished stable attempt is preserved under an immutable archival reference;
+its canonical name is available for a new fork only after approval and green
+stable-prepared `main`. See [stable source integration](stable-integration.md).
+
+Published [RC3](v1.0.0-rc.3.md) remains an immutable provenance record. Stable
+requires a new exact-source candidate, qualification, verified frozen artifacts
+and final admission of its unchanged tip to `main` under the existing runbook.
+Source preparation does not itself create a tag or release. Follow the mutable
 [release status](STATUS.md) for current gates and the live
 [GitHub Releases](https://github.com/onlyxItachi/GAFIME/releases) and
 [PyPI project](https://pypi.org/project/gafime/) for publication state.
 
-The [RC3 release note](v1.0.0-rc.3.md) describes the bounded hardening scope;
+The [stable preparation note](v1.0.0.md) describes the intended source scope;
 live release presence is established by the public channels above.
 
 ## Release Operations
@@ -30,8 +34,10 @@ live release presence is established by the public channels above.
 
 ### v1
 
-- [`v1.0.0-rc.3`](v1.0.0-rc.3.md) — candidate preparation and native file
-  acquisition hardening; see mutable status for outstanding qualification.
+- [`v1.0.0`](v1.0.0.md) — stable source preparation; this entry does not establish
+  completed stable qualification or publication.
+- [`v1.0.0-rc.3`](v1.0.0-rc.3.md) — published release candidate with native file
+  acquisition hardening and qualified immutable artifacts.
 - [`v1.0.0-rc.2`](v1.0.0-rc.2.md) — validation and artifact-identity hardening;
   see current status and public channels for publication state.
 - [`v1.0.0-rc.1`](v1.0.0-rc.1.md) — public release candidate.

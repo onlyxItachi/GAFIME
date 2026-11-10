@@ -342,6 +342,9 @@ def test_documentation_hierarchy_and_local_links_are_valid() -> None:
         ).read_text(encoding="utf-8"),
         COVERAGE_PATH: COVERAGE_PATH.read_text(encoding="utf-8"),
     }
+    for name in ("stable-integration.md", "v1.0.0.md", "release-branches.md"):
+        path = ROOT / "docs" / "releases" / name
+        markdown_sources[path] = path.read_text(encoding="utf-8")
     notebook_markdown = "\n".join(
         "".join(cell["source"])
         for cell in _notebook()["cells"]
@@ -353,6 +356,26 @@ def test_documentation_hierarchy_and_local_links_are_valid() -> None:
         for target in _local_links(markdown):
             resolved = (source_path.parent / target).resolve()
             assert resolved.exists(), f"broken local link in {source_path}: {target}"
+
+
+def test_reference_distinguishes_source_target_from_publication() -> None:
+    source = " ".join(_source_text(_notebook()).split())
+    for required in (
+        "targets the `1.0.0` source identity",
+        "not proof of publication or final qualification",
+        "python -m pip install gafime",
+        "python -m pip install --pre gafime",
+        "Until v1 stable is published, use the prerelease commands",
+        "python -m pip install --pre 'gafime[sklearn]'",
+        "check release status, GitHub Releases, and PyPI",
+    ):
+        assert required in source
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "gafime==1.0.0" in readme
+    assert "gafime-cuda==1.0.0" in readme
+    assert "gafime-rocm==1.0.0" in readme
+    assert "Until v1 stable is published, use these prerelease commands" in readme
 
 
 def test_reference_records_current_non_api_boundaries() -> None:

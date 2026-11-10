@@ -30,9 +30,12 @@ runtime binaries rather than relying on hardware-dependent wheel selection.
 
 ## Install Commands
 
-The commands below select the current published prerelease. Consult the
-[release status](releases/STATUS.md), GitHub Releases, and PyPI when an exact
-version pin is required.
+Until v1 stable is published, the commands below use `--pre` for the v1 API;
+plain installation can select the legacy v0.x stable line. After v1 stable
+publication, omit `--pre` to prefer stable releases. This source targets
+`1.0.0`, but source identity is not evidence of publication or final qualification. Consult the
+[release status](releases/STATUS.md), GitHub Releases, and PyPI before selecting
+an exact version.
 
 Core/native CPU install:
 
@@ -68,6 +71,9 @@ Apple Silicon Metal:
 ```bash
 python -m pip install --pre gafime
 ```
+
+Keep Core and any payload on exactly matching versions. Exact pins to a
+published v1 version are preferred for reproducible testing.
 
 The distribution target is:
 
