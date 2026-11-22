@@ -64,6 +64,15 @@ set_source_files_properties(shader.metal PROPERTIES HEADER_FILE_ONLY TRUE)
 option(GAFIME_METAL_BUILD_TESTS "Build Metal ABI consumer tests" OFF)
 if(GAFIME_METAL_BUILD_TESTS)
     include(CTest)
+    # Host result-finalization regression; includes the actual private writer
+    # but never allocates a Metal matrix or invokes a device.
+    add_executable(gafime_metal_result_metadata
+        "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/metal_result_metadata_test.mm")
+    target_compile_features(gafime_metal_result_metadata PRIVATE cxx_std_23)
+    target_compile_options(gafime_metal_result_metadata PRIVATE -fobjc-arc)
+    target_link_libraries(gafime_metal_result_metadata PRIVATE
+        "-framework Foundation" "-framework Metal")
+    add_test(NAME gafime_metal_result_metadata COMMAND gafime_metal_result_metadata)
     set(GAFIME_ABI_CONSUMER_PAYLOAD_TARGET gafime_metal_v1)
     set(GAFIME_ABI_CONSUMER_BACKEND_KIND 4)
     set(GAFIME_ABI_CONSUMER_EXPECTED_ROUTE_COUNT 1)

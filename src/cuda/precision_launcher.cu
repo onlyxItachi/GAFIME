@@ -113,6 +113,7 @@ struct PrecisionCudaMatrix {
     uint64_t descriptor_metric_id_len;
     uint32_t descriptor_profile;
     std::vector<uint8_t> covariance_modes;
+    std::vector<GafimeArityChunk> covariance_chunks;
 
     void* metric_values;
     uint64_t metric_value_capacity;
@@ -311,6 +312,7 @@ void invalidate_precision_descriptors(PrecisionCudaMatrix* matrix) {
     matrix->descriptor_metric_id_len = 0;
     matrix->descriptor_profile = 0;
     matrix->covariance_modes.clear();
+    matrix->covariance_chunks.clear();
 }
 
 int require_precision_matrix(const PrecisionCudaMatrix* matrix) {
@@ -646,6 +648,29 @@ bool descriptors_resident(
         matrix->descriptor_metric_id_len == base->metric_ids.len;
 }
 
+bool covariance_layout_matches(
+    const PrecisionCudaMatrix* matrix, const GafimeLaunchProtocol* base
+) {
+    if (matrix->covariance_modes.size() != base->chunk_count ||
+        matrix->covariance_chunks.size() != base->chunk_count) return false;
+    for (uint32_t index = 0; index < base->chunk_count; ++index) {
+        const auto& saved = matrix->covariance_chunks[index];
+        const auto& current = base->chunks[index];
+        if (saved.arity != current.arity ||
+            saved.descriptor_offset != current.descriptor_offset ||
+            saved.combo_count != current.combo_count) return false;
+    }
+    return true;
+}
+
+void refresh_covariance_layout(PrecisionCudaMatrix* matrix, const GafimeLaunchProtocol* base) {
+    if (covariance_layout_matches(matrix, base)) return;
+    auto next_modes = covariance_modes_for_protocol(matrix, base);
+    std::vector<GafimeArityChunk> next_chunks(base->chunks, base->chunks + base->chunk_count);
+    matrix->covariance_modes.swap(next_modes);
+    matrix->covariance_chunks.swap(next_chunks);
+}
+
 int prepare_precision_buffers(
     PrecisionCudaMatrix* matrix,
     const GafimePrecisionLaunchProtocol* protocol,
@@ -659,15 +684,22 @@ int prepare_precision_buffers(
             static_cast<size_t>(metric_value_count) * matrix->kernels->result_bytes) != cudaSuccess) {
         return GAFIME_STATUS_DEVICE_ERROR;
     }
-    if (descriptors_resident(matrix, protocol)) return GAFIME_STATUS_OK;
+    const GafimeLaunchProtocol* base = protocol->base;
+    if (descriptors_resident(matrix, protocol)) {
+        // Combo/metric device residency does not identify the caller's chunk
+        // partition. Refresh derived host state without re-uploading those
+        // immutable arrays, including same-count repartitions.
+        refresh_covariance_layout(matrix, base);
+        return GAFIME_STATUS_OK;
+    }
 
     // Invalidate the identity before either descriptor allocation can replace
     // its backing storage.  If the second allocation fails after the first
     // one succeeds, a retry must not mistake the new combo buffer for the
     // previously uploaded descriptor set.
     invalidate_precision_descriptors(matrix);
-    const GafimeLaunchProtocol* base = protocol->base;
     std::vector<uint8_t> next_covariance_modes = covariance_modes_for_protocol(matrix, base);
+    std::vector<GafimeArityChunk> next_chunks(base->chunks, base->chunks + base->chunk_count);
     status = ensure_device_buffer(
         reinterpret_cast<void**>(&matrix->combo_indices), &matrix->combo_capacity,
         base->combo_indices.len, sizeof(uint32_t));
@@ -686,6 +718,7 @@ int prepare_precision_buffers(
     if (status != GAFIME_STATUS_OK) return status;
 
     matrix->covariance_modes.swap(next_covariance_modes);
+    matrix->covariance_chunks.swap(next_chunks);
     const bool cacheable = (base->flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL) != 0 &&
         base->reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] != 0;
     // Profile is an identity component even for an uncached descriptor upload.
@@ -749,6 +782,7 @@ int prepare_spearman_rank_cache(PrecisionCudaMatrix* matrix, const GafimeLaunchP
 int launch_precision_score_kernels(
     PrecisionCudaMatrix* matrix, const GafimeLaunchProtocol* protocol, cudaStream_t stream
 ) {
+    if (matrix->covariance_modes.size() != protocol->chunk_count) return GAFIME_STATUS_DEVICE_ERROR;
     const uint64_t metric_count = protocol->metric_ids.len;
     const uint64_t* cached_ranks = spearman_rank_cache_eligible(matrix, protocol) &&
         matrix->spearman_target_ranks_ready ? matrix->spearman_target_ranks_twice : nullptr;
@@ -758,7 +792,6 @@ int launch_precision_score_kernels(
         void* output = static_cast<unsigned char*>(matrix->metric_values) +
             metric_offset * metric_count * matrix->kernels->result_bytes;
         if (has_covariance_metric(protocol)) {
-            if (matrix->covariance_modes.size() != protocol->chunk_count) return GAFIME_STATUS_DEVICE_ERROR;
             const bool unary_fast_path = chunk.arity == 1 &&
                 matrix->covariance_modes[chunk_index] == 0 && matrix->features_are_finite &&
                 matrix->target_is_finite && matrix->kernels->continuous_unary != nullptr;
@@ -839,6 +872,7 @@ bool graph_shape_matches(
         matrix->graph_profile != protocol->profile || matrix->graph_has_target_copy != target_copy ||
         matrix->graph_target_copy_ptr != target_pointer || matrix->graph_chunk_count != base->chunk_count ||
         matrix->graph_chunk_shapes.size() != base->chunk_count ||
+        matrix->covariance_modes.size() != base->chunk_count ||
         matrix->graph_combo_len != base->combo_indices.len ||
         matrix->graph_metric_id_len != base->metric_ids.len ||
         matrix->graph_metric_value_count != metric_count ||
@@ -863,6 +897,7 @@ int store_graph_shape(
     uint64_t metric_count, bool target_copy
 ) try {
     const GafimeLaunchProtocol* base = protocol->base;
+    if (matrix->covariance_modes.size() != base->chunk_count) return GAFIME_STATUS_DEVICE_ERROR;
     std::vector<PrecisionGraphChunkShape> shapes;
     shapes.reserve(base->chunk_count);
     for (uint32_t index = 0; index < base->chunk_count; ++index) {

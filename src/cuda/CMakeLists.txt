@@ -151,6 +151,22 @@ if(GAFIME_CUDA_BUILD_TESTS)
     include(CTest)
     find_package(Threads REQUIRED)
 
+    if(UNIX AND NOT APPLE)
+        # Exercise private host bookkeeping from the actual NVCC-owned launcher
+        # without opening a device. Dead-section elimination removes unused
+        # execution entry points and their device-kernel-table references.
+        add_executable(gafime_cuda_descriptor_state
+            "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_descriptor_state_test.cu")
+        set_target_properties(gafime_cuda_descriptor_state PROPERTIES
+            CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF
+            CUDA_ARCHITECTURES "${GAFIME_CUDA_ARCHITECTURES}")
+        target_compile_options(gafime_cuda_descriptor_state PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffunction-sections,-fdata-sections>)
+        target_link_options(gafime_cuda_descriptor_state PRIVATE "LINKER:--gc-sections")
+        target_link_libraries(gafime_cuda_descriptor_state PRIVATE CUDA::cudart Threads::Threads)
+        add_test(NAME gafime_cuda_descriptor_state COMMAND gafime_cuda_descriptor_state)
+    endif()
+
     # The v2 fixture is deliberately source-local: it validates that a single
     # CUDA payload links and physically executes each compiled precision lane
     # without introducing a precision-specific distribution or test home.

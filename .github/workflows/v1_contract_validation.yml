@@ -213,8 +213,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cmake -S src/metal -B build/metal-cmake -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/metal-cmake --config Release --verbose
+          cmake -S src/metal -B build/metal-cmake -DCMAKE_BUILD_TYPE=Release \
+            -DGAFIME_METAL_BUILD_TESTS=ON
+          cmake --build build/metal-cmake --config Release --verbose \
+            --target gafime_metal_v1 gafime_metal_result_metadata
+          ctest --test-dir build/metal-cmake -C Release --output-on-failure \
+            --no-tests=error -R '^gafime_metal_result_metadata$'
 
       - name: Install v1 package for Metal validation
         shell: bash

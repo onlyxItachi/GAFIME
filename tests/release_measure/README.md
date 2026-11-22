@@ -42,9 +42,9 @@ When native GPU payloads are available:
 export GAFIME_CUDA_V1_LIB="$PWD/build/cuda-template-hardening-both/libgafime_cuda_v1.so"
 export GAFIME_CUDA_RT_V1_LIB="$PWD/build/cuda-template-hardening-both/libgafime_cuda_v1_rt.so"
 export GAFIME_ROCM_V1_LIB="$PWD/build/rocm-template-hardening-default/libgafime_rocm_v1.so"
-export GAFIME_CUDA_ABI_SMOKE=/tmp/cuda_v1_abi_smoke
-export GAFIME_CUDA_RT_ABI_SMOKE=/tmp/cuda_v1_abi_smoke_rt
-export GAFIME_ROCM_ABI_SMOKE=/tmp/rocm_v1_abi_smoke
+export GAFIME_CUDA_ABI_SMOKE="$PWD/build/cuda-template-hardening-both/gafime_cuda_v1_abi_smoke_no_rt"
+export GAFIME_CUDA_RT_ABI_SMOKE="$PWD/build/cuda-template-hardening-both/gafime_cuda_v1_abi_smoke_rt"
+export GAFIME_ROCM_ABI_SMOKE="$PWD/build/rocm-template-hardening-default/gafime_rocm_v1_abi_smoke"
 python3 tests/release_measure/v1_architecture_gate.py --include-gpu
 python3 tests/release_measure/installed_payload_smoke.py \
   --backend cuda --source-root "$PWD" --execute-profiles
@@ -52,7 +52,10 @@ python3 tests/release_measure/installed_payload_smoke.py \
   --backend rocm --source-root "$PWD" --execute-profiles
 ```
 
-Build both smoke binaries from the current tree before that command; the exact
+Build all three smoke binaries from the current trusted tree before that command,
+using `GAFIME_CUDA_BUILD_TESTS=ON`, CUDA RT mode `both`, and
+`GAFIME_ROCM_BUILD_TESTS=ON`. Keep the build directories protected against
+other-user writes; shared `/tmp` executable defaults are not accepted. The exact
 payload and smoke build sequence is in
 `docs/cuda-template-kernel-hardening.md`.
 

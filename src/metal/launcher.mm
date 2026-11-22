@@ -4,6 +4,7 @@
 #include "../common/gafime_gpu_internal_abi.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -564,6 +565,27 @@ std::vector<uint32_t> all_rows(size_t total_rows) {
     return rows;
 }
 
+struct HostWriteSpan {
+    uintptr_t begin;
+    uintptr_t bytes;
+};
+
+bool host_span(const void* pointer, uint64_t count, uint64_t width, HostWriteSpan* out) {
+    uint64_t bytes = 0;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(pointer);
+    if (!checked_mul_u64(count, width, &bytes) ||
+        bytes > std::numeric_limits<uintptr_t>::max() - begin) {
+        return false;
+    }
+    *out = {begin, static_cast<uintptr_t>(bytes)};
+    return true;
+}
+
+bool host_spans_overlap(const HostWriteSpan& lhs, const HostWriteSpan& rhs) {
+    return lhs.bytes != 0 && rhs.bytes != 0 &&
+        lhs.begin < rhs.begin + rhs.bytes && rhs.begin < lhs.begin + lhs.bytes;
+}
+
 int write_result_rows(
     const GafimeLaunchProtocol* protocol,
     GafimeResultTable* result,
@@ -571,6 +593,51 @@ int write_result_rows(
     const std::vector<uint32_t>& rows,
     bool compact_metric_rows
 ) {
+    // Caller-owned output spans may overlap their own layout header or the
+    // input descriptors. Freeze control metadata before any scatter, and copy
+    // descriptor storage only when a scatter could overwrite a later read.
+    // Ordinary disjoint Rust-owned tables need no extra descriptor allocation.
+    GafimeResultTable sink = *result;
+    GafimeLaunchProtocol source = *protocol;
+    std::array<HostWriteSpan, 7> writes{};
+    uint64_t combo_count = 0;
+    uint64_t metric_value_count = 0;
+    if (!checked_mul_u64(rows.size(), sink.max_arity, &combo_count) ||
+        !checked_mul_u64(rows.size(), sink.metric_count, &metric_value_count) ||
+        !host_span(sink.combo_indices, combo_count, sizeof(uint32_t), &writes[0]) ||
+        !host_span(sink.metric_values, metric_value_count, sizeof(float), &writes[1]) ||
+        !host_span(sink.ranks, rows.size(), sizeof(uint32_t), &writes[2]) ||
+        !host_span(sink.families, rows.size(), sizeof(uint32_t), &writes[3]) ||
+        !host_span(sink.candidate_ids, rows.size(), sizeof(uint64_t), &writes[4]) ||
+        !host_span(sink.row_flags, rows.size(), sizeof(uint32_t), &writes[5]) ||
+        !host_span(&result->flags, 1, sizeof(result->flags), &writes[6])) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    HostWriteSpan chunk_span{}, combo_span{};
+    if (!host_span(source.chunks, source.chunk_count, sizeof(GafimeArityChunk), &chunk_span) ||
+        !host_span(source.combo_indices.ptr, source.combo_indices.len, sizeof(uint32_t), &combo_span)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    const auto overlaps_output = [&](const HostWriteSpan& input) {
+        return std::any_of(writes.begin(), writes.end(), [&](const HostWriteSpan& output) {
+            return host_spans_overlap(input, output);
+        });
+    };
+    std::vector<GafimeArityChunk> saved_chunks;
+    std::vector<uint32_t> saved_combos;
+    if (overlaps_output(chunk_span)) {
+        saved_chunks.assign(source.chunks, source.chunks + source.chunk_count);
+        source.chunks = saved_chunks.data();
+    }
+    if (overlaps_output(combo_span)) {
+        saved_combos.assign(source.combo_indices.ptr,
+            source.combo_indices.ptr + source.combo_indices.len);
+        source.combo_indices.ptr = saved_combos.data();
+    }
+    protocol = &source;
+    GafimeResultTable* caller_result = result;
+    result = &sink;
+    caller_result->flags = 0;
     const uint32_t metric_count = static_cast<uint32_t>(protocol->metric_ids.len);
     for (size_t output_row = 0; output_row < rows.size(); ++output_row) {
         const uint64_t global_row = rows[output_row];
@@ -594,7 +661,7 @@ int write_result_rows(
         result->candidate_ids[output_row] = global_row;
         result->row_flags[output_row] = 0;
     }
-    result->row_count = static_cast<uint64_t>(rows.size());
+    caller_result->row_count = static_cast<uint64_t>(rows.size());
     return GAFIME_STATUS_OK;
 }
 
@@ -2021,7 +2088,6 @@ static int metal_execute_shared(
             matrix->spearman_target_ranks_ready = true;
             matrix->spearman_target_ranks_profile = matrix->precision_profile;
         }
-        result_out->flags = 0;
         if (!ranked_output) {
             const float* values = static_cast<const float*>(metric_buffer.contents);
             std::vector<float> metric_values(values, values + metric_value_count_host);
@@ -2037,6 +2103,7 @@ static int metal_execute_shared(
         }
         rows.resize(selected_count);
         if (selected_count == 0) {
+            result_out->flags = 0;
             result_out->row_count = 0;
             return GAFIME_STATUS_OK;
         }

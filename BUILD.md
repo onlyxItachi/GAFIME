@@ -233,13 +233,26 @@ PYTHONPATH="$PWD/python:$PWD/tests/release_measure" python tests/release_measure
 python tests/release_measure/v1_architecture_gate.py
 ```
 
-When CUDA and ROCm payloads are available, rebuild them and run:
+When CUDA and ROCm payloads are available, rebuild them and their ABI smokes
+from the selected trusted source in user/root-owned build directories that
+other users cannot modify. GPU smoke executable paths must be explicit; the
+gate does not discover executables in shared temporary storage. For a local
+CUDA `both` test build and ROCm test build, run:
 
 ```bash
+export GAFIME_CUDA_ABI_SMOKE="$PWD/build/cuda-template-hardening-both/gafime_cuda_v1_abi_smoke_no_rt"
+export GAFIME_CUDA_RT_ABI_SMOKE="$PWD/build/cuda-template-hardening-both/gafime_cuda_v1_abi_smoke_rt"
+export GAFIME_ROCM_ABI_SMOKE="$PWD/build/rocm-template-hardening-default/gafime_rocm_v1_abi_smoke"
 python tests/release_measure/v1_architecture_gate.py --include-gpu
 PYTHONPATH="$PWD/python:$PWD/tests/release_measure" python tests/release_measure/backend_02_cross_backend_parity.py
 PYTHONPATH="$PWD/python:$PWD/tests/release_measure" python tests/release_measure/backend_03_e2e_smoke_per_backend.py
 ```
+
+The gate validates POSIX ownership, executable permissions and canonical
+parent-directory safety for all three smoke executables. It fails closed on
+platforms without those checks. This is filesystem selection safety, not proof
+of compiler/source provenance; the operator must still build the selected
+smokes from the intended source. See [native boundary snapshots](docs/native-boundary-snapshots.md).
 
 Release validation focuses on continuous interactions, native decision paths,
 time-series candidates, compile artifacts, backend graph launch paths, and

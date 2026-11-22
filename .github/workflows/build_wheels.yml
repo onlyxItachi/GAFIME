@@ -313,6 +313,10 @@ jobs:
       - name: Setup Visual Studio 2026 (Windows Server 2025)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          # CUDA 13.3 cudafe++ faults (0xC0000005) under VS 2026 18.12 / MSVC
+          # 14.52 headers; use the bundled side-by-side MSVC 14.44 toolset.
+          toolset: '14.44'
 
       - name: Verify Visual Studio 2026 environment
         if: runner.os == 'Windows'

@@ -7,10 +7,15 @@ import importlib.util
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
-import tomllib
 import types
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -3575,6 +3580,78 @@ def check_report_scale_view() -> None:
     assert [item.combo for item in top] == [(0,), (1,), (0,)]
 
 
+def trusted_smoke_path(name: str, value: str) -> Path:
+    """Select an explicit operator-built smoke without trusting shared temp files.
+
+    This protects the other-UID filesystem boundary, not hostile code running
+    as the developer/root or proof of compiler/source provenance. The operator
+    must build the executable from the selected trusted source before use.
+    """
+    if os.name != "posix" or not hasattr(os, "geteuid"):
+        raise AssertionError("GPU smoke path validation requires POSIX ownership checks")
+    owner = os.geteuid()
+
+    def check_dir(directory: Path, *, allow_root_sticky: bool) -> None:
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, owner):
+            raise AssertionError(f"untrusted GPU smoke parent: {directory}")
+        if info.st_mode & 0o022:
+            # A private build directory may live below root-owned sticky /tmp;
+            # neither the executable nor a traversed symlink may live directly
+            # in a shared writable directory.
+            if not (allow_root_sticky and info.st_uid == 0 and info.st_mode & stat.S_ISVTX):
+                raise AssertionError(f"writable GPU smoke parent: {directory}")
+
+    # Resolve symlinks step-by-step from root so an attacker-controlled symlink
+    # inside a shared directory cannot redirect to a root/owner-owned binary.
+    raw = Path(value).expanduser()
+    if not raw.is_absolute():
+        raw = Path.cwd() / raw
+    current = Path(raw.anchor)
+    check_dir(current, allow_root_sticky=False)
+    remaining = list(raw.parts[1:])
+    hops = 0
+    while remaining:
+        part = remaining.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = current.parent
+            check_dir(current, allow_root_sticky=bool(remaining))
+            continue
+        candidate = current / part
+        info = candidate.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            if info.st_uid not in (0, owner):
+                raise AssertionError(f"untrusted GPU smoke symlink: {candidate}")
+            check_dir(current, allow_root_sticky=False)
+            hops += 1
+            if hops > 40:
+                raise AssertionError(f"too many GPU smoke symlink hops: {name}={value}")
+            target = Path(os.readlink(candidate))
+            if target.is_absolute():
+                current = Path(target.anchor)
+                check_dir(current, allow_root_sticky=False)
+                remaining = list(target.parts[1:]) + remaining
+            else:
+                remaining = list(target.parts) + remaining
+            continue
+        if remaining:
+            check_dir(candidate, allow_root_sticky=True)
+            current = candidate
+            continue
+        check_dir(current, allow_root_sticky=False)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid not in (0, owner)
+            or info.st_mode & 0o022
+            or not os.access(candidate, os.X_OK)
+        ):
+            raise AssertionError(f"untrusted or non-executable GPU smoke: {name}={candidate}")
+        return candidate
+    raise AssertionError(f"untrusted or non-executable GPU smoke: {name}={current}")
+
+
 def run_cargo(include_gpu: bool) -> None:
     env = os.environ.copy()
     if include_gpu:
@@ -3589,15 +3666,9 @@ def run_cargo(include_gpu: bool) -> None:
             "GAFIME_CUDA_V1_LIB": env.get("GAFIME_CUDA_V1_LIB"),
             "GAFIME_CUDA_RT_V1_LIB": env.get("GAFIME_CUDA_RT_V1_LIB"),
             "GAFIME_ROCM_V1_LIB": env.get("GAFIME_ROCM_V1_LIB"),
-            "GAFIME_CUDA_ABI_SMOKE": env.get(
-                "GAFIME_CUDA_ABI_SMOKE", "/tmp/cuda_v1_abi_smoke"
-            ),
-            "GAFIME_CUDA_RT_ABI_SMOKE": env.get(
-                "GAFIME_CUDA_RT_ABI_SMOKE", "/tmp/cuda_v1_abi_smoke_rt"
-            ),
-            "GAFIME_ROCM_ABI_SMOKE": env.get(
-                "GAFIME_ROCM_ABI_SMOKE", "/tmp/rocm_v1_abi_smoke"
-            ),
+            "GAFIME_CUDA_ABI_SMOKE": env.get("GAFIME_CUDA_ABI_SMOKE"),
+            "GAFIME_CUDA_RT_ABI_SMOKE": env.get("GAFIME_CUDA_RT_ABI_SMOKE"),
+            "GAFIME_ROCM_ABI_SMOKE": env.get("GAFIME_ROCM_ABI_SMOKE"),
         }
         unset = [name for name, value in required_values.items() if not value]
         if unset:
@@ -3616,6 +3687,8 @@ def run_cargo(include_gpu: bool) -> None:
             raise AssertionError(
                 "missing configured GPU payloads or ABI smokes: " + ", ".join(missing)
             )
+        for name in ("GAFIME_CUDA_ABI_SMOKE", "GAFIME_CUDA_RT_ABI_SMOKE", "GAFIME_ROCM_ABI_SMOKE"):
+            required[name] = trusted_smoke_path(name, required_values[name])
         for name in (
             "GAFIME_CUDA_V1_LIB",
             "GAFIME_CUDA_RT_V1_LIB",
