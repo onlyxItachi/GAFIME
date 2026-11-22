@@ -13,8 +13,8 @@ launch header, so writes cannot change the bounds used by later writes.
 If an actual output-write span intersects the chunk or combination descriptors
 that finalization will read, those descriptors are copied before scattering.
 The ordinary disjoint Rust-owned path needs no additional descriptor copy.
-Only the completed row count is committed back; the result header is not
-wholesale copied over caller storage.
+Only the result flags reset and completed row count are committed back; the
+result header is not wholesale copied over caller storage.
 
 This does not promise meaningful simultaneous values for output arrays that
 overlap each other, nor make inaccessible pointers valid. Callers still own
@@ -45,8 +45,9 @@ No kernel equation, ordering rule, or graph/lifecycle ownership changes.
 built from the trusted selected source. It accepts regular executable files
 owned by the invoking user or root, with no group/other write permission, and
 checks canonical parent ownership and permissions. A private directory below
-root-owned sticky `/tmp` is allowed; an executable directly in a shared writable
-directory is not. Canonical symlink targets are checked and executed.
+root-owned sticky `/tmp` is allowed; an executable or traversed symlink
+directly in a shared writable directory is not. Traversed symlinks, their
+containing directories, and canonical targets are checked before execution.
 
 The boundary is replacement by another local UID. The developer/root, compiler,
 source selection and explicitly selected payloads remain trusted. Filesystem

@@ -93,14 +93,52 @@ def test_symlink_executes_only_checked_private_target(setup, monkeypatch):
     assert calls[0][0][0] == [str(paths[SMOKES[0]])]
 
 
+def test_symlink_in_shared_sticky_dir_or_foreign_owned_is_rejected(setup, monkeypatch):
+    paths, calls = setup
+    target = paths[SMOKES[0]]
+    shared = target.parent.parent
+    shared_alias = shared / "shared_alias"
+    shared_alias.symlink_to(target)
+    original = Path.lstat
+
+    def sticky_shared(self, *args, **kwargs):
+        if self == shared:
+            return SimpleNamespace(
+                st_mode=stat.S_IFDIR | stat.S_ISVTX | 0o777, st_uid=0
+            )
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", sticky_shared)
+    monkeypatch.setenv(SMOKES[0], str(shared_alias))
+    with pytest.raises(AssertionError, match="writable GPU smoke parent"):
+        GATE.run_cargo(True)
+    assert not calls
+
+    private_alias = target.parent / "foreign_alias"
+    private_alias.symlink_to(target)
+
+    def foreign_link(self, *args, **kwargs):
+        info = original(self, *args, **kwargs)
+        if self == private_alias:
+            return SimpleNamespace(st_mode=info.st_mode, st_uid=os.geteuid() + 10000)
+        return info
+
+    monkeypatch.setattr(Path, "lstat", foreign_link)
+    monkeypatch.setenv(SMOKES[0], str(private_alias))
+    with pytest.raises(AssertionError, match="untrusted GPU smoke symlink"):
+        GATE.run_cargo(True)
+    assert not calls
+
+
 def test_root_sticky_ancestor_allowed_but_not_direct_shared_parent(setup, monkeypatch):
     paths, _ = setup
     path = paths[SMOKES[0]]
     shared = path.parent.parent
     original = Path.lstat
+    direct_sticky = False
 
     def sticky(self, *args, **kwargs):
-        if self == shared:
+        if self == shared or (direct_sticky and self == path.parent):
             return SimpleNamespace(
                 st_mode=stat.S_IFDIR | stat.S_ISVTX | 0o777, st_uid=0
             )
@@ -108,8 +146,8 @@ def test_root_sticky_ancestor_allowed_but_not_direct_shared_parent(setup, monkey
 
     monkeypatch.setattr(Path, "lstat", sticky)
     assert GATE.trusted_smoke_path("fixture", str(path)) == path
-    # The same mode is forbidden if it is the immediate executable parent.
-    paths[SMOKES[0]].parent.chmod(0o777)
+    # Even a root-owned sticky directory is forbidden as the direct parent.
+    direct_sticky = True
     with pytest.raises(AssertionError, match="writable GPU smoke parent"):
         GATE.trusted_smoke_path("fixture", str(path))
 
