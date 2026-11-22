@@ -7,6 +7,7 @@ import importlib.util
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tomllib
@@ -3575,6 +3576,38 @@ def check_report_scale_view() -> None:
     assert [item.combo for item in top] == [(0,), (1,), (0,)]
 
 
+def trusted_smoke_path(name: str, value: str) -> Path:
+    """Select an explicit operator-built smoke without trusting shared temp files.
+
+    This protects the other-UID filesystem boundary, not hostile code running
+    as the developer/root or proof of compiler/source provenance. The operator
+    must build the executable from the selected trusted source before use.
+    """
+    if os.name != "posix" or not hasattr(os, "geteuid"):
+        raise AssertionError("GPU smoke path validation requires POSIX ownership checks")
+    path = Path(value).expanduser().resolve(strict=True)
+    owner = os.geteuid()
+    # Establish each ancestor's trust before inspecting the child it protects.
+    for parent in reversed(path.parents):
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, owner):
+            raise AssertionError(f"untrusted GPU smoke parent: {parent}")
+        if info.st_mode & 0o022:
+            # A private build directory may live below root-owned sticky /tmp;
+            # the executable itself must never live directly in a shared dir.
+            if parent == path.parent or not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX):
+                raise AssertionError(f"writable GPU smoke parent: {parent}")
+    info = path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid not in (0, owner)
+        or info.st_mode & 0o022
+        or not os.access(path, os.X_OK)
+    ):
+        raise AssertionError(f"untrusted or non-executable GPU smoke: {name}={path}")
+    return path
+
+
 def run_cargo(include_gpu: bool) -> None:
     env = os.environ.copy()
     if include_gpu:
@@ -3589,15 +3622,9 @@ def run_cargo(include_gpu: bool) -> None:
             "GAFIME_CUDA_V1_LIB": env.get("GAFIME_CUDA_V1_LIB"),
             "GAFIME_CUDA_RT_V1_LIB": env.get("GAFIME_CUDA_RT_V1_LIB"),
             "GAFIME_ROCM_V1_LIB": env.get("GAFIME_ROCM_V1_LIB"),
-            "GAFIME_CUDA_ABI_SMOKE": env.get(
-                "GAFIME_CUDA_ABI_SMOKE", "/tmp/cuda_v1_abi_smoke"
-            ),
-            "GAFIME_CUDA_RT_ABI_SMOKE": env.get(
-                "GAFIME_CUDA_RT_ABI_SMOKE", "/tmp/cuda_v1_abi_smoke_rt"
-            ),
-            "GAFIME_ROCM_ABI_SMOKE": env.get(
-                "GAFIME_ROCM_ABI_SMOKE", "/tmp/rocm_v1_abi_smoke"
-            ),
+            "GAFIME_CUDA_ABI_SMOKE": env.get("GAFIME_CUDA_ABI_SMOKE"),
+            "GAFIME_CUDA_RT_ABI_SMOKE": env.get("GAFIME_CUDA_RT_ABI_SMOKE"),
+            "GAFIME_ROCM_ABI_SMOKE": env.get("GAFIME_ROCM_ABI_SMOKE"),
         }
         unset = [name for name, value in required_values.items() if not value]
         if unset:
@@ -3616,6 +3643,8 @@ def run_cargo(include_gpu: bool) -> None:
             raise AssertionError(
                 "missing configured GPU payloads or ABI smokes: " + ", ".join(missing)
             )
+        for name in ("GAFIME_CUDA_ABI_SMOKE", "GAFIME_CUDA_RT_ABI_SMOKE", "GAFIME_ROCM_ABI_SMOKE"):
+            required[name] = trusted_smoke_path(name, required_values[name])
         for name in (
             "GAFIME_CUDA_V1_LIB",
             "GAFIME_CUDA_RT_V1_LIB",

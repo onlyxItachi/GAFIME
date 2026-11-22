@@ -380,6 +380,7 @@ Rebuild distinct, provenance-bearing artifacts from this working tree:
 : "${GAFIME_OPTIX_INCLUDE_DIR:?set this to the OptiX SDK include directory}"
 cmake -S src/cuda -B build/cuda-template-hardening-both \
   -DCMAKE_BUILD_TYPE=Release \
+  -DGAFIME_CUDA_BUILD_TESTS=ON \
   -DGAFIME_CUDA_RT_BUILD_MODE=both \
   -DGAFIME_CUDA_ARCHITECTURES='89-real;89-virtual' \
   -DGAFIME_OPTIX_INCLUDE_DIR="$GAFIME_OPTIX_INCLUDE_DIR"
@@ -397,7 +398,8 @@ cmake -S src/rocm -B build/rocm-mi-wave-baseline \
 cmake --build build/rocm-mi-wave-baseline --config Release -- -j4
 
 cmake -S src/rocm -B build/rocm-template-hardening-default \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_ARCHITECTURES=gfx1150
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_ARCHITECTURES=gfx1150 \
+  -DGAFIME_ROCM_BUILD_TESTS=ON
 cmake --build build/rocm-template-hardening-default --config Release -- -j4
 
 cmake -S src/rocm -B build/rocm-template-hardening \
@@ -414,20 +416,11 @@ cmake -S src/rocm -B build/rocm-static-inspect-gfx90a \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_ARCHITECTURES=gfx90a \
   -DGAFIME_HIP_WAVE_MI_MODE=96
 cmake --build build/rocm-static-inspect-gfx90a --config Release -- -j4
-
-c++ -std=c++20 tests/gpu/cuda_v1_abi_smoke.cpp \
-  -L"$PWD/build/cuda-template-hardening-both" \
-  -Wl,-rpath,"$PWD/build/cuda-template-hardening-both" \
-  -lgafime_cuda_v1 -o /tmp/cuda_v1_abi_smoke
-c++ -std=c++20 tests/gpu/cuda_v1_abi_smoke.cpp \
-  -L"$PWD/build/cuda-template-hardening-both" \
-  -Wl,-rpath,"$PWD/build/cuda-template-hardening-both" \
-  -lgafime_cuda_v1_rt -o /tmp/cuda_v1_abi_smoke_rt
-c++ -std=c++23 tests/gpu/rocm_v1_abi_smoke.cpp \
-  -L"$PWD/build/rocm-template-hardening-default" \
-  -Wl,-rpath,"$PWD/build/rocm-template-hardening-default" \
-  -lgafime_rocm_v1 -o /tmp/rocm_v1_abi_smoke
 ```
+
+Keep the CUDA and ROCm build paths under directories other users cannot
+modify. Select the resulting CMake test executables explicitly; the developer
+gate does not discover smoke executables under shared temporary paths.
 
 Run static and local-device correctness gates before measuring throughput:
 
@@ -442,9 +435,9 @@ export PYTHONPATH="$PWD/python:$PWD/tests/release_measure"
 export GAFIME_CUDA_V1_LIB="$PWD/build/cuda-template-hardening-both/libgafime_cuda_v1.so"
 export GAFIME_CUDA_RT_V1_LIB="$PWD/build/cuda-template-hardening-both/libgafime_cuda_v1_rt.so"
 export GAFIME_ROCM_V1_LIB="$PWD/build/rocm-template-hardening-default/libgafime_rocm_v1.so"
-export GAFIME_CUDA_ABI_SMOKE=/tmp/cuda_v1_abi_smoke
-export GAFIME_CUDA_RT_ABI_SMOKE=/tmp/cuda_v1_abi_smoke_rt
-export GAFIME_ROCM_ABI_SMOKE=/tmp/rocm_v1_abi_smoke
+export GAFIME_CUDA_ABI_SMOKE="$PWD/build/cuda-template-hardening-both/gafime_cuda_v1_abi_smoke_no_rt"
+export GAFIME_CUDA_RT_ABI_SMOKE="$PWD/build/cuda-template-hardening-both/gafime_cuda_v1_abi_smoke_rt"
+export GAFIME_ROCM_ABI_SMOKE="$PWD/build/rocm-template-hardening-default/gafime_rocm_v1_abi_smoke"
 python3 tests/release_measure/v1_architecture_gate.py --include-gpu
 python3 tests/release_measure/backend_02_cross_backend_parity.py
 GAFIME_GRAPH_BACKEND=cuda python3 tests/release_measure/graph_01_replay_parity.py
