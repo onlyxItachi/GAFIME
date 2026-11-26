@@ -565,26 +565,9 @@ std::vector<uint32_t> all_rows(size_t total_rows) {
     return rows;
 }
 
-struct HostWriteSpan {
-    uintptr_t begin;
-    uintptr_t bytes;
-};
-
-bool host_span(const void* pointer, uint64_t count, uint64_t width, HostWriteSpan* out) {
-    uint64_t bytes = 0;
-    const uintptr_t begin = reinterpret_cast<uintptr_t>(pointer);
-    if (!checked_mul_u64(count, width, &bytes) ||
-        bytes > std::numeric_limits<uintptr_t>::max() - begin) {
-        return false;
-    }
-    *out = {begin, static_cast<uintptr_t>(bytes)};
-    return true;
-}
-
-bool host_spans_overlap(const HostWriteSpan& lhs, const HostWriteSpan& rhs) {
-    return lhs.bytes != 0 && rhs.bytes != 0 &&
-        lhs.begin < rhs.begin + rhs.bytes && rhs.begin < lhs.begin + lhs.bytes;
-}
+using HostWriteSpan = gafime_gpu_abi::HostWriteSpan;
+using gafime_gpu_abi::host_span;
+using gafime_gpu_abi::host_spans_overlap;
 
 int write_result_rows(
     const GafimeLaunchProtocol* protocol,
@@ -1558,6 +1541,9 @@ static int metal_interaction_diagnostics_shared(
         if (!metal_matrix_handle_matches_owner(matrix, owner_profile)) {
             return GAFIME_STATUS_INVALID_ARGUMENT;
         }
+        if (diagnostics == nullptr) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
         InteractionDiagnosticSizes sizes{};
         const int validation_status = validate_interaction_diagnostic_batch(
             diagnostics,
@@ -1567,6 +1553,13 @@ static int metal_interaction_diagnostics_shared(
         if (validation_status != GAFIME_STATUS_OK) {
             return validation_status;
         }
+        // Finalization can write through caller-owned output spans. Preserve
+        // the validated descriptor before the first host write so an
+        // overlapping output cannot redirect a later store or change its
+        // count. The scan vectors below retain every input combo before any
+        // output is touched.
+        GafimeInteractionDiagnosticBatch diagnostic = *diagnostics;
+        diagnostics = &diagnostic;
         if (!matrix->content_valid ||
             matrix->feature_stats_profile != matrix->precision_profile ||
             matrix->target_stats_profile != matrix->precision_profile) {

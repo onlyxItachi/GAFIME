@@ -61,6 +61,16 @@ through 3.14. Windows ARM64 keeps ARM64 Python 3.11 as the workflow host and
 uses cibuildwheel's NuGet `pythonarm64` provisioner for each target interpreter,
 including CPython 3.10.
 
+Windows wheels use a closed, case-exact install layout covering the shipped
+Core modules, Core and CUDA binaries, and distribution metadata. The
+composition checker derives only the native extension tag and the
+distribution version from the wheel filename. It rejects other paths,
+including alternate spellings and wheel `.data` relocation, before resolving
+install destinations. This policy keeps unreviewed names out of the install
+tree regardless of whether the target volume creates short-name aliases.
+Changes to the Windows wheel contents require updating the approved layout
+and validating the resulting paths on Windows.
+
 The truthful raw ROCm wheels are attached to the GitHub Release. PyPI receives
 the matching ROCm sdist because raw `linux_x86_64` wheels are rejected and
 `libamdhip64.so.7` cannot truthfully satisfy manylinux.

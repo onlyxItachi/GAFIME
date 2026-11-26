@@ -5,8 +5,8 @@ use std::{
 };
 
 use gafime_orchestrator::{
-    BackendExecutionStats, ComputeBackend, MatrixHandle, OrchestratorError, OrchestratorResult,
-    PrecisionComputeBackend,
+    BackendExecutionStats, ComputeBackend, MatrixHandle, MatrixOwnerToken, OrchestratorError,
+    OrchestratorResult, PrecisionComputeBackend,
 };
 use gafime_types::{
     BackendKind, GafimeConstBufferView, GafimeGpuDeviceInfo, GafimeGpuGraphCapability,
@@ -38,6 +38,7 @@ pub struct GpuBackend {
     pub(crate) functions: GpuFunctionTable,
     pub(crate) device_flags: u32,
     pub(crate) library: Option<Arc<Library>>,
+    matrix_owner: MatrixOwnerToken,
     pub(crate) library_path: Option<PathBuf>,
     numeric_routes_cache: Arc<OnceLock<Result<Arc<[GafimeNumericRoute]>, GpuSysError>>>,
     #[cfg(feature = "local-cmake-experiment")]
@@ -82,6 +83,7 @@ impl GpuBackend {
             functions,
             device_flags: 0,
             library,
+            matrix_owner: MatrixOwnerToken::new(),
             library_path,
             numeric_routes_cache: Arc::new(OnceLock::new()),
             #[cfg(feature = "local-cmake-experiment")]
@@ -449,7 +451,19 @@ impl GpuBackend {
         max_arity: u32,
         row_count: usize,
     ) -> Result<Option<Vec<GpuInteractionDiagnostic>>, GpuSysError> {
-        if matrix.backend_kind() != self.kind || matrix.raw().is_null() {
+        let is_precision_matrix = match matrix.native_abi_version() {
+            Some(version) if version == GAFIME_PRECISION_ABI_VERSION => true,
+            Some(version) if version == GAFIME_ABI_VERSION => false,
+            _ => {
+                return Err(GpuSysError::InvalidInput(
+                    "matrix does not belong to the GPU diagnostics backend",
+                ));
+            }
+        };
+        if matrix.backend_kind() != self.kind
+            || matrix.raw().is_null()
+            || !matrix.has_native_owner(&self.matrix_owner)
+        {
             return Err(GpuSysError::InvalidInput(
                 "matrix does not belong to the GPU diagnostics backend",
             ));
@@ -472,7 +486,7 @@ impl GpuBackend {
             u64::try_from(combo_indices.len()).map_err(|_| GpuSysError::SizeOverflow)?;
         let mut overflow_row_counts = vec![0u64; row_count];
         let mut flags = vec![0u32; row_count];
-        if matrix.native_abi_version() == Some(GAFIME_PRECISION_ABI_VERSION) {
+        if is_precision_matrix {
             let Some(interaction_diagnostics) = self.functions.interaction_diagnostics_v2 else {
                 // Canonical ABI 1.1 payloads are preflighted as a complete
                 // ten-symbol table. Reaching this branch means a caller
@@ -491,8 +505,9 @@ impl GpuBackend {
                 row_flags: flags.as_mut_ptr(),
                 ..Default::default()
             };
-            // SAFETY: the checked caller-owned arrays remain live and the
-            // route exactly matches the resident ABI 1.1 matrix identity.
+            // SAFETY: the checked caller-owned arrays remain live, the route
+            // exactly matches the resident ABI 1.1 matrix identity, and the
+            // owner token above binds this callback to the allocating payload.
             let status = unsafe { interaction_diagnostics(matrix.raw(), &mut batch) };
             status_to_gpu_result("gafime_gpu_interaction_diagnostics_v2", status)?;
         } else {
@@ -509,8 +524,9 @@ impl GpuBackend {
                 flags: flags.as_mut_ptr(),
                 ..Default::default()
             };
-            // SAFETY: matrix identity/non-nullness and every batch length were
-            // checked above. Input and output storage remains live.
+            // SAFETY: matrix kind, ABI, opaque allocator identity, non-nullness,
+            // and every batch length were checked above. Input and output
+            // storage remains live.
             let status = unsafe { interaction_diagnostics(matrix.raw(), &mut batch) };
             status_to_gpu_result("gafime_gpu_interaction_diagnostics", status)?;
         }
@@ -769,7 +785,10 @@ impl GpuBackend {
             // SAFETY: the payload returned a non-null matrix for this backend
             // and shape. OwnedGpuMatrix keeps both the free function and the
             // dynamic library alive and exposes the handle only by borrow.
-            handle: unsafe { MatrixHandle::native(self.kind, raw, rows, cols) },
+            handle: unsafe {
+                MatrixHandle::native(self.kind, raw, rows, cols)
+                    .with_native_owner(self.matrix_owner.clone())
+            },
             functions: self.functions,
             library: self.library.clone(),
             #[cfg(feature = "local-cmake-experiment")]
@@ -850,6 +869,7 @@ impl GpuBackend {
             // this exact backend, profile, and shape.
             handle: unsafe {
                 MatrixHandle::native_with_precision(self.kind, precision, raw, rows, cols)
+                    .with_native_owner(self.matrix_owner.clone())
             },
             functions: self.functions,
             library: self.library.clone(),

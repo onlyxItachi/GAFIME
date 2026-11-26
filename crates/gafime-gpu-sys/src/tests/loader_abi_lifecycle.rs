@@ -850,6 +850,76 @@ fn interaction_diagnostics_remain_optional_and_preserve_u64_counts() {
 }
 
 #[test]
+fn interaction_diagnostics_require_the_allocating_backend_owner() {
+    let mut functions = complete_test_function_table();
+    functions.interaction_diagnostics = Some(test_interaction_diagnostics);
+    let owner = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+    let matrix = owner.alloc_matrix(4, 2).unwrap();
+    let combos = [0, u32::MAX, 0, 1];
+
+    // A clone retains the allocator identity and therefore remains a valid
+    // safe receiver for the owner matrix.
+    let owner_clone = owner.clone();
+    assert_eq!(
+        owner_clone
+            .interaction_diagnostics(matrix.handle(), &combos, 2, 2)
+            .unwrap()
+            .unwrap(),
+        vec![
+            GpuInteractionDiagnostic {
+                overflow_row_count: 2,
+                source_nonfinite: true,
+            },
+            GpuInteractionDiagnostic {
+                overflow_row_count: 3,
+                source_nonfinite: false,
+            },
+        ]
+    );
+
+    // A separately constructed same-kind backend has no allocator proof for
+    // this opaque handle, even though the valid diagnostic fixture is present.
+    let mut foreign_functions = complete_test_function_table();
+    foreign_functions.interaction_diagnostics = Some(test_interaction_diagnostics);
+    let foreign = GpuBackend::new(GAFIME_BACKEND_CUDA, foreign_functions).unwrap();
+    assert!(matches!(
+        foreign.interaction_diagnostics(matrix.handle(), &combos, 2, 2),
+        Err(GpuSysError::InvalidInput(
+            "matrix does not belong to the GPU diagnostics backend"
+        ))
+    ));
+
+    let precision_owner = GpuBackend::new(
+        GAFIME_BACKEND_CUDA,
+        complete_precision_test_function_table(),
+    )
+    .unwrap();
+    let precision_matrix = precision_owner
+        .alloc_matrix_for_profile(PrecisionProfile::Fp32, 4, 2)
+        .unwrap();
+    let precision_clone = precision_owner.clone();
+    assert_eq!(
+        precision_clone
+            .interaction_diagnostics(precision_matrix.handle(), &combos, 2, 2)
+            .unwrap()
+            .unwrap(),
+        vec![GpuInteractionDiagnostic::default(); 2]
+    );
+
+    let precision_foreign = GpuBackend::new(
+        GAFIME_BACKEND_CUDA,
+        complete_precision_test_function_table(),
+    )
+    .unwrap();
+    assert!(matches!(
+        precision_foreign.interaction_diagnostics(precision_matrix.handle(), &combos, 2, 2),
+        Err(GpuSysError::InvalidInput(
+            "matrix does not belong to the GPU diagnostics backend"
+        ))
+    ));
+}
+
+#[test]
 fn same_abi_payload_ranking_support_remains_probe_driven() {
     let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, complete_test_function_table()).unwrap();
     let capability = backend.graph_capability().unwrap();

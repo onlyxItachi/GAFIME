@@ -1,4 +1,5 @@
 use core::ffi::c_void;
+use std::sync::Arc;
 
 use gafime_types::{
     BackendKind, GafimeGpuMatrix, GafimeLaunchProtocol, GafimePrecisionLaunchProtocol,
@@ -22,15 +23,61 @@ pub struct BackendExecutionStats {
     pub rows_written: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+/// Opaque Rust-side identity for the payload that allocated a native matrix.
+///
+/// This token is deliberately not part of the C ABI. Native adapter owners use
+/// it to keep safe Rust operations from passing an opaque matrix handle to a
+/// different loaded payload with the same backend kind.
+#[derive(Clone, Debug)]
+pub struct MatrixOwnerToken(Arc<()>);
+
+impl MatrixOwnerToken {
+    /// Create a distinct native-matrix owner identity.
+    pub fn new() -> Self {
+        Self(Arc::new(()))
+    }
+}
+
+impl Default for MatrixOwnerToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for MatrixOwnerToken {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for MatrixOwnerToken {}
+
+#[derive(Debug)]
 pub struct MatrixHandle {
     backend_kind: BackendKind,
     precision: PrecisionProfile,
     native_abi_version: Option<u32>,
+    native_owner: Option<MatrixOwnerToken>,
     raw: GafimeGpuMatrix,
     rows: u64,
     cols: u32,
 }
+
+impl PartialEq for MatrixHandle {
+    fn eq(&self, other: &Self) -> bool {
+        // The owner token is authorization metadata for selected safe
+        // operations, not part of the established value equality of a raw
+        // matrix handle.
+        self.backend_kind == other.backend_kind
+            && self.precision == other.precision
+            && self.native_abi_version == other.native_abi_version
+            && self.raw == other.raw
+            && self.rows == other.rows
+            && self.cols == other.cols
+    }
+}
+
+impl Eq for MatrixHandle {}
 
 impl MatrixHandle {
     pub fn host(backend_kind: BackendKind, rows: u64, cols: u32) -> Self {
@@ -47,6 +94,7 @@ impl MatrixHandle {
             backend_kind,
             precision,
             native_abi_version: None,
+            native_owner: None,
             raw: core::ptr::null_mut(),
             rows,
             cols,
@@ -82,6 +130,7 @@ impl MatrixHandle {
             backend_kind,
             precision: PrecisionProfile::Mixed,
             native_abi_version: Some(GAFIME_ABI_VERSION),
+            native_owner: None,
             raw,
             rows,
             cols,
@@ -105,6 +154,7 @@ impl MatrixHandle {
             backend_kind,
             precision,
             native_abi_version: Some(GAFIME_PRECISION_ABI_VERSION),
+            native_owner: None,
             raw,
             rows,
             cols,
@@ -123,6 +173,27 @@ impl MatrixHandle {
     /// handles have no native ABI identity.
     pub fn native_abi_version(&self) -> Option<u32> {
         self.native_abi_version
+    }
+
+    /// Attach the private allocator identity retained by the payload that
+    /// allocated this native handle.
+    ///
+    /// # Safety
+    ///
+    /// `owner` must identify the same payload that allocated `self.raw`.
+    /// Attaching an unrelated token could make a safe operation call a payload
+    /// with foreign opaque storage.
+    pub unsafe fn with_native_owner(mut self, owner: MatrixOwnerToken) -> Self {
+        self.native_owner = Some(owner);
+        self
+    }
+
+    /// Whether this handle carries the supplied private allocator identity.
+    ///
+    /// A handle made through a legacy raw constructor carries no owner proof,
+    /// so safe operations requiring allocator identity must reject it.
+    pub fn has_native_owner(&self, owner: &MatrixOwnerToken) -> bool {
+        self.native_owner.as_ref() == Some(owner)
     }
 
     pub fn raw(&self) -> GafimeGpuMatrix {

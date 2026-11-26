@@ -67,6 +67,21 @@ COMMON = {
 }
 
 
+def scoped_native_function(source, signature):
+    """Return one native function body without importing a GPU payload."""
+    start = source.index(signature)
+    opening_brace = source.index("{", start)
+    depth = 0
+    for offset in range(opening_brace, len(source)):
+        if source[offset] == "{":
+            depth += 1
+        elif source[offset] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : offset + 1]
+    raise AssertionError(f"unclosed native function: {signature}")
+
+
 def synthetic_completion(case="graph-both"):
     """Host protocol fixture, explicitly not native execution evidence."""
     config = {
@@ -117,6 +132,14 @@ def synthetic_completion(case="graph-both"):
 
 
 class ExecutionGateSourceTest(unittest.TestCase):
+    def assert_source_order(self, source, *snippets):
+        """Check an ordered source contract with helpful missing-snippet output."""
+        offset = 0
+        for snippet in snippets:
+            next_offset = source.find(snippet, offset)
+            self.assertNotEqual(next_offset, -1, snippet)
+            offset = next_offset + len(snippet)
+
     def test_every_outer_export_enters_once_before_other_work(self):
         for backend, filename in (
             ("cuda", "precision_launcher.cu"),
@@ -157,6 +180,70 @@ class ExecutionGateSourceTest(unittest.TestCase):
                 # updated, and reject any direct export-to-export call.
                 all_references = re.findall(r"\b(gafime_gpu_\w+)\s*\(", source)
                 self.assertCountEqual(all_references, [match[2] for match in exports])
+
+    def test_native_metadata_snapshots_precede_caller_writes(self):
+        """Keep accepted ABI metadata private before native diagnostic/result writes."""
+        cuda = (ROOT / "src/cuda/precision_launcher.cu").read_text()
+        rocm = (ROOT / "src/rocm/launcher.hip").read_text()
+        metal = (ROOT / "src/metal/launcher.mm").read_text()
+
+        with self.subTest(writer="metal_diagnostics"):
+            body = scoped_native_function(
+                metal, "static int metal_interaction_diagnostics_shared("
+            )
+            self.assert_source_order(
+                body,
+                "const int validation_status = validate_interaction_diagnostic_batch(",
+                "if (validation_status != GAFIME_STATUS_OK) {",
+                "return validation_status;",
+                "GafimeInteractionDiagnosticBatch diagnostic = *diagnostics;",
+                "diagnostics = &diagnostic;",
+                "std::fill_n(diagnostics->overflow_row_counts, diagnostic_row_count, 0ull);",
+            )
+
+        with self.subTest(writer="cuda_diagnostics"):
+            body = scoped_native_function(
+                cuda, "int precision_interaction_diagnostics("
+            )
+            self.assert_source_order(
+                body,
+                "if (arity == 0) return GAFIME_STATUS_INVALID_ARGUMENT;",
+                "GafimeInteractionDiagnosticBatch diagnostic = *diagnostics;",
+                "diagnostics = &diagnostic;",
+                "if (combo_overlaps_output) {",
+                "saved_combo_indices.assign(",
+                "std::fill_n(\n        diagnostics->overflow_row_counts,",
+            )
+
+        with self.subTest(writer="rocm_diagnostics"):
+            validation = scoped_native_function(
+                rocm, "int validate_precision_interaction_diagnostics("
+            )
+            self.assertNotIn("std::fill_n(", validation)
+            body = scoped_native_function(
+                rocm, "int precision_interaction_diagnostics_typed("
+            )
+            self.assert_source_order(
+                body,
+                "int status = validate_precision_interaction_diagnostics(matrix, diagnostics, &scan_plan);",
+                "if (status != GAFIME_STATUS_OK) return status;",
+                "GafimeInteractionDiagnosticBatch diagnostic = *diagnostics;",
+                "diagnostics = &diagnostic;",
+                "std::fill_n(\n        diagnostics->overflow_row_counts,",
+                "std::fill_n(\n        diagnostics->flags,",
+                "if (scan_plan.output_rows.empty()) return GAFIME_STATUS_OK;",
+            )
+
+        with self.subTest(writer="cuda_permutation"):
+            body = scoped_native_function(cuda, "int permutation_precision(")
+            self.assert_source_order(
+                body,
+                "status = validate_precision_significance<Storage, Result>(base, matrix, significance, total_rows);",
+                "if (status != GAFIME_STATUS_OK) return status;",
+                "SignificanceTable significance_snapshot = *significance;",
+                "significance = &significance_snapshot;",
+                "significance->p_values[index] =",
+            )
 
     def test_header_is_in_payload_source_distribution(self):
         stage = (ROOT / ".github/scripts/stage_gpu_payload.py").read_text()

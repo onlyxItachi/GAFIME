@@ -710,7 +710,7 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     assert "publish_pypi_core" in rocm
     assert "gafime_rocm-*.tar.gz" in rocm
     assert "gafime_rocm-*.whl" not in rocm
-    assert publish.count("release_bundle.py verify") >= 5
+    assert publish.count("release_bundle.py verify") >= 8
     assert (
         publish.count("ref: ${{ needs.publication_preflight.outputs.source_sha }}") == 7
     )
@@ -722,6 +722,28 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     public_core_cuda = publish.split("\n  verify_public_core_and_cuda:\n", 1)[1].split(
         "\n  verify_public_windows_arm_core:\n", 1
     )[0]
+    public_windows_arm = publish.split("\n  verify_public_windows_arm_core:\n", 1)[
+        1
+    ].split("\n  verify_public_rocm_install:\n", 1)[0]
+    public_rocm = publish.split("\n  verify_public_rocm_install:\n", 1)[1].split(
+        "\n  publish_github_release:\n", 1
+    )[0]
+    for public_job in (public_core_cuda, public_windows_arm, public_rocm):
+        assert "actions/download-artifact" in public_job
+        assert "name: release-bundle" in public_job
+        assert "run-id: ${{ inputs.build_run_id }}" in public_job
+        assert "release_bundle.py verify" in public_job
+        assert "check_pypi_artifact_collisions.py" in public_job
+        assert public_job.find("release_bundle.py verify") < public_job.find(
+            "check_pypi_artifact_collisions.py"
+        )
+    assert (
+        "pip download --no-cache-dir --only-binary=:all: --no-deps" in public_core_cuda
+    )
+    assert "--require-complete-published" in public_core_cuda
+    assert (
+        'pip install --no-cache-dir --no-deps "$receipt_dir"/*.whl' in public_core_cuda
+    )
     assert "Provision pinned CUDA runtime prerequisite (Linux)" in public_core_cuda
     assert "runner.os == 'Linux' && matrix.platform.cuda == true" in public_core_cuda
     assert "CUDA_CUDART_LINUX_SHA256" in public_core_cuda
@@ -743,9 +765,6 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     windows_arm_validator = build.split("\n  validate_windows_arm_wheel:\n", 1)[
         1
     ].split("\n  validate_cuda_payload_wheels:\n", 1)[0]
-    public_windows_arm = publish.split("\n  verify_public_windows_arm_core:\n", 1)[
-        1
-    ].split("\n  verify_public_rocm_install:\n", 1)[0]
     for job in (windows_arm_validator, public_windows_arm):
         assert "cp310-win_arm64" in job
         assert 'python-version: "3.11"' in job
@@ -756,8 +775,46 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     assert "CIBW_BUILD: ${{ env.CIBW_BUILD }}" in windows_arm_builder
     assert "--identifier cp310-win_arm64" in windows_arm_builder
     assert "CIBW_TEST_COMMAND:" in windows_arm_builder
+    assert (
+        "pip download --no-cache-dir --only-binary=:all: --no-deps"
+        in public_windows_arm
+    )
+    assert "--receipt-project gafime" in public_windows_arm
+    assert "--download-sdist-project gafime-rocm" in public_rocm
+    assert '"$receipt_dir"/*.whl "$receipt_dir"/*.tar.gz' in public_rocm
     assert "python .github/scripts/stage_metal_payload.py" in build
     assert "gafime_metal-*.whl" not in build + publish
+
+
+def test_build_workflow_requires_hosted_windows_receipt_and_path_policy_evidence():
+    build = (ROOT / ".github" / "workflows" / "build_wheels.yml").read_text(
+        encoding="utf-8"
+    )
+    receipt_test = (ROOT / "tests" / "python" / "test_release_bundle.py").read_text(
+        encoding="utf-8"
+    )
+
+    receipt_job = build.split("\n  verify_windows_release_receipts:\n", 1)[1].split(
+        "\n  build_arm_linux_wheels:\n", 1
+    )[0]
+    freeze = build.split("\n  freeze_release_bundle:\n", 1)[1]
+    for runner, architecture in (
+        ("windows-2025-vs2026", "x64"),
+        ("windows-11-arm", "arm64"),
+    ):
+        assert f"- os: {runner}" in receipt_job
+        assert f"architecture: {architecture}" in receipt_job
+    assert "python-version: '3.11'" in receipt_job
+    assert "fsutil.exe 8dot3name query" in receipt_job
+    assert "test_release_bundle.py" in receipt_job
+    assert "test_release_archive_member_safety.py" in receipt_job
+    assert "- verify_windows_release_receipts" in freeze
+
+    receipt_test_compact = " ".join(receipt_test.split())
+    assert 'for autocrlf in ("false", "true")' in receipt_test_compact
+    assert '"git", "clone", "--no-checkout", "--no-local"' in receipt_test_compact
+    assert '"git", "config", "core.autocrlf", autocrlf' in receipt_test_compact
+    assert "--fixture-receipt" in receipt_test_compact
 
 
 def test_publish_workflow_keeps_adversarial_dispatch_values_out_of_shell_source():
@@ -774,7 +831,7 @@ def test_publish_workflow_keeps_adversarial_dispatch_values_out_of_shell_source(
         assert not any(expression in script for script in run_scripts)
     assert publish.count("BUILD_RUN_ID: ${{ inputs.build_run_id }}") >= 1
     assert publish.count("RELEASE_TAG: ${{ inputs.release_tag }}") >= 1
-    assert publish.count('--run-id "$BUILD_RUN_ID"') == 5
+    assert publish.count('--run-id "$BUILD_RUN_ID"') >= 7
     assert publish.count('--github-ref "refs/tags/$RELEASE_TAG"') == 2
     assert 'tag_ref="refs/tags/$RELEASE_TAG"' in publish
     assert 'git check-ref-format "$tag_ref"' in publish

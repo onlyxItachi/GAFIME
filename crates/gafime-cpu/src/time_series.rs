@@ -200,26 +200,110 @@ pub fn time_series_columns_precision(
     windows: &[u32],
     velocity: bool,
 ) -> OrchestratorResult<(CpuPrecisionValues, Vec<TimeSeriesFeature>)> {
+    time_series_columns_precision_bounded(
+        profile,
+        columns,
+        rows,
+        cols,
+        lags,
+        windows,
+        velocity,
+        usize::MAX,
+    )
+}
+
+/// Generate only the first `limit` columns in normal source and transform order.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bounded precision lane retains the same input and transform contract"
+)]
+pub fn time_series_columns_precision_bounded(
+    profile: PrecisionProfile,
+    columns: CpuPrecisionSlice<'_>,
+    rows: usize,
+    cols: usize,
+    lags: &[u32],
+    windows: &[u32],
+    velocity: bool,
+    limit: usize,
+) -> OrchestratorResult<(CpuPrecisionValues, Vec<TimeSeriesFeature>)> {
     match (profile, columns) {
         (PrecisionProfile::Fp32, CpuPrecisionSlice::F32(columns)) => {
             let (values, descriptors) =
-                time_series_columns_f32(columns, rows, cols, lags, windows, velocity);
+                time_series_columns_f32(columns, rows, cols, lags, windows, velocity, limit);
             Ok((CpuPrecisionValues::F32(values), descriptors))
         }
         (PrecisionProfile::Mixed, CpuPrecisionSlice::F32(columns)) => {
             let (values, descriptors) =
-                time_series_columns_mixed(columns, rows, cols, lags, windows, velocity);
+                time_series_columns_mixed(columns, rows, cols, lags, windows, velocity, limit);
             Ok((CpuPrecisionValues::F32(values), descriptors))
         }
         (PrecisionProfile::Fp64, CpuPrecisionSlice::F64(columns)) => {
             let (values, descriptors) =
-                time_series_columns_f64(columns, rows, cols, lags, windows, velocity);
+                time_series_columns_f64(columns, rows, cols, lags, windows, velocity, limit);
             Ok((CpuPrecisionValues::F64(values), descriptors))
         }
         _ => Err(OrchestratorError::InvalidPlan(
             "time-series storage dtype does not match the requested precision profile",
         )),
     }
+}
+
+struct TimeSeriesOutput<T> {
+    values: Vec<T>,
+    descriptors: Vec<TimeSeriesFeature>,
+    limit: usize,
+    rows: usize,
+    fill: T,
+}
+
+impl<T: Copy> TimeSeriesOutput<T> {
+    fn new(limit: usize, rows: usize, fill: T) -> Self {
+        Self {
+            values: Vec::new(),
+            descriptors: Vec::new(),
+            limit,
+            rows,
+            fill,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.descriptors.len() == self.limit
+    }
+
+    fn append(&mut self, base: u32, ops: &[TimeSeriesOp]) -> std::slice::ChunksMut<'_, T> {
+        let count = ops.len().min(self.limit - self.descriptors.len());
+        let start = self.values.len();
+        self.values.resize(start + self.rows * count, self.fill);
+        self.descriptors
+            .extend(ops[..count].iter().map(|&op| TimeSeriesFeature {
+                base_feature: base,
+                op,
+            }));
+        self.values[start..].chunks_mut(self.rows)
+    }
+
+    fn into_parts(self) -> (Vec<T>, Vec<TimeSeriesFeature>) {
+        (self.values, self.descriptors)
+    }
+}
+
+fn lag_operations(lag: u32, rows: usize, velocity: bool) -> ([TimeSeriesOp; 4], usize) {
+    let ops = [
+        TimeSeriesOp::Lag(lag),
+        TimeSeriesOp::Delta(lag),
+        TimeSeriesOp::Velocity(lag),
+        TimeSeriesOp::Acceleration(lag),
+    ];
+    let count = if !velocity {
+        1
+    } else if (lag as usize).saturating_mul(2) < rows {
+        4
+    } else {
+        3
+    };
+    (ops, count)
 }
 
 fn time_series_columns_f32(
@@ -229,31 +313,37 @@ fn time_series_columns_f32(
     lags: &[u32],
     windows: &[u32],
     velocity: bool,
+    limit: usize,
 ) -> (Vec<f32>, Vec<TimeSeriesFeature>) {
-    let mut out = Vec::new();
-    let mut descriptors = Vec::new();
-    if rows == 0 || cols == 0 {
-        return (out, descriptors);
+    let mut output = TimeSeriesOutput::new(limit, rows, f32::NAN);
+    if rows == 0 {
+        return output.into_parts();
     }
     for base in 0..cols {
+        if output.is_full() {
+            break;
+        }
         let col = &columns[base * rows..(base + 1) * rows];
-        emit_lag_columns_f32(
-            col,
-            rows,
-            base as u32,
-            lags,
-            velocity,
-            &mut out,
-            &mut descriptors,
-        );
+        emit_lag_columns_f32(col, base as u32, lags, velocity, &mut output);
         for &window in windows {
+            if output.is_full() {
+                break;
+            }
             let w = window as usize;
             if w < 2 || w > rows {
                 continue;
             }
-            let mut mean = vec![f32::NAN; rows];
-            let mut std = vec![f32::NAN; rows];
-            let mut sum_out = vec![f32::NAN; rows];
+            let mut columns = output.append(
+                base as u32,
+                &[
+                    TimeSeriesOp::RollingMean(window),
+                    TimeSeriesOp::RollingStd(window),
+                    TimeSeriesOp::RollingSum(window),
+                ],
+            );
+            let mean = columns.next().expect("at least one column fits");
+            let mut std = columns.next();
+            let mut sum_out = columns.next();
             let mut sum = 0.0f32;
             let mut sum2 = 0.0f32;
             let mut invalid = 0usize;
@@ -276,26 +366,21 @@ fn time_series_columns_f32(
                 }
                 if t + 1 >= w && invalid == 0 {
                     let current_mean = sum / w as f32;
-                    let variance = finalize_rolling_variance_f32(
-                        sum2 / w as f32 - current_mean * current_mean,
-                    );
                     mean[t] = current_mean;
-                    std[t] = variance.sqrt();
-                    sum_out[t] = sum;
+                    if let Some(std) = &mut std {
+                        let variance = finalize_rolling_variance_f32(
+                            sum2 / w as f32 - current_mean * current_mean,
+                        );
+                        std[t] = variance.sqrt();
+                    }
+                    if let Some(sum_out) = &mut sum_out {
+                        sum_out[t] = sum;
+                    }
                 }
             }
-            emit_rolling_columns(
-                base as u32,
-                window,
-                mean,
-                std,
-                sum_out,
-                &mut out,
-                &mut descriptors,
-            );
         }
     }
-    (out, descriptors)
+    output.into_parts()
 }
 
 fn time_series_columns_mixed(
@@ -305,32 +390,38 @@ fn time_series_columns_mixed(
     lags: &[u32],
     windows: &[u32],
     velocity: bool,
+    limit: usize,
 ) -> (Vec<f32>, Vec<TimeSeriesFeature>) {
-    let mut out = Vec::new();
-    let mut descriptors = Vec::new();
-    if rows == 0 || cols == 0 {
-        return (out, descriptors);
+    let mut output = TimeSeriesOutput::new(limit, rows, f32::NAN);
+    if rows == 0 {
+        return output.into_parts();
     }
     for base in 0..cols {
+        if output.is_full() {
+            break;
+        }
         let col = &columns[base * rows..(base + 1) * rows];
         // These are pointwise f32 transforms and remain byte-for-byte f32.
-        emit_lag_columns_f32(
-            col,
-            rows,
-            base as u32,
-            lags,
-            velocity,
-            &mut out,
-            &mut descriptors,
-        );
+        emit_lag_columns_f32(col, base as u32, lags, velocity, &mut output);
         for &window in windows {
+            if output.is_full() {
+                break;
+            }
             let w = window as usize;
             if w < 2 || w > rows {
                 continue;
             }
-            let mut mean = vec![f32::NAN; rows];
-            let mut std = vec![f32::NAN; rows];
-            let mut sum_out = vec![f32::NAN; rows];
+            let mut columns = output.append(
+                base as u32,
+                &[
+                    TimeSeriesOp::RollingMean(window),
+                    TimeSeriesOp::RollingStd(window),
+                    TimeSeriesOp::RollingSum(window),
+                ],
+            );
+            let mean = columns.next().expect("at least one column fits");
+            let mut std = columns.next();
+            let mut sum_out = columns.next();
             let mut sum = 0.0f64;
             let mut sum2 = 0.0f64;
             let mut invalid = 0usize;
@@ -355,27 +446,21 @@ fn time_series_columns_mixed(
                 }
                 if t + 1 >= w && invalid == 0 {
                     let current_mean = sum / w as f64;
-                    let variance = finalize_rolling_variance_f64(
-                        sum2 / w as f64 - current_mean * current_mean,
-                    );
-                    // Generated storage is a materialized f32 feature in mixed.
                     mean[t] = current_mean as f32;
-                    std[t] = variance.sqrt() as f32;
-                    sum_out[t] = sum as f32;
+                    if let Some(std) = &mut std {
+                        let variance = finalize_rolling_variance_f64(
+                            sum2 / w as f64 - current_mean * current_mean,
+                        );
+                        std[t] = variance.sqrt() as f32;
+                    }
+                    if let Some(sum_out) = &mut sum_out {
+                        sum_out[t] = sum as f32;
+                    }
                 }
             }
-            emit_rolling_columns(
-                base as u32,
-                window,
-                mean,
-                std,
-                sum_out,
-                &mut out,
-                &mut descriptors,
-            );
         }
     }
-    (out, descriptors)
+    output.into_parts()
 }
 
 fn time_series_columns_f64(
@@ -385,31 +470,37 @@ fn time_series_columns_f64(
     lags: &[u32],
     windows: &[u32],
     velocity: bool,
+    limit: usize,
 ) -> (Vec<f64>, Vec<TimeSeriesFeature>) {
-    let mut out = Vec::new();
-    let mut descriptors = Vec::new();
-    if rows == 0 || cols == 0 {
-        return (out, descriptors);
+    let mut output = TimeSeriesOutput::new(limit, rows, f64::NAN);
+    if rows == 0 {
+        return output.into_parts();
     }
     for base in 0..cols {
+        if output.is_full() {
+            break;
+        }
         let col = &columns[base * rows..(base + 1) * rows];
-        emit_lag_columns_f64(
-            col,
-            rows,
-            base as u32,
-            lags,
-            velocity,
-            &mut out,
-            &mut descriptors,
-        );
+        emit_lag_columns_f64(col, base as u32, lags, velocity, &mut output);
         for &window in windows {
+            if output.is_full() {
+                break;
+            }
             let w = window as usize;
             if w < 2 || w > rows {
                 continue;
             }
-            let mut mean = vec![f64::NAN; rows];
-            let mut std = vec![f64::NAN; rows];
-            let mut sum_out = vec![f64::NAN; rows];
+            let mut columns = output.append(
+                base as u32,
+                &[
+                    TimeSeriesOp::RollingMean(window),
+                    TimeSeriesOp::RollingStd(window),
+                    TimeSeriesOp::RollingSum(window),
+                ],
+            );
+            let mean = columns.next().expect("at least one column fits");
+            let mut std = columns.next();
+            let mut sum_out = columns.next();
             let mut sum = 0.0f64;
             let mut sum2 = 0.0f64;
             let mut invalid = 0usize;
@@ -432,85 +523,59 @@ fn time_series_columns_f64(
                 }
                 if t + 1 >= w && invalid == 0 {
                     let current_mean = sum / w as f64;
-                    let variance = finalize_rolling_variance_f64(
-                        sum2 / w as f64 - current_mean * current_mean,
-                    );
                     mean[t] = current_mean;
-                    std[t] = variance.sqrt();
-                    sum_out[t] = sum;
+                    if let Some(std) = &mut std {
+                        let variance = finalize_rolling_variance_f64(
+                            sum2 / w as f64 - current_mean * current_mean,
+                        );
+                        std[t] = variance.sqrt();
+                    }
+                    if let Some(sum_out) = &mut sum_out {
+                        sum_out[t] = sum;
+                    }
                 }
             }
-            out.extend_from_slice(&mean);
-            descriptors.push(TimeSeriesFeature {
-                base_feature: base as u32,
-                op: TimeSeriesOp::RollingMean(window),
-            });
-            out.extend_from_slice(&std);
-            descriptors.push(TimeSeriesFeature {
-                base_feature: base as u32,
-                op: TimeSeriesOp::RollingStd(window),
-            });
-            out.extend_from_slice(&sum_out);
-            descriptors.push(TimeSeriesFeature {
-                base_feature: base as u32,
-                op: TimeSeriesOp::RollingSum(window),
-            });
         }
     }
-    (out, descriptors)
+    output.into_parts()
 }
 
 fn emit_lag_columns_f32(
     col: &[f32],
-    rows: usize,
     base: u32,
     lags: &[u32],
     velocity: bool,
-    out: &mut Vec<f32>,
-    descriptors: &mut Vec<TimeSeriesFeature>,
+    output: &mut TimeSeriesOutput<f32>,
 ) {
+    let rows = col.len();
     for &lag in lags {
+        if output.is_full() {
+            break;
+        }
         let k = lag as usize;
         if k == 0 || k >= rows {
             continue;
         }
-        let mut lag_feature = vec![f32::NAN; rows];
+        let (ops, count) = lag_operations(lag, rows, velocity);
+        let mut columns = output.append(base, &ops[..count]);
+        let lag_feature = columns.next().expect("at least one column fits");
         lag_feature[k..].copy_from_slice(&col[..rows - k]);
-        out.extend_from_slice(&lag_feature);
-        descriptors.push(TimeSeriesFeature {
-            base_feature: base,
-            op: TimeSeriesOp::Lag(lag),
-        });
-        if velocity {
-            let mut delta = vec![f32::NAN; rows];
-            let mut velocity_values = vec![f32::NAN; rows];
+        if let Some(delta) = columns.next() {
+            let mut velocity_values = columns.next();
             let scale = k as f32;
             for t in k..rows {
-                delta[t] = col[t] - col[t - k];
-                velocity_values[t] = delta[t] / scale;
+                let value = col[t] - col[t - k];
+                delta[t] = value;
+                if let Some(velocity_values) = &mut velocity_values {
+                    velocity_values[t] = value / scale;
+                }
             }
-            out.extend_from_slice(&delta);
-            descriptors.push(TimeSeriesFeature {
-                base_feature: base,
-                op: TimeSeriesOp::Delta(lag),
-            });
-            out.extend_from_slice(&velocity_values);
-            descriptors.push(TimeSeriesFeature {
-                base_feature: base,
-                op: TimeSeriesOp::Velocity(lag),
-            });
-            let two_k = k.saturating_mul(2);
-            if two_k < rows {
-                let mut acceleration = vec![f32::NAN; rows];
-                let scale2 = (k * k) as f32;
+            if let Some(acceleration) = columns.next() {
+                let two_k = k * 2;
+                let scale2 = (u64::from(lag) * u64::from(lag)) as f32;
                 for t in two_k..rows {
                     acceleration[t] = (col[t] - 2.0 * col[t - k] + col[t - two_k]) / scale2;
                 }
-                out.extend_from_slice(&acceleration);
-                descriptors.push(TimeSeriesFeature {
-                    base_feature: base,
-                    op: TimeSeriesOp::Acceleration(lag),
-                });
             }
         }
     }
@@ -518,84 +583,43 @@ fn emit_lag_columns_f32(
 
 fn emit_lag_columns_f64(
     col: &[f64],
-    rows: usize,
     base: u32,
     lags: &[u32],
     velocity: bool,
-    out: &mut Vec<f64>,
-    descriptors: &mut Vec<TimeSeriesFeature>,
+    output: &mut TimeSeriesOutput<f64>,
 ) {
+    let rows = col.len();
     for &lag in lags {
+        if output.is_full() {
+            break;
+        }
         let k = lag as usize;
         if k == 0 || k >= rows {
             continue;
         }
-        let mut lag_feature = vec![f64::NAN; rows];
+        let (ops, count) = lag_operations(lag, rows, velocity);
+        let mut columns = output.append(base, &ops[..count]);
+        let lag_feature = columns.next().expect("at least one column fits");
         lag_feature[k..].copy_from_slice(&col[..rows - k]);
-        out.extend_from_slice(&lag_feature);
-        descriptors.push(TimeSeriesFeature {
-            base_feature: base,
-            op: TimeSeriesOp::Lag(lag),
-        });
-        if velocity {
-            let mut delta = vec![f64::NAN; rows];
-            let mut velocity_values = vec![f64::NAN; rows];
+        if let Some(delta) = columns.next() {
+            let mut velocity_values = columns.next();
             let scale = k as f64;
             for t in k..rows {
-                delta[t] = col[t] - col[t - k];
-                velocity_values[t] = delta[t] / scale;
+                let value = col[t] - col[t - k];
+                delta[t] = value;
+                if let Some(velocity_values) = &mut velocity_values {
+                    velocity_values[t] = value / scale;
+                }
             }
-            out.extend_from_slice(&delta);
-            descriptors.push(TimeSeriesFeature {
-                base_feature: base,
-                op: TimeSeriesOp::Delta(lag),
-            });
-            out.extend_from_slice(&velocity_values);
-            descriptors.push(TimeSeriesFeature {
-                base_feature: base,
-                op: TimeSeriesOp::Velocity(lag),
-            });
-            let two_k = k.saturating_mul(2);
-            if two_k < rows {
-                let mut acceleration = vec![f64::NAN; rows];
-                let scale2 = (k * k) as f64;
+            if let Some(acceleration) = columns.next() {
+                let two_k = k * 2;
+                let scale2 = (u64::from(lag) * u64::from(lag)) as f64;
                 for t in two_k..rows {
                     acceleration[t] = (col[t] - 2.0 * col[t - k] + col[t - two_k]) / scale2;
                 }
-                out.extend_from_slice(&acceleration);
-                descriptors.push(TimeSeriesFeature {
-                    base_feature: base,
-                    op: TimeSeriesOp::Acceleration(lag),
-                });
             }
         }
     }
-}
-
-fn emit_rolling_columns(
-    base: u32,
-    window: u32,
-    mean: Vec<f32>,
-    std: Vec<f32>,
-    sum: Vec<f32>,
-    out: &mut Vec<f32>,
-    descriptors: &mut Vec<TimeSeriesFeature>,
-) {
-    out.extend_from_slice(&mean);
-    descriptors.push(TimeSeriesFeature {
-        base_feature: base,
-        op: TimeSeriesOp::RollingMean(window),
-    });
-    out.extend_from_slice(&std);
-    descriptors.push(TimeSeriesFeature {
-        base_feature: base,
-        op: TimeSeriesOp::RollingStd(window),
-    });
-    out.extend_from_slice(&sum);
-    descriptors.push(TimeSeriesFeature {
-        base_feature: base,
-        op: TimeSeriesOp::RollingSum(window),
-    });
 }
 
 /// Expand a row-major feature matrix in place-of-mining: the time-series columns
@@ -654,6 +678,73 @@ pub fn feature_label(base_name: &str, op: TimeSeriesOp) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_time_series_generates_the_exact_prefix_at_each_cutoff() {
+        let rows = 5;
+        let columns_f32 = [
+            16_777_216.0f32,
+            1.0,
+            -16_777_216.0,
+            2.0,
+            f32::NAN,
+            1.0,
+            3.0,
+            2.0,
+            5.0,
+            8.0,
+        ];
+        let columns_f64 = columns_f32.map(f64::from);
+        let lags = [0, 1, 3, 5];
+        let windows = [1, 3, 6, 2];
+
+        for profile in [
+            PrecisionProfile::Fp32,
+            PrecisionProfile::Mixed,
+            PrecisionProfile::Fp64,
+        ] {
+            let input = match profile {
+                PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                    CpuPrecisionSlice::F32(&columns_f32)
+                }
+                PrecisionProfile::Fp64 => CpuPrecisionSlice::F64(&columns_f64),
+            };
+            for velocity in [false, true] {
+                let (full, all_descriptors) = time_series_columns_precision(
+                    profile, input, rows, 2, &lags, &windows, velocity,
+                )
+                .unwrap();
+                assert_eq!(all_descriptors.len(), if velocity { 26 } else { 16 });
+
+                for limit in 0..=all_descriptors.len() + 1 {
+                    let (capped, descriptors) = time_series_columns_precision_bounded(
+                        profile, input, rows, 2, &lags, &windows, velocity, limit,
+                    )
+                    .unwrap();
+                    let expected_count = limit.min(all_descriptors.len());
+                    assert_eq!(descriptors, all_descriptors[..expected_count]);
+                    let expected_values = expected_count * rows;
+                    match (capped, &full) {
+                        (CpuPrecisionValues::F32(capped), CpuPrecisionValues::F32(full)) => {
+                            assert_eq!(capped.len(), expected_values);
+                            assert!(capped
+                                .iter()
+                                .zip(full)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()));
+                        }
+                        (CpuPrecisionValues::F64(capped), CpuPrecisionValues::F64(full)) => {
+                            assert_eq!(capped.len(), expected_values);
+                            assert!(capped
+                                .iter()
+                                .zip(full)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()));
+                        }
+                        _ => panic!("bounded generation must retain the precision storage type"),
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn precision_time_series_keeps_profile_storage_and_reduction_contracts() {

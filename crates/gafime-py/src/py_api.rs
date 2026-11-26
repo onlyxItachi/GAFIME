@@ -659,7 +659,10 @@ pub(crate) fn analyze_continuous_cpu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use arrow::{
         array::{ArrayRef, Float32Array, StructArray},
@@ -676,16 +679,20 @@ mod tests {
     fn convenience_arrow_import_passes_schema_request_and_keeps_single_batch_policy() {
         Python::initialize();
         Python::attach(|py| {
-            for batch_count in 0..3 {
+            for batch_count in [0, 1, 2, 4] {
                 let batch = RecordBatch::try_from_iter(vec![(
                     "x",
                     Arc::new(Float32Array::from(vec![1.0, 2.0])) as ArrayRef,
                 )])
                 .unwrap();
-                let batches = (0..batch_count)
-                    .map(|_| Ok(batch.clone()))
-                    .collect::<Vec<_>>();
-                let source = RecordBatchIterator::new(batches.into_iter(), batch.schema());
+                let batches_read = Arc::new(AtomicUsize::new(0));
+                let observed_reads = Arc::clone(&batches_read);
+                let schema = batch.schema();
+                let batches = (0..batch_count).map(move |_| {
+                    observed_reads.fetch_add(1, Ordering::Relaxed);
+                    Ok(batch.clone())
+                });
+                let source = RecordBatchIterator::new(batches, schema);
                 let capsule = PyCapsule::new(
                     py,
                     FFI_ArrowArrayStream::new(Box::new(source)),
@@ -702,6 +709,7 @@ mod tests {
                 .unwrap();
                 let source = scope.get_item("source").unwrap().unwrap();
                 let result = import_arrow_struct(&source);
+                assert_eq!(batches_read.load(Ordering::Relaxed), batch_count.min(2));
                 if batch_count == 1 {
                     assert_eq!(result.unwrap().len(), 2);
                 } else {
@@ -799,20 +807,18 @@ mod tests {
 /// route remains single-batch; callers should `.rechunk()` before ingest. The
 /// following layout conversion copies into independently owned row-major data.
 fn import_arrow_struct(obj: &Bound<'_, PyAny>) -> PyResult<StructArray> {
-    let reader = import_stream(obj)?;
-    let mut batches = Vec::new();
-    for batch in reader {
-        batches.push(batch.map_err(|err| PyValueError::new_err(format!("arrow batch: {err}")))?);
-    }
-    if batches.is_empty() {
-        return Err(PyValueError::new_err("empty Arrow stream"));
-    }
-    if batches.len() > 1 {
+    let mut reader = import_stream(obj)?;
+    let batch_error = |err| PyValueError::new_err(format!("arrow batch: {err}"));
+    let batch = reader
+        .next()
+        .ok_or_else(|| PyValueError::new_err("empty Arrow stream"))?
+        .map_err(batch_error)?;
+    if reader.next().transpose().map_err(batch_error)?.is_some() {
         return Err(PyValueError::new_err(
             "multi-chunk Arrow input; call .rechunk() before ingest",
         ));
     }
-    Ok(StructArray::from(batches.into_iter().next().unwrap()))
+    Ok(StructArray::from(batch))
 }
 
 /// Transpose an Arrow struct of Float32 columns into a row-major f32 buffer in

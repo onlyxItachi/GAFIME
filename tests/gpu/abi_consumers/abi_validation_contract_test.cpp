@@ -1,3 +1,4 @@
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -53,6 +54,51 @@ int expect(int actual, int expected, const char* label) {
     return 1;
 }
 
+int expect_host_write_span_contract() {
+    std::array<uint32_t, 8> storage{};
+    gafime_gpu_abi::HostWriteSpan output{};
+    gafime_gpu_abi::HostWriteSpan overlapping_input{};
+    gafime_gpu_abi::HostWriteSpan disjoint_input{};
+    gafime_gpu_abi::HostWriteSpan empty{};
+    int failed = 0;
+    failed |= expect(
+        gafime_gpu_abi::host_span(
+            storage.data() + 2, 3, sizeof(uint32_t), &output),
+        1,
+        "host output span");
+    failed |= expect(
+        gafime_gpu_abi::host_span(
+            storage.data() + 3, 2, sizeof(uint32_t), &overlapping_input),
+        1,
+        "host overlapping input span");
+    failed |= expect(
+        gafime_gpu_abi::host_span(
+            storage.data() + 6, 2, sizeof(uint32_t), &disjoint_input),
+        1,
+        "host disjoint input span");
+    failed |= expect(
+        gafime_gpu_abi::host_span(nullptr, 0, sizeof(uint32_t), &empty),
+        1,
+        "empty host span");
+    failed |= expect(
+        gafime_gpu_abi::host_span(nullptr, 1, sizeof(uint32_t), &empty),
+        0,
+        "nonempty host span requires storage");
+    failed |= expect(
+        gafime_gpu_abi::host_spans_overlap(output, overlapping_input),
+        1,
+        "overlapping host spans");
+    failed |= expect(
+        gafime_gpu_abi::host_spans_overlap(output, disjoint_input),
+        0,
+        "disjoint host spans");
+    failed |= expect(
+        gafime_gpu_abi::host_spans_overlap(output, empty),
+        0,
+        "empty host span does not overlap");
+    return failed;
+}
+
 int expect_short_buffer_headers_fail_before_payload_reads() {
 #if defined(__unix__)
     const long page_size = sysconf(_SC_PAGESIZE);
@@ -96,6 +142,7 @@ int expect_short_buffer_headers_fail_before_payload_reads() {
 int main() {
     float value = 1.0f;
     int failed = 0;
+    failed |= expect_host_write_span_contract();
     failed |= expect_short_buffer_headers_fail_before_payload_reads();
 
     GafimeConstBufferView prefix_const = const_view(&value, 1);

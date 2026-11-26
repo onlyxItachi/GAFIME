@@ -55,46 +55,47 @@ jobs:
       EXPECTED_CANDIDATE_SHA: ${{ github.event.inputs.expected_candidate_sha }}
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          fetch-depth: 0
-          ref: ${{ github.event.inputs.expected_candidate_sha }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: arm64
 
-      - name: Require exact live PR head before builds
+      - name: Prepare external benchmark paths
+        id: prepare_external_benchmark_paths
         shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          {
+            echo "METAL_RESULTS_DIR=$RUNNER_TEMP/gafime-metal-beast-results"
+            echo "METAL_WHEELHOUSE=$RUNNER_TEMP/gafime-metal-candidate-wheelhouse"
+            echo "METAL_BASELINE_WHEELHOUSE=$RUNNER_TEMP/gafime-metal-baseline-wheelhouse"
+            echo "METAL_BASELINE_SOURCE=$RUNNER_TEMP/gafime-metal-baseline-source"
+            echo "METAL_VENV=$RUNNER_TEMP/gafime-metal-candidate-venv"
+            echo "METAL_BASELINE_VENV=$RUNNER_TEMP/gafime-metal-baseline-venv"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/gafime-metal-beast-results"
+
+      - name: Require exact live PR head before candidate checkout
+        shell: bash
+        working-directory: ${{ runner.temp }}
         env:
           GITHUB_READ_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python - <<'PY'
+          # Keep candidate source outside Python's import path until GitHub
+          # confirms the repository-owned live PR head.
+          python -I - <<'PY'
           import json
           import os
           from pathlib import Path
           import re
-          import subprocess
           import urllib.request
 
           expected = os.environ["EXPECTED_CANDIDATE_SHA"]
           if re.fullmatch(r"[0-9a-f]{40}", expected) is None:
               raise SystemExit("expected_candidate_sha must be a full lowercase commit SHA")
-          checkout = subprocess.run(
-              ["git", "rev-parse", "HEAD"],
-              check=True,
-              capture_output=True,
-              text=True,
-          ).stdout.strip()
-          if checkout != expected:
-              raise SystemExit(
-                  f"checked-out candidate {checkout} does not match expected {expected}"
-              )
-          if subprocess.run(
-              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-              check=True,
-              capture_output=True,
-              text=True,
-          ).stdout:
-              raise SystemExit("candidate checkout is not clean before the build")
-
           repository = os.environ["GITHUB_REPOSITORY"]
           request = urllib.request.Request(
               f"{os.environ['GITHUB_API_URL']}/repos/{repository}/pulls/70",
@@ -127,37 +128,68 @@ jobs:
               "repository": repository,
               "branch": live_head["ref"],
               "expected_candidate_sha": expected,
-              "checkout_sha": checkout,
               "live_pr_head_sha": live_sha,
-              "status": "pass",
+              "pre_checkout_status": "pass",
           }
-          evidence_path = Path(os.environ["RUNNER_TEMP"]) / "gafime-pr70-exact-head.json"
+          evidence_path = Path(os.environ["METAL_RESULTS_DIR"]) / "exact-pr-head.json"
           evidence_path.write_text(
               json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
           )
           print(json.dumps(record, indent=2, sort_keys=True))
           PY
 
-      - name: Prepare external benchmark paths
-        shell: bash
-        run: |
-          {
-            echo "METAL_RESULTS_DIR=$RUNNER_TEMP/gafime-metal-beast-results"
-            echo "METAL_WHEELHOUSE=$RUNNER_TEMP/gafime-metal-candidate-wheelhouse"
-            echo "METAL_BASELINE_WHEELHOUSE=$RUNNER_TEMP/gafime-metal-baseline-wheelhouse"
-            echo "METAL_BASELINE_SOURCE=$RUNNER_TEMP/gafime-metal-baseline-source"
-            echo "METAL_VENV=$RUNNER_TEMP/gafime-metal-candidate-venv"
-            echo "METAL_BASELINE_VENV=$RUNNER_TEMP/gafime-metal-baseline-venv"
-          } >> "$GITHUB_ENV"
-          mkdir -p "$RUNNER_TEMP/gafime-metal-beast-results"
-          cp "$RUNNER_TEMP/gafime-pr70-exact-head.json" \
-            "$RUNNER_TEMP/gafime-metal-beast-results/exact-pr-head.json"
-
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          architecture: arm64
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.expected_candidate_sha }}
+
+      - name: Bind exact candidate checkout
+        id: bind_exact_candidate_checkout
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          python -I - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          expected = os.environ["EXPECTED_CANDIDATE_SHA"]
+          if re.fullmatch(r"[0-9a-f]{40}", expected) is None:
+              raise SystemExit("expected_candidate_sha must be a full lowercase commit SHA")
+          workspace = os.environ["GITHUB_WORKSPACE"]
+          checkout = subprocess.run(
+              ["git", "-C", workspace, "rev-parse", "HEAD"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.strip()
+          if checkout != expected:
+              raise SystemExit(
+                  f"checked-out candidate {checkout} does not match expected {expected}"
+              )
+          if subprocess.run(
+              ["git", "-C", workspace, "status", "--porcelain=v1", "--untracked-files=all"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout:
+              raise SystemExit("candidate checkout is not clean before the build")
+
+          evidence_path = Path(os.environ["METAL_RESULTS_DIR"]) / "exact-pr-head.json"
+          record = json.loads(evidence_path.read_text(encoding="utf-8"))
+          if record.get("expected_candidate_sha") != expected:
+              raise SystemExit("pre-checkout record does not bind the expected candidate")
+          record["checkout_sha"] = checkout
+          record["checkout_status"] = "pass"
+          record["status"] = "pass"
+          evidence_path.write_text(
+              json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(record, indent=2, sort_keys=True))
+          PY
 
       - name: Collect host specs JSON
         shell: bash
@@ -1293,11 +1325,12 @@ jobs:
           PY
 
       - name: Summarize benchmark
-        if: always()
+        if: always() && steps.bind_exact_candidate_checkout.outcome == 'success'
         shell: bash
+        working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          python - <<'PY'
+          python -I - <<'PY'
           import json
           import os
           from pathlib import Path
@@ -1446,11 +1479,12 @@ jobs:
           PY
 
       - name: Upload Metal beast artifacts
-        if: always()
+        if: always() && steps.prepare_external_benchmark_paths.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: metal-beast-${{ matrix.runner_label }}
           path: |
-            ${{ env.METAL_RESULTS_DIR }}/**
-            ${{ env.METAL_WHEELHOUSE }}/*.whl
-            ${{ env.METAL_BASELINE_WHEELHOUSE }}/*.whl
+            ${{ runner.temp }}/gafime-metal-beast-results/**
+            ${{ runner.temp }}/gafime-metal-candidate-wheelhouse/*.whl
+            ${{ runner.temp }}/gafime-metal-baseline-wheelhouse/*.whl
+          if-no-files-found: warn
