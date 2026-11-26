@@ -1,0 +1,163 @@
+{
+  "bundle": {
+    "artifact_id": 15136914727,
+    "build_run_id": 45857407051,
+    "expires_utc": "2026-12-26T16:46:10Z",
+    "freeze_job_id": 140053740538,
+    "manifest_sha256": "cb884fff37d2aaa7f23001fe9cdaae4fb40de31fdfd4af607ebf6fb434b04f58",
+    "provenance_schema_version": 3,
+    "provenance_sha256": "90f5d75527fbeb3c54b8704b1326f441b63d419731c991a83971f061e1373a9f",
+    "source_distributions": 3,
+    "sums_sha256": "6029a66850ff3c70f0c0193ed306678ede476c9fea7d0b904530b1e85a816eea",
+    "verified_checksum_entries": 44,
+    "wheels": 40,
+    "zip_sha256": "bcb6882f3e1a8c89feb7f956cee636d84faad7229d6cc87519e2e2072c0e8ada",
+    "zip_size": 94514300
+  },
+  "candidate": {
+    "branch": "release/v1.0.0",
+    "commit": "06d82a4082e96f0821abe0e323ea91f4c7ee6744",
+    "pr": 126,
+    "release_version": "1.0.0",
+    "repository": "onlyxItachi/GAFIME",
+    "tree": "1fd446e65ff6b2303e3d8b10e34e76c75ce6d216"
+  },
+  "local_validation": {
+    "bundle_provenance": "passed",
+    "dl_method_cpu": {
+      "compiled_session_fallbacks_observed": 2,
+      "status": "blocked_on_consumer_compatibility",
+      "tests_failed": 1,
+      "tests_passed": 46
+    },
+    "frozen_core_ingestion": {
+      "benchmark_exit_code": 0,
+      "budget_cell_failures": 0,
+      "budget_cells": 18,
+      "default_miss_hit_report_present": true,
+      "raw_receipts_sha256": {
+        "cost-verdict.json": "cac0fa0d065f1b335e8fb4d0fe3f5dcc33a262ef9ec940d3aefd0e38db3848d4",
+        "default/report.json": "c871bc542be285b6a9cfc9c4b7120a826b2603a07d5825221df7ef88290be327",
+        "parser/report.json": "5603f19fc26c5c7d2b9b073aeb3ac587d906bae228474283bf54e2636c330b25",
+        "reference/report.json": "36d4b9f4ac977af422941dbabaf191152d52d9801808aa6685c04b75bf2ee636"
+      },
+      "scope": "Exact frozen Core cp314 public-ingestion harness and reviewed same-host cost budget",
+      "status": "passed",
+      "verdict_status": "passed"
+    },
+    "full_composition": "passed",
+    "installed_core_and_cuda": {
+      "core_backend_comparisons": 18,
+      "core_backend_profile_cases": 6,
+      "cuda_binary_targets": [
+        "sm_75",
+        "sm_80",
+        "sm_86",
+        "sm_89",
+        "sm_90",
+        "sm_100",
+        "sm_120"
+      ],
+      "device": "NVIDIA GeForce RTX 4060 Laptop GPU (sm_89)",
+      "nvml_note": "nvidia-smi reported a driver/library mismatch; execution passed through the CUDA driver and runtime",
+      "payload_smoke_log_sha256": "81c30ab039e6ec8dacca657b524c1cd43d3d35ae938f7995793e5486bd5e98f2",
+      "precision_report_sha256": "db6506107dda355d2ce1885b33b0ee5e68902a60288a66e4273b2e21821a1a97",
+      "profiles": [
+        "fp32",
+        "mixed",
+        "fp64"
+      ],
+      "runtime": "libcudart.so.13.3.29; CUDA Driver API version 13050; kernel module 620.70.06",
+      "status": "passed",
+      "wheel_sha256": {
+        "gafime-1.0.0-cp314-cp314-manylinux_2_28_x86_64.whl": "16d0150135a000819ba7532cce46291d1073feb8bc7b7235c9f9ed421ae075ae",
+        "gafime_cuda-1.0.0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl": "f8e96c17b37ad7282bc46c7b89a027b0fcfff399fa57f7573018be13fc94f1cf"
+      }
+    },
+    "installed_core_and_rocm": {
+      "core_backend_comparisons": 18,
+      "core_backend_profile_cases": 6,
+      "device": "AMD Radeon 890M (gfx1150)",
+      "payload_smoke_log_sha256": "8110f49bcc6359ce975fe0ba95400d4c7581959c2461de52991dc786b42b0237",
+      "precision_report_sha256": "92dc371db016726d9a347b0a3fdb1102f8922ccb522aa2c6c0d515f29f2595b1",
+      "profiles": [
+        "fp32",
+        "mixed",
+        "fp64"
+      ],
+      "runtime": "ROCm 7.2.3",
+      "status": "passed",
+      "userspace_image_digest": "sha256:df924f7db5dfaa61ab8a0478f83c9e8eac403a5de50a3d298279a97f803a0eda",
+      "wheel_sha256": {
+        "gafime-1.0.0-cp314-cp314-manylinux_2_28_x86_64.whl": "16d0150135a000819ba7532cce46291d1073feb8bc7b7235c9f9ed421ae075ae",
+        "gafime_rocm-1.0.0-cp314-cp314-linux_x86_64.whl": "6d532d6b7fd9e6eabb135f1c6569c19f72f0706738ac56b167b1640e9937146f"
+      }
+    }
+  },
+  "official_ci": [
+    {
+      "conclusion": "success",
+      "passed_jobs": 5,
+      "run_id": 45857407105,
+      "workflow": "v1_contract_validation.yml"
+    },
+    {
+      "conclusion": "success",
+      "passed_jobs": 3,
+      "run_id": 45857406975,
+      "workflow": "native_platform_validation.yml"
+    },
+    {
+      "conclusion": "success",
+      "passed_jobs": 50,
+      "run_id": 45857407051,
+      "workflow": "build_wheels.yml"
+    }
+  ],
+  "publication_preflight": {
+    "final_tag": "absent",
+    "github_pypi_environment_review_and_v_tags": "verified",
+    "github_release": "absent",
+    "pypi_beta1_resolver_safety": "passed",
+    "pypi_filename_collisions": 0,
+    "pypi_new_filenames": 38,
+    "pypi_trusted_publisher_account_confirmation": "pending_signed_in_maintainer",
+    "release_tag_creation_ruleset": 22304413,
+    "release_tag_no_bypass_update_deletion_ruleset": 11866742
+  },
+  "recorded_utc": "2026-11-26T16:54:35.063773+00:00",
+  "remaining": [
+    "physical Blackwell Colab execution, numeric parity and performance evidence",
+    "DL Method consumer compatibility and GPU qualification",
+    "Stable resident Core production benchmark on approved runner and exact-head PR",
+    "distinct Stable whole-candidate exact-source security acceptance",
+    "account-side PyPI Trusted Publisher confirmation and separately approved final release actions"
+  ],
+  "security_review": {
+    "private_vulnerability_reporting_enabled": true,
+    "review_record_id": 6076996802,
+    "reviewed_commit": "2bc0f144b425dc8db0a0ec464c84169fc189c72d",
+    "reviewed_tree": "1fd446e65ff6b2303e3d8b10e34e76c75ce6d216",
+    "scoped_closed_findings": 12,
+    "stable_whole_candidate_security_acceptance": "open"
+  },
+  "windows_checks": {
+    "arm64": {
+      "job_id": 140039290097,
+      "runner_temp_short_names": "enabled",
+      "status": "passed"
+    },
+    "autocrlf_modes": [
+      false,
+      true
+    ],
+    "fixture_checksums_sha256": "e4c7ad2a57a92891d16c9dbb171b7c655fc3b77d89bb01c7884882cbd13fc0c7",
+    "fixture_manifest_sha256": "cb884fff37d2aaa7f23001fe9cdaae4fb40de31fdfd4af607ebf6fb434b04f58",
+    "fixture_provenance_sha256": "0d1cb5e129dc2c7c99fcf200de504e61e1d4a86db21243552433e82872d03cf4",
+    "x64": {
+      "job_id": 140039290145,
+      "runner_temp_short_names": "disabled",
+      "status": "passed"
+    }
+  }
+}
