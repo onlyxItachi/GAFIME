@@ -1,0 +1,3 @@
+# Frozen-bundle provenance binds this file's raw SHA-256 bytes.  Keep the
+# working-tree representation identical on every Git checkout platform.
+.github/release-artifacts.json text eol=lf

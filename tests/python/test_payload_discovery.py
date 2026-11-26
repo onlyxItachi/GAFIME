@@ -786,6 +786,37 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     assert "gafime_metal-*.whl" not in build + publish
 
 
+def test_build_workflow_requires_hosted_windows_receipt_and_path_policy_evidence():
+    build = (ROOT / ".github" / "workflows" / "build_wheels.yml").read_text(
+        encoding="utf-8"
+    )
+    receipt_test = (ROOT / "tests" / "python" / "test_release_bundle.py").read_text(
+        encoding="utf-8"
+    )
+
+    receipt_job = build.split("\n  verify_windows_release_receipts:\n", 1)[1].split(
+        "\n  build_arm_linux_wheels:\n", 1
+    )[0]
+    freeze = build.split("\n  freeze_release_bundle:\n", 1)[1]
+    for runner, architecture in (
+        ("windows-2025-vs2026", "x64"),
+        ("windows-11-arm", "arm64"),
+    ):
+        assert f"- os: {runner}" in receipt_job
+        assert f"architecture: {architecture}" in receipt_job
+    assert "python-version: '3.11'" in receipt_job
+    assert "fsutil.exe 8dot3name query" in receipt_job
+    assert "test_release_bundle.py" in receipt_job
+    assert "test_release_archive_member_safety.py" in receipt_job
+    assert "- verify_windows_release_receipts" in freeze
+
+    receipt_test_compact = " ".join(receipt_test.split())
+    assert 'for autocrlf in ("false", "true")' in receipt_test_compact
+    assert '"git", "clone", "--no-checkout", "--no-local"' in receipt_test_compact
+    assert '"git", "config", "core.autocrlf", autocrlf' in receipt_test_compact
+    assert "--fixture-receipt" in receipt_test_compact
+
+
 def test_publish_workflow_keeps_adversarial_dispatch_values_out_of_shell_source():
     publish = (ROOT / ".github" / "workflows" / "publish_release.yml").read_text(
         encoding="utf-8"

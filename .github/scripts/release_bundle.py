@@ -16,12 +16,13 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tests" / "release_measure"))
 
-from release_manifest import load_release_manifest, python_tag  # noqa: E402
+from release_manifest import ReleaseManifest, load_release_manifest, python_tag  # noqa: E402
 
 
 PROVENANCE_NAME = "release-bundle-provenance.json"
 CHECKSUMS_NAME = "SHA256SUMS"
 PACKAGE_SUFFIXES = (".whl", ".tar.gz")
+MANIFEST_RELATIVE_PATH = Path(".github/release-artifacts.json")
 SOURCE_SHA_RE = re.compile(r"[0-9a-f]{40,64}")
 RUN_ID_RE = re.compile(r"[1-9][0-9]*")
 REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -50,7 +51,13 @@ def _package_files(directory: Path) -> list[Path]:
 
 
 def _manifest_digest(root: Path) -> str:
-    return _sha256(root / ".github" / "release-artifacts.json")
+    manifest_bytes = (root / MANIFEST_RELATIVE_PATH).read_bytes()
+    if b"\r" in manifest_bytes:
+        raise ValueError(
+            "release manifest must use LF-only bytes; checkout .gitattributes "
+            "before freezing or verifying a bundle"
+        )
+    return hashlib.sha256(manifest_bytes).hexdigest()
 
 
 def _package_precision_contract(filename: str) -> dict[str, list[str]]:
@@ -85,9 +92,7 @@ def _package_precision_contract(filename: str) -> dict[str, list[str]]:
 
 def _validate_source_sha(label: str, source_sha: object) -> str:
     if not isinstance(source_sha, str) or SOURCE_SHA_RE.fullmatch(source_sha) is None:
-        raise ValueError(
-            f"{label} must be 40-64 lowercase hexadecimal characters"
-        )
+        raise ValueError(f"{label} must be 40-64 lowercase hexadecimal characters")
     return source_sha
 
 
@@ -211,14 +216,14 @@ def create(
         authoritative_source_sha=authoritative_source_sha,
     )
     provenance_path = directory / PROVENANCE_NAME
-    provenance_path.write_text(
-        json.dumps(provenance, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    provenance_path.write_bytes(
+        (json.dumps(provenance, indent=2, sort_keys=True) + "\n").encode("utf-8")
     )
     checksum_paths = [*_package_files(directory), provenance_path]
-    (directory / CHECKSUMS_NAME).write_text(
-        "".join(f"{_sha256(path)}  {path.name}\n" for path in checksum_paths),
-        encoding="utf-8",
+    (directory / CHECKSUMS_NAME).write_bytes(
+        "".join(f"{_sha256(path)}  {path.name}\n" for path in checksum_paths).encode(
+            "utf-8"
+        )
     )
 
 
@@ -252,9 +257,7 @@ def verify(
     requested_authoritative_source_sha = (
         _validate_source_sha("source SHA", source_sha)
         if source_sha is not None
-        else _validate_source_sha(
-            "authoritative source SHA", authoritative_source_sha
-        )
+        else _validate_source_sha("authoritative source SHA", authoritative_source_sha)
     )
     if requested_authoritative_source_sha != stored_authoritative_source_sha:
         raise ValueError(
@@ -303,6 +306,77 @@ def verify(
         )
 
 
+def _fixture_filenames(manifest: ReleaseManifest) -> list[str]:
+    """Return a deterministic ordinary fixture for bundle receipt checks."""
+
+    filenames = []
+    for distribution in manifest.standard_distributions:
+        filenames.append(f"{distribution.wheel_prefix}-1.0.0.tar.gz")
+        for wheel in distribution.wheels:
+            for version in wheel.python_versions:
+                filename = wheel.filename_template.format(
+                    python_tag=python_tag(version)
+                ).replace("*", "1.0.0")
+                filenames.append(filename)
+    if len(filenames) != manifest.standard_artifact_count or len(filenames) != len(
+        set(filenames)
+    ):
+        raise AssertionError("release-bundle fixture filename matrix is invalid")
+    return sorted(filenames)
+
+
+def _fixture_kwargs() -> dict[str, str | None]:
+    return {
+        "source_sha": None,
+        "built_source_sha": "a" * 40,
+        "authoritative_source_sha": "b" * 40,
+        "run_id": "12345",
+        "repository": "onlyxItachi/GAFIME",
+    }
+
+
+def _write_fixture_packages(directory: Path, filenames: list[str]) -> None:
+    for index, filename in enumerate(filenames):
+        (directory / filename).write_bytes(f"artifact-{index}".encode("ascii"))
+
+
+def fixture_receipt() -> None:
+    """Exercise a synthetic bundle and print its exact cross-platform receipt."""
+
+    manifest = load_release_manifest(ROOT)
+    package_count = manifest.standard_artifact_count
+    filenames = _fixture_filenames(manifest)
+    with tempfile.TemporaryDirectory(
+        prefix="gafime-release-bundle-receipt-"
+    ) as temporary:
+        directory = Path(temporary)
+        _write_fixture_packages(directory, filenames)
+        kwargs = _fixture_kwargs()
+        create(directory, **kwargs)
+        verify(directory, **kwargs)
+
+        provenance_path = directory / PROVENANCE_NAME
+        checksums_path = directory / CHECKSUMS_NAME
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        manifest_digest = _manifest_digest(ROOT)
+        if provenance.get("release_manifest_sha256") != manifest_digest:
+            raise AssertionError(
+                "fixture provenance did not retain the manifest digest"
+            )
+        if (
+            b"\r" in provenance_path.read_bytes()
+            or b"\r" in checksums_path.read_bytes()
+        ):
+            raise AssertionError("fixture receipts must use exact LF-only bytes")
+        print(
+            "RELEASE BUNDLE FIXTURE RECEIPT: PASS "
+            f"manifest_sha256={manifest_digest} "
+            f"provenance_sha256={_sha256(provenance_path)} "
+            f"sha256sums_sha256={_sha256(checksums_path)} "
+            f"packages={package_count}"
+        )
+
+
 def self_test() -> None:
     manifest = load_release_manifest(ROOT)
     package_count = manifest.standard_artifact_count
@@ -310,26 +384,9 @@ def self_test() -> None:
     frozen_file_count = package_count + 2
     with tempfile.TemporaryDirectory(prefix="gafime-release-bundle-") as temporary:
         directory = Path(temporary)
-        filenames = []
-        for distribution in manifest.standard_distributions:
-            filenames.append(f"{distribution.wheel_prefix}-1.0.0.tar.gz")
-            for wheel in distribution.wheels:
-                for version in wheel.python_versions:
-                    filename = wheel.filename_template.format(
-                        python_tag=python_tag(version)
-                    ).replace("*", "1.0.0")
-                    filenames.append(filename)
-        if len(filenames) != package_count or len(filenames) != len(set(filenames)):
-            raise AssertionError("release-bundle self-test filename matrix is invalid")
-        for index, filename in enumerate(sorted(filenames)):
-            (directory / filename).write_bytes(f"artifact-{index}".encode("ascii"))
-        kwargs = {
-            "source_sha": None,
-            "built_source_sha": "a" * 40,
-            "authoritative_source_sha": "b" * 40,
-            "run_id": "12345",
-            "repository": "onlyxItachi/GAFIME",
-        }
+        filenames = _fixture_filenames(manifest)
+        _write_fixture_packages(directory, filenames)
+        kwargs = _fixture_kwargs()
         create(directory, **kwargs)
         verify(directory, **kwargs)
         verify(
@@ -473,10 +530,20 @@ def main() -> None:
     parser.add_argument("--run-id")
     parser.add_argument("--repository")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--fixture-receipt",
+        action="store_true",
+        help="create and verify a deterministic synthetic bundle receipt",
+    )
     args = parser.parse_args()
 
+    if args.self_test and args.fixture_receipt:
+        parser.error("--self-test and --fixture-receipt are mutually exclusive")
     if args.self_test:
         self_test()
+        return
+    if args.fixture_receipt:
+        fixture_receipt()
         return
     if (
         args.mode is None

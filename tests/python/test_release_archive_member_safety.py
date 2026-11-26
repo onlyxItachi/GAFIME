@@ -4,6 +4,7 @@ import io
 from pathlib import Path
 import runpy
 import stat
+import sys
 import tarfile
 import warnings
 import zipfile
@@ -60,13 +61,21 @@ def _write_sdist(
     return path
 
 
-def _write_wheel(tmp_path: Path, members: list[tuple[zipfile.ZipInfo, bytes]]) -> Path:
-    path = tmp_path / "gafime-1.0.0-cp311-cp311-manylinux_2_28_x86_64.whl"
+def _write_wheel(
+    tmp_path: Path,
+    members: list[tuple[zipfile.ZipInfo, bytes]],
+    *,
+    platform: str = "manylinux_2_28_x86_64",
+) -> Path:
+    path = tmp_path / f"gafime-1.0.0-cp311-cp311-{platform}.whl"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         with zipfile.ZipFile(path, "w") as archive:
             archive.writestr("gafime-1.0.0.dist-info/METADATA", METADATA)
-            archive.writestr("gafime-1.0.0.dist-info/WHEEL", WHEEL)
+            archive.writestr(
+                "gafime-1.0.0.dist-info/WHEEL",
+                WHEEL.replace(b"manylinux_2_28_x86_64", platform.encode("ascii")),
+            )
             for info, data in members:
                 archive.writestr(info, data)
     return path
@@ -236,21 +245,83 @@ def test_release_gate_rejects_wheel_install_destination_aliases(
         read_release_wheel(wheel)
 
 
+@pytest.mark.parametrize("reverse", (False, True))
 def test_release_gate_rejects_wheel_file_parent_destination_alias(
-    tmp_path: Path,
+    tmp_path: Path, reverse: bool
 ) -> None:
-    wheel = _write_wheel(
-        tmp_path,
-        [
-            (zipfile.ZipInfo("gafime/native"), b"file\n"),
-            (zipfile.ZipInfo("gafime/native/detail.py"), b"child\n"),
-        ],
-    )
+    members = [
+        (zipfile.ZipInfo("gafime/native"), b"file\n"),
+        (zipfile.ZipInfo("gafime/native/detail.py"), b"child\n"),
+    ]
+    if reverse:
+        members.reverse()
 
     with pytest.raises(
         AssertionError, match="file/parent install-destination conflict"
     ):
+        read_release_wheel(_write_wheel(tmp_path, members))
+
+
+@pytest.mark.parametrize("platform", ("win_amd64", "win_arm64"))
+def test_release_gate_accepts_canonical_windows_wheel_paths(
+    tmp_path: Path, platform: str
+) -> None:
+    wheel = _write_wheel(
+        tmp_path,
+        [
+            (zipfile.ZipInfo("gafime/__init__.py"), b""),
+            (zipfile.ZipInfo("gafime/compile/flags.py"), b""),
+        ],
+        platform=platform,
+    )
+    assert "gafime/compile/flags.py" in read_release_wheel(wheel).members
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "gafime/extra.py",
+        "gafime/EXAMPL~1/extra.py",
+        "gafime/alternate/extra.py",
+        "gafime-1.0.0.data/purelib/gafime/compile/flags.py",
+        "GAFIME/compile/flags.py",
+    ),
+)
+def test_release_gate_rejects_unapproved_windows_wheel_paths(
+    tmp_path: Path, name: str
+) -> None:
+    wheel = _write_wheel(tmp_path, [(zipfile.ZipInfo(name), b"")], platform="win_amd64")
+    with pytest.raises(AssertionError, match="unapproved Windows wheel destination"):
         read_release_wheel(wheel)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires the Windows filesystem")
+@pytest.mark.parametrize(
+    "filenames",
+    (
+        (
+            "gafime-1.0.0-cp311-cp311-win_amd64.whl",
+            "gafime_cuda-1.0.0-cp311-cp311-win_amd64.whl",
+        ),
+        ("gafime-1.0.0-cp311-cp311-win_arm64.whl",),
+    ),
+)
+def test_approved_wheel_paths_are_distinct_on_windows(
+    tmp_path: Path, filenames: tuple[str, ...]
+) -> None:
+    files = []
+    directories = set()
+    for filename in filenames:
+        wheel_files, wheel_dirs = ARTIFACT_GATE["_windows_wheel_layout"](Path(filename))
+        files.extend(wheel_files)
+        directories.update(wheel_dirs)
+    for name in sorted(directories, key=lambda name: (name.count("/"), name)):
+        (tmp_path / name).mkdir()
+    for name in sorted(files):
+        with (tmp_path / name).open("xb") as destination:
+            destination.write(name.encode("ascii"))
+    for name in files:
+        assert (tmp_path / name).read_bytes() == name.encode("ascii")
 
 
 def test_release_gate_accepts_noncolliding_purelib_relocation(tmp_path: Path) -> None:

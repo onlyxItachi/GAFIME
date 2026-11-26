@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -70,7 +71,62 @@ ARCHIVE_MAX_MEMBER_BYTES = 48 * 1024 * 1024
 ARCHIVE_MAX_EXPANDED_BYTES = 64 * 1024 * 1024
 ARCHIVE_METADATA_BYTES = 1_000_000
 ARCHIVE_SCAN_CHUNK_BYTES = 64 * 1024
+# The retained wheels have at most 41 entries, a 53-byte filename, and a
+# 2,848-byte central directory. These bounds keep ZipFile from constructing
+# unbounded ZipInfo records before the per-member validator runs, while leaving
+# substantial room for ordinary release metadata and ZIP comments.
+ARCHIVE_MAX_ZIP_CENTRAL_DIRECTORY_BYTES = 128 * 1024
+ARCHIVE_MAX_ZIP_FILENAME_BYTES = 512
+ARCHIVE_MAX_ZIP_ENTRY_METADATA_BYTES = 4 * 1024
+# The retained sdists have at most 107 logical members. CUDA and ROCm use up to
+# 34 PAX records, each carrying only an mtime field; the generous limits below
+# preserve ordinary PAX paths and GNU long names while bounding metadata that
+# tarfile consumes before yielding a normal member.
+ARCHIVE_MAX_TAR_HEADER_RECORDS = 512
+ARCHIVE_MAX_TAR_SPECIAL_METADATA_RECORDS = 128
+ARCHIVE_MAX_TAR_CONSECUTIVE_SPECIAL_RECORDS = 4
+ARCHIVE_MAX_TAR_SPECIAL_METADATA_BYTES = 64 * 1024
+ARCHIVE_MAX_TAR_SPECIAL_METADATA_TOTAL_BYTES = 1 * 1024 * 1024
+ARCHIVE_MAX_TAR_PAX_FIELDS = 128
+ARCHIVE_MAX_TAR_PAX_FIELDS_TOTAL = 512
+ARCHIVE_MAX_TAR_PAX_FIELD_BYTES = 4 * 1024
 SUPPORTED_WHEEL_COMPRESSION = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
+
+_ZIP_CENTRAL_DIRECTORY_HEADER = struct.Struct("<4s4B4HL2L5H2L")
+_ZIP_LOCAL_FILE_HEADER = struct.Struct("<4s2B4HL2L2H")
+_ZIP_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x01\x02"
+_ZIP_LOCAL_FILE_HEADER_SIGNATURE = b"PK\x03\x04"
+_ZIP64_SENTINEL_16 = (1 << 16) - 1
+_ZIP64_SENTINEL_32 = (1 << 32) - 1
+_TAR_SPECIAL_METADATA_TYPES = frozenset(
+    {
+        tarfile.XHDTYPE,
+        tarfile.XGLTYPE,
+        tarfile.SOLARIS_XHDTYPE,
+        tarfile.GNUTYPE_LONGNAME,
+        tarfile.GNUTYPE_LONGLINK,
+    }
+)
+# ``tarfile`` applies only these standard keys (and stores ``comment``) before
+# ordinary member validation. A PAX ``size`` or GNU sparse key changes how it
+# advances through later members, so the verifier rejects those unsupported
+# forms before handing bytes to tarfile.
+_TAR_ALLOWED_PAX_KEYS = frozenset(
+    {
+        b"atime",
+        b"charset",
+        b"comment",
+        b"ctime",
+        b"gid",
+        b"gname",
+        b"hdrcharset",
+        b"linkpath",
+        b"mtime",
+        b"path",
+        b"uid",
+        b"uname",
+    }
+)
 CANONICAL_PRECISION_PROFILES = ("fp32", "mixed", "fp64")
 POLARS_V1_SPECIFIERS = frozenset({">=1.3", "<2"})
 POLARS_V1_SHELL_REQUIREMENT = re.compile(r"""(["'])polars>=1\.3,<2\1""")
@@ -386,6 +442,180 @@ def _assert_archive_compressed_limit(path: Path) -> None:
     )
 
 
+def _open_archive_size(path: Path, stream: BinaryIO) -> int:
+    """Get and bound the size of the already-opened archive descriptor."""
+    stream.seek(0, os.SEEK_END)
+    compressed_bytes = stream.tell()
+    _require(
+        compressed_bytes <= ARCHIVE_MAX_COMPRESSED_BYTES,
+        f"{path.name} compressed archive size {compressed_bytes} exceeds verifier "
+        f"limit {ARCHIVE_MAX_COMPRESSED_BYTES}",
+    )
+    return compressed_bytes
+
+
+def _read_exact_archive_bytes(
+    path: Path, stream: BinaryIO, size: int, context: str
+) -> bytes:
+    data = stream.read(size)
+    _require(
+        len(data) == size,
+        f"{path.name} has a truncated {context}",
+    )
+    return data
+
+
+def _assert_zip_local_header_metadata(
+    path: Path,
+    stream: BinaryIO,
+    *,
+    local_offset: int,
+    directory_start: int,
+) -> None:
+    _require(
+        0 <= local_offset <= directory_start - _ZIP_LOCAL_FILE_HEADER.size,
+        f"{path.name} has an out-of-range ZIP local header offset",
+    )
+    stream.seek(local_offset)
+    local_header = _ZIP_LOCAL_FILE_HEADER.unpack(
+        _read_exact_archive_bytes(
+            path,
+            stream,
+            _ZIP_LOCAL_FILE_HEADER.size,
+            "ZIP local file header",
+        )
+    )
+    _require(
+        local_header[0] == _ZIP_LOCAL_FILE_HEADER_SIGNATURE,
+        f"{path.name} has an invalid ZIP local file header",
+    )
+    filename_bytes, extra_bytes = local_header[10:12]
+    _require(
+        filename_bytes <= ARCHIVE_MAX_ZIP_FILENAME_BYTES
+        and filename_bytes + extra_bytes <= ARCHIVE_MAX_ZIP_ENTRY_METADATA_BYTES
+        and local_offset + _ZIP_LOCAL_FILE_HEADER.size + filename_bytes + extra_bytes
+        <= directory_start,
+        f"{path.name} has oversized ZIP local-header metadata",
+    )
+
+
+def _assert_wheel_metadata_admission(path: Path, stream: BinaryIO) -> None:
+    """Bound ZIP parser metadata before constructing any ``ZipInfo`` objects."""
+    archive_size = _open_archive_size(path, stream)
+    # Use the same bounded bootstrap ZipFile uses for EOCD/ZIP64 selection. It
+    # reads at most the standard EOCD tail plus fixed ZIP64 control records, but
+    # does not construct central-directory entries. This verifier supports the
+    # classic end record used by every retained wheel; rejecting archive-level
+    # ZIP64 keeps the location calculation identical on CPython 3.10 through
+    # 3.14, whose private ZIP64 location handling differs.
+    end_record = zipfile._EndRecData(stream)
+    _require(end_record is not None, f"{path.name} has no ZIP end record")
+    _require(
+        end_record[0] == b"PK\x05\x06",
+        f"{path.name} uses unsupported ZIP64 end-record metadata",
+    )
+    disk_number = end_record[1]
+    directory_disk_number = end_record[2]
+    entries_on_disk = end_record[3]
+    entries_total = end_record[4]
+    directory_bytes = end_record[5]
+    directory_offset = end_record[6]
+    _require(
+        disk_number == 0
+        and directory_disk_number == 0
+        and entries_on_disk == entries_total,
+        f"{path.name} must use a single-disk ZIP directory",
+    )
+    directory_start = end_record[9] - directory_bytes
+    prefix_bytes = directory_start - directory_offset
+    _require(
+        prefix_bytes >= 0
+        and 0 <= directory_start <= archive_size
+        and directory_bytes <= archive_size - directory_start,
+        f"{path.name} has an invalid ZIP central-directory range",
+    )
+    _require(
+        entries_total <= ARCHIVE_MAX_MEMBERS,
+        f"{path.name} has more than {ARCHIVE_MAX_MEMBERS} ZIP directory entries",
+    )
+    _require(
+        directory_bytes <= ARCHIVE_MAX_ZIP_CENTRAL_DIRECTORY_BYTES,
+        f"{path.name} ZIP central directory exceeds verifier metadata limit",
+    )
+    stream.seek(directory_start)
+    directory = _read_exact_archive_bytes(
+        path, stream, directory_bytes, "ZIP central directory"
+    )
+    cursor = 0
+    records = 0
+    while cursor < len(directory):
+        _require(
+            len(directory) - cursor >= _ZIP_CENTRAL_DIRECTORY_HEADER.size,
+            f"{path.name} has a truncated ZIP central-directory entry",
+        )
+        central_header = _ZIP_CENTRAL_DIRECTORY_HEADER.unpack_from(directory, cursor)
+        _require(
+            central_header[0] == _ZIP_CENTRAL_DIRECTORY_SIGNATURE,
+            f"{path.name} has an invalid ZIP central-directory entry",
+        )
+        _require(
+            central_header[6] in SUPPORTED_WHEEL_COMPRESSION,
+            f"{path.name} uses unsupported ZIP compression in its directory",
+        )
+        filename_bytes, extra_bytes, comment_bytes = central_header[12:15]
+        variable_bytes = filename_bytes + extra_bytes + comment_bytes
+        _require(
+            filename_bytes <= ARCHIVE_MAX_ZIP_FILENAME_BYTES
+            and variable_bytes <= ARCHIVE_MAX_ZIP_ENTRY_METADATA_BYTES
+            and variable_bytes
+            <= len(directory) - cursor - _ZIP_CENTRAL_DIRECTORY_HEADER.size,
+            f"{path.name} has oversized ZIP central-directory metadata",
+        )
+        _require(
+            central_header[18] != _ZIP64_SENTINEL_32
+            and central_header[15] != _ZIP64_SENTINEL_16,
+            f"{path.name} uses unsupported ZIP64 local-header metadata",
+        )
+        _assert_zip_local_header_metadata(
+            path,
+            stream,
+            local_offset=central_header[18] + prefix_bytes,
+            directory_start=directory_start,
+        )
+        cursor += _ZIP_CENTRAL_DIRECTORY_HEADER.size + variable_bytes
+        records += 1
+        _require(
+            records <= ARCHIVE_MAX_MEMBERS,
+            f"{path.name} has more than {ARCHIVE_MAX_MEMBERS} ZIP directory entries",
+        )
+    _require(
+        records == entries_total,
+        f"{path.name} ZIP directory entry count does not match its end record",
+    )
+
+
+@contextmanager
+def _open_bounded_wheel(path: Path) -> Iterator[zipfile.ZipFile]:
+    """Open a wheel only after bounded raw ZIP metadata admission."""
+    try:
+        with path.open("rb") as raw:
+            _assert_wheel_metadata_admission(path, raw)
+            raw.seek(0)
+            with zipfile.ZipFile(raw) as archive:
+                yield archive
+    except (
+        OSError,
+        RuntimeError,
+        UnicodeError,
+        ValueError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as error:
+        raise AssertionError(
+            f"unable to inspect bounded wheel {path.name}: {error}"
+        ) from error
+
+
 class _ArchiveBudget:
     """Bound archive directory traversal before content reads begin."""
 
@@ -429,8 +659,100 @@ def _wheel_install_destination(path: Path, name: str, *, directory: bool) -> str
     return "/".join(parts[2:])
 
 
-def _wheel_destination_key(path: Path, destination: str) -> str:
-    normalized = []
+# Windows release wheels ship these reviewed paths. Keep the set closed so an
+# unrecognized alternate name cannot address a file or directory under NTFS
+# short-name aliasing. The native extension tag and dist-info version are the
+# only generated parts of the layout.
+_WINDOWS_CORE_MODULES = (
+    "__init__.py",
+    "__main__.py",
+    "_payloads.py",
+    "_precision.py",
+    "_version.py",
+    "api.py",
+    "capabilities.py",
+    "cli.py",
+    "compile/__init__.py",
+    "compile/api.py",
+    "compile/artifact.py",
+    "compile/flags.py",
+    "config.py",
+    "dataloader.py",
+    "decision_path.py",
+    "errors.py",
+    "families.py",
+    "io.py",
+    "reporting/__init__.py",
+    "reporting/report.py",
+    "sklearn.py",
+    "subfunctions.py",
+    "telemetry.py",
+    "tutorial.py",
+    "v1_adapter.py",
+)
+
+
+def _windows_wheel_layout(path: Path) -> tuple[set[str], set[str]] | None:
+    fields = path.stem.rsplit("-", 3)
+    if len(fields) != 4 or not any(
+        tag == "win32" or tag.startswith("win_") for tag in fields[-1].split(".")
+    ):
+        return None
+    prefix, python_tag, abi_tag, platform = fields
+    project, _, version_and_build = prefix.partition("-")
+    version = version_and_build.partition("-")[0]
+    _require(
+        (project, platform)
+        in {
+            ("gafime", "win_amd64"),
+            ("gafime", "win_arm64"),
+            ("gafime_cuda", "win_amd64"),
+        }
+        and re.fullmatch(r"cp3[0-9]+", python_tag) is not None
+        and abi_tag == python_tag,
+        f"{path.name} does not match a supported Windows release wheel layout",
+    )
+    _require(
+        re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:(?:a|b|rc)[0-9]+)?", version)
+        is not None,
+        f"{path.name} has a non-canonical Windows wheel version",
+    )
+    dist_info = f"{project}-{version}.dist-info"
+    files = {
+        f"{dist_info}/{name}"
+        for name in ("METADATA", "WHEEL", "RECORD", "licenses/LICENSE")
+    }
+    if project == "gafime":
+        files.update(f"gafime/{module}" for module in _WINDOWS_CORE_MODULES)
+        files.update(
+            (
+                f"gafime/gafime_py.{python_tag}-{platform}.pyd",
+                f"{dist_info}/entry_points.txt",
+                f"{dist_info}/sboms/gafime-py.cyclonedx.json",
+            )
+        )
+    else:
+        files.update(
+            (
+                "gafime_cuda/__init__.py",
+                f"gafime_cuda/_native.{python_tag}-{platform}.pyd",
+                "gafime_cuda/build_policy.json",
+                "gafime_cuda/gafime_cuda.dll",
+                "gafime_cuda/gafime_cuda.exp",
+                "gafime_cuda/gafime_cuda.lib",
+                f"{dist_info}/top_level.txt",
+            )
+        )
+    directories = {
+        parent.as_posix()
+        for name in files
+        for parent in PurePosixPath(name).parents
+        if parent.parts
+    }
+    return files, directories
+
+
+def _wheel_destination_components(path: Path, destination: str) -> Iterable[str]:
     for part in destination.split("/"):
         portable_part = unicodedata.normalize("NFC", part.rstrip(" .").casefold())
         _require(
@@ -438,8 +760,36 @@ def _wheel_destination_key(path: Path, destination: str) -> str:
             f"{path.name} has an ambiguous empty portable install destination "
             f"component in {destination!r}",
         )
-        normalized.append(portable_part)
-    return "/".join(normalized)
+        yield portable_part
+
+
+class _WheelDestination:
+    def __init__(self) -> None:
+        self.children: dict[str, _WheelDestination] = {}
+        self.is_file = False
+
+    def add(self, path: Path, destination: str) -> None:
+        """Check each component once, irrespective of existing member count."""
+        conflict = (
+            f"{path.name} contains a file/parent install-destination conflict "
+            f"for {destination!r}"
+        )
+        node = self
+        for component in _wheel_destination_components(path, destination):
+            _require(not node.is_file, conflict)
+            # Avoid constructing a node for components already in the index.
+            child = node.children.get(component)
+            if child is None:
+                child = _WheelDestination()
+                node.children[component] = child
+            node = child
+        _require(
+            not node.is_file,
+            f"{path.name} contains archive members with the same install destination "
+            f"{destination!r}",
+        )
+        _require(not node.children, conflict)
+        node.is_file = True
 
 
 def _validated_wheel_members(
@@ -449,7 +799,8 @@ def _validated_wheel_members(
     members: dict[str, zipfile.ZipInfo] = {}
     installed_members: set[str] = set()
     member_sources: dict[str, str] = {}
-    destinations: dict[str, str] = {}
+    destinations = _WheelDestination()
+    windows_layout = _windows_wheel_layout(path)
     budget = _ArchiveBudget(path)
     for info in archive.infolist():
         _require(
@@ -483,29 +834,17 @@ def _validated_wheel_members(
             f"{path.name} contains duplicate archive member {name!r}",
         )
         members[name] = info
+        if windows_layout is not None:
+            files, directories = windows_layout
+            _require(
+                name in (directories if is_directory else files),
+                f"{path.name} has an unapproved Windows wheel destination {name!r}",
+            )
         destination = _wheel_install_destination(path, name, directory=is_directory)
         installed_members.add(destination)
         if is_directory:
             continue
-        destination_key = _wheel_destination_key(path, destination)
-        _require(
-            destination_key not in destinations,
-            f"{path.name} contains archive members with the same install destination "
-            f"{destination!r}",
-        )
-        parents = destination_key.split("/")
-        _require(
-            not any(
-                "/".join(parents[:index]) in destinations
-                for index in range(1, len(parents))
-            )
-            and not any(
-                existing.startswith(f"{destination_key}/") for existing in destinations
-            ),
-            f"{path.name} contains a file/parent install-destination conflict for "
-            f"{destination!r}",
-        )
-        destinations[destination_key] = destination
+        destinations.add(path, destination)
         member_sources[destination] = name
     return members, frozenset(installed_members), member_sources
 
@@ -619,6 +958,186 @@ class _BoundedArchiveReader:
         return True
 
 
+def _tar_header_payload_size(path: Path, header: bytes) -> int:
+    """Decode the standard octal or GNU base-256 TAR size field safely."""
+    try:
+        payload_size = tarfile.nti(header[124:136])
+    except (ValueError, OverflowError) as error:
+        raise AssertionError(f"{path.name} has an invalid TAR header size") from error
+    _require(
+        0 <= payload_size <= ARCHIVE_MAX_MEMBER_BYTES,
+        f"{path.name} TAR header size exceeds verifier member limit",
+    )
+    return payload_size
+
+
+def _assert_pax_metadata_admission(path: Path, payload: bytes) -> int:
+    """Bound PAX framing before tarfile decodes or applies its fields."""
+    offset = 0
+    fields = 0
+    numeric_keys = frozenset({b"atime", b"ctime", b"gid", b"mtime", b"uid"})
+    while offset < len(payload):
+        if payload[offset] == 0:
+            _require(
+                not any(payload[offset:]),
+                f"{path.name} has non-padding bytes after PAX metadata",
+            )
+            break
+        separator = payload.find(b" ", offset)
+        _require(separator >= 0, f"{path.name} has invalid PAX metadata framing")
+        length_text = payload[offset:separator]
+        _require(
+            1 <= len(length_text) <= 10 and length_text.isdigit(),
+            f"{path.name} has invalid PAX metadata length",
+        )
+        record_length = int(length_text)
+        record_end = offset + record_length
+        _require(
+            5 <= record_length <= len(payload) - offset
+            and payload[record_end - 1] == ord("\n"),
+            f"{path.name} has invalid PAX metadata record",
+        )
+        keyword, equals, value = payload[separator + 1 : record_end - 1].partition(b"=")
+        _require(
+            bool(keyword)
+            and equals == b"="
+            and len(keyword) <= 128
+            and len(value) <= ARCHIVE_MAX_TAR_PAX_FIELD_BYTES,
+            f"{path.name} has oversized PAX metadata field",
+        )
+        _require(
+            not keyword.startswith(b"GNU.sparse"),
+            f"{path.name} uses unsupported GNU sparse PAX metadata",
+        )
+        _require(
+            keyword != b"size" and keyword in _TAR_ALLOWED_PAX_KEYS,
+            f"{path.name} uses unsupported PAX metadata key {keyword!r}",
+        )
+        _require(
+            keyword not in numeric_keys or len(value) <= 64,
+            f"{path.name} has an oversized numeric PAX metadata field",
+        )
+        fields += 1
+        _require(
+            fields <= ARCHIVE_MAX_TAR_PAX_FIELDS,
+            f"{path.name} has too many PAX metadata fields",
+        )
+        offset = record_end
+    return fields
+
+
+def _assert_tar_metadata_admission(
+    path: Path,
+    stream: _BoundedArchiveReader,
+    expanded_bytes: int,
+) -> None:
+    """Walk raw TAR records before tarfile processes extension metadata."""
+    offset = 0
+    headers = 0
+    logical_members = 0
+    special_records = 0
+    consecutive_special_records = 0
+    special_extent_bytes = 0
+    pax_fields = 0
+    while offset < expanded_bytes:
+        _require(
+            expanded_bytes - offset >= tarfile.BLOCKSIZE,
+            f"{path.name} has a truncated TAR header block",
+        )
+        stream.seek(offset)
+        header = _read_exact_archive_bytes(
+            path, stream, tarfile.BLOCKSIZE, "TAR header block"
+        )
+        if not any(header):
+            return
+        headers += 1
+        _require(
+            headers <= ARCHIVE_MAX_TAR_HEADER_RECORDS,
+            f"{path.name} has more than {ARCHIVE_MAX_TAR_HEADER_RECORDS} TAR headers",
+        )
+        payload_size = _tar_header_payload_size(path, header)
+        member_type = header[156:157]
+        _require(
+            member_type != tarfile.GNUTYPE_SPARSE,
+            f"{path.name} uses unsupported GNU sparse TAR metadata",
+        )
+        if member_type not in _TAR_SPECIAL_METADATA_TYPES:
+            try:
+                member = tarfile.TarInfo.frombuf(
+                    header,
+                    tarfile.ENCODING,
+                    "surrogateescape",
+                )
+            except (tarfile.HeaderError, UnicodeError, ValueError) as error:
+                raise AssertionError(
+                    f"{path.name} has an invalid TAR header"
+                ) from error
+            _require(
+                member.isfile() or member.isdir(),
+                f"{path.name} archive members must be regular files or directories: "
+                f"{member.name!r}",
+            )
+            _require(
+                not member.isdir() or payload_size == 0,
+                f"{path.name} archive members must be regular files or directories: "
+                f"{member.name!r}",
+            )
+        padded_payload_size = (
+            (payload_size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE
+        ) * tarfile.BLOCKSIZE
+        next_offset = offset + tarfile.BLOCKSIZE + padded_payload_size
+        _require(
+            next_offset <= expanded_bytes,
+            f"{path.name} has a truncated TAR member payload",
+        )
+        if member_type in _TAR_SPECIAL_METADATA_TYPES:
+            special_records += 1
+            consecutive_special_records += 1
+            # tarfile's PAX/GNU extension handlers read ``_block(size)``, not
+            # merely the declared payload. Admit and inspect that exact padded
+            # extent before the parser can materialize it.
+            special_extent_bytes += padded_payload_size
+            _require(
+                special_records <= ARCHIVE_MAX_TAR_SPECIAL_METADATA_RECORDS
+                and consecutive_special_records
+                <= ARCHIVE_MAX_TAR_CONSECUTIVE_SPECIAL_RECORDS
+                and padded_payload_size <= ARCHIVE_MAX_TAR_SPECIAL_METADATA_BYTES
+                and special_extent_bytes
+                <= ARCHIVE_MAX_TAR_SPECIAL_METADATA_TOTAL_BYTES,
+                f"{path.name} has excessive TAR extension metadata",
+            )
+            stream.seek(offset + tarfile.BLOCKSIZE)
+            padded_payload = _read_exact_archive_bytes(
+                path,
+                stream,
+                padded_payload_size,
+                "TAR extension metadata",
+            )
+            payload = padded_payload[:payload_size]
+            _require(
+                not any(padded_payload[payload_size:]),
+                f"{path.name} has nonzero TAR extension metadata padding",
+            )
+            if member_type in {
+                tarfile.XHDTYPE,
+                tarfile.XGLTYPE,
+                tarfile.SOLARIS_XHDTYPE,
+            }:
+                pax_fields += _assert_pax_metadata_admission(path, payload)
+                _require(
+                    pax_fields <= ARCHIVE_MAX_TAR_PAX_FIELDS_TOTAL,
+                    f"{path.name} has too many PAX metadata fields",
+                )
+        else:
+            consecutive_special_records = 0
+            logical_members += 1
+            _require(
+                logical_members <= ARCHIVE_MAX_MEMBERS,
+                f"{path.name} has more than {ARCHIVE_MAX_MEMBERS} archive members",
+            )
+        offset = next_offset
+
+
 def _read_zip_member(
     path: Path,
     archive: zipfile.ZipFile,
@@ -670,25 +1189,35 @@ def _open_bounded_sdist(path: Path) -> Iterator[tarfile.TarFile]:
     headers. Counting the complete decompressed stream first therefore bounds
     those hidden records, padding, and trailers as well as ordinary files.
     """
-    _assert_archive_compressed_limit(path)
     try:
-        with path.open("rb") as raw, gzip.GzipFile(fileobj=raw, mode="rb") as source:
-            with tempfile.SpooledTemporaryFile(
-                max_size=ARCHIVE_SCAN_CHUNK_BYTES, mode="w+b"
-            ) as expanded:
-                expanded_bytes = 0
-                for chunk in _iter_bounded_chunks(
-                    source,
-                    path,
-                    "gzip stream",
-                    maximum=ARCHIVE_MAX_EXPANDED_BYTES,
-                ):
-                    expanded.write(chunk)
-                    expanded_bytes += len(chunk)
-                expanded.seek(0)
-                bounded_expanded = _BoundedArchiveReader(expanded, expanded_bytes, path)
-                with tarfile.open(fileobj=bounded_expanded, mode="r:") as archive:
-                    yield archive
+        with path.open("rb") as raw:
+            _open_archive_size(path, raw)
+            raw.seek(0)
+            with gzip.GzipFile(fileobj=raw, mode="rb") as source:
+                with tempfile.SpooledTemporaryFile(
+                    max_size=ARCHIVE_SCAN_CHUNK_BYTES, mode="w+b"
+                ) as expanded:
+                    expanded_bytes = 0
+                    for chunk in _iter_bounded_chunks(
+                        source,
+                        path,
+                        "gzip stream",
+                        maximum=ARCHIVE_MAX_EXPANDED_BYTES,
+                    ):
+                        expanded.write(chunk)
+                        expanded_bytes += len(chunk)
+                    expanded.seek(0)
+                    bounded_expanded = _BoundedArchiveReader(
+                        expanded, expanded_bytes, path
+                    )
+                    _assert_tar_metadata_admission(
+                        path,
+                        bounded_expanded,
+                        expanded_bytes,
+                    )
+                    bounded_expanded.seek(0)
+                    with tarfile.open(fileobj=bounded_expanded, mode="r:") as archive:
+                        yield archive
     except (OSError, EOFError, gzip.BadGzipFile, tarfile.TarError) as error:
         raise AssertionError(
             f"unable to inspect bounded sdist {path.name}: {error}"
@@ -1273,7 +1802,7 @@ def _read_wheel(path: Path) -> Artifact:
     if filename_distribution == "gafime-rocm":
         _assert_rocm_wheel_compressed_admission(path)
     _assert_archive_compressed_limit(path)
-    with zipfile.ZipFile(path) as archive:
+    with _open_bounded_wheel(path) as archive:
         member_infos, members, member_sources = _validated_wheel_members(path, archive)
         archive_members = frozenset(member_infos)
         _assert_rocm_wheel_admission(
@@ -1835,7 +2364,7 @@ def _assert_cuda_system_wheel(artifact: Artifact) -> None:
         else "gafime_cuda/gafime_cuda.dll"
     )
     _assert_archive_compressed_limit(artifact.path)
-    with zipfile.ZipFile(artifact.path) as archive:
+    with _open_bounded_wheel(artifact.path) as archive:
         _member_infos, installed_members, member_sources = _validated_wheel_members(
             artifact.path, archive
         )
@@ -2036,7 +2565,7 @@ def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, objec
     )
 
     _assert_archive_compressed_limit(artifact.path)
-    with zipfile.ZipFile(artifact.path) as archive:
+    with _open_bounded_wheel(artifact.path) as archive:
         member_infos, installed_members, member_sources = _validated_wheel_members(
             artifact.path, archive
         )
@@ -2230,7 +2759,7 @@ def _assert_core_wheel(artifact: Artifact) -> None:
             f"{artifact.path.name} bundled Metal files {sorted(packaged_metal)} != "
             f"{sorted(metal_members)}",
         )
-        with zipfile.ZipFile(artifact.path) as archive:
+        with _open_bounded_wheel(artifact.path) as archive:
             _assert_native_precision_abi(
                 archive,
                 artifact,
@@ -2267,7 +2796,7 @@ def _assert_payload_wheel(artifact: Artifact, expected_distribution: str) -> Non
         "payload artifacts; "
         f"found {native_members}",
     )
-    with zipfile.ZipFile(artifact.path) as archive:
+    with _open_bounded_wheel(artifact.path) as archive:
         backend = _payload_identity(expected_distribution)[0]
         _assert_native_precision_abi(archive, artifact, native_members[0], backend)
     other_packages = {
