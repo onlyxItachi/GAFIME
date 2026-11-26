@@ -63,6 +63,45 @@ inline bool fits_host_bytes(uint64_t element_count, size_t element_size) {
         element_count <= static_cast<uint64_t>(std::numeric_limits<size_t>::max() / element_size);
 }
 
+// A validated native ABI can still describe caller-owned input and output
+// storage that aliases.  Writers use these checked half-open spans to retain
+// input descriptors only when a later store could clobber them.  This is a
+// host-side implementation aid; it neither changes an ABI layout nor makes an
+// inaccessible caller pointer valid.
+struct HostWriteSpan {
+    uintptr_t begin;
+    uintptr_t bytes;
+};
+
+inline bool host_span(
+    const void* pointer,
+    uint64_t element_count,
+    uint64_t element_width,
+    HostWriteSpan* span_out
+) {
+    if (span_out == nullptr || element_width == 0 ||
+        (element_count != 0 && pointer == nullptr)) {
+        return false;
+    }
+    uint64_t byte_count = 0;
+    if (element_count != 0 &&
+        element_width > std::numeric_limits<uint64_t>::max() / element_count) {
+        return false;
+    }
+    byte_count = element_count * element_width;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(pointer);
+    if (byte_count > std::numeric_limits<uintptr_t>::max() - begin) {
+        return false;
+    }
+    *span_out = {begin, static_cast<uintptr_t>(byte_count)};
+    return true;
+}
+
+inline bool host_spans_overlap(const HostWriteSpan& lhs, const HostWriteSpan& rhs) {
+    return lhs.bytes != 0 && rhs.bytes != 0 &&
+        lhs.begin < rhs.begin + rhs.bytes && rhs.begin < lhs.begin + lhs.bytes;
+}
+
 template <typename T>
 inline bool naturally_aligned(const T* pointer) {
     return pointer == nullptr ||

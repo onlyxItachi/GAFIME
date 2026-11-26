@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -1952,7 +1953,7 @@ bool precision_all_finite_host(const StorageT* values, uint64_t length) {
 // shared typed owner keeps this optional path correct for every route.
 int validate_precision_interaction_diagnostics(
     const PrecisionHipMatrix* matrix,
-    GafimeInteractionDiagnosticBatch* diagnostics,
+    const GafimeInteractionDiagnosticBatch* diagnostics,
     InteractionDiagnosticScanPlan* scan_plan
 ) {
     if (matrix == nullptr || diagnostics == nullptr || scan_plan == nullptr) {
@@ -2020,12 +2021,6 @@ int validate_precision_interaction_diagnostics(
             scan_plan->combo_indices.end(), combo, combo + diagnostics->max_arity);
         scan_plan->output_rows.push_back(row);
     }
-    std::fill_n(
-        diagnostics->overflow_row_counts,
-        static_cast<size_t>(diagnostics->row_count),
-        uint64_t{0});
-    std::fill_n(
-        diagnostics->flags, static_cast<size_t>(diagnostics->row_count), uint32_t{0});
     return GAFIME_STATUS_OK;
 }
 
@@ -2034,14 +2029,26 @@ int precision_interaction_diagnostics_typed(
     PrecisionHipMatrix* matrix,
     GafimeInteractionDiagnosticBatch* diagnostics
 ) try {
-    if (matrix == nullptr || !matrix->content_valid) {
+    if (matrix == nullptr || !matrix->content_valid || diagnostics == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     InteractionDiagnosticScanPlan scan_plan;
     int status = validate_precision_interaction_diagnostics(matrix, diagnostics, &scan_plan);
-    if (status != GAFIME_STATUS_OK || scan_plan.output_rows.empty()) {
-        return status;
-    }
+    if (status != GAFIME_STATUS_OK) return status;
+    if (diagnostics->row_count == 0) return GAFIME_STATUS_OK;
+    // Validation is intentionally read-only. Freeze the accepted legacy
+    // descriptor before clearing caller-owned results; scan_plan already owns
+    // every combo index needed below, so no extra copy is needed on the
+    // ordinary path or when input/output spans overlap.
+    GafimeInteractionDiagnosticBatch diagnostic = *diagnostics;
+    diagnostics = &diagnostic;
+    std::fill_n(
+        diagnostics->overflow_row_counts,
+        static_cast<size_t>(diagnostics->row_count),
+        uint64_t{0});
+    std::fill_n(
+        diagnostics->flags, static_cast<size_t>(diagnostics->row_count), uint32_t{0});
+    if (scan_plan.output_rows.empty()) return GAFIME_STATUS_OK;
     if (scan_plan.output_rows.size() > std::numeric_limits<unsigned int>::max()) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
@@ -2852,6 +2859,60 @@ int precision_write_result_rows(
     const std::vector<ResultT>& metric_values,
     const std::vector<uint32_t>* selected_indices
 ) {
+    // The sink is a private metadata snapshot, but chunk and descriptor spans
+    // remain caller-owned through the launch protocol. Freeze that header and
+    // retain only a descriptor range that an output scatter can overwrite.
+    // Disjoint Rust-owned tables stay on the allocation-free path.
+    GafimeLaunchProtocol source = *protocol;
+    const uint64_t output_rows = selected_indices == nullptr
+        ? precision_planned_row_count(&source)
+        : static_cast<uint64_t>(selected_indices->size());
+    if (output_rows > result->capacity) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    std::array<gafime_gpu_abi::HostWriteSpan, 6> writes{};
+    uint64_t combo_count = 0;
+    uint64_t metric_value_count = 0;
+    if (!checked_mul_u64(output_rows, result->max_arity, &combo_count) ||
+        !checked_mul_u64(output_rows, result->metric_count, &metric_value_count) ||
+        !gafime_gpu_abi::host_span(
+            result->combo_indices, combo_count, sizeof(uint32_t), &writes[0]) ||
+        !gafime_gpu_abi::host_span(
+            result->metric_values, metric_value_count, sizeof(ResultT), &writes[1]) ||
+        !gafime_gpu_abi::host_span(result->ranks, output_rows, sizeof(uint32_t), &writes[2]) ||
+        !gafime_gpu_abi::host_span(result->families, output_rows, sizeof(uint32_t), &writes[3]) ||
+        !gafime_gpu_abi::host_span(
+            result->candidate_ids, output_rows, sizeof(uint64_t), &writes[4]) ||
+        !gafime_gpu_abi::host_span(
+            result->row_flags, output_rows, sizeof(uint32_t), &writes[5])) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    gafime_gpu_abi::HostWriteSpan chunk_span{};
+    gafime_gpu_abi::HostWriteSpan descriptor_span{};
+    if (!gafime_gpu_abi::host_span(
+            source.chunks, source.chunk_count, sizeof(GafimeArityChunk), &chunk_span) ||
+        !gafime_gpu_abi::host_span(
+            source.combo_indices.ptr, source.combo_indices.len, sizeof(uint32_t), &descriptor_span)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    const auto overlaps_output = [&](const gafime_gpu_abi::HostWriteSpan& input) {
+        return std::any_of(writes.begin(), writes.end(), [&](const auto& output) {
+            return gafime_gpu_abi::host_spans_overlap(input, output);
+        });
+    };
+    std::vector<GafimeArityChunk> saved_chunks;
+    std::vector<uint32_t> saved_combo_indices;
+    if (overlaps_output(chunk_span)) {
+        saved_chunks.assign(source.chunks, source.chunks + source.chunk_count);
+        source.chunks = saved_chunks.data();
+    }
+    if (overlaps_output(descriptor_span)) {
+        saved_combo_indices.assign(
+            source.combo_indices.ptr,
+            source.combo_indices.ptr + source.combo_indices.len);
+        source.combo_indices.ptr = saved_combo_indices.data();
+    }
+    protocol = &source;
     if (selected_indices != nullptr) {
         for (uint64_t output_row = 0; output_row < selected_indices->size(); ++output_row) {
             const uint64_t candidate_id = (*selected_indices)[output_row];
@@ -4169,21 +4230,30 @@ GAFIME_GPU_API int gafime_gpu_execute(
     if (status != GAFIME_STATUS_OK) return status;
     status = require_valid_matrix_content(matrix);
     if (status != GAFIME_STATUS_OK) return status;
+    // The frozen table remains caller-owned. Capture all validated metadata
+    // before dispatch so result stores cannot change a later destination or
+    // control field; commit only the two documented completion fields.
+    GafimeResultTable result_snapshot = *result_out;
     PrecisionResultSink sink{
-        result_out->abi_version,
-        result_out->max_arity,
-        result_out->metric_count,
-        &result_out->flags,
-        result_out->capacity,
-        &result_out->row_count,
-        result_out->combo_indices,
-        result_out->metric_values,
-        result_out->ranks,
-        result_out->families,
-        result_out->candidate_ids,
-        result_out->row_flags,
+        result_snapshot.abi_version,
+        result_snapshot.max_arity,
+        result_snapshot.metric_count,
+        &result_snapshot.flags,
+        result_snapshot.capacity,
+        &result_snapshot.row_count,
+        result_snapshot.combo_indices,
+        result_snapshot.metric_values,
+        result_snapshot.ranks,
+        result_snapshot.families,
+        result_snapshot.candidate_ids,
+        result_snapshot.row_flags,
     };
-    return matrix->dispatch->execute(matrix, protocol, &sink);
+    status = matrix->dispatch->execute(matrix, protocol, &sink);
+    if (status == GAFIME_STATUS_OK) {
+        result_out->flags = result_snapshot.flags;
+        result_out->row_count = result_snapshot.row_count;
+    }
+    return status;
 }
 
 }  // extern "C"

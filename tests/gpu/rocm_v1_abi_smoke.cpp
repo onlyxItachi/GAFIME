@@ -122,6 +122,88 @@ int verify_immutable_descriptor_generation(uint32_t backend_kind) {
     return failed;
 }
 
+int verify_result_metadata_snapshot(uint32_t backend_kind) {
+    GafimeMatrixDesc desc{};
+    desc.abi_version = GAFIME_ABI_VERSION;
+    desc.dtype = GAFIME_DTYPE_F32;
+    desc.layout = GAFIME_MATRIX_ROW_MAJOR;
+    desc.rows = 4;
+    desc.cols = 3;
+    desc.row_stride = 3;
+    desc.bytes = 4 * 3 * sizeof(float);
+
+    GafimeGpuMatrix matrix = nullptr;
+    if (require_status(gafime_gpu_matrix_alloc(0, &desc, &matrix),
+                       "result_snapshot_matrix_alloc")) {
+        return 1;
+    }
+    const float features[] = {
+        1.0f, 5.0f, 1.0f,
+        2.0f, 4.0f, 1.0f,
+        3.0f, 3.0f, 1.0f,
+        4.0f, 2.0f, 1.0f,
+    };
+    const float target[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    if (require_status(gafime_gpu_matrix_upload(matrix, features, target, 4, 3),
+                       "result_snapshot_matrix_upload")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+
+    // The first unary row's padded result slot shares the second input
+    // descriptor. The caller storage is ordinary live, aligned, bounded
+    // memory; retaining the descriptors preserves the second row's identity.
+    uint32_t descriptors[4] = {0u, 1u, UINT32_MAX, UINT32_MAX};
+    const uint32_t metric = GAFIME_METRIC_PEARSON;
+    GafimeArityChunk chunk{};
+    chunk.arity = 1;
+    chunk.family = GAFIME_FAMILY_CONTINUOUS;
+    chunk.combo_count = 2;
+    chunk.descriptor_count = 2;
+
+    GafimeLaunchProtocol protocol{};
+    protocol.abi_version = GAFIME_ABI_VERSION;
+    protocol.backend_kind = backend_kind;
+    protocol.max_arity = 1;
+    protocol.n_samples = 4;
+    protocol.n_features = 3;
+    protocol.family_count = 1;
+    protocol.combo_indices = {descriptors, 2};
+    protocol.metric_ids = {&metric, 1};
+    protocol.chunks = &chunk;
+    protocol.chunk_count = 1;
+
+    float values[2]{};
+    uint32_t ranks[2]{};
+    uint32_t families[2]{};
+    uint64_t candidate_ids[2]{};
+    uint32_t row_flags[2]{};
+    GafimeResultTable result{};
+    result.abi_version = GAFIME_ABI_VERSION;
+    result.max_arity = 2;
+    result.metric_count = 1;
+    result.capacity = 2;
+    result.combo_indices = descriptors;
+    result.metric_values = values;
+    result.ranks = ranks;
+    result.families = families;
+    result.candidate_ids = candidate_ids;
+    result.row_flags = row_flags;
+
+    const int status = gafime_gpu_execute(matrix, &protocol, &result);
+    gafime_gpu_matrix_free(matrix);
+    if (require_status(status, "result_metadata_snapshot")) {
+        return 1;
+    }
+    if (result.row_count != 2 || descriptors[0] != 0 || descriptors[1] != UINT32_MAX ||
+        descriptors[2] != 1 || descriptors[3] != UINT32_MAX) {
+        std::fprintf(stderr, "result metadata snapshot did not preserve padded descriptors\n");
+        return 1;
+    }
+    return require_close(values[0], 1.0f, "result snapshot feature0") ||
+        require_close(values[1], -1.0f, "result snapshot feature1");
+}
+
 int verify_interaction_diagnostics() {
     constexpr uint64_t kRows = 4;
     constexpr uint32_t kCols = 5;
@@ -370,6 +452,9 @@ int main() {
         return 1;
     }
     if (verify_immutable_descriptor_generation(GAFIME_BACKEND_ROCM)) {
+        return 1;
+    }
+    if (verify_result_metadata_snapshot(GAFIME_BACKEND_ROCM)) {
         return 1;
     }
     if (verify_interaction_diagnostics()) {

@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -1005,6 +1006,7 @@ int write_result_rows(
     const GafimeLaunchProtocol* protocol,
     uint32_t max_arity,
     uint32_t metric_capacity,
+    uint64_t capacity,
     uint64_t* row_count_out,
     uint32_t* combo_indices_out,
     Result* metric_values_out,
@@ -1018,6 +1020,53 @@ int write_result_rows(
     if (selected_indices == nullptr && protocol->rank.top_k != 0) return GAFIME_STATUS_DEVICE_ERROR;
     const uint64_t rows = selected_indices == nullptr ? planned_row_count(protocol) :
         static_cast<uint64_t>(selected_indices->size());
+    if (rows > capacity) return GAFIME_STATUS_INVALID_ARGUMENT;
+    // The result table's pointer fields are already captured by the caller,
+    // but descriptor data remains caller-owned.  Freeze the launch header and
+    // retain only descriptor ranges that an output scatter could overwrite.
+    // The normal disjoint path therefore remains allocation-free.
+    GafimeLaunchProtocol source = *protocol;
+    std::array<gafime_gpu_abi::HostWriteSpan, 6> writes{};
+    uint64_t combo_count = 0;
+    uint64_t metric_value_count = 0;
+    if (!checked_mul(rows, max_arity, &combo_count) ||
+        !checked_mul(rows, metric_capacity, &metric_value_count) ||
+        !gafime_gpu_abi::host_span(
+            combo_indices_out, combo_count, sizeof(uint32_t), &writes[0]) ||
+        !gafime_gpu_abi::host_span(
+            metric_values_out, metric_value_count, sizeof(Result), &writes[1]) ||
+        !gafime_gpu_abi::host_span(ranks_out, rows, sizeof(uint32_t), &writes[2]) ||
+        !gafime_gpu_abi::host_span(families_out, rows, sizeof(uint32_t), &writes[3]) ||
+        !gafime_gpu_abi::host_span(candidate_ids_out, rows, sizeof(uint64_t), &writes[4]) ||
+        !gafime_gpu_abi::host_span(flags_out, rows, sizeof(uint32_t), &writes[5])) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    gafime_gpu_abi::HostWriteSpan chunk_span{};
+    gafime_gpu_abi::HostWriteSpan descriptor_span{};
+    if (!gafime_gpu_abi::host_span(
+            source.chunks, source.chunk_count, sizeof(GafimeArityChunk), &chunk_span) ||
+        !gafime_gpu_abi::host_span(
+            source.combo_indices.ptr, source.combo_indices.len, sizeof(uint32_t), &descriptor_span)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    const auto overlaps_output = [&](const gafime_gpu_abi::HostWriteSpan& input) {
+        return std::any_of(writes.begin(), writes.end(), [&](const auto& output) {
+            return gafime_gpu_abi::host_spans_overlap(input, output);
+        });
+    };
+    std::vector<GafimeArityChunk> saved_chunks;
+    std::vector<uint32_t> saved_combo_indices;
+    if (overlaps_output(chunk_span)) {
+        saved_chunks.assign(source.chunks, source.chunks + source.chunk_count);
+        source.chunks = saved_chunks.data();
+    }
+    if (overlaps_output(descriptor_span)) {
+        saved_combo_indices.assign(
+            source.combo_indices.ptr,
+            source.combo_indices.ptr + source.combo_indices.len);
+        source.combo_indices.ptr = saved_combo_indices.data();
+    }
+    protocol = &source;
     for (uint64_t output_row = 0; output_row < rows; ++output_row) {
         const uint64_t global_row = selected_indices == nullptr ? output_row :
             static_cast<uint64_t>((*selected_indices)[output_row]);
@@ -1176,6 +1225,17 @@ int execute_precision(
         status = validate_precision_result_f64(base, result);
     }
     if (status != GAFIME_STATUS_OK) return status;
+    // Do not reread ABI metadata after output begins. The private table keeps
+    // every validated destination, capacity and control field stable until the
+    // two scalar completion fields are committed back to the caller.
+    ResultTable result_snapshot = *result;
+    const auto commit_result = [&](int result_status) {
+        if (result_status == GAFIME_STATUS_OK) {
+            result->flags = result_snapshot.flags;
+            result->row_count = result_snapshot.row_count;
+        }
+        return result_status;
+    };
     status = require_precision_matrix(matrix);
     if (status != GAFIME_STATUS_OK) return status;
     ScopedCudaDevice device(matrix->device_id);
@@ -1184,8 +1244,8 @@ int execute_precision(
 
     const uint64_t total_rows = planned_row_count(base);
     if (total_rows == 0) {
-        result->row_count = 0;
-        return GAFIME_STATUS_OK;
+        result_snapshot.row_count = 0;
+        return commit_result(GAFIME_STATUS_OK);
     }
     uint64_t metric_value_count = 0;
     if (!checked_mul(total_rows, base->metric_ids.len, &metric_value_count)) {
@@ -1203,11 +1263,13 @@ int execute_precision(
             scores.data(), matrix->metric_values, static_cast<size_t>(metric_value_count) * sizeof(Result),
             cudaMemcpyDeviceToHost));
         if (status != GAFIME_STATUS_OK) return status;
-        update_graph_result_flag(result, graph_replayed);
-        return write_result_rows<Result>(
-            base, result->max_arity, result->metric_count, &result->row_count,
-            result->combo_indices, result->metric_values, result->ranks, result->families,
-            result->candidate_ids, result->row_flags, scores, nullptr);
+        update_graph_result_flag(&result_snapshot, graph_replayed);
+        return commit_result(write_result_rows<Result>(
+            base, result_snapshot.max_arity, result_snapshot.metric_count, result_snapshot.capacity,
+            &result_snapshot.row_count,
+            result_snapshot.combo_indices, result_snapshot.metric_values,
+            result_snapshot.ranks, result_snapshot.families,
+            result_snapshot.candidate_ids, result_snapshot.row_flags, scores, nullptr));
     }
 
     const uint64_t requested_rows = output_row_count(base, total_rows);
@@ -1244,9 +1306,9 @@ int execute_precision(
     while (selected_count < requested_rows && selected_indices[selected_count] != UINT32_MAX) ++selected_count;
     selected_indices.resize(static_cast<size_t>(selected_count));
     if (selected_count == 0) {
-        result->row_count = 0;
-        update_graph_result_flag(result, graph_replayed);
-        return GAFIME_STATUS_OK;
+        result_snapshot.row_count = 0;
+        update_graph_result_flag(&result_snapshot, graph_replayed);
+        return commit_result(GAFIME_STATUS_OK);
     }
     uint64_t selected_metric_count = 0;
     if (!checked_mul(selected_count, base->metric_ids.len, &selected_metric_count)) {
@@ -1268,11 +1330,14 @@ int execute_precision(
         selected_scores.data(), matrix->selected_metric_values,
         static_cast<size_t>(selected_metric_count) * sizeof(Result), cudaMemcpyDeviceToHost));
     if (status != GAFIME_STATUS_OK) return status;
-    update_graph_result_flag(result, graph_replayed);
-    return write_result_rows<Result>(
-        base, result->max_arity, result->metric_count, &result->row_count,
-        result->combo_indices, result->metric_values, result->ranks, result->families,
-        result->candidate_ids, result->row_flags, selected_scores, &selected_indices);
+    update_graph_result_flag(&result_snapshot, graph_replayed);
+    return commit_result(write_result_rows<Result>(
+        base, result_snapshot.max_arity, result_snapshot.metric_count, result_snapshot.capacity,
+        &result_snapshot.row_count,
+        result_snapshot.combo_indices, result_snapshot.metric_values,
+        result_snapshot.ranks, result_snapshot.families,
+        result_snapshot.candidate_ids, result_snapshot.row_flags, selected_scores,
+        &selected_indices));
 } catch (const std::bad_alloc&) {
     return GAFIME_STATUS_OUT_OF_MEMORY;
 } catch (...) {
@@ -1557,6 +1622,11 @@ int permutation_precision(
     const uint64_t total_rows = planned_row_count(base);
     status = validate_precision_significance<Storage, Result>(base, matrix, significance, total_rows);
     if (status != GAFIME_STATUS_OK) return status;
+    // The frozen ABI permits caller-owned result storage. Keep the complete
+    // significance descriptor private before p-value stores begin so an
+    // overlapping first result cannot redirect a later one.
+    SignificanceTable significance_snapshot = *significance;
+    significance = &significance_snapshot;
     if (total_rows == 0 || significance->row_count == 0) return GAFIME_STATUS_OK;
     ScopedCudaDevice device(matrix->device_id);
     status = cuda_status(device.status());
@@ -1931,6 +2001,36 @@ int precision_interaction_diagnostics(
             ++arity;
         }
         if (arity == 0) return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+
+    // Validation is read-only. Once it has accepted the complete legacy
+    // descriptor, keep its metadata private before clearing caller-owned
+    // output spans; retain the combo payload below only on actual overlap.
+    GafimeInteractionDiagnosticBatch diagnostic = *diagnostics;
+    diagnostics = &diagnostic;
+    std::array<gafime_gpu_abi::HostWriteSpan, 2> output_spans{};
+    gafime_gpu_abi::HostWriteSpan combo_span{};
+    if (!gafime_gpu_abi::host_span(
+            diagnostics->overflow_row_counts, diagnostics->row_count,
+            sizeof(uint64_t), &output_spans[0]) ||
+        !gafime_gpu_abi::host_span(
+            diagnostics->flags, diagnostics->row_count,
+            sizeof(uint32_t), &output_spans[1]) ||
+        !gafime_gpu_abi::host_span(
+            diagnostics->combo_indices, diagnostics->combo_index_count,
+            sizeof(uint32_t), &combo_span)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    const bool combo_overlaps_output = std::any_of(
+        output_spans.begin(), output_spans.end(), [&](const auto& output) {
+            return gafime_gpu_abi::host_spans_overlap(combo_span, output);
+        });
+    std::vector<uint32_t> saved_combo_indices;
+    if (combo_overlaps_output) {
+        saved_combo_indices.assign(
+            diagnostics->combo_indices,
+            diagnostics->combo_indices + diagnostics->combo_index_count);
+        diagnostics->combo_indices = saved_combo_indices.data();
     }
 
     std::fill_n(
