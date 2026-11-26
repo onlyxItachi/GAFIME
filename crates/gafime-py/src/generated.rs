@@ -269,21 +269,26 @@ fn expand_time_series_precision(
             "time-series source feature is outside the candidate prefix".to_string(),
         ));
     }
+    // Every selected source has the same eligible transforms. If any are
+    // emitted, a later source cannot contribute to the capped prefix.
+    let source_features = &source_features[..source_features.len().min(generated_limit)];
     let selected =
         column_major_feature_selection_precision(&input, rows, source_cols, source_features)?;
     let selected_slice = match &selected {
         CpuPrecisionValues::F32(values) => CpuPrecisionSlice::F32(values),
         CpuPrecisionValues::F64(values) => CpuPrecisionSlice::F64(values),
     };
-    let (generated, mut descriptors) = gafime_cpu::time_series::time_series_columns_precision(
-        profile,
-        selected_slice,
-        rows,
-        source_features.len(),
-        lags,
-        windows,
-        velocity,
-    )?;
+    let (generated, mut descriptors) =
+        gafime_cpu::time_series::time_series_columns_precision_bounded(
+            profile,
+            selected_slice,
+            rows,
+            source_features.len(),
+            lags,
+            windows,
+            velocity,
+            generated_limit,
+        )?;
     for descriptor in &mut descriptors {
         descriptor.base_feature = source_features
             .get(descriptor.base_feature as usize)
@@ -294,7 +299,6 @@ fn expand_time_series_precision(
                 )
             })?;
     }
-    descriptors.truncate(generated_limit);
     let generated_count = descriptors.len();
     let expanded_cols = base_candidate_cols
         .checked_add(generated_count)
