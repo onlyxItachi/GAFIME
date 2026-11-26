@@ -253,3 +253,93 @@ def test_collision_selection_accepts_only_canonical_wheel_build_tags() -> None:
     assert collision._artifact_project(recovery, "1.0.0b2") == "gafime"
     with pytest.raises(collision.CollisionError, match="unexpected release artifact"):
         collision._artifact_project(malformed, "1.0.0b2")
+
+
+def test_complete_pypi_inventory_must_match_the_frozen_bundle(tmp_path: Path) -> None:
+    version = "1.0.0"
+    frozen = tmp_path / f"gafime-{version}.tar.gz"
+    frozen.write_bytes(b"frozen-core")
+    extra = f"gafime-{version}-cp311-cp311-manylinux_2_28_x86_64.whl"
+
+    def with_extra(_project: str, _version: str) -> dict[str, object]:
+        return {
+            "urls": [
+                {
+                    "filename": frozen.name,
+                    "digests": {"sha256": collision._sha256(frozen)},
+                },
+                {"filename": extra, "digests": {"sha256": "a" * 64}},
+            ]
+        }
+
+    with pytest.raises(collision.CollisionError, match="outside the frozen bundle"):
+        collision.validate_artifacts(
+            tmp_path,
+            version,
+            with_extra,
+            allow_matching_existing=True,
+            require_complete_published=True,
+        )
+
+    def missing(_project: str, _version: str) -> dict[str, object]:
+        return {"urls": []}
+
+    with pytest.raises(collision.CollisionError, match="missing frozen files"):
+        collision.validate_artifacts(
+            tmp_path,
+            version,
+            missing,
+            allow_matching_existing=True,
+            require_complete_published=True,
+        )
+
+
+def test_resolver_receipt_requires_exact_frozen_filename_and_bytes(
+    tmp_path: Path,
+) -> None:
+    version = "1.0.0"
+    frozen_dir = tmp_path / "frozen"
+    frozen_dir.mkdir()
+    frozen = frozen_dir / f"gafime-{version}.tar.gz"
+    frozen.write_bytes(b"frozen!!")
+    receipt_dir = tmp_path / "receipt"
+    receipt_dir.mkdir()
+    receipt = receipt_dir / frozen.name
+    receipt.write_bytes(frozen.read_bytes())
+
+    assert collision.validate_resolver_receipt(
+        frozen_dir,
+        version,
+        receipt_dir,
+        ["gafime"],
+    ) == ("gafime",)
+
+    receipt.write_bytes(b"changed!")
+    with pytest.raises(collision.CollisionError, match="hash mismatch"):
+        collision.validate_resolver_receipt(
+            frozen_dir,
+            version,
+            receipt_dir,
+            ["gafime"],
+        )
+
+
+def test_raw_receipt_url_must_remain_on_the_pypi_file_origin() -> None:
+    filename = "gafime-rocm-1.0.0.tar.gz"
+    digest = "b" * 64
+    metadata = {
+        "urls": [
+            {
+                "filename": filename,
+                "digests": {"sha256": digest},
+                "url": f"https://files.pythonhosted.org/packages/{filename}",
+            }
+        ]
+    }
+    assert collision._pypi_download_url(
+        metadata, "gafime-rocm", filename, digest
+    ).endswith(filename)
+
+    metadata["urls"][0]["url"] = f"https://files.pythonhosted.org:444/{filename}"
+    with pytest.raises(collision.CollisionError, match="untrusted download URL"):
+        collision._pypi_download_url(metadata, "gafime-rocm", filename, digest)

@@ -7,13 +7,14 @@ import argparse
 from collections.abc import Iterable
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sys
 import tempfile
 from typing import Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -131,13 +132,9 @@ def _remote_digests(metadata: dict[str, object], project: str) -> dict[str, str]
     return digests
 
 
-def validate_artifacts(
-    artifact_dir: Path,
-    version: str,
-    metadata_loader: Callable[[str, str], dict[str, object] | None],
-    *,
-    allow_matching_existing: bool,
-) -> tuple[int, int]:
+def _expected_pypi_artifacts(
+    artifact_dir: Path, version: str
+) -> dict[str, dict[str, Path]]:
     artifacts = sorted(
         path
         for path in artifact_dir.iterdir()
@@ -146,7 +143,7 @@ def validate_artifacts(
     if not artifacts:
         raise CollisionError(f"no release artifacts found in {artifact_dir}")
 
-    by_project: dict[str, list[Path]] = {}
+    by_project: dict[str, dict[str, Path]] = {}
     for artifact in artifacts:
         project = _artifact_project(artifact, version)
         publish_wheels, publish_sdist = PYPI_POLICY[project]
@@ -154,16 +151,53 @@ def validate_artifacts(
             continue
         if artifact.name.endswith(".tar.gz") and not publish_sdist:
             continue
-        by_project.setdefault(project, []).append(artifact)
+        project_artifacts = by_project.setdefault(project, {})
+        if artifact.name in project_artifacts:
+            raise CollisionError(
+                f"duplicate frozen PyPI artifact for {project}: {artifact.name}"
+            )
+        project_artifacts[artifact.name] = artifact
     if not by_project:
         raise CollisionError("the release bundle has no manifest-selected PyPI files")
+    return by_project
+
+
+def validate_artifacts(
+    artifact_dir: Path,
+    version: str,
+    metadata_loader: Callable[[str, str], dict[str, object] | None],
+    *,
+    allow_matching_existing: bool,
+    require_complete_published: bool = False,
+) -> tuple[int, int]:
+    by_project = _expected_pypi_artifacts(artifact_dir, version)
+    remote_by_project: dict[str, dict[str, str]] = {}
+    for project in sorted(by_project):
+        metadata = metadata_loader(project, version)
+        remote_by_project[project] = (
+            {} if metadata is None else _remote_digests(metadata, project)
+        )
+    for project, project_artifacts in sorted(by_project.items()):
+        remote = remote_by_project[project]
+        unexpected = sorted(set(remote) - set(project_artifacts))
+        if unexpected:
+            raise CollisionError(
+                f"PyPI published inventory contains files outside the frozen bundle "
+                f"for {project}: {unexpected}"
+            )
+        if require_complete_published:
+            missing = sorted(set(project_artifacts) - set(remote))
+            if missing:
+                raise CollisionError(
+                    f"PyPI published inventory is missing frozen files for "
+                    f"{project}: {missing}"
+                )
 
     matching = 0
     new = 0
     for project, project_artifacts in sorted(by_project.items()):
-        metadata = metadata_loader(project, version)
-        remote = {} if metadata is None else _remote_digests(metadata, project)
-        for artifact in project_artifacts:
+        remote = remote_by_project[project]
+        for artifact in project_artifacts.values():
             remote_sha256 = remote.get(artifact.name)
             if remote_sha256 is None:
                 new += 1
@@ -181,6 +215,66 @@ def validate_artifacts(
                 )
             matching += 1
     return new, matching
+
+
+def validate_resolver_receipt(
+    artifact_dir: Path,
+    version: str,
+    receipt_dir: Path,
+    projects: Iterable[str],
+) -> tuple[str, ...]:
+    """Bind resolver-selected files to names and bytes in the frozen bundle."""
+    expected = _expected_pypi_artifacts(artifact_dir, version)
+    requested = tuple(sorted(set(projects)))
+    if not requested:
+        raise CollisionError("resolver receipt selects no PyPI projects")
+    unexpected_projects = sorted(set(requested) - set(expected))
+    if unexpected_projects:
+        raise CollisionError(
+            f"resolver receipt requests projects outside the frozen bundle: "
+            f"{unexpected_projects}"
+        )
+    if not receipt_dir.is_dir() or receipt_dir.is_symlink():
+        raise CollisionError(f"resolver receipt directory is invalid: {receipt_dir}")
+
+    receipt_paths = sorted(receipt_dir.iterdir())
+    if not receipt_paths:
+        raise CollisionError(f"resolver receipt is empty: {receipt_dir}")
+    observed: set[str] = set()
+    for receipt in receipt_paths:
+        if receipt.is_symlink() or not receipt.is_file():
+            raise CollisionError(f"resolver receipt has a non-regular entry: {receipt}")
+        project = _artifact_project(receipt, version)
+        if project not in requested:
+            raise CollisionError(
+                f"resolver receipt selected unexpected project artifact: {receipt.name}"
+            )
+        expected_artifact = expected[project].get(receipt.name)
+        if expected_artifact is None:
+            raise CollisionError(
+                f"resolver receipt selected a file outside the frozen bundle: "
+                f"{project}/{receipt.name}"
+            )
+        if project in observed:
+            raise CollisionError(
+                f"resolver receipt selected multiple files for {project}: {receipt.name}"
+            )
+        if receipt.stat().st_size != expected_artifact.stat().st_size:
+            raise CollisionError(
+                f"resolver receipt size mismatch for {project}/{receipt.name}"
+            )
+        expected_sha256 = _sha256(expected_artifact)
+        receipt_sha256 = _sha256(receipt)
+        if receipt_sha256 != expected_sha256:
+            raise CollisionError(
+                f"resolver receipt hash mismatch for {project}/{receipt.name}: "
+                f"frozen={expected_sha256} receipt={receipt_sha256}"
+            )
+        observed.add(project)
+    missing = sorted(set(requested) - observed)
+    if missing:
+        raise CollisionError(f"resolver receipt is missing projects: {missing}")
+    return tuple(sorted(observed))
 
 
 def _load_pypi_metadata(project: str, version: str) -> dict[str, object] | None:
@@ -202,6 +296,132 @@ def _load_pypi_metadata(project: str, version: str) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         raise CollisionError(f"PyPI metadata for {project} is not an object")
     return payload
+
+
+def _pypi_download_url(
+    metadata: dict[str, object],
+    project: str,
+    filename: str,
+    expected_sha256: str,
+) -> str:
+    remote = _remote_digests(metadata, project)
+    if remote.get(filename) != expected_sha256:
+        raise CollisionError(
+            f"PyPI metadata does not bind {project}/{filename} to the frozen SHA-256"
+        )
+    urls = metadata.get("urls")
+    assert isinstance(urls, list)  # Checked by _remote_digests above.
+    matching = [
+        entry
+        for entry in urls
+        if isinstance(entry, dict) and entry.get("filename") == filename
+    ]
+    if len(matching) != 1:
+        raise CollisionError(
+            f"PyPI metadata has an ambiguous download URL for {project}/{filename}"
+        )
+    url = matching[0].get("url")
+    if not isinstance(url, str):
+        raise CollisionError(
+            f"PyPI metadata has no download URL for {project}/{filename}"
+        )
+    _require_trusted_pypi_file_url(url, project, filename)
+    return url
+
+
+def _require_trusted_pypi_file_url(url: str, project: str, filename: str) -> None:
+    """Reject redirects or metadata URLs that leave the PyPI file origin."""
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise CollisionError(
+            f"PyPI metadata has an invalid download URL for {project}/{filename}"
+        ) from error
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "files.pythonhosted.org"
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise CollisionError(
+            f"PyPI metadata has an untrusted download URL for {project}/{filename}"
+        )
+
+
+def download_verified_sdist_receipt(
+    artifact_dir: Path,
+    version: str,
+    project: str,
+    receipt_dir: Path,
+    metadata_loader: Callable[[str, str], dict[str, object] | None],
+) -> Path:
+    """Download the unique public sdist as raw bytes before build tooling sees it."""
+    expected = _expected_pypi_artifacts(artifact_dir, version)
+    project_artifacts = expected.get(project)
+    if project_artifacts is None or len(project_artifacts) != 1:
+        raise CollisionError(
+            f"frozen bundle does not have one public artifact for raw {project} receipt"
+        )
+    filename, frozen = next(iter(project_artifacts.items()))
+    if not filename.endswith(".tar.gz"):
+        raise CollisionError(
+            f"raw receipt is reserved for a unique source distribution, not {filename}"
+        )
+    if not receipt_dir.is_dir() or receipt_dir.is_symlink():
+        raise CollisionError(f"resolver receipt directory is invalid: {receipt_dir}")
+    destination = receipt_dir / filename
+    if destination.exists() or destination.is_symlink():
+        raise CollisionError(f"resolver receipt already contains {destination.name}")
+    metadata = metadata_loader(project, version)
+    if metadata is None:
+        raise CollisionError(
+            f"PyPI project/version does not exist: {project}/{version}"
+        )
+    frozen_sha256 = _sha256(frozen)
+    url = _pypi_download_url(metadata, project, filename, frozen_sha256)
+    expected_size = frozen.stat().st_size
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".receipt-",
+            suffix=".part",
+            dir=receipt_dir,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            digest = hashlib.sha256()
+            downloaded = 0
+            request = Request(url, headers={"User-Agent": "gafime-release-preflight/1"})
+            with urlopen(request, timeout=30) as response:
+                response_url = response.geturl()
+                _require_trusted_pypi_file_url(response_url, project, filename)
+                for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                    downloaded += len(chunk)
+                    if downloaded > expected_size:
+                        raise CollisionError(
+                            f"raw receipt exceeds frozen size for {project}/{filename}"
+                        )
+                    digest.update(chunk)
+                    temporary.write(chunk)
+        if downloaded != expected_size or digest.hexdigest() != frozen_sha256:
+            raise CollisionError(f"raw receipt hash mismatch for {project}/{filename}")
+        try:
+            os.link(temporary_path, destination)
+        except FileExistsError as error:
+            raise CollisionError(
+                f"resolver receipt already contains {destination.name}"
+            ) from error
+    except (HTTPError, URLError, TimeoutError, OSError) as error:
+        raise CollisionError(
+            f"PyPI raw receipt download failed for {project}/{filename}: {error}"
+        ) from error
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+    return destination
 
 
 def _load_pypi_project_metadata(project: str) -> dict[str, object] | None:
@@ -232,6 +452,7 @@ def run_preflight(
     project_metadata_loader: Callable[[str], dict[str, object] | None],
     *,
     allow_matching_existing: bool,
+    require_complete_published: bool = False,
 ) -> tuple[int, int, int]:
     projects = validate_projects(PYPI_POLICY, project_metadata_loader)
     new, matching = validate_artifacts(
@@ -239,6 +460,7 @@ def run_preflight(
         version,
         release_metadata_loader,
         allow_matching_existing=allow_matching_existing,
+        require_complete_published=require_complete_published,
     )
     return len(projects), new, matching
 
@@ -365,6 +587,10 @@ def main() -> None:
     parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--version")
     parser.add_argument("--allow-matching-existing", action="store_true")
+    parser.add_argument("--require-complete-published", action="store_true")
+    parser.add_argument("--receipt-dir", type=Path)
+    parser.add_argument("--receipt-project", action="append", default=[])
+    parser.add_argument("--download-sdist-project", action="append", default=[])
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -375,20 +601,53 @@ def main() -> None:
         parser.error(
             "--artifacts and --version are required unless --self-test is used"
         )
+    if args.receipt_dir is None and (
+        args.receipt_project or args.download_sdist_project
+    ):
+        parser.error("--receipt-dir is required for resolver receipt options")
+    if args.receipt_dir is not None and not args.receipt_project:
+        parser.error("--receipt-project is required with --receipt-dir")
+    if set(args.download_sdist_project) - set(args.receipt_project):
+        parser.error("every --download-sdist-project must be a --receipt-project")
 
     try:
+        require_complete = bool(
+            args.require_complete_published or args.download_sdist_project
+        )
         projects, new, matching = run_preflight(
             args.artifacts,
             args.version,
             _load_pypi_metadata,
             _load_pypi_project_metadata,
-            allow_matching_existing=args.allow_matching_existing,
+            allow_matching_existing=(args.allow_matching_existing or require_complete),
+            require_complete_published=require_complete,
         )
+        downloaded = []
+        for project in args.download_sdist_project:
+            assert args.receipt_dir is not None
+            downloaded.append(
+                download_verified_sdist_receipt(
+                    args.artifacts,
+                    args.version,
+                    project,
+                    args.receipt_dir,
+                    _load_pypi_metadata,
+                ).name
+            )
+        receipt_projects: tuple[str, ...] = ()
+        if args.receipt_dir is not None:
+            receipt_projects = validate_resolver_receipt(
+                args.artifacts,
+                args.version,
+                args.receipt_dir,
+                args.receipt_project,
+            )
     except (CollisionError, OSError) as error:
         parser.exit(1, f"PYPI COLLISION PREFLIGHT: FAIL: {error}\n")
     print(
         "PYPI COLLISION PREFLIGHT: PASS "
-        f"projects={projects} new={new} matching_existing={matching}"
+        f"projects={projects} new={new} matching_existing={matching} "
+        f"receipt_projects={list(receipt_projects)} downloaded={downloaded}"
     )
 
 

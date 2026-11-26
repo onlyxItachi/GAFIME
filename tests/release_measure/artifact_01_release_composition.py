@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from email.parser import Parser
 from fnmatch import fnmatchcase
+import gzip
 import hashlib
 import json
 import os
@@ -18,7 +20,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from typing import Iterable
+from typing import BinaryIO, Iterable, Iterator
+import unicodedata
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -52,6 +55,22 @@ ROCM_BUILD_PACKAGES = (
     "rocm-device-libs7.2.3-1.0.0.70203-90.el8.x86_64",
     "libstdc++-devel-8.5.0-28.el8_10.alma.1.x86_64",
 )
+# These verifier-local ceilings bound archive inspection before a distribution
+# specific policy or archive member is trusted. The original frozen candidate's
+# largest compressed package was 4,570,211 bytes, largest expanded package was
+# 28,230,681 bytes, and largest member was 28,191,336 bytes. The generic caps
+# retain room for non-ROCm package evolution; ROCm receives its checked-in 6 MB,
+# 33 MB, and 34 MB ceilings before content inspection below. The 256-entry cap
+# leaves more than twice the 107 members in the largest recorded package. These
+# are availability guardrails, not replacements for a distribution's tighter
+# artifact policy.
+ARCHIVE_MAX_COMPRESSED_BYTES = 16 * 1024 * 1024
+ARCHIVE_MAX_MEMBERS = 256
+ARCHIVE_MAX_MEMBER_BYTES = 48 * 1024 * 1024
+ARCHIVE_MAX_EXPANDED_BYTES = 64 * 1024 * 1024
+ARCHIVE_METADATA_BYTES = 1_000_000
+ARCHIVE_SCAN_CHUNK_BYTES = 64 * 1024
+SUPPORTED_WHEEL_COMPRESSION = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
 CANONICAL_PRECISION_PROFILES = ("fp32", "mixed", "fp64")
 POLARS_V1_SPECIFIERS = frozenset({">=1.3", "<2"})
 POLARS_V1_SHELL_REQUIREMENT = re.compile(r"""(["'])polars>=1\.3,<2\1""")
@@ -257,6 +276,22 @@ class Artifact:
     python_tags: frozenset[str] = frozenset()
     build_policy: dict[str, object] | None = None
     build_provenance: dict[str, object] | None = None
+    # Wheel ``members`` use their final import-install destination. The source
+    # mapping preserves the corresponding canonical ZIP member for byte reads.
+    archive_members: frozenset[str] | None = None
+    member_sources: tuple[tuple[str, str], ...] = ()
+
+
+def _artifact_archive_members(artifact: Artifact) -> frozenset[str]:
+    return (
+        artifact.archive_members
+        if artifact.archive_members is not None
+        else artifact.members
+    )
+
+
+def _artifact_member_source(artifact: Artifact, member: str) -> str:
+    return dict(artifact.member_sources).get(member, member)
 
 
 def _canonical_name(value: str) -> str:
@@ -342,17 +377,92 @@ def _canonical_archive_member(
     return canonical
 
 
+def _assert_archive_compressed_limit(path: Path) -> None:
+    compressed_bytes = path.stat().st_size
+    _require(
+        compressed_bytes <= ARCHIVE_MAX_COMPRESSED_BYTES,
+        f"{path.name} compressed archive size {compressed_bytes} exceeds verifier "
+        f"limit {ARCHIVE_MAX_COMPRESSED_BYTES}",
+    )
+
+
+class _ArchiveBudget:
+    """Bound archive directory traversal before content reads begin."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.members = 0
+        self.expanded_bytes = 0
+
+    def add(self, name: str, size: object) -> None:
+        _require(
+            isinstance(size, int) and 0 <= size <= ARCHIVE_MAX_MEMBER_BYTES,
+            f"{self.path.name} member {name!r} expanded size {size!r} exceeds "
+            f"verifier member limit {ARCHIVE_MAX_MEMBER_BYTES}",
+        )
+        self.members += 1
+        _require(
+            self.members <= ARCHIVE_MAX_MEMBERS,
+            f"{self.path.name} has more than {ARCHIVE_MAX_MEMBERS} archive members",
+        )
+        self.expanded_bytes += size
+        _require(
+            self.expanded_bytes <= ARCHIVE_MAX_EXPANDED_BYTES,
+            f"{self.path.name} expanded archive size {self.expanded_bytes} exceeds "
+            f"verifier limit {ARCHIVE_MAX_EXPANDED_BYTES}",
+        )
+
+
+def _wheel_install_destination(path: Path, name: str, *, directory: bool) -> str:
+    """Map a canonical wheel member to its import-install destination."""
+    parts = name.split("/")
+    _require(
+        not (parts[0].casefold().endswith(".data") and not parts[0].endswith(".data")),
+        f"{path.name} uses ambiguous wheel .data casing in {name!r}",
+    )
+    if directory or not parts[0].endswith(".data"):
+        return name
+    _require(
+        len(parts) >= 3 and parts[1] in {"purelib", "platlib"},
+        f"{path.name} uses an unsupported wheel install scheme in {name!r}",
+    )
+    return "/".join(parts[2:])
+
+
+def _wheel_destination_key(path: Path, destination: str) -> str:
+    normalized = []
+    for part in destination.split("/"):
+        portable_part = unicodedata.normalize("NFC", part.rstrip(" .").casefold())
+        _require(
+            bool(portable_part),
+            f"{path.name} has an ambiguous empty portable install destination "
+            f"component in {destination!r}",
+        )
+        normalized.append(portable_part)
+    return "/".join(normalized)
+
+
 def _validated_wheel_members(
     path: Path, archive: zipfile.ZipFile
-) -> dict[str, zipfile.ZipInfo]:
+) -> tuple[dict[str, zipfile.ZipInfo], frozenset[str], dict[str, str]]:
+    _assert_archive_compressed_limit(path)
     members: dict[str, zipfile.ZipInfo] = {}
+    installed_members: set[str] = set()
+    member_sources: dict[str, str] = {}
+    destinations: dict[str, str] = {}
+    budget = _ArchiveBudget(path)
     for info in archive.infolist():
+        _require(
+            info.compress_type in SUPPORTED_WHEEL_COMPRESSION,
+            f"{path.name} uses unsupported ZIP compression for {info.filename!r}",
+        )
         _require(
             info.orig_filename == info.filename,
             f"{path.name} contains a non-canonical archive member "
             f"{info.orig_filename!r}",
         )
         is_directory = info.is_dir()
+        budget.add(info.filename, 0 if is_directory else info.file_size)
         if info.create_system == 3:
             unix_mode = (info.external_attr >> 16) & 0xFFFF
             file_type = stat.S_IFMT(unix_mode)
@@ -373,14 +483,40 @@ def _validated_wheel_members(
             f"{path.name} contains duplicate archive member {name!r}",
         )
         members[name] = info
-    return members
+        destination = _wheel_install_destination(path, name, directory=is_directory)
+        installed_members.add(destination)
+        if is_directory:
+            continue
+        destination_key = _wheel_destination_key(path, destination)
+        _require(
+            destination_key not in destinations,
+            f"{path.name} contains archive members with the same install destination "
+            f"{destination!r}",
+        )
+        parents = destination_key.split("/")
+        _require(
+            not any(
+                "/".join(parents[:index]) in destinations
+                for index in range(1, len(parents))
+            )
+            and not any(
+                existing.startswith(f"{destination_key}/") for existing in destinations
+            ),
+            f"{path.name} contains a file/parent install-destination conflict for "
+            f"{destination!r}",
+        )
+        destinations[destination_key] = destination
+        member_sources[destination] = name
+    return members, frozenset(installed_members), member_sources
 
 
 def _validated_sdist_members(
     path: Path, archive: tarfile.TarFile
 ) -> dict[str, tarfile.TarInfo]:
     members: dict[str, tarfile.TarInfo] = {}
-    for info in archive.getmembers():
+    budget = _ArchiveBudget(path)
+    for info in archive:
+        budget.add(info.name, info.size)
         _require(
             info.isfile() or info.isdir(),
             f"{path.name} archive members must be regular files or directories: "
@@ -393,6 +529,207 @@ def _validated_sdist_members(
         )
         members[name] = info
     return members
+
+
+def _iter_bounded_chunks(
+    stream: BinaryIO,
+    path: Path,
+    member: str,
+    *,
+    maximum: int,
+) -> Iterator[bytes]:
+    """Yield a member without requesting an unbounded decompression read."""
+    total = 0
+    while True:
+        request = min(ARCHIVE_SCAN_CHUNK_BYTES, maximum - total + 1)
+        chunk = stream.read(request)
+        _require(
+            isinstance(chunk, bytes),
+            f"unable to read {member!r} from {path.name}",
+        )
+        if not chunk:
+            return
+        total += len(chunk)
+        _require(
+            total <= maximum,
+            f"{path.name} member {member!r} expanded beyond verifier limit {maximum}",
+        )
+        yield chunk
+
+
+def _read_bounded_member(
+    stream: BinaryIO,
+    path: Path,
+    member: str,
+    *,
+    maximum: int,
+) -> bytes:
+    return b"".join(_iter_bounded_chunks(stream, path, member, maximum=maximum))
+
+
+class _BoundedArchiveReader:
+    """Expose a decompressed tar stream without honoring oversized read hints."""
+
+    def __init__(self, stream: BinaryIO, size: int, path: Path) -> None:
+        self._stream = stream
+        self._size = size
+        self._path = path
+
+    def _remaining(self) -> int:
+        return max(0, self._size - self._stream.tell())
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = self._remaining()
+        request = remaining if size < 0 else min(size, remaining)
+        return self._stream.read(request)
+
+    def readline(self, size: int = -1) -> bytes:
+        remaining = self._remaining()
+        request = remaining if size < 0 else min(size, remaining)
+        return self._stream.readline(request)
+
+    def readinto(self, buffer: bytearray | memoryview) -> int:
+        view = memoryview(buffer)
+        data = self.read(len(view))
+        view[: len(data)] = data
+        return len(data)
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:
+            target = offset
+        elif whence == 1:
+            target = self._stream.tell() + offset
+        elif whence == 2:
+            target = self._size + offset
+        else:
+            raise ValueError(f"invalid seek origin {whence}")
+        _require(
+            0 <= target <= self._size,
+            f"{self._path.name} tar parser sought outside the bounded expanded stream",
+        )
+        return self._stream.seek(target)
+
+    def tell(self) -> int:
+        return self._stream.tell()
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+
+def _read_zip_member(
+    path: Path,
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    *,
+    maximum: int,
+) -> bytes:
+    _require(
+        info.compress_type in SUPPORTED_WHEEL_COMPRESSION and info.file_size <= maximum,
+        f"{path.name} member {info.filename!r} exceeds safe read limit {maximum}",
+    )
+    try:
+        with archive.open(info) as stream:
+            return _read_bounded_member(stream, path, info.filename, maximum=maximum)
+    except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+        raise AssertionError(
+            f"unable to read {info.filename!r} from {path.name}: {error}"
+        ) from error
+
+
+def _read_tar_member(
+    path: Path,
+    archive: tarfile.TarFile,
+    info: tarfile.TarInfo,
+    *,
+    maximum: int,
+) -> bytes:
+    _require(
+        info.size <= maximum,
+        f"{path.name} member {info.name!r} exceeds safe read limit {maximum}",
+    )
+    try:
+        stream = archive.extractfile(info)
+        _require(stream is not None, f"unable to read {info.name!r} from {path.name}")
+        assert stream is not None
+        with stream:
+            return _read_bounded_member(stream, path, info.name, maximum=maximum)
+    except (OSError, EOFError, tarfile.TarError) as error:
+        raise AssertionError(
+            f"unable to read {info.name!r} from {path.name}: {error}"
+        ) from error
+
+
+@contextmanager
+def _open_bounded_sdist(path: Path) -> Iterator[tarfile.TarFile]:
+    """Expand a gzip sdist into bounded temporary storage before tar parses it.
+
+    PAX and GNU metadata is consumed by ``tarfile`` before normal member
+    headers. Counting the complete decompressed stream first therefore bounds
+    those hidden records, padding, and trailers as well as ordinary files.
+    """
+    _assert_archive_compressed_limit(path)
+    try:
+        with path.open("rb") as raw, gzip.GzipFile(fileobj=raw, mode="rb") as source:
+            with tempfile.SpooledTemporaryFile(
+                max_size=ARCHIVE_SCAN_CHUNK_BYTES, mode="w+b"
+            ) as expanded:
+                expanded_bytes = 0
+                for chunk in _iter_bounded_chunks(
+                    source,
+                    path,
+                    "gzip stream",
+                    maximum=ARCHIVE_MAX_EXPANDED_BYTES,
+                ):
+                    expanded.write(chunk)
+                    expanded_bytes += len(chunk)
+                expanded.seek(0)
+                bounded_expanded = _BoundedArchiveReader(expanded, expanded_bytes, path)
+                with tarfile.open(fileobj=bounded_expanded, mode="r:") as archive:
+                    yield archive
+    except (OSError, EOFError, gzip.BadGzipFile, tarfile.TarError) as error:
+        raise AssertionError(
+            f"unable to inspect bounded sdist {path.name}: {error}"
+        ) from error
+
+
+def _scan_archive_member(
+    path: Path,
+    member: str,
+    stream: BinaryIO,
+) -> tuple[bool, tuple[str, ...]]:
+    """Inspect one member after streaming it through the admission bound.
+
+    Keeping the existing whole-member matcher semantics matters: its regular
+    expressions deliberately consider byte boundaries and the full UTF-8 value.
+    The bounded reader caps this one allocation before the matcher sees it.
+    """
+    data = _read_bounded_member(
+        stream,
+        path,
+        member,
+        maximum=ARCHIVE_MAX_MEMBER_BYTES,
+    )
+    if _is_nested_archive_member(member, data):
+        return True, ()
+    native_member = _is_native_member(member, data)
+    scan_data = _rt_scan_data(member, data)
+    source_member = _is_source_text_member(
+        member,
+        scan_data,
+        native_member=native_member,
+    )
+    if not native_member and not source_member:
+        return False, ()
+    return False, tuple(
+        _forbidden_rt_content(
+            scan_data,
+            source_member=source_member,
+            native_member=native_member,
+        )
+    )
 
 
 def _validated_sdist_root(path: Path, members: Iterable[str]) -> str:
@@ -409,7 +746,11 @@ def _validated_sdist_root(path: Path, members: Iterable[str]) -> str:
 
 
 def _assert_no_precision_distribution_identity(artifact: Artifact) -> None:
-    identities = [artifact.path.name, *artifact.members]
+    identities = [
+        artifact.path.name,
+        *artifact.members,
+        *_artifact_archive_members(artifact),
+    ]
     forbidden = sorted(
         identity
         for identity in identities
@@ -528,7 +869,19 @@ def _assert_native_precision_abi(
     native_member: str,
     backend: str,
 ) -> None:
-    native = archive.read(native_member)
+    source_member = _artifact_member_source(artifact, native_member)
+    try:
+        info = archive.getinfo(source_member)
+    except KeyError as error:
+        raise AssertionError(
+            f"{artifact.path.name} has no native payload {native_member!r}"
+        ) from error
+    native = _read_zip_member(
+        artifact.path,
+        archive,
+        info,
+        maximum=ARCHIVE_MAX_MEMBER_BYTES,
+    )
     with tempfile.TemporaryDirectory(prefix="gafime-native-exports-") as temporary:
         native_path = Path(temporary) / PurePosixPath(native_member).name
         native_path.write_bytes(native)
@@ -556,7 +909,7 @@ def _assert_native_precision_abi(
 
 
 def _sdist_member_bytes(artifact: Artifact, relative: str) -> bytes:
-    with tarfile.open(artifact.path, "r:gz") as archive:
+    with _open_bounded_sdist(artifact.path) as archive:
         members = _validated_sdist_members(artifact.path, archive)
         root = _validated_sdist_root(artifact.path, members)
         member_name = f"{root}/{relative}"
@@ -566,13 +919,12 @@ def _sdist_member_bytes(artifact: Artifact, relative: str) -> bytes:
             f"{artifact.path.name} expected one source member {relative!r}",
         )
         assert member is not None
-        extracted = archive.extractfile(member)
-        _require(
-            extracted is not None,
-            f"unable to read {relative} from {artifact.path.name}",
+        return _read_tar_member(
+            artifact.path,
+            archive,
+            member,
+            maximum=ARCHIVE_MAX_MEMBER_BYTES,
         )
-        assert extracted is not None
-        return extracted.read()
 
 
 def _forbidden_rt_path(path: str) -> bool:
@@ -771,24 +1123,17 @@ def _assert_wheel_rt_free(
     )
     for info in file_infos:
         member = info.filename.rstrip("/")
-        data = archive.read(info)
-        if _is_nested_archive_member(member, data):
+        try:
+            with archive.open(info) as stream:
+                nested, member_findings = _scan_archive_member(path, member, stream)
+        except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+            raise AssertionError(
+                f"unable to inspect {member!r} from {path.name}: {error}"
+            ) from error
+        if nested:
             nested_archives.append(member)
             continue
-        native_member = _is_native_member(member, data)
-        scan_data = _rt_scan_data(member, data)
-        source_member = _is_source_text_member(
-            member,
-            scan_data,
-            native_member=native_member,
-        )
-        if not native_member and not source_member:
-            continue
-        for identity in _forbidden_rt_content(
-            scan_data,
-            source_member=source_member,
-            native_member=native_member,
-        ):
+        for identity in member_findings:
             findings.append(f"{member}: {identity}")
     _require(
         not nested_archives,
@@ -805,8 +1150,9 @@ def _assert_sdist_rt_free(
     path: Path,
     archive: tarfile.TarFile,
     root: str,
-    raw_members: frozenset[str],
+    member_infos: dict[str, tarfile.TarInfo],
 ) -> None:
+    raw_members = frozenset(member_infos)
     members = sorted(
         name[len(root) + 1 :]
         for name in raw_members
@@ -820,28 +1166,24 @@ def _assert_sdist_rt_free(
 
     findings = []
     nested_archives = []
-    for info in archive.getmembers():
-        if not info.isfile() or not info.name.startswith(f"{root}/"):
+    for name, info in sorted(member_infos.items()):
+        if not info.isfile() or not name.startswith(f"{root}/"):
             continue
-        member = info.name[len(root) + 1 :]
-        extracted = archive.extractfile(info)
-        _require(extracted is not None, f"unable to inspect {info.name}")
-        data = extracted.read()
-        if _is_nested_archive_member(member, data):
+        member = name[len(root) + 1 :]
+        try:
+            extracted = archive.extractfile(info)
+            _require(extracted is not None, f"unable to inspect {info.name}")
+            assert extracted is not None
+            with extracted:
+                nested, member_findings = _scan_archive_member(path, member, extracted)
+        except (OSError, EOFError, tarfile.TarError) as error:
+            raise AssertionError(
+                f"unable to inspect {member!r} from {path.name}: {error}"
+            ) from error
+        if nested:
             nested_archives.append(member)
             continue
-        native_member = _is_native_member(member, data)
-        scan_data = _rt_scan_data(member, data)
-        source_member = _is_source_text_member(
-            member,
-            scan_data,
-            native_member=native_member,
-        )
-        for identity in _forbidden_rt_content(
-            scan_data,
-            source_member=source_member,
-            native_member=native_member,
-        ):
+        for identity in member_findings:
             findings.append(f"{member}: {identity}")
     _require(
         not nested_archives,
@@ -863,6 +1205,55 @@ def _metadata_from_text(text: str, path: Path) -> tuple[str, str, object]:
     return _canonical_name(str(name)), str(version), metadata
 
 
+def _rocm_wheel_limits() -> dict[str, object]:
+    policy = _load_rocm_system_policy(ROOT)
+    limits = policy["artifact_limits"]
+    _require(isinstance(limits, dict), "ROCm artifact limits must be a mapping")
+    return limits
+
+
+def _assert_rocm_wheel_compressed_admission(path: Path) -> dict[str, object]:
+    """Apply the checked-in ROCm compressed-byte ceiling before ZIP parsing."""
+    limits = _rocm_wheel_limits()
+    wheel_bytes = path.stat().st_size
+    _require(
+        wheel_bytes <= limits["wheel_bytes"],
+        f"{path.name} size {wheel_bytes} exceeds policy limit {limits['wheel_bytes']}",
+    )
+    return limits
+
+
+def _assert_rocm_wheel_admission(
+    path: Path,
+    distribution: str,
+    member_infos: dict[str, zipfile.ZipInfo],
+    member_sources: dict[str, str],
+) -> None:
+    """Apply the reviewed ROCm artifact ceilings before full-content scanning."""
+    if distribution != "gafime-rocm":
+        return
+    limits = _assert_rocm_wheel_compressed_admission(path)
+    file_infos = [info for info in member_infos.values() if not info.is_dir()]
+    uncompressed_bytes = sum(info.file_size for info in file_infos)
+    _require(
+        uncompressed_bytes <= limits["wheel_uncompressed_bytes"],
+        f"{path.name} uncompressed size {uncompressed_bytes} exceeds policy limit "
+        f"{limits['wheel_uncompressed_bytes']}",
+    )
+    native_name = "gafime_rocm/libgafime_rocm.so"
+    source_name = member_sources.get(native_name)
+    _require(
+        source_name is not None,
+        f"{path.name} must contain one Linux ROCm native payload",
+    )
+    native_info = member_infos[source_name]
+    _require(
+        native_info.file_size <= limits["native_payload_uncompressed_bytes"],
+        f"{path.name} native payload size {native_info.file_size} exceeds policy limit "
+        f"{limits['native_payload_uncompressed_bytes']}",
+    )
+
+
 def _read_wheel(path: Path) -> Artifact:
     try:
         filename_prefix, wheel_python_tag, abi_tag, platform_tag = path.name[
@@ -878,21 +1269,49 @@ def _read_wheel(path: Path) -> Artifact:
         not build_tag or re.fullmatch(r"[0-9][A-Za-z0-9_]*", build_tag) is not None,
         f"invalid wheel filename: {path.name}: non-canonical build tag {build_tag!r}",
     )
+    filename_distribution = _canonical_name(prefix_parts[0])
+    if filename_distribution == "gafime-rocm":
+        _assert_rocm_wheel_compressed_admission(path)
+    _assert_archive_compressed_limit(path)
     with zipfile.ZipFile(path) as archive:
-        member_infos = _validated_wheel_members(path, archive)
-        members = frozenset(member_infos)
-        _assert_wheel_rt_free(path, archive, members)
+        member_infos, members, member_sources = _validated_wheel_members(path, archive)
+        archive_members = frozenset(member_infos)
+        _assert_rocm_wheel_admission(
+            path,
+            filename_distribution,
+            member_infos,
+            member_sources,
+        )
         candidates = sorted(
             name for name in members if name.endswith(".dist-info/METADATA")
         )
         _require(len(candidates) == 1, f"{path.name} must contain one METADATA file")
-        metadata_text = archive.read(member_infos[candidates[0]]).decode("utf-8")
+        metadata_text = _read_zip_member(
+            path,
+            archive,
+            member_infos[member_sources[candidates[0]]],
+            maximum=ARCHIVE_METADATA_BYTES,
+        ).decode("utf-8")
+        distribution, version, metadata = _metadata_from_text(metadata_text, path)
+        if distribution != filename_distribution:
+            _assert_rocm_wheel_admission(
+                path,
+                distribution,
+                member_infos,
+                member_sources,
+            )
+        _assert_wheel_rt_free(path, archive, archive_members)
         wheel_candidates = sorted(
             name for name in members if name.endswith(".dist-info/WHEEL")
         )
         _require(len(wheel_candidates) == 1, f"{path.name} must contain one WHEEL file")
         wheel_metadata = Parser().parsestr(
-            archive.read(member_infos[wheel_candidates[0]]).decode("utf-8")
+            _read_zip_member(
+                path,
+                archive,
+                member_infos[member_sources[wheel_candidates[0]]],
+                maximum=ARCHIVE_METADATA_BYTES,
+            ).decode("utf-8")
         )
         policy_names = sorted(
             f"{package}/build_policy.json"
@@ -904,7 +1323,14 @@ def _read_wheel(path: Path) -> Artifact:
             f"{path.name} contains multiple payload build policies: {policy_names}",
         )
         build_policy = (
-            json.loads(archive.read(member_infos[policy_names[0]]).decode("utf-8"))
+            json.loads(
+                _read_zip_member(
+                    path,
+                    archive,
+                    member_infos[member_sources[policy_names[0]]],
+                    maximum=ARCHIVE_METADATA_BYTES,
+                ).decode("utf-8")
+            )
             if policy_names
             else None
         )
@@ -919,12 +1345,17 @@ def _read_wheel(path: Path) -> Artifact:
             f"{provenance_names}",
         )
         build_provenance = (
-            json.loads(archive.read(member_infos[provenance_names[0]]).decode("utf-8"))
+            json.loads(
+                _read_zip_member(
+                    path,
+                    archive,
+                    member_infos[member_sources[provenance_names[0]]],
+                    maximum=ARCHIVE_METADATA_BYTES,
+                ).decode("utf-8")
+            )
             if provenance_names
             else None
         )
-    distribution, version, metadata = _metadata_from_text(metadata_text, path)
-    filename_distribution = _canonical_name(prefix_parts[0])
     filename_version = prefix_parts[1]
     _require(
         filename_distribution == distribution,
@@ -978,11 +1409,13 @@ def _read_wheel(path: Path) -> Artifact:
         python_tags=python_tags,
         build_policy=build_policy,
         build_provenance=build_provenance,
+        archive_members=archive_members,
+        member_sources=tuple(sorted(member_sources.items())),
     )
 
 
 def _read_sdist(path: Path) -> Artifact:
-    with tarfile.open(path, "r:gz") as archive:
+    with _open_bounded_sdist(path) as archive:
         member_infos = _validated_sdist_members(path, archive)
         raw_members = frozenset(member_infos)
         root = _validated_sdist_root(path, raw_members)
@@ -991,12 +1424,15 @@ def _read_sdist(path: Path) -> Artifact:
             for name in raw_members
             if name.startswith(f"{root}/") and len(name) > len(root) + 1
         )
-        _assert_sdist_rt_free(path, archive, root, raw_members)
+        _assert_sdist_rt_free(path, archive, root, member_infos)
         metadata_name = f"{root}/PKG-INFO"
         _require(metadata_name in raw_members, f"{path.name} has no root PKG-INFO")
-        extracted = archive.extractfile(member_infos[metadata_name])
-        _require(extracted is not None, f"unable to read {metadata_name}")
-        metadata_text = extracted.read().decode("utf-8")
+        metadata_text = _read_tar_member(
+            path,
+            archive,
+            member_infos[metadata_name],
+            maximum=ARCHIVE_METADATA_BYTES,
+        ).decode("utf-8")
         policy_names = sorted(
             f"{root}/{package}/build_policy.json"
             for _, package, _ in PAYLOAD_IDENTITIES.values()
@@ -1006,11 +1442,17 @@ def _read_sdist(path: Path) -> Artifact:
             len(policy_names) <= 1,
             f"{path.name} contains multiple payload build policies: {policy_names}",
         )
-        policy_file = (
-            archive.extractfile(member_infos[policy_names[0]]) if policy_names else None
-        )
         build_policy = (
-            json.loads(policy_file.read().decode("utf-8")) if policy_file else None
+            json.loads(
+                _read_tar_member(
+                    path,
+                    archive,
+                    member_infos[policy_names[0]],
+                    maximum=ARCHIVE_METADATA_BYTES,
+                ).decode("utf-8")
+            )
+            if policy_names
+            else None
         )
         provenance_names = sorted(
             f"{root}/{package}/build_provenance.json"
@@ -1023,14 +1465,16 @@ def _read_sdist(path: Path) -> Artifact:
             f"{path.name} contains multiple CUDA build provenance records: "
             f"{provenance_names}",
         )
-        provenance_file = (
-            archive.extractfile(member_infos[provenance_names[0]])
-            if provenance_names
-            else None
-        )
         build_provenance = (
-            json.loads(provenance_file.read().decode("utf-8"))
-            if provenance_file
+            json.loads(
+                _read_tar_member(
+                    path,
+                    archive,
+                    member_infos[provenance_names[0]],
+                    maximum=ARCHIVE_METADATA_BYTES,
+                ).decode("utf-8")
+            )
+            if provenance_names
             else None
         )
     distribution, version, metadata = _metadata_from_text(metadata_text, path)
@@ -1390,14 +1834,25 @@ def _assert_cuda_system_wheel(artifact: Artifact) -> None:
         if valid_linux
         else "gafime_cuda/gafime_cuda.dll"
     )
+    _assert_archive_compressed_limit(artifact.path)
     with zipfile.ZipFile(artifact.path) as archive:
+        _member_infos, installed_members, member_sources = _validated_wheel_members(
+            artifact.path, archive
+        )
         _require(
-            native_name in artifact.members,
+            native_name in installed_members,
             f"{artifact.path.name} is missing {native_name}",
+        )
+        native_info = archive.getinfo(member_sources[native_name])
+        native = _read_zip_member(
+            artifact.path,
+            archive,
+            native_info,
+            maximum=ARCHIVE_MAX_MEMBER_BYTES,
         )
         with tempfile.TemporaryDirectory(prefix="gafime-cuda-system-") as temporary:
             native_path = Path(temporary) / PurePosixPath(native_name).name
-            native_path.write_bytes(archive.read(native_name))
+            native_path.write_bytes(native)
             if native_path.suffix == ".so":
                 dynamic = _readelf_dynamic(native_path)
                 _require(
@@ -1580,7 +2035,11 @@ def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, objec
         f"{limits['wheel_bytes']}",
     )
 
+    _assert_archive_compressed_limit(artifact.path)
     with zipfile.ZipFile(artifact.path) as archive:
+        member_infos, installed_members, member_sources = _validated_wheel_members(
+            artifact.path, archive
+        )
         file_infos = [info for info in archive.infolist() if not info.is_dir()]
         uncompressed_bytes = sum(info.file_size for info in file_infos)
         _require(
@@ -1588,27 +2047,27 @@ def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, objec
             f"{artifact.path.name} uncompressed size {uncompressed_bytes} exceeds "
             f"policy limit {limits['wheel_uncompressed_bytes']}",
         )
-        native_infos = [
-            info
-            for info in file_infos
-            if info.filename == "gafime_rocm/libgafime_rocm.so"
-        ]
         _require(
-            len(native_infos) == 1,
+            "gafime_rocm/libgafime_rocm.so" in installed_members,
             f"{artifact.path.name} must contain one Linux ROCm native payload",
         )
-        native_info = native_infos[0]
+        native_info = member_infos[member_sources["gafime_rocm/libgafime_rocm.so"]]
         _require(
             native_info.file_size <= limits["native_payload_uncompressed_bytes"],
             f"{artifact.path.name} native payload size {native_info.file_size} exceeds "
             f"policy limit {limits['native_payload_uncompressed_bytes']}",
         )
-        native_payload = archive.read(native_info)
+        native_payload = _read_zip_member(
+            artifact.path,
+            archive,
+            native_info,
+            maximum=limits["native_payload_uncompressed_bytes"],
+        )
         forbidden = sorted(
-            info.filename
-            for info in file_infos
-            if info.filename.startswith("gafime_rocm.libs/")
-            or PurePosixPath(info.filename).name.startswith(
+            member
+            for member in installed_members
+            if member.startswith("gafime_rocm.libs/")
+            or PurePosixPath(member).name.startswith(
                 (
                     "libamd",
                     "libhsa",
@@ -1624,7 +2083,7 @@ def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, objec
             f"{forbidden}",
         )
         sboms = [
-            info.filename for info in file_infos if ".dist-info/sboms/" in info.filename
+            member for member in installed_members if ".dist-info/sboms/" in member
         ]
         _require(
             not sboms,
@@ -2648,6 +3107,22 @@ def _assert_publish_workflow(workflow: str) -> None:
             "ref: ${{ needs.publication_preflight.outputs.source_sha }}" in job,
             f"{job_name} must execute the exact preflight-bound source",
         )
+        _require(
+            "actions/download-artifact" in job
+            and "name: release-bundle" in job
+            and "run-id: ${{ inputs.build_run_id }}" in job
+            and "release_bundle.py verify" in job
+            and "BUILD_RUN_ID: ${{ inputs.build_run_id }}" in job,
+            f"{job_name} must independently bind its public receipt to the exact "
+            "verified frozen build bundle",
+        )
+        bundle_verification = job.find("release_bundle.py verify")
+        receipt_validation = job.find("check_pypi_artifact_collisions.py")
+        _require(
+            0 <= bundle_verification < receipt_validation,
+            f"{job_name} must verify the frozen bundle before validating a public "
+            "resolver receipt",
+        )
     public_matrix = _workflow_job_block(workflow, "verify_public_core_and_cuda")
     for version in RELEASE_MANIFEST.supported_python:
         _require(
@@ -2672,6 +3147,23 @@ def _assert_publish_workflow(workflow: str) -> None:
         '"gafime==$PYPI_VERSION"' in public_matrix
         and '"gafime-cuda==$PYPI_VERSION"' in public_matrix,
         "public installation must pin Core and CUDA to the same release identity",
+    )
+    _require(
+        "pip download --no-cache-dir --only-binary=:all: --no-deps" in public_matrix
+        and "--require-complete-published" in public_matrix
+        and "--receipt-dir" in public_matrix
+        and "--receipt-project" in public_matrix
+        and 'pip install --no-cache-dir --no-deps "$receipt_dir"/*.whl'
+        in public_matrix,
+        "public Core/CUDA installation must install only a complete, frozen-byte "
+        "resolver receipt after wheel-only resolution",
+    )
+    _require(
+        public_matrix.find("check_pypi_artifact_collisions.py")
+        < public_matrix.find(
+            'pip install --no-cache-dir --no-deps "$receipt_dir"/*.whl'
+        ),
+        "public Core/CUDA receipt validation must precede its local install",
     )
     _require(
         "Provision pinned CUDA runtime prerequisite (Linux)" in public_matrix
@@ -2702,6 +3194,24 @@ def _assert_publish_workflow(workflow: str) -> None:
         and "installed_wheel_smoke.py" in public_windows_arm,
         "public Windows ARM64 installs must execute the Core precision smoke",
     )
+    _require(
+        "pip download --no-cache-dir --only-binary=:all: --no-deps"
+        in public_windows_arm
+        and "--require-complete-published" in public_windows_arm
+        and "--receipt-dir" in public_windows_arm
+        and "--receipt-project gafime" in public_windows_arm
+        and "pip install --no-cache-dir --no-deps $wheels[0].FullName"
+        in public_windows_arm,
+        "public Windows ARM64 installation must install only its verified frozen "
+        "wheel receipt",
+    )
+    _require(
+        public_windows_arm.find("check_pypi_artifact_collisions.py")
+        < public_windows_arm.find(
+            "pip install --no-cache-dir --no-deps $wheels[0].FullName"
+        ),
+        "public Windows ARM64 receipt validation must precede its local install",
+    )
     public_rocm = _workflow_job_block(workflow, "verify_public_rocm_install")
     _require(
         "installed_wheel_smoke.py" in public_rocm
@@ -2709,6 +3219,22 @@ def _assert_publish_workflow(workflow: str) -> None:
         and "--backend rocm" in public_rocm,
         "public ROCm source installation must verify both Core and payload "
         "precision surfaces",
+    )
+    _require(
+        "pip download --no-cache-dir --only-binary=:all: --no-deps" in public_rocm
+        and "--require-complete-published" in public_rocm
+        and "--receipt-project gafime" in public_rocm
+        and "--receipt-project gafime-rocm" in public_rocm
+        and "--download-sdist-project gafime-rocm" in public_rocm
+        and "pip install --no-cache-dir --no-deps" in public_rocm
+        and '"$receipt_dir"/*.whl "$receipt_dir"/*.tar.gz' in public_rocm,
+        "public ROCm installation must fetch its source distribution as a raw "
+        "verified receipt before pip prepares it",
+    )
+    _require(
+        public_rocm.find("check_pypi_artifact_collisions.py")
+        < public_rocm.find("pip install --no-cache-dir --no-deps"),
+        "public ROCm raw receipt validation must precede every pip source install",
     )
 
     github_release = _workflow_job_block(workflow, "publish_github_release")

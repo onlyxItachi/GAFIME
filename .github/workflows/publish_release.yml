@@ -404,10 +404,29 @@ jobs:
         with:
           ref: ${{ needs.publication_preflight.outputs.source_sha }}
 
+      - name: Download frozen release bundle for public receipt binding
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-bundle
+          path: dist
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python_version }}
           architecture: ${{ matrix.platform.architecture }}
+
+      - name: Verify frozen release bundle for public receipt binding
+        shell: bash
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: >-
+          python .github/scripts/release_bundle.py verify
+          --artifacts dist
+          --source-sha "${{ needs.publication_preflight.outputs.source_sha }}"
+          --run-id "$BUILD_RUN_ID"
+          --repository "$GITHUB_REPOSITORY"
 
       - name: Set up installed-payload ABI tools (Windows)
         if: runner.os == 'Windows' && matrix.platform.cuda == true
@@ -433,28 +452,41 @@ jobs:
             "$runtime_root" "${LD_LIBRARY_PATH:-}" \
             >> "$GITHUB_ENV"
 
-      - name: Install exact public artifacts from PyPI
+      - name: Resolve, verify, and install exact public artifact receipt
         shell: bash
         env:
           PYPI_VERSION: ${{ needs.publication_preflight.outputs.pep440 }}
           INSTALL_CUDA: ${{ matrix.platform.cuda }}
         run: |
           set -euo pipefail
-          python -m pip install "packaging==25.0"
+          python -m pip install --no-cache-dir --only-binary=:all: \
+            "packaging==25.0" "polars>=1.3,<2"
           requirements=("gafime==$PYPI_VERSION")
+          receipt_projects=(--receipt-project gafime)
           if [ "$INSTALL_CUDA" = "true" ]; then
             requirements+=("gafime-cuda==$PYPI_VERSION")
+            receipt_projects+=(--receipt-project gafime-cuda)
           fi
           for attempt in $(seq 1 18); do
-            if python -m pip install --no-cache-dir --only-binary=:all: "${requirements[@]}"; then
+            receipt_dir="$(mktemp -d "$RUNNER_TEMP/gafime-pypi-receipt-XXXXXX")"
+            if python -m pip download --no-cache-dir --only-binary=:all: --no-deps \
+              --dest "$receipt_dir" "${requirements[@]}" \
+              && python .github/scripts/check_pypi_artifact_collisions.py \
+                --artifacts dist \
+                --version "$PYPI_VERSION" \
+                --require-complete-published \
+                --receipt-dir "$receipt_dir" \
+                "${receipt_projects[@]}"
+            then
               break
             fi
             if [ "$attempt" -eq 18 ]; then
-              echo "PyPI artifacts did not become installable in time."
+              echo "PyPI artifacts did not become receipt-verifiable in time."
               exit 1
             fi
             sleep 10
           done
+          python -m pip install --no-cache-dir --no-deps "$receipt_dir"/*.whl
 
       - name: Verify public dependency direction
         shell: bash
@@ -544,11 +576,33 @@ jobs:
         with:
           ref: ${{ needs.publication_preflight.outputs.source_sha }}
 
+      - name: Download frozen release bundle for public receipt binding
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-bundle
+          path: dist
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
       - name: Set up ARM64 Python 3.11 workflow host
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
           architecture: arm64
+
+      - name: Verify frozen release bundle for public receipt binding
+        shell: pwsh
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          python .github/scripts/release_bundle.py verify `
+            --artifacts dist `
+            --source-sha "${{ needs.publication_preflight.outputs.source_sha }}" `
+            --run-id "$env:BUILD_RUN_ID" `
+            --repository "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Frozen release bundle verification failed."
+          }
 
       - name: Install pinned cibuildwheel NuGet provisioner
         run: python -m pip install "cibuildwheel==3.4.1"
@@ -562,20 +616,51 @@ jobs:
           --github-output "$env:GITHUB_OUTPUT"
           --github-env "$env:GITHUB_ENV"
 
-      - name: Install exact public Core wheel
+      - name: Resolve, verify, and install exact public Core receipt
         shell: pwsh
         env:
           PYPI_VERSION: ${{ needs.publication_preflight.outputs.pep440 }}
         run: |
+          & $env:TARGET_PYTHON -m pip install --no-cache-dir --only-binary=:all: `
+            "packaging==25.0" "polars>=1.3,<2"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The target interpreter could not install public non-GAFIME dependencies."
+          }
+          $receiptDir = $null
           for ($attempt = 1; $attempt -le 18; $attempt++) {
-            & $env:TARGET_PYTHON -m pip install --no-cache-dir --only-binary=:all: "gafime==$env:PYPI_VERSION"
+            $candidateReceipt = Join-Path $env:RUNNER_TEMP "gafime-pypi-receipt-$attempt"
+            New-Item -ItemType Directory -Path $candidateReceipt -ErrorAction Stop | Out-Null
+            & $env:TARGET_PYTHON -m pip download --no-cache-dir --only-binary=:all: --no-deps `
+              --dest "$candidateReceipt" "gafime==$env:PYPI_VERSION"
             if ($LASTEXITCODE -eq 0) {
-              & $env:TARGET_PYTHON -c "import gafime, os; assert gafime.__version__ == os.environ['PYPI_VERSION']"
-              exit 0
+              python .github/scripts/check_pypi_artifact_collisions.py `
+                --artifacts dist `
+                --version "$env:PYPI_VERSION" `
+                --require-complete-published `
+                --receipt-dir "$candidateReceipt" `
+                --receipt-project gafime
+              if ($LASTEXITCODE -eq 0) {
+                $receiptDir = $candidateReceipt
+                break
+              }
+            }
+            if ($attempt -eq 18) {
+              throw "The Windows ARM64 Core wheel did not become receipt-verifiable in time."
             }
             Start-Sleep -Seconds 10
           }
-          throw "The Windows ARM64 Core wheel did not become installable in time."
+          $wheels = @(Get-ChildItem -LiteralPath $receiptDir -File -Filter "*.whl")
+          if ($wheels.Count -ne 1) {
+            throw "The verified receipt must contain exactly one Core wheel."
+          }
+          & $env:TARGET_PYTHON -m pip install --no-cache-dir --no-deps $wheels[0].FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "The verified Core receipt could not be installed."
+          }
+          & $env:TARGET_PYTHON -c "import gafime, os; assert gafime.__version__ == os.environ['PYPI_VERSION']"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The verified Core receipt installed an unexpected version."
+          }
 
       - name: Verify public Windows ARM64 Core precision profiles
         shell: pwsh
@@ -600,6 +685,25 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ needs.publication_preflight.outputs.source_sha }}
+
+      - name: Download frozen release bundle for public receipt binding
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-bundle
+          path: dist
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify frozen release bundle for public receipt binding
+        shell: bash
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: >-
+          python .github/scripts/release_bundle.py verify
+          --artifacts dist
+          --source-sha "${{ needs.publication_preflight.outputs.source_sha }}"
+          --run-id "$BUILD_RUN_ID"
+          --repository "$GITHUB_REPOSITORY"
 
       - name: Build and install public ROCm sdist against pinned system ROCm
         shell: bash
@@ -633,17 +737,32 @@ jobs:
               export GAFIME_ROCM_ARCHS=linux-release
               export GAFIME_ROCM_WHEEL_POLICY=system
               python=/opt/python/cp314-cp314/bin/python
+              "$python" -m pip install --no-cache-dir "polars>=1.3,<2"
+              receipt_dir=""
               for attempt in $(seq 1 18); do
-                if "$python" -m pip install --no-cache-dir \
-                  "gafime==$PYPI_VERSION" "gafime-rocm==$PYPI_VERSION"
+                candidate_receipt="$(mktemp -d /tmp/gafime-pypi-receipt-XXXXXX)"
+                if "$python" -m pip download --no-cache-dir --only-binary=:all: --no-deps \
+                  --dest "$candidate_receipt" "gafime==$PYPI_VERSION" \
+                  && "$python" /project/.github/scripts/check_pypi_artifact_collisions.py \
+                    --artifacts /project/dist \
+                    --version "$PYPI_VERSION" \
+                    --require-complete-published \
+                    --receipt-dir "$candidate_receipt" \
+                    --receipt-project gafime \
+                    --receipt-project gafime-rocm \
+                    --download-sdist-project gafime-rocm
                 then
+                  receipt_dir="$candidate_receipt"
                   break
                 fi
                 if [ "$attempt" -eq 18 ]; then
+                  echo "PyPI ROCm artifacts did not become receipt-verifiable in time."
                   exit 1
                 fi
                 sleep 10
               done
+              "$python" -m pip install --no-cache-dir --no-deps \
+                "$receipt_dir"/*.whl "$receipt_dir"/*.tar.gz
               cp /project/tests/release_measure/installed_wheel_smoke.py /tmp/
               cp /project/tests/release_measure/installed_payload_smoke.py /tmp/
               "$python" /tmp/installed_wheel_smoke.py \

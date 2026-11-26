@@ -202,7 +202,9 @@ class ExecutionGateSourceTest(unittest.TestCase):
             )
 
         with self.subTest(writer="cuda_diagnostics"):
-            body = scoped_native_function(cuda, "int precision_interaction_diagnostics(")
+            body = scoped_native_function(
+                cuda, "int precision_interaction_diagnostics("
+            )
             self.assert_source_order(
                 body,
                 "if (arity == 0) return GAFIME_STATUS_INVALID_ARGUMENT;",

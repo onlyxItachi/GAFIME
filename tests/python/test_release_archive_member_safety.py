@@ -43,9 +43,18 @@ def _tar_special(
     return info, b""
 
 
-def _write_sdist(tmp_path: Path, members: list[tuple[tarfile.TarInfo, bytes]]) -> Path:
+def _write_sdist(
+    tmp_path: Path,
+    members: list[tuple[tarfile.TarInfo, bytes]],
+    *,
+    pax_format: bool = False,
+) -> Path:
     path = tmp_path / "gafime-1.0.0.tar.gz"
-    with tarfile.open(path, "w:gz") as archive:
+    with tarfile.open(
+        path,
+        "w:gz",
+        format=tarfile.PAX_FORMAT if pax_format else tarfile.DEFAULT_FORMAT,
+    ) as archive:
         for info, data in members:
             archive.addfile(info, io.BytesIO(data) if info.isfile() else None)
     return path
@@ -84,6 +93,24 @@ def test_release_gate_accepts_canonical_regular_archive_members(tmp_path: Path) 
         "gafime/__init__.py",
     }
     assert "gafime/__init__.py" in read_release_wheel(wheel).members
+
+
+def test_release_gate_accepts_pax_metadata_through_bounded_stream(
+    tmp_path: Path,
+) -> None:
+    package = _tar_file("gafime-1.0.0/gafime/__init__.py", b"")
+    package[0].pax_headers = {"comment": "release metadata"}
+    sdist = _write_sdist(
+        tmp_path,
+        [
+            _tar_special("gafime-1.0.0", tarfile.DIRTYPE),
+            _tar_file("gafime-1.0.0/PKG-INFO", METADATA),
+            package,
+        ],
+        pax_format=True,
+    )
+
+    assert "gafime/__init__.py" in read_release_sdist(sdist).members
 
 
 @pytest.mark.parametrize(
@@ -182,6 +209,149 @@ def test_release_gate_rejects_duplicate_wheel_members(tmp_path: Path) -> None:
 
     with pytest.raises(AssertionError, match="duplicate"):
         read_release_wheel(wheel)
+
+
+@pytest.mark.parametrize(
+    "alias",
+    (
+        "gafime-1.0.0.data/purelib/gafime/__init__.py",
+        "gafime-1.0.0.data/platlib/gafime/__init__.py",
+        "GAFIME/__init__.py",
+        "gafime/__init__.py.",
+        "gafime/__init__.py ",
+    ),
+)
+def test_release_gate_rejects_wheel_install_destination_aliases(
+    tmp_path: Path, alias: str
+) -> None:
+    wheel = _write_wheel(
+        tmp_path,
+        [
+            (zipfile.ZipInfo("gafime/__init__.py"), b"reviewed\n"),
+            (zipfile.ZipInfo(alias), b"different\n"),
+        ],
+    )
+
+    with pytest.raises(AssertionError, match="same install destination"):
+        read_release_wheel(wheel)
+
+
+def test_release_gate_rejects_wheel_file_parent_destination_alias(
+    tmp_path: Path,
+) -> None:
+    wheel = _write_wheel(
+        tmp_path,
+        [
+            (zipfile.ZipInfo("gafime/native"), b"file\n"),
+            (zipfile.ZipInfo("gafime/native/detail.py"), b"child\n"),
+        ],
+    )
+
+    with pytest.raises(
+        AssertionError, match="file/parent install-destination conflict"
+    ):
+        read_release_wheel(wheel)
+
+
+def test_release_gate_accepts_noncolliding_purelib_relocation(tmp_path: Path) -> None:
+    wheel = _write_wheel(
+        tmp_path,
+        [
+            (zipfile.ZipInfo("gafime/__init__.py"), b"package\n"),
+            (
+                zipfile.ZipInfo("gafime-1.0.0.data/purelib/companion.py"),
+                b"helper\n",
+            ),
+        ],
+    )
+
+    artifact = read_release_wheel(wheel)
+
+    assert "companion.py" in artifact.members
+    assert dict(artifact.member_sources)["companion.py"] == (
+        "gafime-1.0.0.data/purelib/companion.py"
+    )
+
+
+def test_release_gate_rejects_ambiguous_data_scheme_casing(tmp_path: Path) -> None:
+    wheel = _write_wheel(
+        tmp_path,
+        [
+            (
+                zipfile.ZipInfo("gafime-1.0.0.DATA/purelib/companion.py"),
+                b"helper\n",
+            ),
+        ],
+    )
+
+    with pytest.raises(AssertionError, match="ambiguous wheel .data casing"):
+        read_release_wheel(wheel)
+
+
+def test_release_gate_rejects_unicode_equivalent_install_destinations(
+    tmp_path: Path,
+) -> None:
+    wheel = _write_wheel(
+        tmp_path,
+        [
+            (zipfile.ZipInfo("gafime/caf\u00e9.py"), b"composed\n"),
+            (zipfile.ZipInfo("gafime/cafe\u0301.py"), b"decomposed\n"),
+        ],
+    )
+
+    with pytest.raises(AssertionError, match="same install destination"):
+        read_release_wheel(wheel)
+
+
+def test_release_gate_rejects_empty_portable_destination_component(
+    tmp_path: Path,
+) -> None:
+    wheel = _write_wheel(
+        tmp_path,
+        [(zipfile.ZipInfo("gafime/ . /module.py"), b"safe\n")],
+    )
+
+    with pytest.raises(AssertionError, match="empty portable install destination"):
+        read_release_wheel(wheel)
+
+
+def test_release_gate_bounds_member_metadata_before_content_read(
+    tmp_path: Path,
+) -> None:
+    wheel = _write_wheel(
+        tmp_path,
+        [(zipfile.ZipInfo("gafime/__init__.py"), b"safe\n")],
+    )
+
+    with zipfile.ZipFile(wheel) as archive:
+        info = archive.getinfo("gafime/__init__.py")
+        info.file_size = ARTIFACT_GATE["ARCHIVE_MAX_MEMBER_BYTES"] + 1
+        with pytest.raises(AssertionError, match="expanded size"):
+            ARTIFACT_GATE["_validated_wheel_members"](wheel, archive)
+
+
+def test_release_gate_scans_normal_member_with_bounded_reads() -> None:
+    chunk = ARTIFACT_GATE["ARCHIVE_SCAN_CHUNK_BYTES"]
+
+    class BoundedStream:
+        def __init__(self, data: bytes) -> None:
+            self.data = data
+            self.offset = 0
+
+        def read(self, size: int) -> bytes:
+            assert 0 < size <= chunk
+            result = self.data[self.offset : self.offset + size]
+            self.offset += len(result)
+            return result
+
+    nested, findings = ARTIFACT_GATE["_scan_archive_member"](
+        Path("normal.whl"),
+        "gafime/module.py",
+        BoundedStream(b"safe source\n" * (chunk // 3 + 3)),
+    )
+
+    assert nested is False
+    assert findings == ()
 
 
 def test_release_gate_rejects_nul_truncated_wheel_member(tmp_path: Path) -> None:
